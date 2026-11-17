@@ -1,0 +1,113 @@
+package auth
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/gosuda/spira/web"
+)
+
+type Principal struct {
+	ID    string
+	Roles []string
+}
+
+var PrincipalKey = web.NewKey[Principal]("auth.principal")
+
+var authenticateRanKey = web.NewKey[bool]("auth.authenticate-ran")
+
+type Authenticator func(ctx *web.Context) (Principal?, error)
+
+type Rule func(p Principal?) bool
+
+func Authenticate(methods ...Authenticator) web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			web.Set(ctx, authenticateRanKey, true)
+			p, err := firstPrincipal(ctx, methods)
+			if err != nil {
+				return nil, err
+			}
+			if p != nil {
+				web.Set(ctx, PrincipalKey, p)
+			}
+			return next(ctx)
+		}
+	}
+}
+
+func firstPrincipal(ctx *web.Context, methods []Authenticator) (Principal?, error) {
+	for _, m := range methods {
+		p, err := m(ctx)
+		if err != nil {
+			slog.Error("auth: authenticator failed", "error", err)
+			return nil, web.Fail(web.Problem{Title: "Unauthorized", Status: http.StatusUnauthorized})
+		}
+		if p != nil {
+			return p, nil
+		}
+	}
+	return nil, nil
+}
+
+func Require(rule Rule) web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if web.Get(ctx, authenticateRanKey) == nil {
+				slog.Error("auth.Require used without auth.Authenticate")
+				return nil, web.Fail(web.Problem{
+					Title:  "Internal Server Error",
+					Status: http.StatusInternalServerError,
+				})
+			}
+			p := web.Get(ctx, PrincipalKey)
+			if rule(p) {
+				return next(ctx)
+			}
+			return nil, deny(p)
+		}
+	}
+}
+
+func deny(p Principal?) error {
+	if p == nil {
+		return web.Fail(web.Problem{Title: "Unauthorized", Status: http.StatusUnauthorized})
+	}
+	return web.Fail(web.Problem{Title: "Forbidden", Status: http.StatusForbidden})
+}
+
+func Authenticated() Rule {
+	return func(p Principal?) bool {
+		return p != nil
+	}
+}
+
+func HasRole(role string) Rule {
+	return func(p Principal?) bool {
+		if p == nil {
+			return false
+		}
+		return slices.Contains(p.Roles, role)
+	}
+}
+
+func Bearer(verify func(ctx context.Context, token string) (Principal?, error)) Authenticator {
+	return func(ctx *web.Context) (Principal?, error) {
+		token := bearerToken(ctx.Request.Header.Get("Authorization"))
+		if token == "" {
+			return nil, nil
+		}
+		return verify(ctx.Ctx(), token)
+	}
+}
+
+func bearerToken(header string) string {
+	scheme, token, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimLeft(token, " ")
+}

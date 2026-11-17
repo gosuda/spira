@@ -1,0 +1,266 @@
+package auth_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/web"
+)
+
+func newTestSessions() (*auth.Sessions, auth.SessionStore) {
+	store := auth.NewMemoryStore()
+	return &auth.Sessions{Store: store}, store
+}
+
+func loginRoute(s *auth.Sessions) *web.Router {
+	r := web.NewRouter()
+	r.Handle("POST", "/login", func(ctx *web.Context) (web.Reply, error) {
+		p := auth.Principal{ID: "u-1", Roles: []string{"user"}}
+		cookie, err := s.Login(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		if cookie == nil {
+			return nil, fmt.Errorf("auth: login returned no cookie")
+		}
+		ctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+		return web.Empty{}, nil
+	})
+	return r
+}
+
+func logoutHandler(s *auth.Sessions) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		cookie, err := s.Logout(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if cookie == nil {
+			return nil, fmt.Errorf("auth: logout returned no cookie")
+		}
+		ctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+		return web.Empty{}, nil
+	}
+}
+
+func guardedRoute(s *auth.Sessions) *web.Router {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(s.Authenticator()))
+	r.Use(auth.Require(auth.Authenticated()))
+	r.Handle("GET", "/who", principalHandler)
+	r.Handle("POST", "/logout", logoutHandler(s))
+	return r
+}
+
+func sessionCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie? {
+	t.Helper()
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("want one cookie, got %d (%v)", len(cookies), cookies)
+		return nil
+	}
+	return cookies[0]
+}
+
+func hashSessionKey(t *testing.T, id string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])
+}
+
+func loadSession(t *testing.T, store auth.SessionStore, key string) auth.Principal? {
+	t.Helper()
+	p, err := store.Load(context.Background(), key)
+	if err != nil {
+		t.Fatalf("store load %q: %v", key, err)
+		return nil
+	}
+	return p
+}
+
+func TestLoginCookieShapeAndStoreSeesSHA256(t *testing.T) {
+	s, store := newTestSessions()
+	rec := callAuth(t, loginRoute(s), httptest.NewRequest(http.MethodPost, "/login", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+	c := sessionCookie(t, rec)
+	if c == nil {
+		return
+	}
+	if c.Name != s.Cookie {
+		t.Fatalf("cookie name %q want %q", c.Name, s.Cookie)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(c.Value)
+	if err != nil {
+		t.Fatalf("cookie value %q is not base64url: %v", c.Value, err)
+		return
+	}
+	if len(raw) != 32 {
+		t.Fatalf("cookie value decodes to %d bytes, want 32", len(raw))
+	}
+	if !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
+		t.Fatalf("cookie flags secure=%v httpOnly=%v sameSite=%v path=%q",
+			c.Secure, c.HttpOnly, c.SameSite, c.Path)
+	}
+	if p := loadSession(t, store, c.Value); p != nil {
+		t.Fatalf("store holds the raw id as a key")
+	}
+	p := loadSession(t, store, hashSessionKey(t, c.Value))
+	if p == nil {
+		t.Fatalf("store has no session under the sha256 key")
+		return
+	}
+	if p.ID != "u-1" {
+		t.Fatalf("stored id %q want u-1", p.ID)
+	}
+}
+
+func TestLoginRotatesIDAndRemovesOldSession(t *testing.T) {
+	s, store := newTestSessions()
+	r := loginRoute(s)
+
+	c1 := sessionCookie(t, callAuth(t, r, httptest.NewRequest(http.MethodPost, "/login", nil)))
+	if c1 == nil {
+		return
+	}
+	again := httptest.NewRequest(http.MethodPost, "/login", nil)
+	again.AddCookie(c1)
+	c2 := sessionCookie(t, callAuth(t, r, again))
+	if c2 == nil {
+		return
+	}
+	if c1.Value == c2.Value {
+		t.Fatalf("login reused session id %q", c1.Value)
+	}
+	if p := loadSession(t, store, hashSessionKey(t, c1.Value)); p != nil {
+		t.Fatalf("old session survived re-login")
+	}
+	if p := loadSession(t, store, hashSessionKey(t, c2.Value)); p == nil {
+		t.Fatalf("new session missing after re-login")
+	}
+}
+
+func TestTamperedOrUnknownSessionIDIsAnonymous(t *testing.T) {
+	s, _ := newTestSessions()
+	r := guardedRoute(s)
+
+	for _, id := range []string{"not-a-real-id", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"} {
+		req := httptest.NewRequest(http.MethodGet, "/who", nil)
+		req.AddCookie(&http.Cookie{Name: s.Cookie, Value: id})
+		rec := callAuth(t, r, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("id %q: status %d want 401 body %s", id, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestExpiredSessionIsAnonymous(t *testing.T) {
+	s := &auth.Sessions{Store: auth.NewMemoryStore(), TTL: -time.Second}
+	rec := callAuth(t, loginRoute(s), httptest.NewRequest(http.MethodPost, "/login", nil))
+	cookie := sessionCookie(t, rec)
+	if cookie == nil {
+		return
+	}
+	req := httptest.NewRequest(http.MethodGet, "/who", nil)
+	req.AddCookie(&http.Cookie{Name: s.Cookie, Value: cookie.Value})
+	if got := callAuth(t, guardedRoute(s), req); got.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401: a session past its TTL is anonymous", got.Code)
+	}
+}
+
+func TestLogoutRemovesSessionAndExpiresCookie(t *testing.T) {
+	s, store := newTestSessions()
+	c1 := sessionCookie(t, callAuth(t, loginRoute(s), httptest.NewRequest(http.MethodPost, "/login", nil)))
+	if c1 == nil {
+		return
+	}
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.AddCookie(c1)
+	rec := callAuth(t, guardedRoute(s), req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+	if p := loadSession(t, store, hashSessionKey(t, c1.Value)); p != nil {
+		t.Fatalf("session survived logout")
+	}
+	expired := sessionCookie(t, rec)
+	if expired == nil {
+		return
+	}
+	if !expired.Expires.Before(time.Now()) || expired.MaxAge >= 0 {
+		t.Fatalf("cookie not expired: expires=%v maxAge=%d", expired.Expires, expired.MaxAge)
+	}
+}
+
+func TestMemoryStoreServesSixteenConcurrentChildren(t *testing.T) {
+	store := auth.NewMemoryStore()
+	if err := driveSixteenSlots(t.Context(), store, t); err != nil {
+		t.Fatalf("concurrent drive: %v", err)
+	}
+	for i := range 16 {
+		assertSlot(t, store, i)
+	}
+}
+
+func driveSixteenSlots(ctx context.Context, store auth.SessionStore, t *testing.T) error {
+	go group (ctx, limit = 16) {
+		for i := range 16 {
+			go exerciseSlot(ctx, store, t, i)
+		}
+	}
+	return nil
+}
+
+func exerciseSlot(ctx context.Context, store auth.SessionStore, t *testing.T, i int) error {
+	id := fmt.Sprintf("slot-%d", i)
+	p := auth.Principal{ID: fmt.Sprintf("user-%d", i), Roles: []string{"user"}}
+	if err := store.Save(ctx, id, p, time.Minute); err != nil {
+		t.Errorf("slot %d: save: %v", i, err)
+		return nil
+	}
+	got, err := store.Load(ctx, id)
+	if err != nil {
+		t.Errorf("slot %d: load: %v", i, err)
+		return nil
+	}
+	if got == nil {
+		t.Errorf("slot %d: load returned none", i)
+		return nil
+	}
+	if got.ID != p.ID {
+		t.Errorf("slot %d: load returned %s want %s", i, got.ID, p.ID)
+	}
+	if i%2 == 0 {
+		if err := store.Delete(ctx, id); err != nil {
+			t.Errorf("slot %d: delete: %v", i, err)
+		}
+	}
+	return nil
+}
+
+func assertSlot(t *testing.T, store auth.SessionStore, i int) {
+	t.Helper()
+	p := loadSession(t, store, fmt.Sprintf("slot-%d", i))
+	if i%2 == 0 {
+		if p != nil {
+			t.Fatalf("slot %d: deleted session still present", i)
+		}
+		return
+	}
+	if p == nil {
+		t.Fatalf("slot %d: session missing", i)
+		return
+	}
+	if p.ID != fmt.Sprintf("user-%d", i) {
+		t.Fatalf("slot %d: id %s", i, p.ID)
+	}
+}

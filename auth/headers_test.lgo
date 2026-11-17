@@ -1,0 +1,119 @@
+package auth_test
+
+import (
+	"encoding/json/v2"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/web"
+)
+
+const wantCSP = "default-src 'self'; script-src 'self' 'nonce-%s'; style-src 'self'; " +
+	"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; " +
+	"base-uri 'self'; form-action 'self'"
+
+func nonceHandler(ctx *web.Context) (web.Reply, error) {
+	nonce := web.Get(ctx, auth.NonceKey)
+	if nonce == nil {
+		return nil, fmt.Errorf("auth: nonce missing from context")
+	}
+	return web.Data{Value: nonce}, nil
+}
+
+func assertCommonHeaders(t *testing.T, h http.Header) {
+	t.Helper()
+	want := map[string]string{
+		"Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+		"X-Content-Type-Options":    "nosniff",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+	}
+	for name, value := range want {
+		if got := h.Get(name); got != value {
+			t.Fatalf("%s = %q want %q", name, got, value)
+		}
+	}
+}
+
+func TestSecureHeadersWriteExactValuesWithFreshNonce(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.SecureHeaders())
+	r.Handle("GET", "/x", nonceHandler)
+
+	nonces := make([]string, 2)
+	for i := range 2 {
+		rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d want 200 body %s", rec.Code, rec.Body.String())
+		}
+		var nonce string
+		if err := json.Unmarshal(rec.Body.Bytes(), &nonce); err != nil {
+			t.Fatalf("decode nonce body %q: %v", rec.Body.String(), err)
+			continue
+		}
+		nonces[i] = nonce
+		want := fmt.Sprintf(wantCSP, nonce)
+		if csp := rec.Header().Get("Content-Security-Policy"); csp != want {
+			t.Fatalf("csp %q want %q", csp, want)
+		}
+		assertCommonHeaders(t, rec.Header())
+	}
+	if nonces[0] == nonces[1] {
+		t.Fatalf("nonce repeated across requests: %q", nonces[0])
+	}
+}
+
+func TestDevHeadersWriteCommonHeadersWithoutCSP(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.DevHeaders())
+	r.Handle("GET", "/x", okHandler)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); csp != "" {
+		t.Fatalf("DevHeaders set CSP %q", csp)
+	}
+	assertCommonHeaders(t, rec.Header())
+}
+
+func TestCrossOriginRejectsUnsafeCrossSiteRequests(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.CrossOrigin())
+	r.Handle("POST", "/x", okHandler)
+	r.Handle("GET", "/x", okHandler)
+
+	cases := []struct {
+		name   string
+		method string
+		origin string
+		fetch  string
+		want   int
+	}{
+		{"cross-site post", http.MethodPost, "", "cross-site", http.StatusForbidden},
+		{"same-origin post", http.MethodPost, "", "same-origin", http.StatusNoContent},
+		{"none post", http.MethodPost, "", "none", http.StatusNoContent},
+		{"foreign origin post", http.MethodPost, "https://evil.example", "", http.StatusForbidden},
+		{"matching origin post", http.MethodPost, "http://shop.example", "", http.StatusNoContent},
+		{"cross-site get", http.MethodGet, "", "cross-site", http.StatusNoContent},
+		{"headerless post", http.MethodPost, "", "", http.StatusNoContent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "http://shop.example/x", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.fetch != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.fetch)
+			}
+			rec := callAuth(t, r, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status %d want %d body %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}

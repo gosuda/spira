@@ -1,0 +1,76 @@
+package auth
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+
+	"github.com/gosuda/spira/web"
+)
+
+var NonceKey = web.NewKey[string]("auth.nonce")
+
+const (
+	hstsValue   = "max-age=63072000; includeSubDomains"
+	noSniff     = "nosniff"
+	referrerPol = "strict-origin-when-cross-origin"
+)
+
+func CrossOrigin() web.Stage {
+	protection := http.NewCrossOriginProtection()
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if err := protection.Check(ctx.Request); err != nil {
+				return nil, web.Fail(web.Problem{
+					Title:  "Forbidden",
+					Status: http.StatusForbidden,
+					Detail: err.Error(),
+				})
+			}
+			return next(ctx)
+		}
+	}
+}
+
+func SecureHeaders() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			nonce := newNonce()?
+			h := ctx.ResponseHeader()
+			h.Set("Content-Security-Policy", contentSecurityPolicy(nonce))
+			setCommonHeaders(h)
+			web.Set(ctx, NonceKey, nonce)
+			return next(ctx)
+		}
+	}
+}
+
+func DevHeaders() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			setCommonHeaders(ctx.ResponseHeader())
+			return next(ctx)
+		}
+	}
+}
+
+func contentSecurityPolicy(nonce string) string {
+	return fmt.Sprintf("default-src 'self'; script-src 'self' 'nonce-%s'; "+
+		"style-src 'self'; img-src 'self' data:; connect-src 'self'; "+
+		"frame-ancestors 'none'; base-uri 'self'; form-action 'self'", nonce)
+}
+
+func setCommonHeaders(h http.Header) {
+	h.Set("Strict-Transport-Security", hstsValue)
+	h.Set("X-Content-Type-Options", noSniff)
+	h.Set("Referrer-Policy", referrerPol)
+}
+
+func newNonce() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("auth: nonce entropy: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
