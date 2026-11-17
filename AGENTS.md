@@ -12,7 +12,7 @@ spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). I
 
 ## Toolchain environment
 
-The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113 and #114 applied. The comptime packages need #102, `just eject` needs #103, and `resilience` needs #109. Every command needs:
+The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113, #114, #116 and #117 applied. The comptime packages need #102, `just eject` needs #103, and `resilience` needs #109. #116 rejects an exported comptime generic that names an unexported identifier of its package, so such a generic calls only exported names. Every command needs:
 
 ```sh
 export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
