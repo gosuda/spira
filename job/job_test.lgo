@@ -1,0 +1,525 @@
+package job_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/job"
+)
+
+func expectPanic(t *testing.T, want string, call func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("call did not panic, want %q", want)
+		}
+		if got := fmt.Sprint(r); got != want {
+			t.Fatalf("panic = %q, want %q", got, want)
+		}
+	}()
+	call()
+}
+
+func TestEveryRejectsNonPositiveInterval(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		expectPanic(t, `job: Every "held": interval must be positive`, func() {
+			var s job.Scheduler
+			s.Every("held", interval, func(ctx context.Context) error { return nil })
+		})
+	}
+}
+
+func TestEveryAfterStartPanics(t *testing.T) {
+	var s job.Scheduler
+	s.Every("first", time.Second, func(ctx context.Context) error { return nil })
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	expectPanic(t, `job: Every "second": scheduler already started`, func() {
+		s.Every("second", time.Second, func(ctx context.Context) error { return nil })
+	})
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestSchedulerTicksAtLeastThreeTimes(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan struct{}, 8)
+	runs := atomic.Int64{}
+	s.Every("ticker", time.Millisecond, func(ctx context.Context) error {
+		runs.Add(1)
+		select {
+		case ticks <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ctx := t.Context()
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for i := range 3 {
+		select {
+		case <-ticks:
+		case <-timeout.C:
+			t.Fatalf("job ticked %d times, want at least 3", i)
+		case <-ctx.Done():
+			t.Fatalf("test context ended while waiting for tick %d", i)
+		}
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if runs.Load() < 3 {
+		t.Fatalf("runs = %d, want at least 3", runs.Load())
+	}
+}
+
+func TestSchedulerLogsJobErrorAndKeepsTicking(t *testing.T) {
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(previous)
+	var s job.Scheduler
+	ticks := make(chan struct{}, 8)
+	s.Every("failing", time.Millisecond, func(ctx context.Context) error {
+		select {
+		case ticks <- struct{}{}:
+		default:
+		}
+		return errors.New("boom")
+	})
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ctx := t.Context()
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for i := range 2 {
+		select {
+		case <-ticks:
+		case <-timeout.C:
+			t.Fatalf("scheduler stopped after %d ticks despite job errors", i)
+		case <-ctx.Done():
+			t.Fatalf("test context ended while waiting for tick %d", i)
+		}
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if !strings.Contains(buf.String(), "failing") {
+		t.Fatalf("log output %q does not name the failing job", buf.String())
+	}
+}
+
+func waitStart(t *testing.T, starts <-chan time.Time, what string) time.Time {
+	t.Helper()
+	select {
+	case at := <-starts:
+		return at
+	case <-time.After(3 * time.Second):
+		t.Fatalf("job never started: %s", what)
+	case <-t.Context().Done():
+		t.Fatalf("test context ended while waiting for %s", what)
+	}
+	return time.Time{}
+}
+
+func TestSchedulerSkipsTicksDuringRun(t *testing.T) {
+	var s job.Scheduler
+	starts := make(chan time.Time, 8)
+	release := make(chan struct{})
+	var released atomic.Bool
+	s.Every("held", 200*time.Millisecond, func(ctx context.Context) error {
+		select {
+		case starts <- time.Now():
+		default:
+		}
+		if !released.Load() {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		return nil
+	})
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	first := waitStart(t, starts, "the first run")
+	deadline := time.Now().Add(3 * time.Second)
+	for s.Skipped() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if s.Skipped() == 0 {
+		t.Fatal("no tick was counted as skipped during the first run")
+	}
+	close(release)
+	released.Store(true)
+	relAt := time.Now()
+	second := waitStart(t, starts, "the second run")
+	if gap := second.Sub(relAt); gap < 50*time.Millisecond {
+		t.Fatalf("second run started %v after release, want at least 50ms; a queued tick would start it at once", gap)
+	}
+	expected := int64(relAt.Sub(first) / (200 * time.Millisecond))
+	if got := int64(s.Skipped()); got < expected-1 || got > expected+1 {
+		t.Fatalf("Skipped = %d, want %d within one (ticks that fell inside the first run)", got, expected)
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestSchedulerRecoversJobPanic(t *testing.T) {
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(previous)
+	var s job.Scheduler
+	runs := make(chan struct{}, 8)
+	s.Every("panicky", time.Millisecond, func(ctx context.Context) error {
+		select {
+		case runs <- struct{}{}:
+		default:
+		}
+		panic("kaboom")
+	})
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ctx := t.Context()
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for i := range 2 {
+		select {
+		case <-runs:
+		case <-timeout.C:
+			t.Fatalf("scheduler stopped after %d runs despite job panics", i)
+		case <-ctx.Done():
+			t.Fatalf("test context ended while waiting for run %d", i)
+		}
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if !strings.Contains(buf.String(), "panicky") {
+		t.Fatalf("log output %q does not name the panicking job", buf.String())
+	}
+}
+
+func TestQueueBackpressure(t *testing.T) {
+	gate := make(chan struct{})
+	processed := atomic.Int64{}
+	q := job.NewQueue[int](1, 2, func(ctx context.Context, v int) error {
+		<-gate
+		processed.Add(1)
+		return nil
+	})
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := range 3 {
+		if err := q.Enqueue(t.Context(), i); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	err := q.Enqueue(ctx, 3)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Enqueue on full queue = %v, want context deadline", err)
+	}
+	close(gate)
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if processed.Load() != 3 {
+		t.Fatalf("processed = %d, want 3", processed.Load())
+	}
+}
+
+func TestQueueDrainsAfterStartContextCancel(t *testing.T) {
+	gate := make(chan struct{})
+	processed := atomic.Int64{}
+	q := job.NewQueue[int](1, 4, func(ctx context.Context, v int) error {
+		<-gate
+		processed.Add(1)
+		return nil
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	if err := q.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := range 3 {
+		if err := q.Enqueue(ctx, i); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+	cancel()
+	close(gate)
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if processed.Load() != 3 {
+		t.Fatalf("processed = %d, want 3 after the start context was cancelled before Stop", processed.Load())
+	}
+}
+
+func TestQueueHandlerErrorDoesNotStopQueue(t *testing.T) {
+	attempts := atomic.Int64{}
+	q := job.NewQueue[int](1, 4, func(ctx context.Context, v int) error {
+		attempts.Add(1)
+		if v == 0 {
+			return errors.New("bad item")
+		}
+		return nil
+	})
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := range 3 {
+		if err := q.Enqueue(t.Context(), i); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop = %v, want nil with the handler error contained", err)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("attempts = %d, want 3 with the queue running past the failed item", attempts.Load())
+	}
+}
+
+func TestQueueRecoversHandlerPanic(t *testing.T) {
+	attempts := atomic.Int64{}
+	q := job.NewQueue[int](1, 4, func(ctx context.Context, v int) error {
+		attempts.Add(1)
+		if v == 0 {
+			panic("bad item")
+		}
+		return nil
+	})
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := range 3 {
+		if err := q.Enqueue(t.Context(), i); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop = %v, want nil with the handler panic contained", err)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("attempts = %d, want 3 with the queue running past the panicking item", attempts.Load())
+	}
+}
+
+func TestNewQueueRejectsBadWorkers(t *testing.T) {
+	expectPanic(t, "job: NewQueue: workers must be at least 1", func() {
+		_ = job.NewQueue[int](0, 1, func(ctx context.Context, v int) error { return nil })
+	})
+}
+
+func TestNewQueueRejectsNegativeCapacity(t *testing.T) {
+	expectPanic(t, "job: NewQueue: capacity must not be negative", func() {
+		_ = job.NewQueue[int](1, -1, func(ctx context.Context, v int) error { return nil })
+	})
+}
+
+func TestQueueStopTimesOutWhenHandlerNeverReturns(t *testing.T) {
+	ended := atomic.Bool{}
+	q := job.NewQueue[int](1, 2, func(ctx context.Context, v int) error {
+		<-ctx.Done()
+		ended.Store(true)
+		return nil
+	})
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := q.Enqueue(t.Context(), 1); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	stopCtx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	err := q.Stop(stopCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop = %v, want context deadline", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !ended.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !ended.Load() {
+		t.Fatal("handler context did not end after Stop timed out")
+	}
+}
+
+func TestEnqueueAfterStopFails(t *testing.T) {
+	q := job.NewQueue[int](1, 2, func(ctx context.Context, v int) error { return nil })
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	err := q.Enqueue(ctx, 7)
+	if err == nil {
+		t.Fatal("Enqueue after Stop returned nil, want an error")
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("Enqueue after Stop blocked until %v, want an immediate queue-closed error", err)
+	}
+}
+
+func TestStartTwiceFails(t *testing.T) {
+	var s job.Scheduler
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("scheduler Start: %v", err)
+	}
+	if err := s.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "already started") {
+		t.Fatalf("second scheduler Start = %v, want an already-started error", err)
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("scheduler Stop: %v", err)
+	}
+	q := job.NewQueue[int](1, 2, func(ctx context.Context, v int) error { return nil })
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("queue Start: %v", err)
+	}
+	if err := q.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "already started") {
+		t.Fatalf("second queue Start = %v, want an already-started error", err)
+	}
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("queue Stop: %v", err)
+	}
+}
+
+func TestChunkWriteFailureStopsRun(t *testing.T) {
+	boom := errors.New("boom")
+	var written []int
+	calls := 0
+	c := job.Chunk[int, int]{
+		Read: func(yield func(int, error) bool) {
+			for i := range 5 {
+				if !yield(i, nil) {
+					return
+				}
+			}
+		},
+		Process: func(in int) (int, error) {
+			return in * 2, nil
+		},
+		Write: func(ctx context.Context, items const []int) error {
+			calls++
+			if calls == 2 {
+				return boom
+			}
+			written = append(written, items...)
+			return nil
+		},
+		Size: 2,
+	}
+	_, err := c.Run(t.Context())
+	if err == nil {
+		t.Fatal("Run error = nil, want boom")
+		return
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run error = %v, want boom", err)
+		return
+	}
+	ce, ok := errors.AsType[*job.ChunkError](err)
+	if !ok {
+		t.Fatalf("Run error %T carries no chunk stats", err)
+		return
+	}
+	if ce.Stats.Items != 2 || ce.Stats.Chunks != 1 {
+		t.Fatalf("ChunkError stats = %+v, want Items=2 Chunks=1 for the chunks written before the failure", ce.Stats)
+	}
+	if got := err.Error(); got != "job: chunk failed after 2 items in 1 chunks: boom" {
+		t.Fatalf("Run error text = %q, want the chunk-failed form", got)
+	}
+	if !slices.Equal(written, []int{0, 2}) {
+		t.Fatalf("written = %v, want [0 2] with the run stopped at the failed chunk", written)
+	}
+}
+
+func TestChunkSuccessStats(t *testing.T) {
+	var written []int
+	c := job.Chunk[int, int]{
+		Read: func(yield func(int, error) bool) {
+			for i := range 5 {
+				if !yield(i, nil) {
+					return
+				}
+			}
+		},
+		Process: func(in int) (int, error) {
+			return in * 2, nil
+		},
+		Write: func(ctx context.Context, items const []int) error {
+			written = append(written, items...)
+			return nil
+		},
+		Size: 2,
+	}
+	stats, err := c.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run error = %v, want nil", err)
+		return
+	}
+	if stats.Items != 5 || stats.Chunks != 3 {
+		t.Fatalf("stats = %+v, want Items=5 Chunks=3", stats)
+	}
+	if !slices.Equal(written, []int{0, 2, 4, 6, 8}) {
+		t.Fatalf("written = %v, want [0 2 4 6 8]", written)
+	}
+}
+
+func TestChunkReadError(t *testing.T) {
+	boom := errors.New("read boom")
+	read := func(yield func(int, error) bool) {
+		yield(1, nil)
+		yield(0, boom)
+	}
+	c := job.Chunk[int, int]{
+		Read:    read,
+		Process: func(in int) (int, error) { return in, nil },
+		Write: func(ctx context.Context, items const []int) error {
+			return nil
+		},
+		Size: 10,
+	}
+	_, err := c.Run(t.Context())
+	if err == nil {
+		t.Fatal("Run error = nil, want read boom")
+		return
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run error = %v, want read boom", err)
+		return
+	}
+	ce, ok := errors.AsType[*job.ChunkError](err)
+	if !ok {
+		t.Fatalf("Run error %T carries no chunk stats", err)
+		return
+	}
+	if ce.Stats.Items != 0 || ce.Stats.Chunks != 0 {
+		t.Fatalf("ChunkError stats = %+v, want zero items before the read error", ce.Stats)
+	}
+}

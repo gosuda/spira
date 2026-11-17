@@ -1,0 +1,76 @@
+package job
+
+import (
+	"context"
+	"fmt"
+	"iter"
+)
+
+type Stats struct {
+	Items  int
+	Chunks int
+}
+
+type ChunkError struct {
+	Stats Stats
+	Err   error
+}
+
+func (e *ChunkError) Error() string {
+	return fmt.Sprintf("job: chunk failed after %d items in %d chunks: %v", e.Stats.Items, e.Stats.Chunks, e.Err)
+}
+
+func (e *ChunkError) Unwrap() error {
+	return e.Err
+}
+
+type Chunk[In any, Out any] struct {
+	Read    iter.Seq2[In, error]
+	Process func(in In) (Out, error)
+	Write   func(ctx context.Context, items const []Out) error
+	Size    int = 100
+}
+
+func (c Chunk[In, Out]) Run(ctx context.Context) (Stats, error) {
+	size := c.Size
+	if size < 1 {
+		size = 100
+	}
+	var stats Stats
+	batch := make([]Out, 0, size)
+	for in, readErr := range c.Read {
+		if readErr != nil {
+			return Stats{}, &ChunkError{Stats: stats, Err: readErr}
+		}
+		out, err := c.Process(in)
+		if err != nil {
+			return Stats{}, &ChunkError{Stats: stats, Err: err}
+		}
+		batch = append(batch, out)
+		if len(batch) < size {
+			continue
+		}
+		if err := c.writeBatch(ctx, batch, &stats); err != nil {
+			return Stats{}, &ChunkError{Stats: stats, Err: err}
+		}
+		batch = batch[:0]
+	}
+	if len(batch) > 0 {
+		if err := c.writeBatch(ctx, batch, &stats); err != nil {
+			return Stats{}, &ChunkError{Stats: stats, Err: err}
+		}
+	}
+	return stats, nil
+}
+
+func (c Chunk[In, Out]) writeBatch(ctx context.Context, batch []Out, stats *Stats) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.Write(ctx, batch); err != nil {
+		return err
+	}
+	stats.Chunks++
+	stats.Items += len(batch)
+	return nil
+}

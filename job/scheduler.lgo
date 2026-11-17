@@ -1,0 +1,156 @@
+package job
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync/atomic"
+	"time"
+
+	"logos/rt"
+	"logos/sync"
+)
+
+type jobEntry struct {
+	name     string
+	interval time.Duration
+	run      func(ctx context.Context) error
+	busy     atomic.Bool
+}
+
+type joinState struct {
+	done chan struct{}
+	err  sync.Locked[error]
+}
+
+type schedRun struct {
+	join       *joinState
+	cancel     context.CancelFunc
+	joinCancel context.CancelFunc
+}
+
+type Scheduler struct {
+	jobs    []jobEntry
+	started atomic.Bool
+	skipped atomic.Uint64
+	run     atomic.Pointer[schedRun]
+}
+
+func (s *Scheduler) Every(name string, interval time.Duration, run func(ctx context.Context) error) {
+	if s.started.Load() {
+		panic(fmt.Sprintf("job: Every %q: scheduler already started", name))
+	}
+	if interval <= 0 {
+		panic(fmt.Sprintf("job: Every %q: interval must be positive", name))
+	}
+	s.jobs = append(s.jobs, jobEntry{name: name, interval: interval, run: run})
+}
+
+func (s *Scheduler) Skipped() uint64 {
+	return s.skipped.Load()
+}
+
+func (s *Scheduler) Start(ctx context.Context) error {
+	if !s.started.CompareAndSwap(false, true) {
+		return fmt.Errorf("job: scheduler already started")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	g, _ := rt.NewGroup(runCtx, 0)
+	for i := range s.jobs {
+		s.spawn(g, &s.jobs[i])
+	}
+	js := &joinState{done: make(chan struct{})}
+	joinCtx, joinCancel := context.WithCancel(context.Background())
+	context.AfterFunc(joinCtx, func() {
+		js.err.WithLock(func(e *error) {
+			*e = g.Wait()
+		})
+		close(js.done)
+	})
+	s.run.Store(&schedRun{join: js, cancel: cancel, joinCancel: joinCancel})
+	return nil
+}
+
+func (s *Scheduler) Stop(ctx context.Context) error {
+	if !s.started.Swap(false) {
+		return nil
+	}
+	r := s.run.Load()
+	if r == nil {
+		return nil
+	}
+	r.cancel()
+	r.joinCancel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.join.done:
+	}
+	var err error
+	r.join.err.WithLock(func(e *error) {
+		err = *e
+	})
+	return err
+}
+
+func (s *Scheduler) spawn(g *rt.Group, j *jobEntry) {
+	tick := make(chan struct{}, 1)
+	g.Go(func(ctx context.Context) error {
+		return s.pump(ctx, j, tick)
+	})
+	g.Go(func(ctx context.Context) error {
+		return s.runner(ctx, j, tick)
+	})
+}
+
+func (s *Scheduler) pump(ctx context.Context, j *jobEntry, tick chan struct{}) error {
+	ticker := time.NewTicker(j.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if !s.deliver(ctx, j, tick) {
+				return nil
+			}
+		}
+	}
+}
+
+func (s *Scheduler) deliver(ctx context.Context, j *jobEntry, tick chan struct{}) bool {
+	if !j.busy.CompareAndSwap(false, true) {
+		s.skipped.Add(1)
+		return true
+	}
+	select {
+	case tick <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		j.busy.Store(false)
+		return false
+	}
+}
+
+func (s *Scheduler) runner(ctx context.Context, j *jobEntry, tick chan struct{}) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick:
+		}
+		s.runOnce(ctx, j)
+		j.busy.Store(false)
+	}
+}
+
+func (s *Scheduler) runOnce(ctx context.Context, j *jobEntry) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("job: run panicked", "job", j.name, "panic", fmt.Sprint(r))
+		}
+	}()
+	if err := j.run(ctx); err != nil {
+		slog.Warn("job: run failed", "job", j.name, "error", err)
+	}
+}
