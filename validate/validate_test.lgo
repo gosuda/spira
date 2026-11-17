@@ -1,0 +1,43 @@
+package validate_test
+
+import (
+	"encoding/json"
+	"maps"
+	"slices"
+	"testing"
+
+	"github.com/gosuda/spira/validate"
+)
+
+func TestRequireAppendsExactlyWhenOkIsFalse(t *testing.T) {
+	var errs validate.Errors
+	errs.Require(true, "name", "required", "ignored")
+	errs.Require(true, "age", "min", "ignored")
+	if len(errs) != 0 {
+		t.Fatalf("Require with ok=true appended %d errors, want none", len(errs))
+	}
+	errs.Require(false, "age", "min", "age must be at least 1")
+	errs.Require(false, "email", "email", "email is not valid")
+	want := []validate.FieldError{
+		{Field: "age", Rule: "min", Message: "age must be at least 1"},
+		{Field: "email", Rule: "email", Message: "email is not valid"},
+	}
+	if !slices.Equal(errs, want) {
+		t.Fatalf("errs = %+v, want %+v", errs, want)
+	}
+}
+
+func TestFieldErrorUsesWireNames(t *testing.T) {
+	bs, err := json.Marshal(validate.FieldError{Field: "age", Rule: "min", Message: "too small"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(bs, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	want := map[string]string{"field": "age", "rule": "min", "message": "too small"}
+	if !maps.Equal(got, want) {
+		t.Fatalf("wire names = %v, want %v", got, want)
+	}
+}

@@ -1,0 +1,19 @@
+package validate
+
+type FieldError struct {
+	Field   string `json:"field"`
+	Rule    string `json:"rule"`
+	Message string `json:"message"`
+}
+
+type Errors []FieldError
+
+type Checker interface {
+	Check() Errors
+}
+
+func (e *Errors) Require(ok bool, field string, rule string, message string) {
+	if !ok {
+		*e = append(*e, FieldError{Field: field, Rule: rule, Message: message})
+	}
+}
