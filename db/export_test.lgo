@@ -1,0 +1,24 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+)
+
+func (p *Pool) HoldStatement(ctx context.Context, query string) (*sql.Stmt?, error) {
+	return p.stmts.prepare(ctx, p.handle, query)
+}
+
+func (p *Pool) ReleaseStatement(query string) {
+	p.stmts.release(query)
+}
+
+func (p *Pool) RetiredStatementsEmpty() bool {
+	empty := false
+	p.stmts.state.WithLock(s => {
+		if s.retiredCount == 0 {
+			empty = true
+		}
+	})
+	return empty
+}
