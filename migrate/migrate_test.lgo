@@ -1,0 +1,388 @@
+package migrate_test
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/migrate"
+
+	_ "modernc.org/sqlite"
+)
+
+func dsnFor(t *testing.T) string {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", "_", ")", "_", "$", "_").Replace(t.Name())
+	return fmt.Sprintf("file:spira_%s?mode=memory&cache=shared", key)
+}
+
+func openPool(t *testing.T) *db.Pool {
+	t.Helper()
+	pool, err := db.Open("sqlite", dsnFor(t))
+	if err != nil {
+		panic(fmt.Sprintf("migrate_test: open %s: %v", t.Name(), err))
+	}
+	if pool == nil {
+		panic("migrate_test: Open returned no pool")
+	}
+	if serr := pool.Start(t.Context()); serr != nil {
+		panic(fmt.Sprintf("migrate_test: start %s: %v", t.Name(), serr))
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func loadSteps(t *testing.T, dir string) []migrate.Step {
+	t.Helper()
+	steps, err := migrate.Load(os.DirFS("testdata/" + dir))
+	if err != nil {
+		t.Fatalf("Load(%s): %v", dir, err)
+		return nil
+	}
+	return steps
+}
+
+func tableNames(t *testing.T, pool *db.Pool) []string {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+	if err != nil {
+		t.Fatalf("tableNames: %v", err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatal("tableNames: no rows")
+		return nil
+	}
+	defer closeRows(t, rows)
+	var names []string
+	for rows.Next() {
+		var name string
+		if serr := rows.Scan(&name); serr != nil {
+			t.Fatalf("scan: %v", serr)
+			return nil
+		}
+		names = append(names, name)
+	}
+	if serr := rows.Err(); serr != nil {
+		t.Fatalf("rows: %v", serr)
+		return nil
+	}
+	return names
+}
+
+func storedNames(t *testing.T, pool *db.Pool) []string {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), "SELECT name FROM spira_migrations ORDER BY name")
+	if err != nil {
+		t.Fatalf("storedNames: %v", err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatal("storedNames: no rows")
+		return nil
+	}
+	defer closeRows(t, rows)
+	var names []string
+	for rows.Next() {
+		var name string
+		if serr := rows.Scan(&name); serr != nil {
+			t.Fatalf("scan: %v", serr)
+			return nil
+		}
+		names = append(names, name)
+	}
+	if serr := rows.Err(); serr != nil {
+		t.Fatalf("rows: %v", serr)
+		return nil
+	}
+	return names
+}
+
+func rawFingerprint(t *testing.T) string {
+	t.Helper()
+	handle, err := sql.Open("sqlite", dsnFor(t))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+		return ""
+	}
+	defer func() {
+		if cerr := handle.Close(); cerr != nil {
+			t.Errorf("raw close: %v", cerr)
+		}
+	}()
+	rows, err := handle.Query("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")
+	if err != nil {
+		t.Fatalf("raw fingerprint: %v", err)
+		return ""
+	}
+	defer closeRows(t, rows)
+	var parts []string
+	for rows.Next() {
+		var line string
+		if serr := rows.Scan(&line); serr != nil {
+			t.Fatalf("raw scan: %v", serr)
+			return ""
+		}
+		parts = append(parts, line)
+	}
+	if serr := rows.Err(); serr != nil {
+		t.Fatalf("raw rows: %v", serr)
+		return ""
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\n")
+}
+
+func closeRows(t *testing.T, rows *sql.Rows) {
+	t.Helper()
+	if err := rows.Close(); err != nil {
+		t.Errorf("close rows: %v", err)
+	}
+}
+
+func TestLoadOrdersByName(t *testing.T) {
+	steps := loadSteps(t, "good")
+	if len(steps) != 2 {
+		t.Fatalf("Load returned %d steps, want 2", len(steps))
+		return
+	}
+	if steps[0].Name != "0001_create_users" || steps[1].Name != "0002_add_email" {
+		t.Fatalf("Load names = %q, %q", steps[0].Name, steps[1].Name)
+		return
+	}
+	if !strings.Contains(steps[0].Up, "CREATE TABLE users") {
+		t.Fatalf("step 0 up = %q", steps[0].Up)
+	}
+}
+
+func TestLoadRefusesMissingDown(t *testing.T) {
+	_, err := migrate.Load(os.DirFS("testdata/downonly"))
+	if err == nil {
+		t.Fatal("Load accepted a .down.sql without .up.sql")
+		return
+	}
+	if !strings.Contains(err.Error(), "0001_orphan.down.sql") {
+		t.Fatalf("Load error = %q, want it to name the file", err.Error())
+	}
+}
+
+func TestLoadRefusesMissingUp(t *testing.T) {
+	fsys := fstest.MapFS{
+		"0001_only.up.sql": &fstest.MapFile{Data: []byte("CREATE TABLE only (id integer)")},
+	}
+	_, err := migrate.Load(fsys)
+	if err == nil {
+		t.Fatal("Load accepted an .up.sql without .down.sql")
+		return
+	}
+	if !strings.Contains(err.Error(), "0001_only.up.sql") {
+		t.Fatalf("Load error = %q, want it to name the file", err.Error())
+	}
+}
+
+func TestApplyAppliesInOrderAndIsIdempotent(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	got := tableNames(t, pool)
+	want := []string{"posts", "spira_migrations", "users"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("tables = %v, want %v", got, want)
+		return
+	}
+	gotApplied := storedNames(t, pool)
+	wantApplied := []string{"0001_create_users", "0002_add_email"}
+	if strings.Join(gotApplied, ",") != strings.Join(wantApplied, ",") {
+		t.Fatalf("applied = %v, want %v", gotApplied, wantApplied)
+		return
+	}
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("second Apply: %v", err)
+		return
+	}
+	if got := storedNames(t, pool); len(got) != 2 {
+		t.Fatalf("applied after second Apply = %v", got)
+	}
+}
+
+func TestApplyRefusesReorderedSteps(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	before := rawFingerprint(t)
+	err := migrate.Apply(t.Context(), pool, []migrate.Step{steps[1], steps[0]})
+	if err == nil {
+		t.Fatal("Apply accepted reordered steps")
+		return
+	}
+	if !strings.Contains(err.Error(), `applied step 0 is "0001_create_users", expected "0002_add_email"`) {
+		t.Fatalf("Apply error = %q", err.Error())
+		return
+	}
+	if after := rawFingerprint(t); after != before {
+		t.Fatalf("schema changed on refusal:\n%s\n->\n%s", before, after)
+	}
+}
+
+func TestApplyRefusesMissingMiddleStep(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	before := rawFingerprint(t)
+	skipped := []migrate.Step{steps[0], {Name: "0099_other", Up: "CREATE TABLE other (id integer)", Down: "DROP TABLE other"}}
+	err := migrate.Apply(t.Context(), pool, skipped)
+	if err == nil {
+		t.Fatal("Apply accepted a missing middle step")
+		return
+	}
+	if !strings.Contains(err.Error(), `applied step 1 is "0002_add_email", expected "0099_other"`) {
+		t.Fatalf("Apply error = %q", err.Error())
+		return
+	}
+	if after := rawFingerprint(t); after != before {
+		t.Fatalf("schema changed on refusal:\n%s\n->\n%s", before, after)
+	}
+}
+
+func TestApplyFailingStepLeavesNothing(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "bad")
+	err := migrate.Apply(t.Context(), pool, steps)
+	if err == nil {
+		t.Fatal("Apply accepted a failing step")
+		return
+	}
+	if !strings.Contains(err.Error(), "migrate: 0001_broken up:") {
+		t.Fatalf("Apply error = %q", err.Error())
+		return
+	}
+	got := tableNames(t, pool)
+	want := []string{"spira_migrations"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("tables after failure = %v, want %v", got, want)
+		return
+	}
+	if got := storedNames(t, pool); len(got) != 0 {
+		t.Fatalf("applied rows after failure = %v", got)
+	}
+}
+
+func TestApplyPartialPrefixLeavesSchema(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps[:1]); err != nil {
+		t.Fatalf("Apply first: %v", err)
+		return
+	}
+	if got := tableNames(t, pool); strings.Join(got, ",") != "posts,spira_migrations,users" {
+		t.Fatalf("tables = %v", got)
+		return
+	}
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply remaining: %v", err)
+		return
+	}
+	if got := storedNames(t, pool); len(got) != 2 {
+		t.Fatalf("applied = %v", got)
+	}
+}
+
+func TestRollbackOneAndAll(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	if err := migrate.Rollback(t.Context(), pool, steps, 1); err != nil {
+		t.Fatalf("Rollback 1: %v", err)
+		return
+	}
+	got := tableNames(t, pool)
+	want := []string{"posts", "spira_migrations", "users"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("tables after rollback 1 = %v, want %v", got, want)
+		return
+	}
+	if got := storedNames(t, pool); strings.Join(got, ",") != "0001_create_users" {
+		t.Fatalf("applied after rollback 1 = %v", got)
+		return
+	}
+	if err := migrate.Rollback(t.Context(), pool, steps, 1); err != nil {
+		t.Fatalf("Rollback all: %v", err)
+		return
+	}
+	if got := tableNames(t, pool); strings.Join(got, ",") != "spira_migrations" {
+		t.Fatalf("tables after rollback all = %v", got)
+		return
+	}
+	if err := migrate.Rollback(t.Context(), pool, steps, 5); err == nil {
+		t.Fatal("Rollback accepted count larger than applied")
+	}
+}
+
+func TestCheckReversiblePasses(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.CheckReversible(t.Context(), pool, steps); err != nil {
+		t.Fatalf("CheckReversible: %v", err)
+		return
+	}
+	if got := tableNames(t, pool); len(got) != 0 {
+		t.Fatalf("tables after CheckReversible = %v, want no table left behind", got)
+		return
+	}
+	if fp := rawFingerprint(t); fp != "" {
+		t.Fatalf("fingerprint after CheckReversible = %q, want empty", fp)
+	}
+}
+
+func TestCheckReversibleFailsOnLeftoverColumn(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "badpair")
+	err := migrate.CheckReversible(t.Context(), pool, steps)
+	if err == nil {
+		t.Fatal("CheckReversible accepted a down that leaves a column")
+		return
+	}
+	if !strings.Contains(err.Error(), "migrate: 0001_thing down does not restore the schema") {
+		t.Fatalf("CheckReversible error = %q", err.Error())
+	}
+}
+
+func TestCheckReversibleRefusesNonEmpty(t *testing.T) {
+	pool := openPool(t)
+	if _, err := db.Exec(t.Context(), pool, "CREATE TABLE users (id integer)"); err != nil {
+		t.Fatalf("create: %v", err)
+		return
+	}
+	steps := loadSteps(t, "good")
+	err := migrate.CheckReversible(t.Context(), pool, steps)
+	if err == nil {
+		t.Fatal("CheckReversible accepted a non-empty database")
+		return
+	}
+	if !strings.Contains(err.Error(), "migrate: scratch database is not empty") {
+		t.Fatalf("CheckReversible error = %q", err.Error())
+	}
+}
+
