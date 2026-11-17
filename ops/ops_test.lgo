@@ -1,0 +1,252 @@
+package ops_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/meter"
+	"github.com/gosuda/spira/ops"
+	"github.com/gosuda/spira/web"
+)
+
+const opsToken = "ops-test-token"
+
+type checkFunc = func(ctx context.Context) error
+
+func tokenGuard() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if ctx.Request.Header.Get("Authorization") != "Bearer "+opsToken {
+				return nil, web.Fail(web.Problem{Status: http.StatusUnauthorized, Title: "ops token required"})
+			}
+			return next(ctx)
+		}
+	}
+}
+
+func newOpsRouter(checks map[string]checkFunc) (*web.Router, *meter.Registry) {
+	reg := meter.NewRegistry()
+	r := web.NewRouter()
+	r.Use(meter.HTTP(reg))
+	r.Handle("GET", "/catalog/{id}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: ctx.Request.PathValue("id")}, nil
+	})
+	ops.Mount(r, tokenGuard(), ops.Options{Checks: checks, Info: map[string]string{"env": "test"}, Registry: reg, CheckTimeout: 50 * time.Millisecond})
+	return r, reg
+}
+
+func opsGet(r *web.Router, path string, withToken bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", path, nil)
+	if withToken {
+		req.Header.Set("Authorization", "Bearer "+opsToken)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+type reportCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
+type reportBody struct {
+	Status string        `json:"status"`
+	Checks []reportCheck `json:"checks"`
+}
+
+func decodeBody(t *testing.T, rec *httptest.ResponseRecorder, into any) {
+	t.Helper()
+	if err := json.Unmarshal(rec.Body.Bytes(), into); err != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), err)
+	}
+}
+
+func TestReadyNamesFailingCheck(t *testing.T) {
+	checks := map[string]checkFunc{
+		"db":   func(ctx context.Context) error { return errors.New("db: connection refused") },
+		"disk": func(ctx context.Context) error { return nil },
+	}
+	r, _ := newOpsRouter(checks)
+	rec := opsGet(r, "/ops/ready", true)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /ops/ready status = %d, want 503", rec.Code)
+	}
+	var body reportBody
+	decodeBody(t, rec, &body)
+	if body.Status != "unavailable" {
+		t.Fatalf("report status = %q, want unavailable", body.Status)
+	}
+	if len(body.Checks) != 2 {
+		t.Fatalf("report checks = %+v, want both checks", body.Checks)
+	}
+	byName := map[string]reportCheck{}
+	for _, c := range body.Checks {
+		byName[c.Name] = c
+	}
+	dbCheck, ok := byName["db"]
+	if !ok || dbCheck.Status != "fail" || !strings.Contains(dbCheck.Error, "connection refused") {
+		t.Fatalf("db check = %+v, want fail naming the error", dbCheck)
+	}
+	diskCheck, ok := byName["disk"]
+	if !ok || diskCheck.Status != "ok" {
+		t.Fatalf("disk check = %+v, want ok", diskCheck)
+	}
+}
+
+func TestReadyAndHealthPassAllChecks(t *testing.T) {
+	checks := map[string]checkFunc{"db": func(ctx context.Context) error { return nil }}
+	r, _ := newOpsRouter(checks)
+	for _, path := range []string{"/ops/ready", "/ops/health"} {
+		rec := opsGet(r, path, true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", path, rec.Code)
+		}
+		var body reportBody
+		decodeBody(t, rec, &body)
+		if body.Status != "ok" || len(body.Checks) != 1 || body.Checks[0].Name != "db" || body.Checks[0].Status != "ok" {
+			t.Fatalf("GET %s body = %+v, want one ok db check", path, body)
+		}
+	}
+}
+
+func TestLiveAnswers200WhileServing(t *testing.T) {
+	r, _ := newOpsRouter(nil)
+	rec := opsGet(r, "/ops/live", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ops/live status = %d, want 200", rec.Code)
+	}
+	rec = opsGet(r, "/ops/health", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ops/health with no checks status = %d, want 200", rec.Code)
+	}
+}
+
+func TestEveryOpsEndpointRefusedWithoutGuardCredentials(t *testing.T) {
+	r, _ := newOpsRouter(nil)
+	for _, path := range []string{"/ops/live", "/ops/ready", "/ops/health", "/ops/info", "/ops/metrics", "/ops/routes"} {
+		if rec := opsGet(r, path, false); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("GET %s without token status = %d, want 401", path, rec.Code)
+		}
+	}
+}
+
+func TestMetricsServesRegistryTextWithRouteLabel(t *testing.T) {
+	r, reg := newOpsRouter(map[string]checkFunc{})
+	reg.Counter("ops_probe_total", "probe seeded by the test", "kind").With("seed").Add(3)
+	if rec := opsGet(r, "/catalog/42", false); rec.Code != http.StatusOK {
+		t.Fatalf("GET /catalog/42 status = %d, want 200", rec.Code)
+	}
+	rec := opsGet(r, "/ops/metrics", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ops/metrics with token status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", ct)
+	}
+	text := rec.Body.String()
+	if !strings.Contains(text, `ops_probe_total{kind="seed"} 3`) {
+		t.Fatalf("metrics text missing the seeded sample:\n%s", text)
+	}
+	if !strings.Contains(text, "http_request_duration_seconds") {
+		t.Fatalf("metrics text missing the duration histogram:\n%s", text)
+	}
+	if !strings.Contains(text, `route="GET /catalog/{id}"`) {
+		t.Fatalf("metrics text missing the registered route label:\n%s", text)
+	}
+}
+
+func TestRoutesEndpointListsRoutes(t *testing.T) {
+	r, _ := newOpsRouter(nil)
+	rec := opsGet(r, "/ops/routes", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ops/routes status = %d, want 200", rec.Code)
+	}
+	var routes []struct {
+		Method  string `json:"Method"`
+		Pattern string `json:"Pattern"`
+	}
+	decodeBody(t, rec, &routes)
+	found := map[string]bool{}
+	for _, route := range routes {
+		found[route.Method+" "+route.Pattern] = true
+	}
+	for _, want := range []string{"GET /ops/ready", "GET /ops/metrics", "GET /catalog/{id}"} {
+		if !(found[want] ?? false) {
+			t.Fatalf("routes missing %q: %+v", want, routes)
+		}
+	}
+}
+
+func TestInfoEndpointReportsBuildInfo(t *testing.T) {
+	r, _ := newOpsRouter(nil)
+	rec := opsGet(r, "/ops/info", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ops/info status = %d, want 200", rec.Code)
+	}
+	var info struct {
+		Go   string            `json:"go"`
+		Info map[string]string `json:"info"`
+	}
+	decodeBody(t, rec, &info)
+	if info.Go == "" {
+		t.Fatalf("go version missing: %s", rec.Body.String())
+	}
+	if v, ok := info.Info["env"]; !ok || v != "test" {
+		t.Fatalf("info.env = %+v, want test", info.Info)
+	}
+}
+
+func TestPanickingCheckFails(t *testing.T) {
+	checks := map[string]checkFunc{
+		"flaky": func(ctx context.Context) error { panic("check exploded") },
+	}
+	r, _ := newOpsRouter(checks)
+	rec := opsGet(r, "/ops/ready", true)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /ops/ready status = %d, want 503", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "flaky") || !strings.Contains(body, "check exploded") {
+		t.Fatalf("body must name the panicking check and its panic value: %s", body)
+	}
+}
+
+func TestTimedOutCheckFails(t *testing.T) {
+	checks := map[string]checkFunc{
+		"slow": func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	r, _ := newOpsRouter(checks)
+	start := time.Now()
+	rec := opsGet(r, "/ops/health", true)
+	elapsed := time.Since(start)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /ops/health status = %d, want 503", rec.Code)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("check ended after %v; the 50ms check timeout did not bound it", elapsed)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "slow") || !strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("body must name the timed-out check and the deadline: %s", body)
+	}
+}
+
+func TestMountRefusesNonPositiveCheckTimeout(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Mount accepted a zero check timeout")
+		}
+	}()
+	ops.Mount(web.NewRouter(), tokenGuard(), ops.Options{Registry: meter.NewRegistry(), CheckTimeout: 0})
+}

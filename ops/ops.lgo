@@ -1,0 +1,147 @@
+package ops
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"runtime/debug"
+	"slices"
+	"time"
+
+	"github.com/gosuda/spira/meter"
+	"github.com/gosuda/spira/web"
+)
+
+type Options struct {
+	Checks       map[string]func(ctx context.Context) error
+	Info         map[string]string
+	Registry     *meter.Registry
+	CheckTimeout time.Duration = 5 * time.Second
+}
+
+func Mount(r *web.Router, guard web.Stage, o Options) {
+	if o.Registry == nil {
+		panic("ops: Options.Registry is required")
+	}
+	if o.CheckTimeout <= 0 {
+		panic("ops: Options.CheckTimeout must be positive")
+	}
+	r.Group("/ops", func(g *web.Router) {
+		g.Use(guard)
+		g.Handle("GET", "/live", live)
+		g.Handle("GET", "/ready", func(ctx *web.Context) (web.Reply, error) { return checksResponse(ctx, o), nil })
+		g.Handle("GET", "/health", func(ctx *web.Context) (web.Reply, error) { return checksResponse(ctx, o), nil })
+		g.Handle("GET", "/info", func(ctx *web.Context) (web.Reply, error) { return infoResponse(o.Info), nil })
+		g.Handle("GET", "/metrics", func(ctx *web.Context) (web.Reply, error) { return metricsResponse(ctx, o.Registry), nil })
+		g.Handle("GET", "/routes", func(ctx *web.Context) (web.Reply, error) { return routesResponse(r), nil })
+	})
+}
+
+func live(ctx *web.Context) (web.Reply, error) {
+	return web.Data{Value: statusReport{Status: "ok"}}, nil
+}
+
+func checksResponse(ctx *web.Context, o Options) web.Reply {
+	statuses := make([]checkStatus, 0, len(o.Checks))
+	for name, check := range o.Checks {
+		statuses = append(statuses, runCheck(ctx.Ctx(), name, check, o.CheckTimeout))
+	}
+	slices.SortFunc(statuses, func(a checkStatus, b checkStatus) int { return cmp.Compare(a.Name, b.Name) })
+	report := checksReport{Status: "ok", Checks: statuses}
+	for _, st := range statuses {
+		if st.Status != "ok" {
+			report.Status = "unavailable"
+		}
+	}
+	if report.Status == "unavailable" {
+		return web.Data{Value: report, Status: http.StatusServiceUnavailable}
+	}
+	return web.Data{Value: report}
+}
+
+func runCheck(parent context.Context, name string, check func(ctx context.Context) error, timeout time.Duration) checkStatus {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	if err := guardedCheck(ctx, check); err != nil {
+		return checkStatus{Name: name, Status: "fail", Error: err.Error()}
+	}
+	return checkStatus{Name: name, Status: "ok"}
+}
+
+func guardedCheck(ctx context.Context, check func(ctx context.Context) error) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("ops: check panicked: %v", rec)
+		}
+	}()
+	return check(ctx)
+}
+
+func infoResponse(extra map[string]string) web.Reply {
+	report := buildReport{Module: "unknown", Version: "unknown", Go: "unknown", Info: extra}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		report.Module = bi.Main.Path
+		report.Version = bi.Main.Version
+		report.Go = bi.GoVersion
+	}
+	return web.Data{Value: report}
+}
+
+func metricsResponse(ctx *web.Context, reg *meter.Registry) web.Reply {
+	return web.Stream{
+		ContentType: "text/plain; version=0.0.4; charset=utf-8",
+		Write: func(w io.Writer) error {
+			reg.Handler().ServeHTTP(&bodyResponse{w: w, h: http.Header{}}, ctx.Request)
+			return nil
+		},
+	}
+}
+
+func routesResponse(r *web.Router) web.Reply {
+	src := r.Routes()
+	out := make([]web.RouteInfo, 0, len(src))
+	for _, route := range src {
+		out = append(out, route)
+	}
+	return web.Data{Value: out}
+}
+
+type statusReport struct {
+	Status string `json:"status"`
+}
+
+type checksReport struct {
+	Status string        `json:"status"`
+	Checks []checkStatus `json:"checks"`
+}
+
+type checkStatus struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitzero"`
+}
+
+type buildReport struct {
+	Module  string            `json:"module"`
+	Version string            `json:"version"`
+	Go      string            `json:"go"`
+	Info    map[string]string `json:"info"`
+}
+
+type bodyResponse struct {
+	w io.Writer
+	h http.Header
+}
+
+func (b *bodyResponse) Header() http.Header {
+	return b.h
+}
+
+func (b *bodyResponse) Write(p []byte) (int, error) {
+	return b.w.Write(p)
+}
+
+func (b *bodyResponse) WriteHeader(int) {
+}
