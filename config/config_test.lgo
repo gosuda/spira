@@ -1,0 +1,665 @@
+package config_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/config"
+)
+
+type twoFields struct {
+	Name  string
+	Retry int
+}
+
+
+type tagged struct {
+	DB   inner
+	Zone string `env:"SPIRA_ZONE"`
+}
+
+type badMap struct {
+	Rules map[string]string
+}
+
+type badFloat struct {
+	Ratio float32
+}
+
+type dbOnly struct {
+	DB inner
+}
+
+type camel struct {
+	HTTPPort int
+	MaxConns int
+	TLSKey   string
+	Addr2    int
+}
+
+func writeBody(w http.ResponseWriter, body string) {
+	_, err := w.Write([]byte(body))
+	if err != nil {
+		return
+	}
+}
+
+func TestLoadFirstSourceWins(t *testing.T) {
+	first := config.Map(map[string]string{"NAME": "first", "RETRY": "1"})
+	second := config.Map(map[string]string{"NAME": "second", "RETRY": "2"})
+	cfg, err := config.Load[twoFields](first, second)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "first" || cfg.Retry != 1 {
+		t.Fatalf("Load = %+v, want first source values Name first Retry 1", cfg)
+	}
+}
+
+func TestLoadEnvBeatsLaterMap(t *testing.T) {
+	t.Setenv("NAME", "from-env")
+	cfg, err := config.Load[twoFields](config.Env(), config.Map(map[string]string{"NAME": "from-map"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "from-env" {
+		t.Fatalf("Name = %q, want from-env", cfg.Name)
+	}
+}
+
+func TestLoadMapBeatsLaterMap(t *testing.T) {
+	cfg, err := config.Load[twoFields](config.Map(map[string]string{"NAME": "from-map"}), config.Env())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "from-map" {
+		t.Fatalf("Name = %q, want from-map", cfg.Name)
+	}
+}
+
+type requiredMix struct {
+	Present     string
+	Missing     string `required:"true"`
+	MissingBool bool   `required:"true"`
+	MissingList []string `required:"true"`
+	Defaulted   string = "dflt" `required:"true"`
+	Empty       string `required:"true"`
+}
+
+func TestLoadMissingKeysReport(t *testing.T) {
+	rows := []struct {
+		key      string
+		required bool
+		sourced  bool
+	}{
+		{"PRESENT", false, false},
+		{"MISSING", true, false},
+		{"MISSING_BOOL", true, false},
+		{"MISSING_LIST", true, false},
+		{"DEFAULTED", true, false},
+		{"EMPTY", true, true},
+	}
+	var want []string
+	for _, r := range rows {
+		if r.required && !r.sourced {
+			want = append(want, r.key)
+		}
+	}
+	_, err := config.Load[requiredMix](config.Map(map[string]string{"EMPTY": ""}))
+	if err == nil {
+		t.Fatalf("Load error = nil, want missing keys report")
+		return
+	}
+	if got := err.Error(); got != "config: missing keys: "+strings.Join(want, ", ") {
+		t.Fatalf("Load error = %q, want %q", got, "config: missing keys: "+strings.Join(want, ", "))
+	}
+}
+
+type emptyOnly struct {
+	Empty string `required:"true"`
+	Note  string
+}
+
+func TestLoadEmptySourcedStringIsAValue(t *testing.T) {
+	cfg, err := config.Load[emptyOnly](config.Map(map[string]string{"EMPTY": ""}))
+	if err != nil {
+		t.Fatalf("Load: %v, want EMPTY sourced as empty string to satisfy required", err)
+		return
+	}
+	if cfg.Empty != "" {
+		t.Fatalf("Empty = %q, want empty string assigned", cfg.Empty)
+	}
+}
+
+type inner struct {
+	Host string
+	Port int
+	Conn struct {
+		Addr string
+	}
+}
+
+type nested struct {
+	Name string
+	DB   inner
+}
+
+func TestLoadNestedStructKeys(t *testing.T) {
+	src := config.Map(map[string]string{
+		"NAME":         "shop",
+		"DB_HOST":      "db.internal",
+		"DB_PORT":      "5432",
+		"DB_CONN_ADDR": "10.0.0.1",
+	})
+	cfg, err := config.Load[nested](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "shop" {
+		t.Fatalf("Name = %q, want shop", cfg.Name)
+	}
+	if cfg.DB.Host != "db.internal" {
+		t.Fatalf("DB.Host = %q, want db.internal", cfg.DB.Host)
+	}
+	if cfg.DB.Port != 5432 {
+		t.Fatalf("DB.Port = %d, want 5432", cfg.DB.Port)
+	}
+	if cfg.DB.Conn.Addr != "10.0.0.1" {
+		t.Fatalf("DB.Conn.Addr = %q, want 10.0.0.1", cfg.DB.Conn.Addr)
+	}
+}
+
+func TestLoadEnvTagReplacesPath(t *testing.T) {
+	src := config.Map(map[string]string{
+		"DB_HOST":    "h",
+		"DB_PORT":    "1",
+		"SPIRA_ZONE": "eu",
+	})
+	cfg, err := config.Load[tagged](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Zone != "eu" {
+		t.Fatalf("Zone = %q, want eu", cfg.Zone)
+	}
+	if cfg.DB.Host != "h" || cfg.DB.Port != 1 {
+		t.Fatalf("DB = %+v, want host h port 1", cfg.DB)
+	}
+}
+
+type kinds struct {
+	S      string
+	B      bool
+	D      time.Duration
+	F      float64
+	I      int
+	Small  int8
+	Mid    int16
+	Wide   int32
+	Huge   int64
+	U      uint
+	USmall uint8
+	UMid   uint16
+	UWide  uint32
+	UHuge  uint64
+	L      []string
+}
+
+func kindsWant() kinds {
+	return kinds{
+		S:      "x",
+		B:      true,
+		D:      1500 * time.Millisecond,
+		F:      2.5,
+		I:      -7,
+		Small:  120,
+		Mid:    300,
+		Wide:   70000,
+		Huge:   5000000000,
+		U:      7,
+		USmall: 250,
+		UMid:   60000,
+		UWide:  4000000000,
+		UHuge:  10000000000,
+		L:      []string{"a", "b", "c"},
+	}
+}
+
+func kindsValues() map[string]string {
+	return map[string]string{
+		"S":      "x",
+		"B":      "true",
+		"D":      "1500ms",
+		"F":      "2.5",
+		"I":      "-7",
+		"SMALL":  "120",
+		"MID":    "300",
+		"WIDE":   "70000",
+		"HUGE":   "5000000000",
+		"U":      "7",
+		"U_SMALL":  "250",
+		"U_MID":   "60000",
+		"U_WIDE":  "4000000000",
+		"U_HUGE":  "10000000000",
+		"L":      "a, b,c",
+	}
+}
+
+func TestLoadEveryTypeParses(t *testing.T) {
+	cfg, err := config.Load[kinds](config.Map(kindsValues()))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	want := kindsWant()
+	if cfg.S != want.S || cfg.B != want.B || cfg.D != want.D || cfg.F != want.F {
+		t.Fatalf("scalar fields = %+v, want %+v", cfg, want)
+	}
+	if cfg.I != want.I || cfg.Small != want.Small || cfg.Mid != want.Mid || cfg.Wide != want.Wide || cfg.Huge != want.Huge {
+		t.Fatalf("signed fields = %+v, want %+v", cfg, want)
+	}
+	if cfg.U != want.U || cfg.USmall != want.USmall || cfg.UMid != want.UMid || cfg.UWide != want.UWide || cfg.UHuge != want.UHuge {
+		t.Fatalf("unsigned fields = %+v, want %+v", cfg, want)
+	}
+	if !slices.Equal(cfg.L, want.L) {
+		t.Fatalf("L = %v, want %v", cfg.L, want.L)
+	}
+}
+
+func TestLoadMalformedValueNamesTheKey(t *testing.T) {
+	cases := []struct {
+		key   string
+		value string
+	}{
+		{"B", "nope"},
+		{"D", "5x"},
+		{"F", "2.5z"},
+		{"I", "12.5"},
+		{"SMALL", "200"},
+		{"MID", "40000"},
+		{"WIDE", "3000000000"},
+		{"U", "-1"},
+		{"U_SMALL", "300"},
+		{"U_MID", "70000"},
+		{"U_WIDE", "5000000000"},
+		{"U_HUGE", "-5"},
+	}
+	for _, c := range cases {
+		values := map[string]string{c.key: c.value}
+		_, err := config.Load[kinds](config.Map(values))
+		if err == nil {
+			t.Fatalf("Load with %s=%q error = nil, want key-named parse error", c.key, c.value)
+			return
+		}
+		want := "config: " + c.key + ": "
+		if !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("Load with %s=%q error = %q, want prefix %q", c.key, c.value, err.Error(), want)
+		}
+	}
+}
+
+func TestLoadReportsEveryParseFailure(t *testing.T) {
+	_, err := config.Load[kinds](config.Map(map[string]string{"B": "nope", "I": "12.5"}))
+	if err == nil {
+		t.Fatalf("Load error = nil, want both parse failures reported")
+		return
+	}
+	joined := err.Error()
+	for _, key := range []string{"config: B: ", "config: I: "} {
+		if !strings.Contains(joined, key) {
+			t.Fatalf("Load error = %q, want it to name %q", joined, key)
+		}
+	}
+}
+
+func TestLoadUnsupportedFieldTypesAreRunTimeErrors(t *testing.T) {
+	_, err := config.Load[badMap](config.Map(map[string]string{"RULES": "x"}))
+	if err == nil || err.Error() != "config: RULES: unsupported type" {
+		t.Fatalf("badMap error = %v, want config: RULES: unsupported type", err)
+		return
+	}
+	_, err = config.Load[badFloat](config.Map(map[string]string{"RATIO": "1.5"}))
+	if err == nil || err.Error() != "config: RATIO: unsupported type" {
+		t.Fatalf("badFloat error = %v, want config: RATIO: unsupported type", err)
+		return
+	}
+	_, err = config.Load[badFloat](config.Map(map[string]string{}))
+	if err == nil || err.Error() != "config: RATIO: unsupported type" {
+		t.Fatalf("badFloat without value error = %v, want config: RATIO: unsupported type", err)
+	}
+}
+
+func TestLoadRequiresAStruct(t *testing.T) {
+	_, err := config.Load[int](config.Map(map[string]string{"I": "1"}))
+	if err == nil || err.Error() != "config: Load needs a struct" {
+		t.Fatalf("Load[int] error = %v, want config: Load needs a struct", err)
+	}
+}
+
+func TestLoadFieldWithoutSourceKeepsSourceProvidedValue(t *testing.T) {
+	base := config.Map(map[string]string{"NAME": "base"})
+	extra := config.Map(map[string]string{"RETRY": "9"})
+	cfg, err := config.Load[twoFields](base, extra)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "base" || cfg.Retry != 9 {
+		t.Fatalf("Load = %+v, want Name base Retry 9", cfg)
+	}
+}
+
+func TestFileSourceReadsOneJSONObject(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	body := `{"name": "filed", "retry": "4", "db": {"host": "fhost", "port": "9"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	src, err := config.File(path)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+		return
+	}
+	cfg, err := config.Load[twoFields](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "filed" || cfg.Retry != 4 {
+		t.Fatalf("Load = %+v, want Name filed Retry 4", cfg)
+	}
+}
+
+func TestFileSourceRejectsBadDocuments(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"name": `), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := config.File(bad); err == nil || !strings.HasPrefix(err.Error(), "config: file ") {
+		t.Fatalf("File(bad) error = %v, want config: file prefix", err)
+	}
+	array := filepath.Join(dir, "array.json")
+	if err := os.WriteFile(array, []byte(`[1, 2]`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := config.File(array); err == nil {
+		t.Fatalf("File(array) error = nil, want non-object error")
+	}
+	if _, err := config.File(filepath.Join(dir, "absent.json")); err == nil {
+		t.Fatalf("File(absent) error = nil, want read error")
+	}
+}
+
+func TestFileSourceRejectsArrayValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "array-value.json")
+	if err := os.WriteFile(path, []byte(`{"hosts": ["a"]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := config.File(path)
+	if err == nil || !strings.Contains(err.Error(), "HOSTS") {
+		t.Fatalf("File error = %v, want it to name HOSTS", err)
+	}
+}
+
+func TestFileSourceScalarsAndSkipsNulls(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mixed.json")
+	body := `{"retry": 3, "name": null, "flag": true, "ratio": 0.25}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	src, err := config.File(path)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+		return
+	}
+	cfg, err := config.Load[twoFields](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "" || cfg.Retry != 3 {
+		t.Fatalf("Load = %+v, want empty Name and Retry 3", cfg)
+	}
+}
+
+func TestRemoteSourceReadsOneJSONObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(w, `{"name": "remote", "retry": "2"}`)
+	}))
+	defer srv.Close()
+	src, err := config.Remote(t.Context(), srv.URL)
+	if err != nil {
+		t.Fatalf("Remote: %v", err)
+		return
+	}
+	cfg, err := config.Load[twoFields](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "remote" || cfg.Retry != 2 {
+		t.Fatalf("Load = %+v, want Name remote Retry 2", cfg)
+	}
+}
+
+func TestRemoteSourceNestedObjectsFlatten(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeBody(w, `{"db": {"host": "rhost"}}`)
+	}))
+	defer srv.Close()
+	src, err := config.Remote(t.Context(), srv.URL)
+	if err != nil {
+		t.Fatalf("Remote: %v", err)
+		return
+	}
+	cfg, err := config.Load[dbOnly](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.DB.Host != "rhost" {
+		t.Fatalf("DB.Host = %q, want rhost", cfg.DB.Host)
+	}
+}
+
+func TestRemoteSourceRejectsNonObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeBody(w, `[1, 2]`)
+	}))
+	defer srv.Close()
+	if _, err := config.Remote(t.Context(), srv.URL); err == nil {
+		t.Fatalf("Remote error = nil, want non-object error")
+	}
+}
+
+func TestRemoteSourceRejectsArrayValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeBody(w, `{"hosts": ["a"]}`)
+	}))
+	defer srv.Close()
+	_, err := config.Remote(t.Context(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "HOSTS") {
+		t.Fatalf("Remote error = %v, want it to name HOSTS", err)
+	}
+}
+
+func TestRemoteSourceRejectsNon200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	_, err := config.Remote(t.Context(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "status 500") {
+		t.Fatalf("Remote error = %v, want status 500", err)
+	}
+}
+
+func TestRemoteSourceRejectsOversizeBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, (1<<20)+16)
+		for i := range body {
+			body[i] = 'a'
+		}
+		writeBody(w, string(body))
+	}))
+	defer srv.Close()
+	_, err := config.Remote(t.Context(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "body exceeds") {
+		t.Fatalf("Remote error = %v, want body exceeds", err)
+	}
+}
+
+func TestRemoteSourceHonorsContextTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		writeBody(w, `{}`)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err := config.Remote(ctx, srv.URL)
+	if err == nil {
+		t.Fatalf("Remote error = nil, want timeout error")
+		return
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Remote error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestRemoteSourceHonorsContextCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		writeBody(w, `{}`)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var remoteErr error
+	run := func() error {
+		go group (t.Context()) {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				cancel()
+			}()
+			_, remoteErr = config.Remote(ctx, srv.URL)
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if remoteErr == nil || !errors.Is(remoteErr, context.Canceled) {
+		t.Fatalf("Remote error = %v, want context.Canceled", remoteErr)
+	}
+}
+
+func TestProfileDefaultsToDev(t *testing.T) {
+	t.Setenv("SPIRA_PROFILE", "")
+	if got := config.Profile(); got != "dev" {
+		t.Fatalf("Profile = %q, want dev", got)
+	}
+}
+
+
+type crossFixture struct {
+	Name     string `required:"true"`
+	Region   string
+	Settings inner
+}
+
+func TestLoadCrossPackageNestedAndRequired(t *testing.T) {
+	src := config.Map(map[string]string{
+		"NAME":         "shop",
+		"REGION":       "eu",
+		"SETTINGS_HOST": "cross.internal",
+		"SETTINGS_PORT": "5432",
+	})
+	cfg, err := config.Load[crossFixture](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Name != "shop" || cfg.Region != "eu" {
+		t.Fatalf("scalars = %+v, want Name shop Region eu", cfg)
+	}
+	if cfg.Settings.Host != "cross.internal" || cfg.Settings.Port != 5432 {
+		t.Fatalf("Settings = %+v, want host cross.internal port 5432", cfg.Settings)
+	}
+	_, err = config.Load[crossFixture](config.Map(map[string]string{"SETTINGS_HOST": "h", "SETTINGS_PORT": "1"}))
+	if err == nil || err.Error() != "config: missing keys: NAME" {
+		t.Fatalf("Load without NAME error = %v, want config: missing keys: NAME", err)
+	}
+}
+
+func TestProfileReadsEnvironment(t *testing.T) {
+	t.Setenv("SPIRA_PROFILE", "prod")
+	if got := config.Profile(); got != "prod" {
+		t.Fatalf("Profile = %q, want prod", got)
+	}
+}
+
+func TestSnakeKeysFromCamelFieldNames(t *testing.T) {
+	src := config.Map(map[string]string{
+		"HTTP_PORT": "1",
+		"MAX_CONNS": "2",
+		"TLS_KEY":   "k",
+		"ADDR2":     "3",
+	})
+	cfg, err := config.Load[camel](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.HTTPPort != 1 {
+		t.Fatalf("HTTPPort = %d, want key HTTP_PORT to set 1", cfg.HTTPPort)
+	}
+	if cfg.MaxConns != 2 {
+		t.Fatalf("MaxConns = %d, want key MAX_CONNS to set 2", cfg.MaxConns)
+	}
+	if cfg.TLSKey != "k" {
+		t.Fatalf("TLSKey = %q, want key TLS_KEY to set k", cfg.TLSKey)
+	}
+	if cfg.Addr2 != 3 {
+		t.Fatalf("Addr2 = %d, want key ADDR2 to set 3", cfg.Addr2)
+	}
+}
+
+type withDefaults struct {
+	Host string = "localhost"
+	Port int    = 8080
+}
+
+func TestFillKeepsFieldDefaultsThatNoSourceSets(t *testing.T) {
+	cfg := withDefaults{}
+	ld := config.NewLoader([]config.Source{config.Map(map[string]string{"HOST": "db.internal"})})
+	config.Fill(ld, &cfg, "")
+	if err := ld.Err(); err != nil {
+		t.Fatalf("Fill: %v", err)
+		return
+	}
+	if cfg.Host != "db.internal" {
+		t.Fatalf("Host = %q, want the source value db.internal", cfg.Host)
+	}
+	if cfg.Port != 8080 {
+		t.Fatalf("Port = %d, want the field default 8080", cfg.Port)
+	}
+}

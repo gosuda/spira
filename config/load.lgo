@@ -1,0 +1,188 @@
+package config
+
+import (
+	"comptime"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Loader struct {
+	sources []Source
+	missing []string
+	errs    []error
+}
+
+func NewLoader(sources []Source) *Loader {
+	return &Loader{sources: sources}
+}
+
+func (l *Loader) Key(prefix string, name string, tag string) string {
+	return joinKey(prefix, name, tag)
+}
+
+func (l *Loader) Set(dst any, key string, required bool) {
+	set := setterOf(dst)
+	if set == nil {
+		l.errs = append(l.errs, fmt.Errorf("config: %s: unsupported type", key))
+		return
+	}
+	raw, found := l.lookup(key)
+	if !found {
+		if required {
+			l.missing = append(l.missing, key)
+		}
+		return
+	}
+	if err := set(raw); err != nil {
+		l.errs = append(l.errs, fmt.Errorf("config: %s: %w", key, err))
+	}
+}
+
+func (l *Loader) Err() error {
+	if len(l.errs) > 0 {
+		return errors.Join(l.errs...)
+	}
+	if len(l.missing) > 0 {
+		return fmt.Errorf("config: missing keys: %s", strings.Join(l.missing, ", "))
+	}
+	return nil
+}
+
+func (l *Loader) lookup(key string) (string, bool) {
+	for _, src := range l.sources {
+		if v := src.Lookup(key); v != nil {
+			return v ?? "", true
+		}
+	}
+	return "", false
+}
+
+func Load[T any](sources ...Source) (T, error) {
+	var out T
+	const if comptime.IsStruct[T]() {
+		ld := NewLoader(sources)
+		Fill[T](ld, &out, "")
+		if err := ld.Err(); err != nil {
+			var zero T
+			return zero, err
+		}
+	} else {
+		return out, errors.New("config: Load needs a struct")
+	}
+	return out, nil
+}
+
+func Fill[S any](ld *Loader, dst *S, prefix string) {
+	const for _, f := range comptime.Fields[S]() {
+		key := ld.Key(prefix, f.Name, f.Tag.Get("env"))
+		const if comptime.IsStruct[f.Type]() {
+			Fill[f.Type](ld, &dst.[f], key)
+		} else {
+			ld.Set(&dst.[f], key, f.Tag.Get("required") == "true")
+		}
+	}
+}
+
+type setter func(raw string) error
+
+func setterOf(dst any) setter {
+	switch d := dst.(type) {
+	case *string:
+		return func(raw string) error {
+			*d = raw
+			return nil
+		}
+	case *[]string:
+		return func(raw string) error {
+			*d = splitList(raw)
+			return nil
+		}
+	case *bool:
+		return parsed(d, strconv.ParseBool)
+	case *time.Duration:
+		return parsed(d, time.ParseDuration)
+	case *float64:
+		return parsed(d, func(raw string) (float64, error) {
+			return strconv.ParseFloat(raw, 64)
+		})
+	}
+	return integerSetter(dst)
+}
+
+func integerSetter(dst any) setter {
+	switch d := dst.(type) {
+	case *int:
+		return parsed(d, signedOf[int](strconv.IntSize))
+	case *int8:
+		return parsed(d, signedOf[int8](8))
+	case *int16:
+		return parsed(d, signedOf[int16](16))
+	case *int32:
+		return parsed(d, signedOf[int32](32))
+	case *int64:
+		return parsed(d, signedOf[int64](64))
+	case *uint:
+		return parsed(d, unsignedOf[uint](strconv.IntSize))
+	case *uint8:
+		return parsed(d, unsignedOf[uint8](8))
+	case *uint16:
+		return parsed(d, unsignedOf[uint16](16))
+	case *uint32:
+		return parsed(d, unsignedOf[uint32](32))
+	case *uint64:
+		return parsed(d, unsignedOf[uint64](64))
+	}
+	return nil
+}
+
+func parsed[V any](dst *V, parse func(raw string) (V, error)) setter {
+	return func(raw string) error {
+		v, err := parse(raw)
+		if err != nil {
+			return err
+		}
+		*dst = v
+		return nil
+	}
+}
+
+type signed interface {
+	int | int8 | int16 | int32 | int64
+}
+
+type unsigned interface {
+	uint | uint8 | uint16 | uint32 | uint64
+}
+
+func signedOf[E signed](bits int) func(raw string) (E, error) {
+	return func(raw string) (E, error) {
+		n, err := strconv.ParseInt(raw, 10, bits)
+		if err != nil {
+			return 0, err
+		}
+		return E(n), nil
+	}
+}
+
+func unsignedOf[E unsigned](bits int) func(raw string) (E, error) {
+	return func(raw string) (E, error) {
+		n, err := strconv.ParseUint(raw, 10, bits)
+		if err != nil {
+			return 0, err
+		}
+		return E(n), nil
+	}
+}
+
+func splitList(raw string) []string {
+	var parts []string
+	for _, p := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return parts
+}

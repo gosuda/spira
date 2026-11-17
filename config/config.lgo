@@ -1,0 +1,153 @@
+package config
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Source interface {
+	Lookup(key string) string?
+}
+
+type envSource struct{}
+
+func (s envSource) Lookup(key string) string? {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		var none string?
+		return none
+	}
+	return v
+}
+
+type mapSource struct {
+	values map[string]string
+}
+
+func (s mapSource) Lookup(key string) string? {
+	return s.values[key]
+}
+
+func Env() Source {
+	return envSource{}
+}
+
+func Map(values const map[string]string) Source {
+	copied := make(map[string]string, len(values))
+	for k, v := range values {
+		copied[k] = v
+	}
+	return mapSource{values: copied}
+}
+
+func File(path string) (Source, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: file %q: %w", path, err)
+	}
+	values, err := decodeObject(body)
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: file %q: %w", path, err)
+	}
+	return mapSource{values: values}, nil
+}
+
+const remoteTimeout = 10 * time.Second
+const remoteLimit = 1 << 20
+
+func Remote(ctx context.Context, url string) (Source, error) {
+	ctx, cancel := context.WithTimeout(ctx, remoteTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: remote %q: %w", url, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: remote %q: %w", url, err)
+	}
+	defer resp.Body.Close()?
+	if resp.StatusCode != http.StatusOK {
+		return mapSource{}, fmt.Errorf("config: remote %q: status %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, remoteLimit+1))
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: remote %q: %w", url, err)
+	}
+	if len(body) > remoteLimit {
+		return mapSource{}, fmt.Errorf("config: remote %q: body exceeds %d bytes", url, remoteLimit)
+	}
+	values, err := decodeObject(body)
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: remote %q: %w", url, err)
+	}
+	return mapSource{values: values}, nil
+}
+
+const profileEnv = "SPIRA_PROFILE"
+
+func Profile() string {
+	if v := os.Getenv(profileEnv); v != "" {
+		return v
+	}
+	return "dev"
+}
+
+func decodeObject(body []byte) (map[string]string, error) {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if parsed == nil {
+		return nil, errors.New("document is not a JSON object")
+	}
+	values := make(map[string]string, len(parsed))
+	if err := flatten("", parsed, values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func flatten(prefix string, m map[string]any, out map[string]string) error {
+	for k, v := range m {
+		key := k
+		if prefix != "" {
+			key = prefix + "_" + k
+		}
+		if child, ok := v.(map[string]any); ok {
+			if err := flatten(key, child, out); err != nil {
+				return err
+			}
+			continue
+		}
+		if v == nil {
+			continue
+		}
+		s, ok := scalarString(v)
+		if !ok {
+			return fmt.Errorf("%s: array value", strings.ToUpper(key))
+		}
+		out[strings.ToUpper(key)] = s
+	}
+	return nil
+}
+
+func scalarString(v any) (string, bool) {
+	switch value := v.(type) {
+	case string:
+		return value, true
+	case bool:
+		return strconv.FormatBool(value), true
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64), true
+	}
+	return "", false
+}
