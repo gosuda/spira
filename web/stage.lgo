@@ -96,7 +96,7 @@ func AccessLog(log *slog.Logger) Stage {
 			log.Info("web: request",
 				"method", ctx.Request.Method,
 				"route", routeName(ctx.Request),
-				"status", statusOf(ctx),
+				"status", ctx.Status(),
 				"duration", time.Since(start).String(),
 				"request_id", ctx.writer.Header().Get("X-Request-Id"),
 			)
@@ -115,8 +115,8 @@ func routeName(req *http.Request) string {
 	return req.URL.Path
 }
 
-func statusOf(ctx *Context) int {
-	if sw, ok := ctx.writer.(*statusWriter); ok {
+func (c *Context) Status() int {
+	if sw, ok := c.writer.(*statusWriter); ok {
 		return sw.status
 	}
 	return http.StatusOK

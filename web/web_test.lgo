@@ -585,3 +585,28 @@ func TestStageSetsResponseHeaderOnEveryReply(t *testing.T) {
 		}
 	}
 }
+
+func TestStageReadsTheWrittenStatus(t *testing.T) {
+	seen := map[string]int{}
+	record := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			reply, err := next(ctx)
+			seen[ctx.Request.URL.Path] = ctx.Status()
+			return reply, err
+		}
+	}
+	r := web.NewRouter()
+	r.Use(record)
+	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	r.Handle("GET", "/gone", goneFail)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	call(t, r, httptest.NewRequest(http.MethodGet, "/gone", nil))
+	if got := seen["/ok"] ?? 0; got != http.StatusOK {
+		t.Fatalf("status seen for /ok = %d, want 200", got)
+	}
+	if got := seen["/gone"] ?? 0; got != http.StatusNotFound {
+		t.Fatalf("status seen for /gone = %d, want 404", got)
+	}
+}
