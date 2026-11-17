@@ -1,0 +1,270 @@
+package web
+
+import (
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"log/slog"
+	"mime"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/validate"
+	"github.com/gosuda/spira/view"
+)
+
+type Reply interface { Page | Fragment | Data | Redirect | Problem | Empty | Stream }
+
+type Page struct {
+	Title  string
+	Body   view.Node
+	Status int
+}
+
+type Fragment struct {
+	Body     view.Node
+	Status   int
+	Retarget string?
+	Reswap   string?
+	PushURL  string?
+	Trigger  string?
+}
+
+type Data struct {
+	Value  any
+	Status int = 200
+}
+
+type Redirect struct {
+	To     string
+	Status int = 303
+}
+
+type Problem struct {
+	Type     string = "about:blank" `json:"type,omitzero"`
+	Title    string `json:"title,omitzero"`
+	Status   int32  `json:"status,omitzero"`
+	Detail   string `json:"detail,omitzero"`
+	Instance string `json:"instance,omitzero"`
+	Errors   validate.Errors `json:"errors,omitzero"`
+}
+
+type Empty struct {
+	Status int = 204
+}
+
+type Stream struct {
+	ContentType string
+	Write       func(w io.Writer) error
+}
+
+func (r *Router) writeReply(ctx *Context, reply Reply) error {
+	switch v := reply.(type) {
+	case Page:
+		return r.writePage(ctx, v)
+	case Fragment:
+		return r.writeFragment(ctx, v)
+	case Data:
+		return r.writeData(ctx, v)
+	case Redirect:
+		return r.writeRedirect(ctx, v)
+	case Problem:
+		return r.writeProblem(ctx, v)
+	case Empty:
+		return r.writeEmpty(ctx, v)
+	case Stream:
+		return r.writeStream(ctx, v)
+	case nil:
+		return nil
+	}
+	return nil
+}
+
+func (r *Router) writePage(ctx *Context, p Page) error {
+	w := ctx.writer
+	w.Header().Add("Vary", "HX-Request")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	htmx := ctx.Htmx()
+	if htmx.Request && !htmx.Boosted && !htmx.HistoryRestore {
+		writeHead(ctx, pageStatus(p.Status))
+		return renderReply(ctx, w, p.Body, "web: render page body")
+	}
+	if r.Layout == nil {
+		slog.Error("web: page reply has no layout; set Router.Layout", "path", ctx.Request.URL.Path)
+		missing := Problem{Title: "Internal Server Error", Status: http.StatusInternalServerError, Detail: "web: page reply has no layout; set Router.Layout"}
+		return r.writeProblem(ctx, missing)
+	}
+	writeHead(ctx, pageStatus(p.Status))
+	return renderReply(ctx, w, r.Layout(ctx, p), "web: render page layout")
+}
+
+func pageStatus(status int) int {
+	if status == 0 {
+		return http.StatusOK
+	}
+	return status
+}
+
+func writeHead(ctx *Context, status int) {
+	if d := Get(ctx, cacheControlKey); d != nil && status >= 200 && status < 300 {
+		ctx.writer.Header().Set("Cache-Control", d)
+	}
+	ctx.writer.WriteHeader(status)
+}
+
+func renderReply(ctx *Context, w http.ResponseWriter, n view.Node, what string) error {
+	if err := view.Render(ctx.Ctx(), w, n); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
+}
+
+func (r *Router) writeFragment(ctx *Context, f Fragment) error {
+	w := ctx.writer
+	w.Header().Add("Vary", "HX-Request")
+	setHtmxHeader(w, "HX-Retarget", f.Retarget)
+	setHtmxHeader(w, "HX-Reswap", f.Reswap)
+	setHtmxHeader(w, "HX-Push-Url", f.PushURL)
+	setHtmxHeader(w, "HX-Trigger", f.Trigger)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writeHead(ctx, pageStatus(f.Status))
+	return renderReply(ctx, w, f.Body, "web: render fragment body")
+}
+
+func setHtmxHeader(w http.ResponseWriter, name string, value string?) {
+	if v := value; v != nil {
+		w.Header().Set(name, v)
+	}
+}
+
+func (r *Router) writeData(ctx *Context, d Data) error {
+	b, err := json.Marshal(d.Value)
+	if err != nil {
+		return fmt.Errorf("web: encode data reply: %w", err)
+	}
+	w := ctx.writer
+	w.Header().Set("Content-Type", "application/json")
+	writeHead(ctx, d.Status)
+	if _, werr := w.Write(b); werr != nil {
+		return fmt.Errorf("web: write data reply: %w", werr)
+	}
+	return nil
+}
+
+func (r *Router) writeRedirect(ctx *Context, d Redirect) error {
+	w := ctx.writer
+	htmx := ctx.Htmx()
+	if htmx.Request && !htmx.Boosted {
+		w.Header().Set("HX-Redirect", d.To)
+		writeHead(ctx, http.StatusOK)
+		return nil
+	}
+	w.Header().Set("Location", d.To)
+	writeHead(ctx, d.Status)
+	return nil
+}
+
+func (r *Router) writeProblem(ctx *Context, p Problem) error {
+	w := ctx.writer
+	if r.ProblemView != nil && prefersHTML(ctx.Request.Header.Get("Accept")) {
+		if node := r.ProblemView(p); node != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			writeHead(ctx, int(p.Status))
+			return renderReply(ctx, w, node, "web: render problem view")
+		}
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("web: encode problem: %w", err)
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	writeHead(ctx, int(p.Status))
+	if _, werr := w.Write(b); werr != nil {
+		return fmt.Errorf("web: write problem: %w", werr)
+	}
+	return nil
+}
+
+func (r *Router) writeEmpty(ctx *Context, e Empty) error {
+	writeHead(ctx, e.Status)
+	return nil
+}
+
+func (r *Router) writeStream(ctx *Context, s Stream) error {
+	w := ctx.writer
+	w.Header().Set("Content-Type", s.ContentType)
+	writeHead(ctx, http.StatusOK)
+	fw := newFlushWriter(w)
+	if err := s.Write(fw); err != nil {
+		return fmt.Errorf("web: stream: %w", err)
+	}
+	return nil
+}
+
+func prefersHTML(accept string) bool {
+	best := ""
+	bestQ := -1.0
+	for _, part := range strings.Split(accept, ",") {
+		mt, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil {
+			continue
+		}
+		q := acceptQ(params)
+		if q <= bestQ {
+			continue
+		}
+		if mt == "text/html" {
+			best, bestQ = "html", q
+		}
+		if mt == "application/json" {
+			best, bestQ = "json", q
+		}
+	}
+	return best == "html"
+}
+
+func acceptQ(params map[string]string) float64 {
+	qs, ok := params["q"]
+	if !ok {
+		return 1
+	}
+	q, err := strconv.ParseFloat(qs, 64)
+	if err != nil || q < 0 {
+		return 1
+	}
+	return q
+}
+
+type flushWriter struct {
+	inner io.Writer
+	flush http.Flusher
+}
+
+func newFlushWriter(inner io.Writer) *flushWriter {
+	fw := &flushWriter{inner: inner}
+	if f, ok := inner.(http.Flusher); ok {
+		fw.flush = f
+	}
+	return fw
+}
+
+func (fw *flushWriter) Write(b []byte) (int, error) {
+	n, err := fw.inner.Write(b)
+	if fw.flush != nil {
+		fw.flush.Flush()
+	}
+	return n, err
+}
+
+type ProblemError struct {
+	Problem Problem
+}
+
+func (e *ProblemError) Error() string {
+	return "web: " + e.Problem.Title
+}
+
+func Fail(p Problem) error {
+	return &ProblemError{Problem: p}
+}
