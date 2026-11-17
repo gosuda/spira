@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# engines_test.sh: prove scripts/engines.sh without spira code.
+#  1. engines.sh runs a command that checks the three DSNs, their ports and
+#     that spira_test exists in each engine.
+#  2. After engines.sh returns, no spira-engines- container is left.
+#  3. engines.sh false exits nonzero and leaves no container.
+#  4. engines.sh with no argument exits 2.
+#  5. With SPIRA_ENGINES_MSSQL_IMAGE pointing at busybox (its default command
+#     exits at once), engines.sh true fails fast, names the exit code and
+#     leaves no container.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly ENGINES="$SCRIPT_DIR/engines.sh"
+
+fail() {
+	printf 'engines_test.sh: FAIL: %s\n' "$*" >&2
+	exit 1
+}
+
+command -v docker >/dev/null 2>&1 || fail 'docker is required'
+
+leftovers() {
+	docker ps -a --filter name=spira-engines- --format '{{.Names}}'
+}
+
+# --- 1. DSNs, ports and spira_test in each engine ---
+"$ENGINES" bash -s <<'CHECKS'
+set -euo pipefail
+: "${SPIRA_TEST_POSTGRES_DSN:?missing}"
+: "${SPIRA_TEST_MYSQL_DSN:?missing}"
+: "${SPIRA_TEST_MSSQL_DSN:?missing}"
+: "${SPIRA_PG_CONTAINER:?missing}"
+: "${SPIRA_MYSQL_CONTAINER:?missing}"
+: "${SPIRA_MSSQL_CONTAINER:?missing}"
+
+pg_port="${SPIRA_TEST_POSTGRES_DSN##*@127.0.0.1:}"
+pg_port="${pg_port%%/*}"
+my_port="${SPIRA_TEST_MYSQL_DSN##*@tcp(127.0.0.1:}"
+my_port="${my_port%%)*}"
+ms_port="${SPIRA_TEST_MSSQL_DSN##*@127.0.0.1:}"
+ms_port="${ms_port%%/*}"
+
+: "</dev/tcp/127.0.0.1/${pg_port}"
+: "</dev/tcp/127.0.0.1/${my_port}"
+: "</dev/tcp/127.0.0.1/${ms_port}"
+
+docker exec "$SPIRA_PG_CONTAINER" psql -U postgres -d postgres -tAc \
+	"SELECT 1 FROM pg_database WHERE datname='spira_test'" | grep -qx 1
+
+docker exec "$SPIRA_MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -NBe \
+	"SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='spira_test'" | grep -qx 1
+
+docker exec "$SPIRA_MSSQL_CONTAINER" sh -c \
+	'/opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$MSSQL_SA_PASSWORD" -b -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name='"'"'spira_test'"'"'"' | grep -qx spira_test
+CHECKS
+
+[ -z "$(leftovers)" ] || fail "containers left after success: $(leftovers)"
+printf 'engines_test.sh: PASS: DSNs, ports and spira_test verified; containers removed\n'
+
+# --- 2. failure propagates and cleans up ---
+if "$ENGINES" false; then
+	fail 'engines.sh false exited 0'
+fi
+[ -z "$(leftovers)" ] || fail "containers left after failure: $(leftovers)"
+printf 'engines_test.sh: PASS: nonzero exit propagates and containers removed\n'
+
+# --- 3. no argument exits 2 ---
+rc=0
+"$ENGINES" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || fail "engines.sh with no argument exited $rc, want 2"
+[ -z "$(leftovers)" ] || fail "containers left after usage: $(leftovers)"
+printf 'engines_test.sh: PASS: no-argument usage exits 2\n'
+
+# --- 4. an mssql image that exits at once fails fast ---
+docker pull busybox:latest >/dev/null || fail 'busybox pull failed'
+rc=0
+SECONDS=0
+ms_log="$(env SPIRA_ENGINES_MSSQL_IMAGE=busybox:latest "$ENGINES" true 2>&1)" || rc=$?
+elapsed=$SECONDS
+[ "$rc" -ne 0 ] || fail 'engines.sh true with fast-exit mssql image exited 0'
+[ "$elapsed" -lt 90 ] || fail "engines.sh true took ${elapsed}s to fail, want under 90"
+printf '%s\n' "$ms_log" | grep -q 'exit code' || fail "failure output names no exit code: $ms_log"
+[ -z "$(leftovers)" ] || fail "containers left after fast-fail: $(leftovers)"
+printf 'engines_test.sh: PASS: fast-exit mssql image failed in %ss, exit code reported, no containers left\n' "$elapsed"
+
+printf 'engines_test.sh: all checks passed\n'
