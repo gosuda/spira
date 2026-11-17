@@ -1,0 +1,69 @@
+package bus
+
+import (
+	"context"
+	"sync/atomic"
+
+	"logos/sync"
+)
+
+type Topic[T any] struct {
+	buffer  int
+	subs    sync.Locked[[]chan T]
+	dropped atomic.Uint64
+}
+
+func NewTopic[T any](buffer int) *Topic[T] {
+	if buffer < 0 {
+		panic("bus: negative buffer")
+	}
+	return &Topic[T]{buffer: buffer}
+}
+
+func (t *Topic[T]) Publish(v T) {
+	t.subs.WithLock(func(subs *[]chan T) {
+		for _, ch := range *subs {
+			t.offer(ch, v)
+		}
+	})
+}
+
+func (t *Topic[T]) offer(ch chan T, v T) {
+	select {
+	case ch <- v:
+	default:
+		t.dropped.Add(1)
+	}
+}
+
+func (t *Topic[T]) Subscribe(ctx context.Context) <-chan T {
+	ch := make(chan T, t.buffer)
+	t.add(ch)
+	context.AfterFunc(ctx, func() {
+		t.remove(ch)
+		close(ch)
+	})
+	return ch
+}
+
+func (t *Topic[T]) add(ch chan T) {
+	t.subs.WithLock(func(subs *[]chan T) {
+		*subs = append(*subs, ch)
+	})
+}
+
+func (t *Topic[T]) remove(ch chan T) {
+	t.subs.WithLock(func(subs *[]chan T) {
+		kept := (*subs)[:0]
+		for _, c := range *subs {
+			if c != ch {
+				kept = append(kept, c)
+			}
+		}
+		*subs = kept
+	})
+}
+
+func (t *Topic[T]) Dropped() uint64 {
+	return t.dropped.Load()
+}

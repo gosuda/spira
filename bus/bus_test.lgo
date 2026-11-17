@@ -1,0 +1,238 @@
+package bus_test
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/bus"
+	"logos/sync"
+)
+
+func drain[T any](ch <-chan T, n int, wait time.Duration) []T {
+	out := make([]T, 0, n)
+	timer := time.NewTimer(wait)
+	for range n {
+		timer.Reset(wait)
+		select {
+		case v := <-ch:
+			out = append(out, v)
+		case <-timer.C:
+			return out
+		}
+	}
+	return out
+}
+
+func wantRange(n int) []int {
+	out := make([]int, n)
+	for i := range n {
+		out[i] = i
+	}
+	return out
+}
+func TestSlowSubscriberLosesEventsAndFastReceivesAll(t *testing.T) {
+	const count = 100
+	const buffer = 2
+	topic := bus.NewTopic[int](buffer)
+	slow := topic.Subscribe(t.Context())
+	fast := topic.Subscribe(t.Context())
+	acked := sync.Locked[int]{}
+	acked.WithLock(func(a *int) { *a = -1 })
+	state := fanoutState{topic: topic, fast: fast, want: wantRange(count), acked: &acked}
+	if err := fanout(t.Context(), &state, count); err != nil {
+		t.Fatalf("fanout: %v", err)
+	}
+	assertFastDrained(t, fast)
+	if dropped := topic.Dropped(); dropped != count-buffer {
+		t.Fatalf("Dropped = %d, want %d", dropped, count-buffer)
+	}
+	if n := len(slow); n != buffer {
+		t.Fatalf("slow subscriber buffered %d events, want %d", n, buffer)
+	}
+	if got := drain(slow, buffer, 5*time.Second); !slices.Equal(got, wantRange(buffer)) {
+		t.Fatalf("slow subscriber got %v, want the first %d events", got, buffer)
+	}
+}
+
+type fanoutState struct {
+	topic *bus.Topic[int]
+	fast  <-chan int
+	want  []int
+	acked *sync.Locked[int]
+}
+
+func fanout(ctx context.Context, state *fanoutState, count int) error {
+	go group (ctx) {
+		go consumeFast(ctx, state, count)
+		go publishAll(ctx, state, count)
+	}
+	return nil
+}
+
+func consumeFast(ctx context.Context, state *fanoutState, count int) error {
+	got := make([]int, 0, count)
+	for range count {
+		v, ok, err := nextEvent(ctx, state.fast)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		got = append(got, v)
+		state.acked.WithLock(func(a *int) { *a = v + 1 })
+	}
+	if !slices.Equal(got, state.want) {
+		return fmt.Errorf("bus test: fast subscriber got %d events, want all %d in publish order", len(got), count)
+	}
+	return nil
+}
+
+func nextEvent(ctx context.Context, ch <-chan int) (int, bool, error) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	var v int
+	var ok bool
+	select {
+	case v, ok = <-ch:
+	case <-timer.C:
+		return 0, false, fmt.Errorf("bus test: fast subscriber timed out")
+	case <-ctx.Done():
+		return 0, false, nil
+	}
+	return v, ok, nil
+}
+
+func publishAll(ctx context.Context, state *fanoutState, count int) error {
+	for i := range count {
+		state.topic.Publish(i)
+		if err := waitForAck(ctx, state.acked, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitForAck(ctx context.Context, acked *sync.Locked[int], want int) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		done := false
+		acked.WithLock(func(a *int) {
+			if *a > want {
+				done = true
+			}
+		})
+		if done {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("bus test: fast subscriber did not acknowledge event %d", want)
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertFastDrained[T any](t *testing.T, ch <-chan T) {
+	select {
+	case v, ok := <-ch:
+		if ok {
+			t.Fatalf("fast subscriber channel still holds event %v", v)
+		}
+	default:
+	}
+}
+
+func TestPublishNeverBlocksWithFullSubscriber(t *testing.T) {
+	topic := bus.NewTopic[int](0)
+	ch := topic.Subscribe(t.Context())
+	start := time.Now()
+	for i := range 1000 {
+		topic.Publish(i)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("1000 publishes to a full subscriber took %v", took)
+	}
+	if got := topic.Dropped(); got != 1000 {
+		t.Fatalf("Dropped = %d, want 1000", got)
+	}
+	select {
+	case v := <-ch:
+		t.Fatalf("full subscriber delivered %d", v)
+	default:
+	}
+}
+
+func TestConcurrentPublishersDeliverEveryEvent(t *testing.T) {
+	topic := bus.NewTopic[int](1000)
+	ch := topic.Subscribe(t.Context())
+	const workers = 4
+	const each = 250
+	if err := publishConcurrently(topic, workers, each); err != nil {
+		t.Fatalf("publish group: %v", err)
+	}
+	got := drain(ch, workers*each, 5*time.Second)
+	slices.Sort(got)
+	if !slices.Equal(got, wantRange(workers*each)) {
+		t.Fatalf("received %d events, want each of %d exactly once", len(got), workers*each)
+	}
+	if dropped := topic.Dropped(); dropped != 0 {
+		t.Fatalf("Dropped = %d, want 0", dropped)
+	}
+}
+
+func publishConcurrently(topic *bus.Topic[int], workers int, each int) error {
+	go group (context.Background()) {
+		for w := range workers {
+			go {
+				for i := range each {
+					topic.Publish(w*each + i)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func TestChannelClosesWhenContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	topic := bus.NewTopic[string](4)
+	first := topic.Subscribe(ctx)
+	second := topic.Subscribe(ctx)
+	cancel()
+	timer := time.NewTimer(2 * time.Second)
+	for _, ch := range []<-chan string{first, second} {
+		timer.Reset(2 * time.Second)
+		select {
+		case _, ok := <-ch:
+			if ok {
+				t.Fatal("receive after cancel delivered a value instead of closing")
+			}
+		case <-timer.C:
+			t.Fatal("channel did not close within 2s of context cancel")
+		}
+	}
+	topic.Publish("late")
+}
+
+func TestNewTopicRejectsNegativeBuffer(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("NewTopic(-1) did not panic")
+		}
+		if !strings.HasPrefix(fmt.Sprint(r), "bus: negative buffer") {
+			t.Fatalf("panic = %v, want message starting with \"bus: negative buffer\"", r)
+		}
+	}()
+	bus.NewTopic[int](-1)
+}
