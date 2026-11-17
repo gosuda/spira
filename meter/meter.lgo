@@ -1,0 +1,437 @@
+package meter
+
+import (
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"logos/sync"
+)
+
+const maxSeries = 1000
+
+type metricKind int
+
+const (
+	counterKind metricKind = iota
+	gaugeKind
+	histogramKind
+)
+
+type metricSpec struct {
+	labels  []string
+	buckets []float64
+}
+
+type Registry struct {
+	metrics sync.Locked[[]*metric]
+}
+
+func NewRegistry() *Registry {
+	return &Registry{}
+}
+
+func (r *Registry) Counter(name string, help string, labels ...string) *Counter {
+	m := r.add(name, help, metricSpec{labels: labels}, counterKind)
+	return &Counter{m: m}
+}
+
+func (r *Registry) Gauge(name string, help string, labels ...string) *Gauge {
+	m := r.add(name, help, metricSpec{labels: labels}, gaugeKind)
+	return &Gauge{m: m}
+}
+
+func (r *Registry) Histogram(name string, help string, buckets const []float64, labels ...string) *Histogram {
+	checkBuckets(buckets)
+	for _, l := range labels {
+		if l == "le" {
+			panic("meter: label name le is reserved on histograms")
+		}
+	}
+	m := r.add(name, help, metricSpec{labels: labels, buckets: append([]float64(nil), buckets...)}, histogramKind)
+	return &Histogram{m: m}
+}
+
+func (r *Registry) add(name string, help string, spec metricSpec, kind metricKind) *metric {
+	checkName(name)
+	checkLabels(spec.labels)
+	m := &metric{name: name, help: help, labels: slices.Clone(spec.labels), kind: kind, buckets: spec.buckets}
+	r.metrics.WithLock(func(ms *[]*metric) {
+		for _, existing := range *ms {
+			if existing.name == name {
+				panic("meter: duplicate metric name " + name)
+			}
+		}
+		*ms = append(*ms, m)
+	})
+	return m
+}
+
+func checkName(name string) {
+	if name == "" || !metricNameStart(name[0]) {
+		panic("meter: invalid metric name " + strconv.Quote(name))
+	}
+	for i := 1; i < len(name); i++ {
+		if !metricNameChar(name[i]) {
+			panic("meter: invalid metric name " + strconv.Quote(name))
+		}
+	}
+}
+
+func metricNameStart(c byte) bool {
+	return c == '_' || c == ':' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func metricNameChar(c byte) bool {
+	return metricNameStart(c) || c >= '0' && c <= '9'
+}
+
+func checkLabels(labels []string) {
+	for i, l := range labels {
+		if l == "" || !labelNameStart(l[0]) {
+			panic("meter: invalid label name " + strconv.Quote(l))
+		}
+		for j := 1; j < len(l); j++ {
+			if !labelNameChar(l[j]) {
+				panic("meter: invalid label name " + strconv.Quote(l))
+			}
+		}
+		for k := 0; k < i; k++ {
+			if labels[k] == l {
+				panic("meter: duplicate label name " + strconv.Quote(l))
+			}
+		}
+	}
+}
+
+func labelNameStart(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func labelNameChar(c byte) bool {
+	return labelNameStart(c) || c >= '0' && c <= '9'
+}
+
+func checkBuckets(buckets const []float64) {
+	if len(buckets) == 0 {
+		panic("meter: histogram needs at least one bucket")
+	}
+	for i, b := range buckets {
+		if math.IsNaN(b) || math.IsInf(b, 0) {
+			panic("meter: invalid bucket bound " + strconv.FormatFloat(b, 'g', -1, 64))
+		}
+		if i > 0 && b <= buckets[i-1] {
+			panic("meter: buckets must be strictly increasing")
+		}
+	}
+}
+
+type metric struct {
+	name    string
+	help    string
+	labels  []string
+	kind    metricKind
+	buckets []float64
+	state   sync.Locked[metricState]
+}
+
+type metricState struct {
+	byKey map[string]*series
+	order []*series
+}
+
+type series struct {
+	idx     int
+	values  []string
+	count   uint64
+	value   float64
+	sum     float64
+	buckets []uint64
+}
+
+type metricSnapshot struct {
+	name    string
+	help    string
+	labels  []string
+	kind    metricKind
+	buckets []float64
+	series  []series
+}
+
+func (m *metric) keyFor(values []string) string {
+	var b strings.Builder
+	for _, v := range values {
+		b.WriteString(strconv.Itoa(len(v)))
+		b.WriteByte(':')
+		b.WriteString(v)
+	}
+	return b.String()
+}
+
+func (m *metric) withKey(values []string) int {
+	if len(values) != len(m.labels) {
+		panic("meter: metric " + m.name + " has " + strconv.Itoa(len(m.labels)) + " labels, got " + strconv.Itoa(len(values)))
+	}
+	key := m.keyFor(values)
+	idx := -1
+	m.state.WithLock(func(st *metricState) {
+		if st.byKey == nil {
+			st.byKey = map[string]*series{}
+		}
+		if ser, exists := st.byKey[key]; exists {
+			idx = ser.idx
+			return
+		}
+		if len(st.order) < maxSeries-1 {
+			ser := newSeries(m, slices.Clone(values))
+			ser.idx = len(st.order)
+			st.order = append(st.order, ser)
+			st.byKey[key] = ser
+			idx = ser.idx
+			return
+		}
+		overflowValues := m.overflowValues()
+		overflowKey := m.keyFor(overflowValues)
+		if ser, exists := st.byKey[overflowKey]; exists {
+			idx = ser.idx
+			return
+		}
+		ser := newSeries(m, overflowValues)
+		ser.idx = len(st.order)
+		st.order = append(st.order, ser)
+		st.byKey[overflowKey] = ser
+		idx = ser.idx
+	})
+	return idx
+}
+
+func newSeries(m *metric, values []string) *series {
+	ser := &series{values: values}
+	if m.kind == histogramKind {
+		ser.buckets = make([]uint64, len(m.buckets)+1)
+	}
+	return ser
+}
+
+func (m *metric) overflowValues() []string {
+	values := make([]string, len(m.labels))
+	for i := range values {
+		values[i] = "overflow"
+	}
+	return values
+}
+
+func (m *metric) update(idx int, f func(*series)) {
+	m.state.WithLock(func(st *metricState) {
+		f(st.order[idx])
+	})
+}
+
+type Counter struct {
+	m *metric
+}
+
+type CounterSeries struct {
+	m   *metric
+	idx int
+}
+
+func (c *Counter) With(values ...string) CounterSeries {
+	return CounterSeries{m: c.m, idx: c.m.withKey(values)}
+}
+
+func (s CounterSeries) Add(n uint64) {
+	s.m.update(s.idx, func(ser *series) {
+		ser.count += n
+	})
+}
+
+type Gauge struct {
+	m *metric
+}
+
+type GaugeSeries struct {
+	m   *metric
+	idx int
+}
+
+func (g *Gauge) With(values ...string) GaugeSeries {
+	return GaugeSeries{m: g.m, idx: g.m.withKey(values)}
+}
+
+func (s GaugeSeries) Add(delta float64) {
+	s.m.update(s.idx, func(ser *series) {
+		ser.value += delta
+	})
+}
+
+func (s GaugeSeries) Set(v float64) {
+	s.m.update(s.idx, func(ser *series) {
+		ser.value = v
+	})
+}
+
+type Histogram struct {
+	m *metric
+}
+
+type HistogramSeries struct {
+	m   *metric
+	idx int
+}
+
+func (h *Histogram) With(values ...string) HistogramSeries {
+	return HistogramSeries{m: h.m, idx: h.m.withKey(values)}
+}
+
+func (s HistogramSeries) Observe(v float64) {
+	s.m.update(s.idx, func(ser *series) {
+		ser.buckets[bucketIndex(s.m.buckets, v)]++
+		ser.count++
+		ser.sum += v
+	})
+}
+
+func bucketIndex(buckets []float64, v float64) int {
+	return sort.Search(len(buckets), func(i int) bool {
+		return v <= buckets[i]
+	})
+}
+
+func (r *Registry) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var ms []*metric
+		r.metrics.WithLock(func(list *[]*metric) {
+			ms = slices.Clone(*list)
+		})
+		var b strings.Builder
+		for _, m := range ms {
+			writeMetric(&b, m.snapshot())
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if _, err := io.WriteString(w, b.String()); err != nil {
+			return
+		}
+	})
+}
+
+func (m *metric) snapshot() *metricSnapshot {
+	snap := &metricSnapshot{
+		name:    m.name,
+		help:    m.help,
+		labels:  slices.Clone(m.labels),
+		kind:    m.kind,
+		buckets: slices.Clone(m.buckets),
+	}
+	m.state.WithLock(func(st *metricState) {
+		out := make([]series, 0, len(st.order))
+		for _, ser := range st.order {
+			out = append(out, snapshotSeries(ser))
+		}
+		snap.series = out
+	})
+	return snap
+}
+
+func snapshotSeries(ser *series) series {
+	out := series{
+		values: slices.Clone(ser.values),
+		count:  ser.count,
+		value:  ser.value,
+		sum:    ser.sum,
+	}
+	if ser.buckets != nil {
+		out.buckets = slices.Clone(ser.buckets)
+	}
+	return out
+}
+
+func writeMetric(b *strings.Builder, m *metricSnapshot) {
+	fmt.Fprintf(b, "# HELP %s %s\n", m.name, escapeHelp(m.help))
+	fmt.Fprintf(b, "# TYPE %s %s\n", m.name, kindName(m.kind))
+	for _, ser := range m.series {
+		writeSeries(b, m, ser)
+	}
+}
+
+func kindName(k metricKind) string {
+	return [...]string{"counter", "gauge", "histogram"}[k]
+}
+
+func writeSeries(b *strings.Builder, m *metricSnapshot, ser series) {
+	switch m.kind {
+	case counterKind:
+		fmt.Fprintf(b, "%s%s %d\n", m.name, labelsSuffix(m.labels, ser.values), ser.count)
+	case gaugeKind:
+		fmt.Fprintf(b, "%s%s %s\n", m.name, labelsSuffix(m.labels, ser.values), formatFloat(ser.value))
+	case histogramKind:
+		writeHistogram(b, m, ser)
+	}
+}
+
+func writeHistogram(b *strings.Builder, m *metricSnapshot, ser series) {
+	var cumulative uint64
+	for i, e := range m.buckets {
+		cumulative += ser.buckets[i]
+		fmt.Fprintf(b, "%s_bucket%s %d\n", m.name, labelsSuffixWith(m.labels, ser.values, "le", formatFloat(e)), cumulative)
+	}
+	cumulative += ser.buckets[len(m.buckets)]
+	fmt.Fprintf(b, "%s_bucket%s %d\n", m.name, labelsSuffixWith(m.labels, ser.values, "le", "+Inf"), cumulative)
+	fmt.Fprintf(b, "%s_sum%s %s\n", m.name, labelsSuffix(m.labels, ser.values), formatFloat(ser.sum))
+	fmt.Fprintf(b, "%s_count%s %d\n", m.name, labelsSuffix(m.labels, ser.values), ser.count)
+}
+
+func labelsSuffix(names []string, values []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, n := range names {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		writeLabel(&b, n, values[i])
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+func labelsSuffixWith(names []string, values []string, extraName string, extraValue string) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, n := range names {
+		writeLabel(&b, n, values[i])
+		b.WriteByte(',')
+	}
+	writeLabel(&b, extraName, extraValue)
+	b.WriteByte('}')
+	return b.String()
+}
+
+func writeLabel(b *strings.Builder, name string, value string) {
+	b.WriteString(name)
+	b.WriteString("=\"")
+	b.WriteString(escapeLabel(value))
+	b.WriteByte('"')
+}
+
+func escapeHelp(help string) string {
+	help = strings.ReplaceAll(help, "\\", "\\\\")
+	return strings.ReplaceAll(help, "\n", "\\n")
+}
+
+func escapeLabel(v string) string {
+	v = strings.ReplaceAll(v, "\\", "\\\\")
+	v = strings.ReplaceAll(v, "\n", "\\n")
+	return strings.ReplaceAll(v, "\"", "\\\"")
+}
+
+func formatFloat(v float64) string {
+	return strconv.FormatFloat(v, 'g', -1, 64)
+}
