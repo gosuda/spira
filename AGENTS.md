@@ -4,7 +4,7 @@ spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). I
 
 ## Module rules
 
-- This module holds only `.lgo` packages. Tests are `_test.lgo` files in an external test package (`package x_test`). The one in-package file a package may add is `export_test.lgo`: it holds no test and only exposes internal state that an external test must observe. A `main` package cannot be imported, so its tests are in the package itself. [David Parnas]
+- This module holds only `.lgo` packages. Tests are `_test.lgo` files in an external test package (`package x_test`; `package main_test` for a command, which imports its own `main` package). The one in-package file a package may add is `export_test.lgo`: it holds no test and only exposes internal state that an external test must observe. [David Parnas]
 - Build with `logos`. Plain `go` ignores `.lgo` files. [John Carmack]
 - `logos.toml` sits next to `go.mod`. Unknown tables or keys are errors. Add a `[capabilities]` allowlist entry only when `logos build` reports a capability diagnostic, and name the exact module path it reports. [Tony Hoare]
 - Strictly no cgo (human-supplied). `logos.toml` keeps `[build] cgo = "forbid"`; never change it, never set `CGO_ENABLED=1`, and never add a dependency that needs cgo. The race detector needs cgo, so the gate runs tests without `-race`. [Tony Hoare]
