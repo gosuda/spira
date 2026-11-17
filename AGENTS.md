@@ -40,6 +40,29 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 - Third-party modules: `golang.org/x/crypto` in `auth`; database drivers only in tests, `example/` and generated applications. Resolve versions with `logos get`; never type one from memory. [Richard Feynman]
 - Tests run the real parts: in-memory SQLite and `net/http/httptest`. [John Carmack]
 
+## Design procedure
+
+Follow these steps in order before a new exported name lands. [Christopher Alexander]
+
+1. Survey: read how two or more of the clones under `.references/` solve the problem. Record in the commit body what spira keeps and what it drops. [Richard Feynman]
+2. Lexicon: name every exported identifier with a word the application author already uses for the thing (`Route`, `Stage`, `Slot`, `Island`). A name that needs a comment to explain it is the wrong name. [Kenya Hara]
+3. Caller first: write the file an application author would write, in `example/` or in a test, before the package. It MUST fail to build for the missing names only. [Tony Hoare]
+4. One layer: the caller file reaches the standard library through one spira call at most. A second spira layer between them needs a reason in the commit body. [Dieter Rams]
+5. Probe: build every LoGOs form the design needs in a scratch module before a brief or a package uses it. A form that fails is a finding. [Richard Feynman]
+6. Signature freeze: a signature that a later plan step names changes only together with that step text. [David Parnas]
+
+## Wire contract
+
+The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A change to one side changes the other side and the corpus in the same commit. [Claude Shannon]
+
+- Slot id: `s<16 hex digits>-<n>`. The 16 digits are random for each `Render` call; `n` counts slots from 0 in that call. [Claude Shannon]
+- Slot match: the client compares the `id` attribute byte for byte. It MUST NOT build a selector from an id. [Tony Hoare]
+- Island `when`: a closed set of values. An unknown value keeps the fallback and logs one error. [Tony Hoare]
+- Island props: one JSON object. Malformed JSON, or a value that is not a plain object, keeps the fallback: no mount, no child removal, one error log. [Tony Hoare]
+- Events: `live.Events` writes a named `event:` line before each `data:` body and sends a heartbeat comment. The stream ends when the client disconnects. [Claude Shannon]
+- Fragments: a request with `HX-Request` gets the fragment without the document shell, and the response carries `Vary: HX-Request`. [Claude Shannon]
+- Corpus: `wire/corpus.jsonl` holds one JSON object per line (`name`, `request`, `response`, `reject`). The LoGOs tests and the vitest tests both read this file; neither keeps a copy. [Richard Feynman]
+
 ## Finding protocol
 
 A finding is any case where the toolchain at the worktree revision disagrees with `logos-doc/SPEC.md`, crashes, miscompiles, gives a misleading diagnostic, lacks a form that would remove real spira code, or where `just eject` output fails to build or behaves differently from the native build. For each finding, in this order:
