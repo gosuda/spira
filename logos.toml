@@ -1,0 +1,9 @@
+[build]
+cgo = "forbid"
+
+[lints]
+perf = "deny"
+style = "deny"
+suspicious = "deny"
+portability = "deny"
+pedantic = "warn"
