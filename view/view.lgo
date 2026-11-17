@@ -1,0 +1,127 @@
+package view
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+type Node interface { Element | Text | Trusted | Group | *Island | *Later }
+type Part interface { Node | Attribute }
+
+type Element struct {
+	tag   string
+	parts []Part
+}
+
+type Text struct{ S string }
+
+type Trusted struct{ HTML string }
+
+type Group struct{ Nodes []Node }
+
+type Attribute struct {
+	name  string
+	value string
+	flag  bool
+}
+
+type Island struct {
+	Entry    string
+	Props    any
+	When     string = "visible"
+	Fallback Node?
+}
+
+type Later struct {
+	Fallback Node
+	Resolve  func(ctx context.Context) (Node, error)
+}
+
+var namePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9:_.-]*$`)
+
+func El(tag string, parts ...Part) Element {
+	if !namePattern.MatchString(tag) {
+		panic(fmt.Sprintf("view: invalid tag name %q", tag))
+	}
+	return Element{tag: tag, parts: parts}
+}
+
+func T(s string) Text { return Text{S: s} }
+
+func Trust(html string) Trusted { return Trusted{HTML: html} }
+
+func Attr(name string, value string) Attribute {
+	return attrOf(name, value, false)
+}
+
+func Flag(name string) Attribute {
+	return attrOf(name, "", true)
+}
+
+func attrOf(name string, value string, flag bool) Attribute {
+	if !namePattern.MatchString(name) {
+		panic(fmt.Sprintf("view: invalid attribute name %q", name))
+	}
+	return Attribute{name: name, value: value, flag: flag}
+}
+
+func Class(names ...string) Attribute {
+	return Attribute{name: "class", value: strings.Join(names, " ")}
+}
+
+func Hx(name string, value string) Attribute {
+	return Attr("hx-"+name, value)
+}
+
+func When(cond bool, n Node) Group {
+	if cond {
+		return Group{Nodes: []Node{n}}
+	}
+	return Group{}
+}
+
+func Each[T any](items const []T, row func(item const T) Node) Group {
+	var nodes []Node
+	for _, item := range items {
+		nodes = append(nodes, row(item))
+	}
+	return Group{Nodes: nodes}
+}
+
+func Html(parts ...Part) Element    { return El("html", parts...) }
+func Head(parts ...Part) Element    { return El("head", parts...) }
+func Body(parts ...Part) Element    { return El("body", parts...) }
+func Title(parts ...Part) Element   { return El("title", parts...) }
+func Meta(parts ...Part) Element    { return El("meta", parts...) }
+func Link(parts ...Part) Element    { return El("link", parts...) }
+func Script(parts ...Part) Element  { return El("script", parts...) }
+func Main(parts ...Part) Element    { return El("main", parts...) }
+func Nav(parts ...Part) Element     { return El("nav", parts...) }
+func Header(parts ...Part) Element  { return El("header", parts...) }
+func Footer(parts ...Part) Element  { return El("footer", parts...) }
+func Section(parts ...Part) Element { return El("section", parts...) }
+func Div(parts ...Part) Element     { return El("div", parts...) }
+func Span(parts ...Part) Element    { return El("span", parts...) }
+func P(parts ...Part) Element       { return El("p", parts...) }
+func A(parts ...Part) Element       { return El("a", parts...) }
+func H1(parts ...Part) Element      { return El("h1", parts...) }
+func H2(parts ...Part) Element      { return El("h2", parts...) }
+func H3(parts ...Part) Element      { return El("h3", parts...) }
+func Ul(parts ...Part) Element      { return El("ul", parts...) }
+func Li(parts ...Part) Element      { return El("li", parts...) }
+func Form(parts ...Part) Element    { return El("form", parts...) }
+func Label(parts ...Part) Element   { return El("label", parts...) }
+func Input(parts ...Part) Element   { return El("input", parts...) }
+func Button(parts ...Part) Element  { return El("button", parts...) }
+func Select(parts ...Part) Element  { return El("select", parts...) }
+func Option(parts ...Part) Element  { return El("option", parts...) }
+func Textarea(parts ...Part) Element { return El("textarea", parts...) }
+func Table(parts ...Part) Element   { return El("table", parts...) }
+func Thead(parts ...Part) Element   { return El("thead", parts...) }
+func Tbody(parts ...Part) Element   { return El("tbody", parts...) }
+func Tr(parts ...Part) Element      { return El("tr", parts...) }
+func Th(parts ...Part) Element      { return El("th", parts...) }
+func Td(parts ...Part) Element      { return El("td", parts...) }
+func Img(parts ...Part) Element     { return El("img", parts...) }

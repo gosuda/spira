@@ -1,0 +1,393 @@
+package view
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"logos/sync"
+)
+
+var escaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;", "'", "&#39;")
+
+func escapeHTML(s string) string {
+	return escaper.Replace(s)
+}
+
+func safeURL(v string) string {
+	stripped := stripControlAndSpace(v)
+	i := strings.IndexAny(stripped, ":/?#")
+	if i < 0 || stripped[i] != ':' {
+		return v
+	}
+	switch strings.ToLower(stripped[:i]) {
+	case "http", "https", "mailto", "tel":
+		return v
+	}
+	return "about:invalid"
+}
+
+func stripControlAndSpace(v string) string {
+	var b []byte
+	for _, c := range []byte(v) {
+		if c <= 0x20 || c == 0x7f {
+			continue
+		}
+		b = append(b, c)
+	}
+	return string(b)
+}
+
+func validWhen(when string) bool {
+	switch when {
+	case "load", "visible", "idle":
+		return true
+	}
+	return false
+}
+
+func isVoid(tag string) bool {
+	switch tag {
+	case "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr":
+		return true
+	}
+	return false
+}
+
+func writeRaw(w io.Writer, s string) error {
+	io.WriteString(w, s)?
+	return nil
+}
+
+func writeEscaped(w io.Writer, s string) error {
+	return writeRaw(w, escapeHTML(s))
+}
+
+type slotTask struct {
+	id    string
+	later *Later
+}
+
+type slotQueue struct {
+	nonce string
+	next  sync.Locked[int]
+	tasks sync.Locked[[]slotTask]
+	errs  sync.Locked[[]error]
+}
+
+func slotNonce() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("view: slot nonce: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func (q *slotQueue) add(l *Later) string {
+	var seq int
+	q.next.WithLock(func(n *int) {
+		seq = *n
+		*n++
+	})
+	id := fmt.Sprintf("s%s-%d", q.nonce, seq)
+	q.tasks.WithLock(func(ts *[]slotTask) {
+		*ts = append(*ts, slotTask{id: id, later: l})
+	})
+	return id
+}
+
+func (q *slotQueue) drain() []slotTask {
+	var out []slotTask
+	q.tasks.WithLock(func(ts *[]slotTask) {
+		out = append(out, *ts...)
+		*ts = nil
+	})
+	return out
+}
+
+func (q *slotQueue) fail(id string, err error) {
+	q.errs.WithLock(func(es *[]error) {
+		*es = append(*es, fmt.Errorf("view: slot %s: %w", id, err))
+	})
+}
+
+func (q *slotQueue) joined() error {
+	var errs []error
+	q.errs.WithLock(func(es *[]error) {
+		errs = append(errs, *es...)
+	})
+	return errors.Join(errs...)
+}
+
+type lockedWriter struct {
+	inner sync.Locked[io.Writer]
+}
+
+func newLockedWriter(w io.Writer) *lockedWriter {
+	lw := &lockedWriter{}
+	lw.inner.WithLock(func(p *io.Writer) { *p = w })
+	return lw
+}
+
+func (lw *lockedWriter) write(b []byte) error {
+	var err error
+	lw.inner.WithLock(func(p *io.Writer) {
+		_, err = (*p).Write(b)
+	})
+	return err
+}
+
+func (lw *lockedWriter) flush() {
+	lw.inner.WithLock(func(p *io.Writer) {
+		if f, ok := (*p).(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+}
+
+func Render(ctx context.Context, w io.Writer, n Node) error {
+	nonce, err := slotNonce()
+	if err != nil {
+		return err
+	}
+	q := &slotQueue{nonce: nonce}
+	if e, ok := n.(Element); ok && e.tag == "html" {
+		writeRaw(w, "<!doctype html>")?
+	}
+	if err := writeNode(w, n, q); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return resolveSlots(ctx, q, w)
+}
+
+func resolveSlots(ctx context.Context, q *slotQueue, w io.Writer) error {
+	lw := newLockedWriter(w)
+	for {
+		tasks := q.drain()
+		if len(tasks) == 0 {
+			return q.joined()
+		}
+		q.runTasks(ctx, lw, tasks)?
+	}
+}
+
+func (q *slotQueue) runTasks(ctx context.Context, lw *lockedWriter, tasks []slotTask) error {
+	go group (ctx, limit = 8) {
+		for _, task := range tasks {
+			go {
+				q.resolve(ctx, lw, task)
+			}
+		}
+	}
+	return nil
+}
+
+func (q *slotQueue) resolve(ctx context.Context, lw *lockedWriter, task slotTask) {
+	node, err := resolveNode(ctx, task.later)
+	if err != nil {
+		q.failSlot(lw, task.id, err)
+		return
+	}
+	var buf bytes.Buffer
+	if err := writeNode(&buf, node, q); err != nil {
+		q.failSlot(lw, task.id, err)
+		return
+	}
+	out := append([]byte(`<template data-spira-slot="`+task.id+`">`), buf.Bytes()...)
+	out = append(out, "</template>"...)
+	if err := lw.write(out); err != nil {
+		q.fail(task.id, err)
+		return
+	}
+	lw.flush()
+}
+
+func resolveNode(ctx context.Context, l *Later) (node Node, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("resolver panicked: %v", r)
+		}
+	}()
+	return l.Resolve(ctx)
+}
+
+func (q *slotQueue) failSlot(lw *lockedWriter, id string, err error) {
+	bad := []byte(`<template data-spira-slot="` + id + `"><spira-error></spira-error></template>`)
+	if writeErr := lw.write(bad); writeErr != nil {
+		err = errors.Join(err, writeErr)
+	}
+	lw.flush()
+	q.fail(id, err)
+}
+
+func writeNode(w io.Writer, p Part, q *slotQueue) error {
+	switch v := p.(type) {
+	case Element:
+		return writeElement(w, v, q)
+	case Text:
+		return writeEscaped(w, v.S)
+	case Trusted:
+		return writeRaw(w, v.HTML)
+	case Group:
+		return writeGroup(w, v, q)
+	case *Island:
+		return writeIsland(w, v, q)
+	case *Later:
+		return writeSlot(w, v, q)
+	case Attribute:
+		return nil
+	case nil:
+		return nil
+	}
+	return nil
+}
+
+func writeElement(w io.Writer, e Element, q *slotQueue) error {
+	if isVoid(e.tag) {
+		return writeOpen(w, e)
+	}
+	if err := writeOpen(w, e); err != nil {
+		return err
+	}
+	if err := writeChildren(w, e.parts, q); err != nil {
+		return err
+	}
+	return writeRaw(w, "</"+e.tag+">")
+}
+
+func writeOpen(w io.Writer, e Element) error {
+	if err := writeRaw(w, "<"+e.tag); err != nil {
+		return err
+	}
+	if err := writeAttrs(w, e.parts); err != nil {
+		return err
+	}
+	return writeRaw(w, ">")
+}
+
+func writeAttrs(w io.Writer, parts []Part) error {
+	for _, p := range parts {
+		if a, ok := p.(Attribute); ok {
+			if err := writeAttr(w, a); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func writeAttr(w io.Writer, a Attribute) error {
+	if a.flag {
+		return writeRaw(w, " "+a.name)
+	}
+	return writeValuedAttr(w, a)
+}
+
+func writeValuedAttr(w io.Writer, a Attribute) error {
+	value := a.value
+	switch strings.ToLower(a.name) {
+	case "href", "src", "action", "formaction", "xlink:href", "data":
+		value = safeURL(value)
+	}
+	if err := writeRaw(w, " "+a.name+`="`); err != nil {
+		return err
+	}
+	if err := writeEscaped(w, value); err != nil {
+		return err
+	}
+	return writeRaw(w, `"`)
+}
+
+func writeChildren(w io.Writer, parts []Part, q *slotQueue) error {
+	for _, p := range parts {
+		if err := writeNode(w, p, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeGroup(w io.Writer, g Group, q *slotQueue) error {
+	for _, n := range g.Nodes {
+		if err := writeNode(w, n, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeIsland(w io.Writer, i *Island, q *slotQueue) error {
+	if !validWhen(i.When) {
+		return fmt.Errorf("view: island %q: when %q is not load, visible or idle", i.Entry, i.When)
+	}
+	props, err := islandProps(i)
+	if err != nil {
+		return err
+	}
+	if err := writeIslandOpen(w, i, props); err != nil {
+		return err
+	}
+	if fb := i.Fallback; fb != nil {
+		if err := writeNode(w, fb, q); err != nil {
+			return err
+		}
+	}
+	return writeRaw(w, "</spira-island>")
+}
+
+func islandProps(i *Island) ([]byte, error) {
+	if i.Props == nil {
+		return []byte("{}"), nil
+	}
+	props, err := json.Marshal(i.Props)
+	if err != nil {
+		return nil, fmt.Errorf("view: island %s props: %w", i.Entry, err)
+	}
+	if len(props) == 0 || props[0] != '{' {
+		return nil, fmt.Errorf("view: island %s props must encode to a JSON object", i.Entry)
+	}
+	return props, nil
+}
+
+func writeIslandOpen(w io.Writer, i *Island, props []byte) error {
+	if err := writeRaw(w, `<spira-island entry="`); err != nil {
+		return err
+	}
+	if err := writeEscaped(w, i.Entry); err != nil {
+		return err
+	}
+	if err := writeRaw(w, `" when="`); err != nil {
+		return err
+	}
+	if err := writeEscaped(w, i.When); err != nil {
+		return err
+	}
+	if err := writeRaw(w, `" props="`); err != nil {
+		return err
+	}
+	if err := writeEscaped(w, string(props)); err != nil {
+		return err
+	}
+	return writeRaw(w, `">`)
+}
+
+func writeSlot(w io.Writer, l *Later, q *slotQueue) error {
+	id := q.add(l)
+	if err := writeRaw(w, `<spira-slot id="`+id+`">`); err != nil {
+		return err
+	}
+	if err := writeNode(w, l.Fallback, q); err != nil {
+		return err
+	}
+	return writeRaw(w, "</spira-slot>")
+}

@@ -1,0 +1,709 @@
+package view_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"maps"
+	"math/rand"
+	"os"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/view"
+
+	"logos/rt"
+	"logos/sync"
+)
+
+var slotOpenRe = regexp.MustCompile(`<spira-slot id="([^"]+)"`)
+var slotWrittenRe = regexp.MustCompile(`data-spira-slot="([^"]+)"`)
+var slotIDPatternRe = regexp.MustCompile(`^s[0-9a-f]{16}-[0-9]+$`)
+
+const (
+	startMark = "~s~"
+	endMark   = "~e~"
+)
+
+func randomPayload(r *rand.Rand) string {
+	pool := "<>&\"'abcXYZ019 ,;:!?="
+	var b strings.Builder
+	for range r.Intn(40) {
+		b.WriteByte(pool[r.Intn(len(pool))])
+	}
+	return b.String()
+}
+
+func renderNode(t *testing.T, n view.Node) string {
+	var b bytes.Buffer
+	if err := view.Render(context.Background(), &b, n); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	return b.String()
+}
+
+func textMid(t *testing.T, payload string) string {
+	out := renderNode(t, view.Div(view.T(startMark), view.T(payload), view.T(endMark)))
+	start := strings.Index(out, startMark) + len(startMark)
+	end := strings.LastIndex(out, endMark)
+	return out[start:end]
+}
+
+func attrMid(t *testing.T, payload string) string {
+	out := renderNode(t, view.Div(view.Attr("title", payload), view.T(startMark)))
+	start := strings.Index(out, `title="`) + len(`title="`)
+	end := strings.LastIndex(out, `">`)
+	return out[start:end]
+}
+
+func countEntities(mid string) int {
+	total := 0
+	for _, e := range []string{"&amp;", "&lt;", "&gt;", "&#34;", "&#39;"} {
+		total += strings.Count(mid, e)
+	}
+	return total
+}
+
+func assertEscaped(t *testing.T, kind string, payload string, mid string) {
+	for _, raw := range []string{"<", ">", `"`, "'"} {
+		if strings.Contains(mid, raw) {
+			t.Fatalf("%s: raw %q reached the output in %q (payload %q)", kind, raw, mid, payload)
+		}
+	}
+	if got := countEntities(mid); got != strings.Count(mid, "&") {
+		t.Fatalf("%s: %d known entities vs %d raw ampersands in %q (payload %q)", kind, got, strings.Count(mid, "&"), mid, payload)
+	}
+	if back := html.UnescapeString(mid); back != payload {
+		t.Fatalf("%s: unescape(%q) = %q, want the payload %q", kind, mid, back, payload)
+	}
+}
+
+func TestEscapingProperty(t *testing.T) {
+	r := rand.New(rand.NewSource(7))
+	for range 200 {
+		payload := randomPayload(r)
+		if !strings.ContainsAny(payload, `<>&"'`) {
+			payload += `<>&"'`
+		}
+		assertEscaped(t, "text", payload, textMid(t, payload))
+		assertEscaped(t, "attribute", payload, attrMid(t, payload))
+	}
+}
+
+func elementWith(attr string, url string) view.Element {
+	switch strings.ToLower(attr) {
+	case "href":
+		return view.A(view.Attr(attr, url), view.T("l"))
+	case "src":
+		return view.Img(view.Attr(attr, url))
+	case "action":
+		return view.Form(view.Attr(attr, url))
+	}
+	return view.Button(view.Attr(attr, url), view.T("g"))
+}
+
+func TestURLSchemeFilter(t *testing.T) {
+	cases := []struct {
+		attr string
+		url  string
+		want string
+	}{
+		{"href", "JaVaScRiPt:alert(1)", "about:invalid"},
+		{"href", "\tjavascript:alert(1)", "about:invalid"},
+		{"href", "data:text/html;base64,PGI+", "about:invalid"},
+		{"href", "vbscript:msgbox", "about:invalid"},
+		{"href", "https://example.com/a", "https://example.com/a"},
+		{"href", "mailto:a@example.com", "mailto:a@example.com"},
+		{"href", "/relative/path", "/relative/path"},
+		{"src", "\tjavascript:alert(1)", "about:invalid"},
+		{"action", "data:x", "about:invalid"},
+		{"formaction", "vbscript:x", "about:invalid"},
+		{"HREF", "JaVaScRiPt:alert(1)", "about:invalid"},
+		{"Src", "\tjavascript:alert(1)", "about:invalid"},
+		{"formAction", "vbscript:x", "about:invalid"},
+		{"ACTION", "data:text/html;base64,PGI+", "about:invalid"},
+		{"xlink:href", "javascript:alert(1)", "about:invalid"},
+		{"XLINK:HREF", "javascript:alert(1)", "about:invalid"},
+		{"data", "javascript:alert(1)", "about:invalid"},
+		{"xlink:href", "/x.svg", "/x.svg"},
+		{"data", "/x.svg", "/x.svg"},
+	}
+	for _, c := range cases {
+		out := renderNode(t, elementWith(c.attr, c.url))
+		want := c.attr + `="` + c.want + `"`
+		if !strings.Contains(out, want) {
+			t.Fatalf("%s=%q rendered %q, want it to contain %q", c.attr, c.url, out, want)
+		}
+	}
+}
+
+func elRecovered(tag string) (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	view.El(tag, view.T("x"))
+	return nil
+}
+
+func attrRecovered(name string) (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	view.Attr(name, "v")
+	return nil
+}
+
+func assertPanicValue(t *testing.T, got any, want string, what string) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("%s did not panic, want %q", what, want)
+		return
+	}
+	if s, ok := got.(string); !ok || s != want {
+		t.Fatalf("%s panicked with %v, want %q", what, got, want)
+		return
+	}
+}
+
+func TestConstructorNameRule(t *testing.T) {
+	names := []string{"div onclick=x", "a>b", `x"y`, "", "1a", "a b"}
+	for _, name := range names {
+		wantTag := fmt.Sprintf("view: invalid tag name %q", name)
+		assertPanicValue(t, elRecovered(name), wantTag, fmt.Sprintf("El(%q)", name))
+		wantAttr := fmt.Sprintf("view: invalid attribute name %q", name)
+		assertPanicValue(t, attrRecovered(name), wantAttr, fmt.Sprintf("Attr(%q)", name))
+	}
+}
+
+func idSet(re *regexp.Regexp, out string) map[string]bool {
+	ids := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(out, -1) {
+		ids[m[1]] = true
+	}
+	return ids
+}
+
+func keysOf(ids map[string]bool) []string {
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func renderSlots(t *testing.T, count int, delay func(i int) time.Duration) string {
+	nodes := make([]view.Node, count)
+	for i := range count {
+		nodes[i] = &view.Later{Fallback: view.T("fb"), Resolve: func(ctx context.Context) (view.Node, error) {
+			time.Sleep(delay(i))
+			return view.T("ok"), nil
+		}}
+	}
+	var b bytes.Buffer
+	if err := view.Render(context.Background(), &b, view.Group{Nodes: nodes}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	return b.String()
+}
+
+func TestSlotIDContract(t *testing.T) {
+	out := renderSlots(t, 2, func(i int) time.Duration { return 0 })
+	open := idSet(slotOpenRe, out)
+	written := idSet(slotWrittenRe, out)
+	if len(open) != 2 || !maps.Equal(open, written) {
+		t.Fatalf("slot ids %v vs written %v, want two equal sets", keysOf(open), keysOf(written))
+	}
+	suffixes := map[string]bool{}
+	for id := range open {
+		if !slotIDPatternRe.MatchString(id) {
+			t.Fatalf("slot id %q does not match the wire contract", id)
+		}
+		suffixes[id[strings.LastIndex(id, "-")+1:]] = true
+	}
+	if !(suffixes["0"] ?? false) || !(suffixes["1"] ?? false) {
+		t.Fatalf("slot id suffixes %v, want 0 and 1", keysOf(suffixes))
+	}
+	out2 := renderSlots(t, 1, func(i int) time.Duration { return 0 })
+	second := idSet(slotOpenRe, out2)
+	if len(second) != 1 {
+		t.Fatalf("second render queued %d ids, want 1", len(second))
+	}
+	for id := range second {
+		if open[id] ?? false {
+			t.Fatalf("slot id %q reused across Render calls", id)
+		}
+		if !strings.HasSuffix(id, "-0") {
+			t.Fatalf("first slot id %q does not end in -0", id)
+		}
+	}
+}
+
+func TestSlotOrderIndependence(t *testing.T) {
+	const count = 6
+	out := renderSlots(t, count, func(i int) time.Duration {
+		return time.Duration(count-i) * 2 * time.Millisecond
+	})
+	open := idSet(slotOpenRe, out)
+	written := idSet(slotWrittenRe, out)
+	if len(open) != count {
+		t.Fatalf("queued %d slot ids, want %d", len(open), count)
+	}
+	if !maps.Equal(open, written) {
+		t.Fatalf("written slot ids %v do not equal queued ids %v", keysOf(written), keysOf(open))
+	}
+}
+
+func TestResolverError(t *testing.T) {
+	boom := errors.New("boom")
+	node := &view.Later{Fallback: view.T("fb"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return nil, boom
+	}}
+	var b bytes.Buffer
+	err := view.Render(context.Background(), &b, view.Div(view.T(startMark), node, view.T(endMark)))
+	if err == nil {
+		t.Fatalf("Render returned nil, want an error carrying boom")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("Render error = %v, want it to carry boom", err)
+	}
+	out := b.String()
+	ids := orderedSlotIDs(out)
+	if len(ids) != 1 || !strings.Contains(err.Error(), "view: slot "+ids[0]+": boom") {
+		t.Fatalf("Render error = %v, want view: slot %v: boom", err, ids)
+	}
+	if !strings.Contains(out, `<template data-spira-slot="`) || !strings.Contains(out, "<spira-error></spira-error>") {
+		t.Fatalf("output %q lacks the slot error template", out)
+	}
+	if !strings.Contains(out, ">fb<") {
+		t.Fatalf("output %q lost the fallback", out)
+	}
+}
+
+func islandRejected(entry string, when string, props any) (rejected bool) {
+	island := &view.Island{Entry: entry, When: when, Props: props}
+	var b bytes.Buffer
+	return view.Render(context.Background(), &b, island) != nil
+}
+
+func TestDoctypeRoot(t *testing.T) {
+	out := renderNode(t, view.Html(view.Head(), view.Body(view.T("x"))))
+	if !strings.HasPrefix(out, "<!doctype html><html") {
+		t.Fatalf("html root rendered %q, want the <!doctype html><html prefix", out)
+	}
+	frag := renderNode(t, view.Div(view.T("x")))
+	if strings.Contains(frag, "<!doctype") {
+		t.Fatalf("fragment root rendered %q, want no doctype", frag)
+	}
+	nested := renderNode(t, view.Div(view.Html(view.Head(), view.Body(view.T("x")))))
+	if strings.Contains(nested, "<!doctype") {
+		t.Fatalf("html below the root rendered %q, want the doctype only before a root html", nested)
+	}
+}
+
+func islandRenderResult(entry string, when string, props any) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panicked: %v", r)
+		}
+	}()
+	island := &view.Island{Entry: entry, When: when, Props: props}
+	var b bytes.Buffer
+	return view.Render(context.Background(), &b, island)
+}
+
+func TestIslandWhenContract(t *testing.T) {
+	err := islandRenderResult("w.js", "hover", map[string]any{"n": 1})
+	if err == nil {
+		t.Fatalf("unknown when rendered without an error")
+	}
+	if strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("unknown when rejected by a panic (%v), want a Render error naming the island and the value", err)
+	}
+	if !strings.Contains(err.Error(), "w.js") || !strings.Contains(err.Error(), `when "hover" is not load, visible or idle`) {
+		t.Fatalf(`unknown when error = %v, want view: island "w.js": when "hover" is not load, visible or idle`, err)
+	}
+	if err := islandRenderResult("w.js", "visible", map[string]any{"n": 1}); err != nil {
+		t.Fatalf("known when errored: %v", err)
+	}
+}
+
+func TestIslandPropsMustBeObject(t *testing.T) {
+	var b bytes.Buffer
+	err := view.Render(context.Background(), &b, &view.Island{Entry: "x.js", Props: []string{"a"}})
+	if err == nil || !strings.Contains(err.Error(), "x.js") || !strings.Contains(err.Error(), "JSON object") {
+		t.Fatalf("array props error = %v, want a JSON object complaint naming x.js", err)
+	}
+	out := renderNode(t, &view.Island{Entry: "x.js", Props: map[string]any{"count": 1}})
+	want := `<spira-island entry="x.js" when="visible" props="{&#34;count&#34;:1}">`
+	if !strings.Contains(out, want) {
+		t.Fatalf("output %q lacks %q", out, want)
+	}
+	nilOut := renderNode(t, &view.Island{Entry: "nil.js"})
+	if !strings.Contains(nilOut, `props="{}"`) {
+		t.Fatalf("nil props rendered %q, want props=\"{}\"", nilOut)
+	}
+}
+
+type corpusRequest struct {
+	Kind  string `json:"kind"`
+	ID    string `json:"id"`
+	When  string `json:"when"`
+	Props string `json:"props"`
+}
+
+type corpusResponse struct {
+	Valid    bool `json:"valid"`
+	Accepted bool `json:"accepted"`
+}
+
+type corpusLine struct {
+	Name     string         `json:"name"`
+	Request  corpusRequest  `json:"request"`
+	Response corpusResponse `json:"response"`
+	Reject   bool           `json:"reject"`
+}
+
+func corpusPath(t *testing.T) string {
+	for _, p := range []string{"../wire/corpus.jsonl", "wire/corpus.jsonl"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	t.Fatal("view_test: wire/corpus.jsonl not found next to the module")
+	return ""
+}
+
+func readCorpus(t *testing.T) []corpusLine {
+	data, err := os.ReadFile(corpusPath(t))
+	if err != nil {
+		t.Fatalf("read corpus: %v", err)
+	}
+	var lines []corpusLine
+	for i, row := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(row) == "" {
+			continue
+		}
+		var line corpusLine
+		if err := json.Unmarshal([]byte(row), &line); err != nil {
+			t.Fatalf("corpus line %d: %v", i+1, err)
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) < 12 {
+		t.Fatalf("corpus holds %d lines, want at least the view-owned cases", len(lines))
+	}
+	return lines
+}
+
+func TestWireCorpus(t *testing.T) {
+	out := renderSlots(t, 1, func(i int) time.Duration { return 0 })
+	produced := idSet(slotWrittenRe, out)
+	if len(produced) != 1 {
+		t.Fatalf("produced %d slot ids, want 1", len(produced))
+	}
+	for id := range produced {
+		if !slotIDPatternRe.MatchString(id) {
+			t.Fatalf("produced id %q violates the wire contract", id)
+		}
+	}
+	for _, line := range readCorpus(t) {
+		checkCorpusLine(t, line)
+	}
+}
+
+func checkCorpusLine(t *testing.T, line corpusLine) {
+	switch line.Request.Kind {
+	case "slot-id":
+		checkCorpusSlotID(t, line)
+	case "island-when":
+		checkCorpusWhen(t, line)
+	case "island-props":
+		checkCorpusProps(t, line)
+	default:
+		t.Fatalf("%s: unknown corpus kind %q", line.Name, line.Request.Kind)
+	}
+}
+
+func checkCorpusSlotID(t *testing.T, line corpusLine) {
+	valid := slotIDPatternRe.MatchString(line.Request.ID)
+	if valid == line.Reject {
+		t.Fatalf("%s: id %q valid=%v conflicts with reject=%v", line.Name, line.Request.ID, valid, line.Reject)
+	}
+	if line.Response.Valid != valid {
+		t.Fatalf("%s: response.valid=%v, computed %v", line.Name, line.Response.Valid, valid)
+	}
+}
+
+func checkCorpusWhen(t *testing.T, line corpusLine) {
+	rejected := islandRejected("corpus.js", line.Request.When, map[string]any{"n": 1})
+	if rejected != line.Reject {
+		t.Fatalf("%s: when %q rejected=%v, want reject=%v", line.Name, line.Request.When, rejected, line.Reject)
+	}
+	if line.Response.Accepted == line.Reject {
+		t.Fatalf("%s: response.accepted=%v conflicts with reject=%v", line.Name, line.Response.Accepted, line.Reject)
+	}
+}
+
+func checkCorpusProps(t *testing.T, line corpusLine) {
+	var parsed any
+	parseErr := json.Unmarshal([]byte(line.Request.Props), &parsed)
+	if parseErr != nil {
+		if !line.Reject {
+			t.Fatalf("%s: malformed props %q must be a reject case", line.Name, line.Request.Props)
+		}
+		return
+	}
+	rejected := islandRejected("corpus.js", "visible", parsed)
+	if rejected != line.Reject {
+		t.Fatalf("%s: props %q rejected=%v, want reject=%v", line.Name, line.Request.Props, rejected, line.Reject)
+	}
+	if line.Response.Accepted != !rejected {
+		t.Fatalf("%s: response.accepted=%v conflicts with rejected=%v", line.Name, line.Response.Accepted, rejected)
+	}
+}
+
+func orderedSlotIDs(out string) []string {
+	var ids []string
+	for _, m := range slotOpenRe.FindAllStringSubmatch(out, -1) {
+		ids = append(ids, m[1])
+	}
+	return ids
+}
+
+type eventLog struct {
+	events sync.Locked[[]string]
+}
+
+func (l *eventLog) add(e string) {
+	l.events.WithLock(func(es *[]string) { *es = append(*es, e) })
+}
+
+func (l *eventLog) snapshot() []string {
+	var out []string
+	l.events.WithLock(func(es *[]string) { out = append(out, *es...) })
+	return out
+}
+
+type recordingWriter struct {
+	log *eventLog
+}
+
+func (w *recordingWriter) Write(b []byte) (int, error) {
+	w.log.add("write:" + string(b))
+	return len(b), nil
+}
+
+func (w *recordingWriter) Flush() {
+	w.log.add("flush")
+}
+
+var errBrokenWriter = errors.New("broken writer")
+
+type failingWriter struct {
+	failOn func(b []byte) bool
+	log    *eventLog
+}
+
+func (w *failingWriter) Write(b []byte) (int, error) {
+	w.log.add("write:" + string(b))
+	if w.failOn(b) {
+		return 0, errBrokenWriter
+	}
+	return len(b), nil
+}
+
+func TestRootWriteFailure(t *testing.T) {
+	log := &eventLog{}
+	w := &failingWriter{log: log, failOn: func(b []byte) bool { return true }}
+	err := view.Render(context.Background(), w, view.Div(view.T("x")))
+	if !errors.Is(err, errBrokenWriter) {
+		t.Fatalf("Render error = %v, want the root write failure returned unchanged", err)
+	}
+}
+
+func TestSlotWriteFailure(t *testing.T) {
+	log := &eventLog{}
+	w := &failingWriter{log: log, failOn: func(b []byte) bool {
+		return strings.Contains(string(b), `data-spira-slot="`)
+	}}
+	later := &view.Later{Fallback: view.T("fb"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.T("late"), nil
+	}}
+	err := view.Render(context.Background(), w, view.Div(later))
+	if !errors.Is(err, errBrokenWriter) {
+		t.Fatalf("Render error = %v, want the slot template write failure returned from Render", err)
+	}
+	id := slotIDFromEvents(log.snapshot())
+	if !strings.Contains(err.Error(), "view: slot "+id+": broken writer") {
+		t.Fatalf("Render error = %v, want view: slot %s: broken writer", err, id)
+	}
+	before := len(log.snapshot())
+	time.Sleep(50 * time.Millisecond)
+	if after := len(log.snapshot()); after != before {
+		t.Fatalf("%d writer calls happened after Render returned", after-before)
+	}
+}
+
+func slotIDFromEvents(events []string) string {
+	for _, e := range events {
+		if m := slotOpenRe.FindStringSubmatch(e); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+func TestResolverPanic(t *testing.T) {
+	bad := &view.Later{Fallback: view.T("bf"), Resolve: func(ctx context.Context) (view.Node, error) {
+		panic("kaboom")
+	}}
+	good := &view.Later{Fallback: view.T("gf"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.T("good"), nil
+	}}
+	var b bytes.Buffer
+	err := view.Render(context.Background(), &b, view.Div(bad, good))
+	if err == nil {
+		t.Fatalf("Render returned nil, want the contained panic as an error")
+	}
+	out := b.String()
+	ids := orderedSlotIDs(out)
+	if len(ids) != 2 {
+		t.Fatalf("output %q holds %d slot ids, want 2", out, len(ids))
+	}
+	if !strings.Contains(err.Error(), "view: slot "+ids[0]+": resolver panicked: kaboom") {
+		t.Fatalf("Render error = %v, want view: slot %s: resolver panicked: kaboom", err, ids[0])
+	}
+	if want := `<template data-spira-slot="` + ids[0] + `"><spira-error></spira-error></template>`; !strings.Contains(out, want) {
+		t.Fatalf("output %q lacks the panic slot marker %q", out, want)
+	}
+	if want := `<template data-spira-slot="` + ids[1] + `">good</template>`; !strings.Contains(out, want) {
+		t.Fatalf("output %q lacks the resolved good slot %q after the panic was contained", out, want)
+	}
+}
+
+func TestSlotFlushOrder(t *testing.T) {
+	log := &eventLog{}
+	w := &recordingWriter{log: log}
+	release := make(chan struct{})
+	fast := &view.Later{Fallback: view.T("ff"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.T("fast"), nil
+	}}
+	slow := &view.Later{Fallback: view.T("sf"), Resolve: func(ctx context.Context) (view.Node, error) {
+		select {
+		case <-release:
+			return view.T("slow"), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	g, _ := rt.NewGroup(context.Background(), 1)
+	g.Go(func(ctx context.Context) error {
+		return view.Render(ctx, w, view.Div(fast, slow))
+	})
+	if !waitForFlushes(log, 2) {
+		close(release)
+		finishRender(t, g)
+		t.Fatalf("events %v: root flush and fast template flush not both seen while the slow resolver was blocked", log.snapshot())
+	}
+	if got := countTemplateWrites(log.snapshot()); got != 1 {
+		close(release)
+		finishRender(t, g)
+		t.Fatalf("%d slot templates written before release, want only the fast one", got)
+	}
+	close(release)
+	finishRender(t, g)
+	assertFlushOrder(t, log.snapshot())
+}
+
+func finishRender(t *testing.T, g *rt.Group) {
+	t.Helper()
+	if err := g.Wait(); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+}
+
+func waitForFlushes(log *eventLog, want int) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if countEvent(log.snapshot(), "flush") >= want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func countEvent(events []string, e string) int {
+	n := 0
+	for _, s := range events {
+		if s == e {
+			n++
+		}
+	}
+	return n
+}
+
+func countTemplateWrites(events []string) int {
+	n := 0
+	for _, e := range events {
+		if strings.HasPrefix(e, "write:") && strings.Contains(e, `data-spira-slot="`) {
+			n++
+		}
+	}
+	return n
+}
+
+func assertFlushOrder(t *testing.T, events []string) {
+	t.Helper()
+	var flushes []int
+	var templates []int
+	for i, e := range events {
+		if e == "flush" {
+			flushes = append(flushes, i)
+		}
+		if strings.HasPrefix(e, "write:") && strings.Contains(e, `data-spira-slot="`) {
+			templates = append(templates, i)
+		}
+	}
+	if len(flushes) != 3 || len(templates) != 2 {
+		t.Fatalf("flushes at %v, templates at %v, want three flushes around two templates", flushes, templates)
+	}
+	if !(flushes[0] < templates[0] && templates[0] < flushes[1] && flushes[1] < templates[1] && templates[1] < flushes[2]) {
+		t.Fatalf("flushes at %v do not interleave the templates at %v", flushes, templates)
+	}
+}
+
+type shelfItem struct {
+	Name string
+	Tags []string
+}
+
+func shelfRow(it const shelfItem) view.Node {
+	return view.Li(view.T(it.Name), view.Attr("data-tags", fmt.Sprint(len(it.Tags))))
+}
+
+func TestEachConstView(t *testing.T) {
+	items := []shelfItem{{Name: "mug", Tags: []string{"kitchen"}}, {Name: "plate"}}
+	out := renderNode(t, view.Ul(view.Each(items, shelfRow)))
+	if !strings.Contains(out, `<li data-tags="1">mug</li><li data-tags="0">plate</li>`) {
+		t.Fatalf("named const callback rendered %q", out)
+	}
+	lambda := renderNode(t, view.Ul(view.Each(items, it => view.Li(view.T(it.Name)))))
+	if !strings.Contains(lambda, "<li>mug</li><li>plate</li>") {
+		t.Fatalf("lambda callback rendered %q", lambda)
+	}
+	ptrs := []*shelfItem{{Name: "cup", Tags: []string{"a"}}}
+	ptrOut := renderNode(t, view.Ul(view.Each(ptrs, p => view.Li(view.T(p.Name)))))
+	if !strings.Contains(ptrOut, "<li>cup</li>") {
+		t.Fatalf("pointer callback rendered %q", ptrOut)
+	}
+}
