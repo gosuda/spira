@@ -1,6 +1,7 @@
 import * as reactAdapter from "./adapters/react";
 import * as solidAdapter from "./adapters/solid";
 import * as svelteAdapter from "./adapters/svelte";
+import * as wasmAdapter from "./adapters/wasm";
 
 export type IslandModule = { default: unknown };
 export type IslandLoader = () => Promise<IslandModule>;
@@ -28,6 +29,11 @@ const adapters: Adapter[] = [
 		ext: ".svelte",
 		mount: (target, component, props) =>
 			svelteAdapter.mount(target, component, props),
+	},
+	{
+		ext: ".wasm",
+		mount: (target, component, props) =>
+			wasmAdapter.mount(target, component, props),
 	},
 ];
 
