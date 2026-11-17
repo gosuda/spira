@@ -12,10 +12,10 @@ spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). I
 
 ## Toolchain environment
 
-The toolchain is a LoGOs worktree, not the system Go. Every command needs:
+The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102 and gosuda/LoGOs#103, which the comptime packages need. Every command needs:
 
 ```sh
-export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-dogfood PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
+export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
 ```
 
 The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carmack]
