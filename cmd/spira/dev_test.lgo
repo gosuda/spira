@@ -1,0 +1,507 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func TestWatchRestartsServerOnlyOnLgoChange(t *testing.T) {
+	dir := t.TempDir()
+	fix := newStandins(dir)
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", 10*time.Second, func() bool { return fix.count() == 1 }); err != nil {
+			return err
+		}
+		if err := touchLater(seed); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart after .lgo change", 10*time.Second, func() bool { return fix.count() == 2 }); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
+			return err
+		}
+		if err := settle(sctx, "no restart after .txt write", cfg.Interval, func() bool { return fix.count() != 2 }); err != nil {
+			return err
+		}
+		if err := os.Mkdir(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "node_modules", "skip.lgo"), []byte("package main\n"), 0o644); err != nil {
+			return err
+		}
+		if err := settle(sctx, "no restart after node_modules write", cfg.Interval, func() bool { return fix.count() != 2 }); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+}
+
+func TestWatchCancelEndsLoopAndKillsStandinGroups(t *testing.T) {
+	dir := t.TempDir()
+	fix := newStandins(dir)
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", 10*time.Second, func() bool { return fix.count() >= 1 }); err != nil {
+			return err
+		}
+		if err := await(sctx, "standin pids", 5*time.Second, fix.pidsReady); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+	for _, pid := range fix.serverPids() {
+		assertGone(t, "server stand-in", pid)
+	}
+	for _, pid := range fix.frontendPids() {
+		assertGone(t, "frontend stand-in", pid)
+	}
+}
+
+func TestWatchServerSelfExitWaitsForChange(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "starts.log")
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf("printf 'start\\n' >> '%s'\nexit 3\n", counter)
+	cfg := Loop{
+		ServerCmd:   []string{"sh", "-c", script},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		Root:        dir,
+		Interval:    20 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", 10*time.Second, func() bool { return lineCount(counter) == 1 }); err != nil {
+			return err
+		}
+		if err := settle(sctx, "no restart after self exit", cfg.Interval, func() bool { return lineCount(counter) != 1 }); err != nil {
+			return err
+		}
+		if err := touchLater(seed); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart after .lgo change", 10*time.Second, func() bool { return lineCount(counter) == 2 }); err != nil {
+			return err
+		}
+		if err := settle(sctx, "no restart after second self exit", cfg.Interval, func() bool { return lineCount(counter) != 2 }); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+}
+
+func driveWatch(ctx context.Context, cfg Loop, scenario func(ctx context.Context) error) error {
+	go group (ctx) {
+		go watch(ctx, cfg)
+		go scenario(ctx)
+	}
+	return nil
+}
+
+type standin struct {
+	dir         string
+	serverCmd   []string
+	frontendCmd []string
+}
+
+func newStandins(dir string) *standin {
+	serverScript := fmt.Sprintf("sleep 300 & printf '%%s\\n' $! >> '%s'\nprintf '%%s\\n' $$ >> '%s'\nprintf 'start\\n' >> '%s'\nwait\n",
+		filepath.Join(dir, "server_sleep.pid"), filepath.Join(dir, "server_sh.pid"), filepath.Join(dir, "starts.log"))
+	frontScript := fmt.Sprintf("sleep 300 & printf '%%s\\n' $! >> '%s'\nprintf '%%s\\n' $$ >> '%s'\nwait\n",
+		filepath.Join(dir, "front_sleep.pid"), filepath.Join(dir, "front_sh.pid"))
+	return &standin{
+		dir:         dir,
+		serverCmd:   []string{"sh", "-c", serverScript},
+		frontendCmd: []string{"sh", "-c", frontScript},
+	}
+}
+
+func (s *standin) count() int {
+	return lineCount(filepath.Join(s.dir, "starts.log"))
+}
+
+func (s *standin) pidsReady() bool {
+	for _, name := range []string{"server_sleep.pid", "server_sh.pid", "front_sleep.pid", "front_sh.pid"} {
+		if lineCount(filepath.Join(s.dir, name)) < 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *standin) serverPids() []int {
+	return pidPair(s.dir, "server_sh.pid", "server_sleep.pid")
+}
+
+func (s *standin) frontendPids() []int {
+	return pidPair(s.dir, "front_sh.pid", "front_sleep.pid")
+}
+
+func pidPair(dir string, shName string, sleepName string) []int {
+	return []int{lastPid(filepath.Join(dir, shName)), lastPid(filepath.Join(dir, sleepName))}
+}
+
+func await(ctx context.Context, what string, budget time.Duration, probe func() bool) error {
+	deadline := time.Now().Add(budget)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if probe() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cmd/spira test: timed out waiting for %s", what)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("cmd/spira test: cancelled while waiting for %s", what)
+		case <-tick.C:
+		}
+	}
+}
+
+func settle(ctx context.Context, label string, interval time.Duration, bad func() bool) error {
+	deadline := time.Now().Add(10 * interval)
+	tick := time.NewTicker(interval / 2)
+	defer tick.Stop()
+	for time.Now().Before(deadline) {
+		if bad() {
+			return fmt.Errorf("cmd/spira test: unexpected event while waiting for %s", label)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+	return nil
+}
+
+func touchLater(path string) error {
+	future := time.Now().Add(2 * time.Second)
+	return os.Chtimes(path, future, future)
+}
+
+func lineCount(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(data), "\n")
+}
+
+func lastPid(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0
+	}
+	pid, err := strconv.Atoi(fields[len(fields)-1])
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+func processDead(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true
+	}
+	i := strings.LastIndex(string(data), ")")
+	if i < 0 || i+1 >= len(data) {
+		return false
+	}
+	fields := strings.Fields(string(data[i+1:]))
+	return len(fields) > 0 && fields[0] == "Z"
+}
+
+func assertGone(t *testing.T, what string, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if processDead(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s pid %d still alive after shutdown", what, pid)
+}
+
+func TestWatchServerSelfExitLogsOneWarningWithRealStatus(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "starts.log")
+	warnPath := filepath.Join(dir, "warn.log")
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logFile, err := os.OpenFile(warnPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{})))
+	defer slog.SetDefault(previous)
+	script := fmt.Sprintf("printf 'start\\n' >> '%s'\nexit 3\n", counter)
+	cfg := Loop{
+		ServerCmd:   []string{"sh", "-c", script},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		Root:        dir,
+		Interval:    20 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", 10*time.Second, func() bool { return lineCount(counter) == 1 }); err != nil {
+			return err
+		}
+		if err := await(sctx, "exit warning", 10*time.Second, func() bool { return strings.Contains(warnText(warnPath), "server exited") }); err != nil {
+			return err
+		}
+		if err := settle(sctx, "exactly one exit warning", 250*time.Millisecond, func() bool {
+			return strings.Count(warnText(warnPath), "server exited") != 1
+		}); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+	text := warnText(warnPath)
+	if n := strings.Count(text, "server exited"); n != 1 {
+		t.Fatalf("server exited warnings = %d, want 1:\n%s", n, text)
+	}
+	if !strings.Contains(text, "exit status 3") {
+		t.Fatalf("warning lacks the real exit error:\n%s", text)
+	}
+	if strings.Contains(text, "already started") {
+		t.Fatalf("warning reports already started:\n%s", text)
+	}
+}
+
+func TestWatchRestartReapsPreviousServerBeforeNextStart(t *testing.T) {
+	dir := t.TempDir()
+	pidsLog := filepath.Join(dir, "pids.log")
+	startsLog := filepath.Join(dir, "starts.log")
+	violationLog := filepath.Join(dir, "violation.log")
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf(
+		"if [ -f '%[1]s' ]; then\n"+
+			"while read -r prev; do\n"+
+			"[ -d /proc/$prev ] && printf '%%s\\n' \"$prev\" >> '%[3]s'\n"+
+			"done < '%[1]s'\n"+
+			"fi\n"+
+			"printf '%%s\\n' $$ >> '%[1]s'\n"+
+			"printf 'start\\n' >> '%[2]s'\n"+
+			"sleep 300\n",
+		pidsLog, startsLog, violationLog)
+	cfg := Loop{
+		ServerCmd:   []string{"sh", "-c", script},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		Root:        dir,
+		Interval:    20 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", 10*time.Second, func() bool { return lineCount(startsLog) == 1 }); err != nil {
+			return err
+		}
+		if err := touchLater(seed); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart after .lgo change", 10*time.Second, func() bool { return lineCount(startsLog) == 2 }); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+	data, readErr := os.ReadFile(violationLog)
+	if readErr == nil && strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("previous server stand-in still present at next start:\n%s", string(data))
+	}
+}
+
+func TestWatchCancelReapsAllChildren(t *testing.T) {
+	dir := t.TempDir()
+	fix := newStandins(dir)
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", 10*time.Second, func() bool { return fix.count() >= 1 }); err != nil {
+			return err
+		}
+		if err := await(sctx, "standin pids", 5*time.Second, fix.pidsReady); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+	assertNoChildren(t)
+}
+
+func TestWatchRejectsRootThatIsNotADirectory(t *testing.T) {
+	dir := t.TempDir()
+	notDir := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(notDir, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	counter := filepath.Join(dir, "starts.log")
+	script := fmt.Sprintf("printf 'start\\n' >> '%s'\nsleep 300\n", counter)
+	cfg := Loop{
+		ServerCmd:   []string{"sh", "-c", script},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		Root:        notDir,
+		Interval:    20 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := watch(ctx, cfg)
+	want := fmt.Sprintf("cmd/spira: %s is not a directory", notDir)
+	if err == nil || err.Error() != want {
+		t.Fatalf("watch error = %v, want %q", err, want)
+	}
+	if serr := settle(ctx, "nothing starts", 100*time.Millisecond, func() bool { return lineCount(counter) != 0 }); serr != nil {
+		t.Fatal(serr)
+	}
+}
+
+func warnText(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func childPids() []int {
+	mine := os.Getpid()
+	var pids []int
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		pid, convErr := strconv.Atoi(entry.Name())
+		if convErr != nil {
+			continue
+		}
+		data, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if readErr != nil {
+			continue
+		}
+		i := strings.LastIndex(string(data), ")")
+		if i < 0 || i+1 >= len(data) {
+			continue
+		}
+		fields := strings.Fields(string(data[i+1:]))
+		if len(fields) < 2 {
+			continue
+		}
+		ppid, convErr := strconv.Atoi(fields[1])
+		if convErr == nil && ppid == mine {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+func assertNoChildren(t *testing.T) {
+	t.Helper()
+	var status syscall.WaitStatus
+	var usage syscall.Rusage
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(childPids()) == 0 {
+			if _, err := syscall.Wait4(-1, &status, syscall.WNOHANG, &usage); err == syscall.ECHILD {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("children of the test process remain unreaped after shutdown: %v", childPids())
+}
+
+func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
+	t.Setenv("SPIRA_VITE_ORIGIN", "inherited")
+	dir := t.TempDir()
+	seen := filepath.Join(dir, "server.env")
+	script := fmt.Sprintf("printf '%%s\\n' \"$SPIRA_VITE_ORIGIN\" > '%s'\nsleep 300\n", seen)
+	cfg := Loop{
+		ServerCmd:   []string{"sh", "-c", script},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		Root:        dir,
+		Interval:    20 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "the server to record its environment", 10*time.Second, func() bool { return lineCount(seen) == 1 }); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+		return
+	}
+	data, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("read %s: %v", seen, err)
+		return
+	}
+	if got := strings.TrimSpace(string(data)); got != "http://localhost:5173" {
+		t.Fatalf("server SPIRA_VITE_ORIGIN = %q, want http://localhost:5173", got)
+	}
+}

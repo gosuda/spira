@@ -1,0 +1,219 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+)
+
+const viteOrigin = "SPIRA_VITE_ORIGIN=http://localhost:5173"
+
+type Loop struct {
+	ServerCmd   []string
+	FrontendCmd []string
+	Root        string
+	Interval    time.Duration
+}
+
+func watch(ctx context.Context, cfg Loop) error {
+	if err := requireRoot(cfg.Root); err != nil {
+		return err
+	}
+	restarts := make(chan struct{}, 1)
+	go group (ctx) {
+		go frontend(ctx, cfg)
+		go scanLoop(ctx, cfg, restarts)
+		for ctx.Err() == nil {
+			cmd, startErr := startProc(ctx, cfg.ServerCmd, []string{viteOrigin})
+			if startErr != nil {
+				if !reportExit(ctx, startErr, restarts) {
+					return nil
+				}
+				continue
+			}
+			if cmd == nil {
+				return fmt.Errorf("cmd/spira: start %s: no process", cfg.ServerCmd[0])
+			}
+			exited := make(chan error, 1)
+			go reap(ctx, cmd, exited)
+			if !superviseExit(ctx, cmd, exited, restarts) {
+				return nil
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func requireRoot(root string) error {
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("cmd/spira: %s is not a directory", root)
+	}
+	return nil
+}
+
+func reportExit(ctx context.Context, runErr error, restarts <-chan struct{}) bool {
+	if ctx.Err() == nil {
+		slog.Warn("cmd/spira: server exited; next .lgo change restarts it", "error", runErr)
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-restarts:
+		return true
+	}
+}
+
+func reap(ctx context.Context, cmd *exec.Cmd, exited chan<- error) {
+	waitErr := cmd.Wait()
+	select {
+	case exited <- waitErr:
+	case <-ctx.Done():
+	}
+}
+
+func awaitReaped(ctx context.Context, exited <-chan error) {
+	select {
+	case <-exited:
+	case <-ctx.Done():
+	}
+}
+
+func superviseExit(ctx context.Context, cmd *exec.Cmd, exited <-chan error, restarts <-chan struct{}) bool {
+	select {
+	case runErr := <-exited:
+		return reportExit(ctx, runErr, restarts)
+	case <-restarts:
+		stopGroup(cmd.Process)
+		awaitReaped(ctx, exited)
+		return true
+	case <-ctx.Done():
+		stopGroup(cmd.Process)
+		awaitReaped(ctx, exited)
+		return false
+	}
+}
+
+func frontend(ctx context.Context, cfg Loop) error {
+	cmd, err := startProc(ctx, cfg.FrontendCmd, nil)
+	if err != nil {
+		return err
+	}
+	if cmd == nil {
+		return fmt.Errorf("cmd/spira: start %s: no process", cfg.FrontendCmd[0])
+	}
+	if runErr := cmd.Wait(); runErr != nil && ctx.Err() == nil {
+		slog.Warn("cmd/spira: frontend exited", "error", runErr)
+	}
+	return nil
+}
+
+func scanLoop(ctx context.Context, cfg Loop, restarts chan<- struct{}) error {
+	prev, err := snapshot(cfg.Root)
+	if err != nil {
+		return err
+	}
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+		now, nowErr := snapshot(cfg.Root)
+		if nowErr != nil {
+			return nowErr
+		}
+		queueRestart(prev, now, restarts)
+		prev = now
+	}
+}
+
+func queueRestart(prev const map[string]int64, now const map[string]int64, restarts chan<- struct{}) {
+	if differs(prev, now) {
+		select {
+		case restarts <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func snapshot(root string) (map[string]int64, error) {
+	files := map[string]int64{}
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != root && (strings.HasPrefix(d.Name(), ".") || d.Name() == "node_modules") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".lgo") {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		files[path] = info.ModTime().UnixNano()
+		return nil
+	})
+	return files, walkErr
+}
+
+func differs(prev const map[string]int64, now const map[string]int64) bool {
+	for path, mod := range now {
+		if had, ok := prev[path]; !ok || had != mod {
+			return true
+		}
+	}
+	for path := range prev {
+		if _, ok := now[path]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func startProc(ctx context.Context, command []string, extraEnv []string) (*exec.Cmd?, error) {
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return killNow(cmd.Process)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), extraEnv...)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("cmd/spira: start %s: %w", command[0], err)
+	}
+	return cmd, nil
+}
+
+func killNow(p *os.Process) error {
+	if p == nil {
+		return nil
+	}
+	err := syscall.Kill(-p.Pid, syscall.SIGKILL)
+	if err == syscall.ESRCH {
+		return nil
+	}
+	return err
+}
+
+func stopGroup(p *os.Process) {
+	if err := killNow(p); err != nil {
+		slog.Warn("cmd/spira: stop server group", "pid", p.Pid, "error", err)
+	}
+}

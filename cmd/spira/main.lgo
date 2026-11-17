@@ -1,0 +1,29 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	if len(os.Args) != 3 || os.Args[1] != "dev" {
+		fmt.Fprintln(os.Stderr, "usage: spira dev <main-package>")
+		os.Exit(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	loop := Loop{
+		ServerCmd:   []string{"logos", "run", os.Args[2]},
+		FrontendCmd: []string{"pnpm", "--dir", "frontend", "run", "dev"},
+		Root:        ".",
+		Interval:    500 * time.Millisecond,
+	}
+	if err := watch(ctx, loop); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
