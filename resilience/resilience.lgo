@@ -1,0 +1,127 @@
+package resilience
+
+import (
+	"context"
+	"errors"
+	"math/rand/v2"
+	"time"
+)
+
+type Retry struct {
+	Attempts int           = 3
+	Base     time.Duration = 100 * time.Millisecond
+	Max      time.Duration = 2 * time.Second
+}
+
+type Policy struct {
+	Timeout time.Duration = 10 * time.Second
+	Retry   Retry?
+	Breaker *Breaker?
+}
+
+func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T, error)) (T, error) {
+	var zero T
+	var last error
+	for i := range tries(p.Retry) {
+		if err := pause(ctx, p.Retry, i); err != nil {
+			return zero, errors.Join(last, err)
+		}
+		value, err := attempt(ctx, p, call)
+		if err == nil {
+			return value, nil
+		}
+		last = err
+		if errors.Is(err, ErrOpen) || ctx.Err() != nil {
+			return zero, halted(ctx, last)
+		}
+	}
+	return zero, last
+}
+
+func attempt[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T, error)) (T, error) {
+	var zero T
+	breaker := p.Breaker
+	var tk ticket
+	if breaker != nil {
+		var ok bool
+		tk, ok = breaker.admit()
+		if !ok {
+			return zero, ErrOpen
+		}
+	}
+	bounded, cancel := context.WithTimeout(ctx, p.Timeout)
+	defer cancel()
+	settled := false
+	defer func() {
+		if b := breaker; b != nil && !settled {
+			b.record(tk, false)
+		}
+	}()
+	value, err := call(bounded)
+	settled = true
+	if breaker != nil {
+		breaker.settle(ctx, tk, err)
+	}
+	if err != nil {
+		return zero, err
+	}
+	return value, nil
+}
+
+func tries(retry Retry?) int {
+	if r := retry; r != nil {
+		return max(r.Attempts, 1)
+	}
+	return 1
+}
+
+func paused(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func pause(ctx context.Context, retry Retry?, attempt int) error {
+	if attempt == 0 {
+		return nil
+	}
+	r := retry
+	if r == nil {
+		return nil
+	}
+	return paused(ctx, jitter(r, attempt-1))
+}
+
+func halted(ctx context.Context, last error) error {
+	if err := ctx.Err(); err != nil {
+		return errors.Join(last, err)
+	}
+	return last
+}
+
+func jitter(r Retry, retries int) time.Duration {
+	ceiling := backoff(r, retries)
+	if ceiling <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(ceiling)))
+}
+
+func backoff(r Retry, retries int) time.Duration {
+	c := r.Base
+	for range retries {
+		if c > r.Max/2 {
+			return r.Max
+		}
+		c *= 2
+	}
+	return min(c, r.Max)
+}

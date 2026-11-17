@@ -1,0 +1,146 @@
+package resilience
+
+import (
+	"context"
+	"errors"
+	"logos/sync"
+	"time"
+)
+
+var ErrOpen = errors.New("resilience: circuit open")
+
+type Breaker struct {
+	Window      int              = 20
+	FailureRate float64          = 0.5
+	OpenFor     time.Duration    = 30 * time.Second
+	Now         (func() time.Time)?
+	circuit     sync.Locked[circuit]
+}
+
+type phase int
+
+const (
+	closed phase = iota
+	open
+	halfOpen
+)
+
+type ticket struct {
+	epoch uint64
+	seq   uint64
+	probe bool
+}
+
+type circuit struct {
+	phase    phase
+	probing  bool
+	probeID  uint64
+	epoch    uint64
+	seq      uint64
+	recent   []bool
+	openedAt time.Time
+}
+
+func (b *Breaker) admit() (ticket, bool) {
+	now := (b.Now ?? time.Now)()
+	var tk ticket
+	admitted := false
+	b.circuit.WithLock(c => {
+		switch c.phase {
+		case closed:
+			tk = ticket{epoch: c.epoch}
+			admitted = true
+		case open:
+			if now.Sub(c.openedAt) >= b.OpenFor {
+				c.phase = halfOpen
+				c.probing = true
+				c.seq++
+				c.probeID = c.seq
+				tk = ticket{epoch: c.epoch, seq: c.seq, probe: true}
+				admitted = true
+			}
+		case halfOpen:
+			if !c.probing {
+				c.probing = true
+				c.seq++
+				c.probeID = c.seq
+				tk = ticket{epoch: c.epoch, seq: c.seq, probe: true}
+				admitted = true
+			}
+		}
+	})
+	return tk, admitted
+}
+
+func (b *Breaker) settle(ctx context.Context, tk ticket, err error) {
+	if ctx.Err() != nil {
+		b.release(tk)
+		return
+	}
+	b.record(tk, err == nil)
+}
+
+func (b *Breaker) release(tk ticket) {
+	b.circuit.WithLock(c => {
+		if tk.epoch != c.epoch || !tk.probe || tk.seq != c.probeID {
+			return
+		}
+		if c.phase == halfOpen && c.probing {
+			c.probing = false
+		}
+	})
+}
+
+func (b *Breaker) record(tk ticket, succeeded bool) {
+	now := (b.Now ?? time.Now)()
+	window := max(b.Window, 1)
+	b.circuit.WithLock(c => {
+		if tk.epoch != c.epoch {
+			return
+		}
+		switch c.phase {
+		case closed:
+			if tk.probe {
+				return
+			}
+			c.recent = appendBounded(c.recent, succeeded, window)
+			if len(c.recent) == window && failureShare(c.recent) >= b.FailureRate {
+				c.trip(now)
+			}
+		case halfOpen:
+			if !tk.probe || tk.seq != c.probeID || !c.probing {
+				return
+			}
+			c.probing = false
+			if succeeded {
+				c.phase = closed
+				c.recent = nil
+				c.epoch++
+			} else {
+				c.trip(now)
+			}
+		case open:
+		}
+	})
+}
+
+func (c *circuit) trip(now time.Time) {
+	c.phase = open
+	c.probing = false
+	c.recent = nil
+	c.openedAt = now
+	c.epoch++
+}
+
+func appendBounded(recent []bool, outcome bool, window int) []bool {
+	if len(recent) == window {
+		copy(recent, recent[1:])
+		recent = recent[:window-1]
+	}
+	return append(recent, outcome)
+}
+
+func failureShare(recent const []bool) float64 {
+	failures := recent.count(succeeded => !succeeded)
+	return float64(failures) / float64(len(recent))
+}
