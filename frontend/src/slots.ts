@@ -7,8 +7,10 @@ export function installSlotMover(root: ParentNode = document): void {
 			if (id === undefined) {
 				continue;
 			}
-			const slot = root.querySelector<HTMLElement>(`spira-slot[id="${id}"]`);
-			if (slot === null) {
+			const slot = Array.from(
+				root.querySelectorAll<HTMLElement>("spira-slot"),
+			).find((candidate) => candidate.getAttribute("id") === id);
+			if (slot === undefined) {
 				continue;
 			}
 			for (const child of Array.from(slot.childNodes)) {

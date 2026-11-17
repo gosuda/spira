@@ -42,15 +42,20 @@ function adapterFor(entry: string): Adapter {
 	throw new Error(`spira-island: no adapter for island entry "${entry}"`);
 }
 
-function parseProps(raw: string): Record<string, unknown> {
+function parseProps(raw: string): Record<string, unknown> | null {
 	if (raw === "") {
 		return {};
 	}
-	const parsed: unknown = JSON.parse(raw);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
 	if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
 		return parsed as Record<string, unknown>;
 	}
-	return {};
+	return null;
 }
 
 export class SpiraIslandElement extends HTMLElement {
@@ -60,7 +65,13 @@ export class SpiraIslandElement extends HTMLElement {
 
 	connectedCallback(): void {
 		const when = this.getAttribute("when") ?? "visible";
-		if (!WHEN_VALUES.has(when) || when === "load") {
+		if (!WHEN_VALUES.has(when)) {
+			this.reject(
+				`spira-island: unknown when "${when}" for entry "${this.getAttribute("entry") ?? ""}"`,
+			);
+			return;
+		}
+		if (when === "load") {
 			this.activate();
 			return;
 		}
@@ -100,7 +111,16 @@ export class SpiraIslandElement extends HTMLElement {
 		this.activated = true;
 		const entry = this.getAttribute("entry") ?? "";
 		const props = parseProps(this.getAttribute("props") ?? "");
+		if (props === null) {
+			console.error(`spira-island: invalid props for entry "${entry}"`);
+			return;
+		}
 		void this.load(entry, props);
+	}
+
+	private reject(message: string): void {
+		this.activated = true;
+		console.error(message);
 	}
 
 	private async load(

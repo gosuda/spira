@@ -81,6 +81,113 @@ describe("spira-island", () => {
 		expect(el.querySelector("span")?.textContent).toBe("fallback");
 		spy.mockRestore();
 	});
+
+	test.each(["WHEN", "", "eager"])(
+		"rejects when=%j without calling the loader",
+		async (when) => {
+			const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const el = document.createElement("spira-island");
+			el.setAttribute("entry", "example/shop/react.react.tsx");
+			el.setAttribute("when", when);
+			el.setAttribute("props", "{}");
+			el.innerHTML = "<span>fallback</span>";
+			document.body.append(el);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(spy).toHaveBeenCalledTimes(1);
+			const message = String(spy.mock.calls[0]?.[0]);
+			expect(message).toContain("example/shop/react.react.tsx");
+			expect(message).toContain(when);
+			expect(el.querySelector("span")?.textContent).toBe("fallback");
+			expect(el.querySelector("button")).toBeNull();
+			spy.mockRestore();
+		},
+	);
+
+	test.each(["[1]", '"x"', "3", "null"])(
+		"rejects non-object props %s without calling the loader",
+		async (props) => {
+			const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const el = document.createElement("spira-island");
+			el.setAttribute("entry", "example/shop/react.react.tsx");
+			el.setAttribute("when", "load");
+			el.setAttribute("props", props);
+			el.innerHTML = "<span>fallback</span>";
+			document.body.append(el);
+			await vi.waitFor(() => {
+				expect(spy).toHaveBeenCalled();
+			});
+			expect(spy).toHaveBeenCalledTimes(1);
+			const message = String(spy.mock.calls[0]?.[0]);
+			expect(message).toContain("example/shop/react.react.tsx");
+			expect(el.querySelector("span")?.textContent).toBe("fallback");
+			expect(el.querySelector("button")).toBeNull();
+			spy.mockRestore();
+		},
+	);
+
+	test("rejects malformed props JSON with a named error", async () => {
+		const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const el = document.createElement("spira-island");
+		el.setAttribute("entry", "example/shop/react.react.tsx");
+		el.setAttribute("when", "load");
+		el.setAttribute("props", "{,");
+		el.innerHTML = "<span>fallback</span>";
+		document.body.append(el);
+		await vi.waitFor(() => {
+			expect(spy).toHaveBeenCalled();
+		});
+		expect(spy).toHaveBeenCalledTimes(1);
+		const message = String(spy.mock.calls[0]?.[0]);
+		expect(message).toContain("example/shop/react.react.tsx");
+		expect(message).not.toContain("SyntaxError");
+		expect(el.querySelector("span")?.textContent).toBe("fallback");
+		expect(el.querySelector("button")).toBeNull();
+		spy.mockRestore();
+	});
+});
+
+describe("slot mover hardening", () => {
+	test("treats the slot id as a value, not a selector", async () => {
+		document.body.innerHTML = `
+			<spira-slot id="s1"><p>text A</p></spira-slot>
+			<spira-slot id="s2"><p>text B</p></spira-slot>
+		`;
+		installSlotMover(document.body);
+		const bad = document.createElement("template");
+		bad.dataset.spiraSlot = 'x"],spira-slot[id="s1';
+		bad.innerHTML = "<em>injected</em>";
+		document.body.append(bad);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(document.querySelector("spira-slot#s1 p")?.textContent).toBe(
+			"text A",
+		);
+		expect(document.querySelector("spira-slot#s1 em")).toBeNull();
+
+		const good = document.createElement("template");
+		good.dataset.spiraSlot = "s2";
+		good.innerHTML = "<em>resolved</em>";
+		document.body.append(good);
+		await vi.waitFor(() => {
+			expect(document.querySelector("spira-slot#s2 em")?.textContent).toBe(
+				"resolved",
+			);
+		});
+		expect(document.querySelector("template[data-spira-slot]")).toBe(bad);
+	});
+
+	test("leaves a template with no matching slot in place", async () => {
+		document.body.innerHTML = `<spira-slot id="s1"><p>text A</p></spira-slot>`;
+		installSlotMover(document.body);
+		const orphan = document.createElement("template");
+		orphan.dataset.spiraSlot = "nope";
+		orphan.innerHTML = "<em>orphan</em>";
+		document.body.append(orphan);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(document.querySelector("template[data-spira-slot]")).toBe(orphan);
+		expect(document.querySelector("spira-slot#s1 p")?.textContent).toBe(
+			"text A",
+		);
+	});
 });
 
 describe("slot mover", () => {
