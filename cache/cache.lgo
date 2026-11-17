@@ -1,0 +1,226 @@
+package cache
+
+import (
+	"container/list"
+	"context"
+	"errors"
+	"time"
+
+	"logos/sync"
+)
+
+var errLoadPanicked = errors.New("cache: load panicked")
+
+type Memory[K comparable, V any] struct {
+	ttl   time.Duration
+	store sync.Locked[store[K, V]]
+	Now   func() time.Time
+}
+
+type store[K comparable, V any] struct {
+	capacity int
+	entries  map[K]*list.Element
+	order    *list.List
+	flights  map[K]*flight[K, V]
+}
+
+type item[K comparable, V any] struct {
+	key K
+	val V
+	at  time.Time
+}
+
+type flight[K comparable, V any] struct {
+	waiters    []chan outcome[V]
+	superseded bool
+}
+
+type outcome[V any] struct {
+	ok    bool
+	value V
+	err   error
+}
+
+func NewMemory[K comparable, V any](capacity int, ttl time.Duration) *Memory[K, V] {
+	if capacity < 1 {
+		panic("cache: capacity must be at least 1")
+	}
+	m := &Memory[K, V]{ttl: ttl, Now: time.Now}
+	m.store.WithLock(func(s *store[K, V]) {
+		s.capacity = capacity
+		s.entries = map[K]*list.Element{}
+		s.order = list.New()
+		s.flights = map[K]*flight[K, V]{}
+	})
+	return m
+}
+
+func (s *store[K, V]) element(k K) *list.Element? {
+	return s.entries[k]
+}
+
+func (c *Memory[K, V]) Get(k K) V? {
+	var out outcome[V]
+	c.store.WithLock(func(s *store[K, V]) {
+		el := s.element(k)
+		if el == nil {
+			return
+		}
+		it := el.Value.(*item[K, V])
+		if c.expired(it.at) {
+			s.order.Remove(el)
+			delete(s.entries, k)
+			return
+		}
+		s.order.MoveToFront(el)
+		out = outcome[V]{ok: true, value: it.val}
+	})
+	var v V?
+	if out.ok {
+		v = out.value
+	}
+	return v
+}
+
+func (s *store[K, V]) drop(k K) {
+	if el, ok := s.entries[k]; ok {
+		s.order.Remove(el)
+		delete(s.entries, k)
+	}
+}
+
+func (s *store[K, V]) insert(it *item[K, V]) {
+	s.drop(it.key)
+	s.entries[it.key] = s.order.PushFront(it)
+	for s.order.Len() > s.capacity {
+		oldest := s.order.Back()
+		if oldest == nil {
+			break
+		}
+		s.drop(oldest.Value.(*item[K, V]).key)
+	}
+}
+
+func (s *store[K, V]) supersede(k K) {
+	if fl, ok := s.flights[k]; ok {
+		fl.superseded = true
+	}
+}
+
+func (c *Memory[K, V]) Put(k K, v V) {
+	c.store.WithLock(func(s *store[K, V]) {
+		s.supersede(k)
+		s.insert(&item[K, V]{key: k, val: v, at: c.Now()})
+	})
+}
+
+func (c *Memory[K, V]) Delete(k K) {
+	c.store.WithLock(func(s *store[K, V]) {
+		s.supersede(k)
+		s.drop(k)
+	})
+}
+
+func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load func(ctx context.Context) (V, error)) (V, error) {
+	nf := &flight[K, V]{}
+	lead := false
+	hit := false
+	var ch chan outcome[V]
+	var out outcome[V]
+	c.store.WithLock(func(s *store[K, V]) {
+		el := s.element(k)
+		if el != nil {
+			it := el.Value.(*item[K, V])
+			if !c.expired(it.at) {
+				s.order.MoveToFront(el)
+				out = outcome[V]{ok: true, value: it.val}
+				hit = true
+				return
+			}
+			s.order.Remove(el)
+			delete(s.entries, k)
+		}
+		if fl, ok := s.flights[k]; ok {
+			ch = make(chan outcome[V], 1)
+			fl.waiters = append(fl.waiters, ch)
+			return
+		}
+		s.flights[k] = nf
+		lead = true
+	})
+	if hit {
+		return c.finish(out)
+	}
+	if !lead {
+		return c.wait(ctx, ch)
+	}
+	return c.runLoad(ctx, k, nf, load)
+}
+
+func (c *Memory[K, V]) wait(ctx context.Context, ch chan outcome[V]) (V, error) {
+	select {
+	case out := <-ch:
+		return c.finish(out)
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
+	}
+}
+
+func (c *Memory[K, V]) finish(out outcome[V]) (V, error) {
+	if out.err != nil {
+		var zero V
+		return zero, out.err
+	}
+	return out.value, nil
+}
+
+func (c *Memory[K, V]) runLoad(ctx context.Context, k K, f *flight[K, V], load func(ctx context.Context) (V, error)) (V, error) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.failFlight(k, f)
+			panic(r)
+		}
+	}()
+	v, err := load(ctx)
+	out := outcome[V]{err: err}
+	if err == nil {
+		out.ok = true
+		out.value = v
+	}
+	c.store.WithLock(func(s *store[K, V]) {
+		delete(s.flights, k)
+		if err == nil && !f.superseded {
+			s.insert(&item[K, V]{key: k, val: v, at: c.Now()})
+		}
+	})
+	for _, w := range f.waiters {
+		sendOutcome(w, out)
+	}
+	return c.finish(out)
+}
+
+func (c *Memory[K, V]) clearFlight(k K) {
+	c.store.WithLock(func(s *store[K, V]) {
+		delete(s.flights, k)
+	})
+}
+
+func (c *Memory[K, V]) failFlight(k K, f *flight[K, V]) {
+	c.clearFlight(k)
+	out := outcome[V]{err: errLoadPanicked}
+	for _, w := range f.waiters {
+		sendOutcome(w, out)
+	}
+}
+
+func (c *Memory[K, V]) expired(at time.Time) bool {
+	return c.ttl > 0 && c.Now().Sub(at) >= c.ttl
+}
+
+func sendOutcome[V any](ch chan outcome[V], out outcome[V]) {
+	select {
+	case ch <- out:
+	default:
+	}
+}

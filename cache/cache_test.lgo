@@ -1,0 +1,614 @@
+package cache_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/cache"
+)
+
+const modelCap = 4
+
+func optInt(got int?, want int) bool {
+	if got == nil {
+		return false
+	}
+	return (got ?? want) == want
+}
+
+func removeKey(model []string, key string) []string {
+	i := slices.Index(model, key)
+	if i < 0 {
+		return model
+	}
+	return slices.Delete(model, i, i+1)
+}
+
+func modelTouch(model []string, key string) []string {
+	if slices.Index(model, key) < 0 {
+		return model
+	}
+	model = removeKey(model, key)
+	return append([]string{key}, model...)
+}
+
+func modelPut(model []string, values map[string]int, key string, v int) []string {
+	model = removeKey(model, key)
+	model = append([]string{key}, model...)
+	if len(model) > modelCap {
+		for _, dropped := range model[modelCap:] {
+			delete(values, dropped)
+		}
+		model = model[:modelCap]
+	}
+	values[key] = v
+	return model
+}
+
+func checkGet(model []string, values map[string]int, key string, got int?) ([]string, error) {
+	want, present := values[key]
+	if !present {
+		if got != nil {
+			return model, fmt.Errorf("cache test: Get %s = ?, want absent", key)
+		}
+		return model, nil
+	}
+	if !optInt(got, want) {
+		return model, fmt.Errorf("cache test: Get %s = ?, want %d", key, want)
+	}
+	return modelTouch(model, key), nil
+}
+
+func sweepAll(t *testing.T, c *cache.Memory[string, int], model []string, values map[string]int) []string {
+	for k := range 16 {
+		fk := fmt.Sprintf("k%d", k)
+		m, checkErr := checkGet(model, values, fk, c.Get(fk))
+		if checkErr != nil {
+			t.Fatal(checkErr)
+			return model
+		}
+		model = m
+	}
+	return model
+}
+
+func TestMixedOperationsMatchLRUModel(t *testing.T) {
+	c := cache.NewMemory[string, int](modelCap, 0)
+	var model []string
+	values := map[string]int{}
+	r := int64(1)
+	for range 2400 {
+		r = (r*1103515245 + 12345) % 2147483648
+		op := r % 3
+		r = (r*1103515245 + 12345) % 2147483648
+		key := fmt.Sprintf("k%d", r%16)
+		switch op {
+		case 0:
+			model = modelPut(model, values, key, int(i(r)))
+			c.Put(key, int(i(r)))
+		case 1:
+			m, checkErr := checkGet(model, values, key, c.Get(key))
+			if checkErr != nil {
+				t.Fatal(checkErr)
+				return
+			}
+			model = m
+		case 2:
+			c.Delete(key)
+			model = removeKey(model, key)
+			delete(values, key)
+		}
+		model = sweepAll(t, c, model, values)
+		if !cache.IndexMatchesOrder(c) {
+			t.Fatalf("index and order differ in size after an operation on %q", key)
+			return
+		}
+	}
+}
+
+func i(r int64) int64 {
+	return r % 1000
+}
+
+func TestExpiryFollowsNowField(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := cache.NewMemory[string, int](4, 50*time.Millisecond)
+	c.Now = func() time.Time { return now }
+	c.Put("a", 1)
+	if !optInt(c.Get("a"), 1) {
+		t.Fatal("Get a: missing before expiry")
+	}
+	now = now.Add(49 * time.Millisecond)
+	if !optInt(c.Get("a"), 1) {
+		t.Fatal("Get a: missing at 49ms of a 50ms ttl")
+	}
+	now = now.Add(1 * time.Millisecond)
+	if c.Get("a") != nil {
+		t.Fatal("Get a: present at 50ms of a 50ms ttl")
+	}
+	c.Put("a", 2)
+	if !optInt(c.Get("a"), 2) {
+		t.Fatal("Get a: expired entry blocked a fresh Put")
+	}
+	never := cache.NewMemory[string, int](4, 0)
+	never.Now = func() time.Time { return now.Add(10000 * time.Hour) }
+	never.Put("b", 3)
+	if !optInt(never.Get("b"), 3) {
+		t.Fatal("Get b: entry expired with ttl 0")
+	}
+}
+
+func waitUntil(cond func() bool, bound time.Duration) bool {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(bound)
+	defer deadline.Stop()
+	for {
+		if cond() {
+			return true
+		}
+		select {
+		case <-deadline.C:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+func closeWhen(arrived *atomic.Int64, need int64, gate chan struct{}) error {
+	if !waitUntil(func() bool { return arrived.Load() == need }, 5*time.Second) {
+		close(gate)
+		return fmt.Errorf("cache test: %d callers never arrived at the gate", need)
+	}
+	close(gate)
+	return nil
+}
+
+func releaseWhenJoined(c *cache.Memory[string, int], need int, release chan struct{}) error {
+	joined := waitUntil(func() bool { return cache.FlightWaiters(c, "k") == need }, 5*time.Second)
+	close(release)
+	if !joined {
+		return fmt.Errorf("cache test: %d waiters never joined the flight", need)
+	}
+	return nil
+}
+
+func blockingLoad(release chan struct{}, result func() (int, error), calls *atomic.Int64) func(context.Context) (int, error) {
+	return func(lctx context.Context) (int, error) {
+		calls.Add(1)
+		select {
+		case <-release:
+		case <-lctx.Done():
+			return 0, lctx.Err()
+		}
+		return result()
+	}
+}
+
+func assertAllLoads(t *testing.T, values []int, errs []error, want int) {
+	for i := range values {
+		if errs[i] != nil {
+			t.Fatalf("caller %d error = %v", i, errs[i])
+			return
+		}
+		if values[i] != want {
+			t.Fatalf("caller %d value = %d, want %d", i, values[i], want)
+		}
+	}
+}
+
+func TestLoadRunsOnceForConcurrentCallers(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	ctx := t.Context()
+	const callers = 100
+	var calls atomic.Int64
+	var arrived atomic.Int64
+	gate := make(chan struct{})
+	release := make(chan struct{})
+	result := func() (int, error) {
+		return 7, nil
+	}
+	load := blockingLoad(release, result, &calls)
+	values := make([]int, callers)
+	errs := make([]error, callers)
+	run := func() error {
+		go group (ctx) {
+			for i := range callers {
+				go {
+					arrived.Add(1)
+					select {
+					case <-gate:
+					case <-ctx.Done():
+					}
+					values[i], errs[i] = cache.Load(ctx, c, "k", load)
+				}
+			}
+			go {
+				closeWhen(&arrived, callers, gate)?
+				releaseWhenJoined(c, callers-1, release)?
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("load ran %d times for 100 concurrent callers, want 1", calls.Load())
+	}
+	assertAllLoads(t, values, errs, 7)
+	v, err := cache.Load(ctx, c, "k", load)
+	if err != nil {
+		t.Fatalf("second Load: %v", err)
+		return
+	}
+	if v != 7 {
+		t.Fatalf("second Load value = %d, want 7", v)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("second Load ran load again, calls = %d", calls.Load())
+	}
+}
+
+func TestLoadFailureSharedAndNotCached(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	ctx := t.Context()
+	var calls atomic.Int64
+	var arrived atomic.Int64
+	gate := make(chan struct{})
+	release := make(chan struct{})
+	boom := errors.New("cache test: boom")
+	failing := true
+	result := func() (int, error) {
+		if failing {
+			return 0, boom
+		}
+		return 7, nil
+	}
+	load := blockingLoad(release, result, &calls)
+	errs := make([]error, 3)
+	run := func() error {
+		go group (ctx) {
+			for i := range 3 {
+				go {
+					arrived.Add(1)
+					select {
+					case <-gate:
+					case <-ctx.Done():
+					}
+					_, errs[i] = cache.Load(ctx, c, "k", load)
+				}
+			}
+			go {
+				closeWhen(&arrived, 3, gate)?
+				releaseWhenJoined(c, 2, release)?
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	for i := range 3 {
+		if !errors.Is(errs[i], boom) {
+			t.Fatalf("caller %d error = %v, want boom", i, errs[i])
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("load ran %d times for one failing flight, want 1", calls.Load())
+	}
+	failing = false
+	v, err := cache.Load(ctx, c, "k", load)
+	if err != nil {
+		t.Fatalf("retry Load: %v", err)
+		return
+	}
+	if v != 7 {
+		t.Fatalf("retry Load value = %d, want 7", v)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("load ran %d times total, want 2 (failure must not be cached)", calls.Load())
+	}
+}
+
+func TestLoadWaiterContextCancel(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	load := func(lctx context.Context) (int, error) {
+		close(started)
+		select {
+		case <-release:
+			return 5, nil
+		case <-lctx.Done():
+			return 0, lctx.Err()
+		}
+	}
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	defer leaderCancel()
+	waiterCtx, waiterCancel := context.WithCancel(context.Background())
+	defer waiterCancel()
+	vals := make([]int, 2)
+	errs := make([]error, 2)
+	run := func() error {
+		go group (t.Context()) {
+			go {
+				vals[0], errs[0] = cache.Load(leaderCtx, c, "k", load)
+			}
+			go {
+				select {
+				case <-started:
+				case <-t.Context().Done():
+				}
+				waiterCancel()
+				_, errs[1] = cache.Load(waiterCtx, c, "k", load)
+				close(release)
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	if errs[0] != nil {
+		t.Fatalf("leader error = %v", errs[0])
+		return
+	}
+	if vals[0] != 5 {
+		t.Fatalf("leader value = %d, want 5", vals[0])
+	}
+	if !errors.Is(errs[1], context.Canceled) {
+		t.Fatalf("waiter error = %v, want context.Canceled", errs[1])
+	}
+}
+
+func recordPanic(saw chan<- string, panicked *atomic.Int64) {
+	if r := recover(); r != nil {
+		panicked.Add(1)
+		if s, ok := r.(string); ok {
+			select {
+			case saw <- s:
+			default:
+			}
+		}
+	}
+}
+
+func sawValue(saw chan string) string {
+	select {
+	case got := <-saw:
+		return got
+	default:
+		return ""
+	}
+}
+
+func assertLoadRerunsAfterPanic(t *testing.T, ctx context.Context, c *cache.Memory[string, int]) {
+	load := func(lctx context.Context) (int, error) {
+		return 9, nil
+	}
+	v, err := cache.Load(ctx, c, "k", load)
+	if err != nil {
+		t.Fatalf("Load after panic: %v", err)
+		return
+	}
+	if v != 9 {
+		t.Fatalf("Load after panic value = %d, want 9", v)
+	}
+}
+
+func TestLoadPanicReleasesWaiters(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	load := func(lctx context.Context) (int, error) {
+		close(entered)
+		<-release
+		panic("cache test: load exploded")
+	}
+	leaderErrs := make([]error, 1)
+	waiterErrs := make([]error, 2)
+	var panicked atomic.Int64
+	saw := make(chan string, 1)
+	run := func() error {
+		go group (ctx) {
+			go {
+				defer recordPanic(saw, &panicked)
+				_, leaderErrs[0] = cache.Load(ctx, c, "k", load)
+			}
+			for i := range 2 {
+				go {
+					<-entered
+					_, waiterErrs[i] = cache.Load(ctx, c, "k", load)
+				}
+			}
+			go {
+				<-entered
+				releaseWhenJoined(c, 2, release)?
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	if panicked.Load() != 1 {
+		t.Fatalf("panicking leaders = %d, want exactly 1", panicked.Load())
+	}
+	if leaderErrs[0] != nil {
+		t.Fatalf("leader error = %v, want the panic re-raised, not returned", leaderErrs[0])
+	}
+	if got := sawValue(saw); got != "cache test: load exploded" {
+		t.Fatalf("panic value = %q, want cache test: load exploded", got)
+	}
+	for i := range 2 {
+		if waiterErrs[i] == nil || !strings.Contains(waiterErrs[i].Error(), "cache: load panicked") {
+			t.Fatalf("waiter %d error = %v, want cache: load panicked", i, waiterErrs[i])
+		}
+	}
+	assertLoadRerunsAfterPanic(t, ctx, c)
+}
+
+func TestDifferentKeysLoadConcurrently(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	ctx := t.Context()
+	var live atomic.Int64
+	var peak atomic.Int64
+	var opened atomic.Bool
+	gate := make(chan struct{})
+	load := func(lctx context.Context) (int, error) {
+		n := live.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		if n >= 2 && !opened.Swap(true) {
+			close(gate)
+		}
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-gate:
+		case <-timer.C:
+		case <-lctx.Done():
+			return 0, lctx.Err()
+		}
+		live.Add(-1)
+		return 1, nil
+	}
+	errs := make([]error, 4)
+	run := func() error {
+		go group (ctx) {
+			for i, k := range []string{"a", "b", "c", "d"} {
+				go {
+					_, errs[i] = cache.Load(ctx, c, k, load)
+				}
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	for i := range 4 {
+		if errs[i] != nil {
+			t.Fatalf("key %d error = %v", i, errs[i])
+		}
+	}
+	if peak.Load() < 2 {
+		t.Fatalf("peak concurrent loads = %d, want at least 2 (different keys must not serialize)", peak.Load())
+	}
+}
+
+func TestNewMemoryRejectsBadCapacity(t *testing.T) {
+	for _, bad := range []int{0, -3} {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("NewMemory(%d) did not panic", bad)
+				}
+				if !strings.HasPrefix(fmt.Sprint(r), "cache: capacity") {
+					t.Fatalf("NewMemory(%d) panic = %v, want message starting with \"cache: capacity\"", bad, r)
+				}
+			}()
+			cache.NewMemory[string, int](bad, time.Minute)
+		}()
+	}
+}
+
+func TestGetPutDeleteRoundTrip(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	if got := c.Get("a"); got != nil {
+		t.Fatalf("Get before Put = ?, want absent")
+	}
+	c.Put("a", 7)
+	if got := c.Get("a"); !optInt(got, 7) {
+		t.Fatalf("Get after Put, want 7")
+	}
+	c.Put("a", 9)
+	if got := c.Get("a"); !optInt(got, 9) {
+		t.Fatalf("Get after overwrite, want 9")
+	}
+	c.Delete("a")
+	if got := c.Get("a"); got != nil {
+		t.Fatalf("Get after Delete, want absent")
+	}
+	c.Delete("missing")
+}
+
+func loadWhile(t *testing.T, c *cache.Memory[string, int], during func()) int {
+	t.Helper()
+	ctx := t.Context()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	load := func(lctx context.Context) (int, error) {
+		close(entered)
+		<-release
+		return 2, nil
+	}
+	vals := make([]int, 1)
+	errs := make([]error, 1)
+	run := func() error {
+		go group (ctx) {
+			go {
+				vals[0], errs[0] = cache.Load(ctx, c, "a", load)
+			}
+			go {
+				<-entered
+				during()
+				close(release)
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return 0
+	}
+	if errs[0] != nil {
+		t.Fatalf("Load: %v", errs[0])
+		return 0
+	}
+	return vals[0]
+}
+
+func TestPutDuringLoadKeepsThePutValue(t *testing.T) {
+	c := cache.NewMemory[string, int](2, time.Minute)
+	if got := loadWhile(t, c, func() { c.Put("a", 1) }); got != 2 {
+		t.Fatalf("Load returned %d, want the loaded value 2", got)
+	}
+	c.Put("b", 3)
+	if !cache.IndexMatchesOrder(c) {
+		t.Fatalf("index and order differ in size after a Put during a load")
+	}
+	if got := c.Get("a"); !optInt(got, 1) {
+		t.Fatalf("Get a, want 1: the Put during the load is newer than the loaded value")
+	}
+	if got := c.Get("b"); !optInt(got, 3) {
+		t.Fatalf("Get b, want 3")
+	}
+}
+
+func TestDeleteDuringLoadKeepsTheKeyAbsent(t *testing.T) {
+	c := cache.NewMemory[string, int](2, time.Minute)
+	if got := loadWhile(t, c, func() { c.Delete("a") }); got != 2 {
+		t.Fatalf("Load returned %d, want the loaded value 2", got)
+	}
+	if got := c.Get("a"); got != nil {
+		t.Fatalf("Get a after a Delete during the load, want absent")
+	}
+	if !cache.IndexMatchesOrder(c) {
+		t.Fatalf("index and order differ in size after a Delete during a load")
+	}
+}
