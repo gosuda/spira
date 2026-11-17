@@ -1,0 +1,71 @@
+package meter
+
+import (
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/gosuda/spira/web"
+)
+
+const (
+	httpRequestsName   = "http_requests_total"
+	httpDurationName   = "http_request_duration_seconds"
+	httpRouteUnmatched = "unmatched"
+)
+
+const httpBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+
+func HTTP(reg *Registry) web.Stage {
+	requests := reg.Counter(httpRequestsName, "HTTP requests by method, route and status class.", "method", "route", "status")
+	durations := reg.Histogram(httpDurationName, "HTTP request duration in seconds by method, route and status class.", httpBuckets, "method", "route", "status")
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			start := time.Now()
+			reply, err := next(ctx)
+			labels := []string{ctx.Request.Method, routeLabel(ctx.Request), statusClass(responseStatus(ctx, err))}
+			requests.With(labels...).Add(1)
+			durations.With(labels...).Observe(time.Since(start).Seconds())
+			return reply, err
+		}
+	}
+}
+
+func routeLabel(req *http.Request) string {
+	if req.Pattern != "" {
+		return req.Pattern
+	}
+	return httpRouteUnmatched
+}
+
+func responseStatus(ctx *web.Context, err error) int {
+	if err == nil {
+		return ctx.Status()
+	}
+	if problem := problemIn(err); problem != nil {
+		return int(problem.Problem.Status)
+	}
+	return http.StatusInternalServerError
+}
+
+func problemIn(err error) *web.ProblemError? {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if pe, ok := e.(*web.ProblemError); ok {
+			return pe
+		}
+	}
+	return nil
+}
+
+func statusClass(code int) string {
+	switch {
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	case code >= 300:
+		return "3xx"
+	default:
+		return "2xx"
+	}
+}

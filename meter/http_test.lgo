@@ -1,0 +1,215 @@
+package meter_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/meter"
+	"github.com/gosuda/spira/web"
+)
+
+type metricSample struct {
+	name   string
+	labels map[string]string
+	value  string
+}
+
+func parseMetricLines(t *testing.T, text string) []metricSample {
+	t.Helper()
+	var out []metricSample
+	for _, line := range strings.Split(text, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		brace := strings.IndexByte(line, '{')
+		if brace < 0 {
+			out = append(out, metricWithoutLabels(t, line))
+			continue
+		}
+		end := closingBrace(line, brace)
+		if end < 0 {
+			t.Fatalf("unterminated labels in %q", line)
+		}
+		out = append(out, metricSample{
+			name:   line[:brace],
+			labels: parseLabels(t, line[brace+1:end]),
+			value:  strings.TrimSpace(line[end+1:]),
+		})
+	}
+	return out
+}
+
+func metricWithoutLabels(t *testing.T, line string) metricSample {
+	t.Helper()
+	name, value, ok := strings.Cut(line, " ")
+	if !ok {
+		t.Fatalf("bad exposition line %q", line)
+	}
+	return metricSample{name: name, labels: map[string]string{}, value: strings.TrimSpace(value)}
+}
+
+func closingBrace(line string, brace int) int {
+	inQuote := false
+	for i := brace; i < len(line); i++ {
+		if line[i] == '\\' && inQuote && i+1 < len(line) {
+			i++
+			continue
+		}
+		if line[i] == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if line[i] == '}' && !inQuote {
+			return i
+		}
+	}
+	return -1
+}
+
+func findMetric(samples []metricSample, name string, labels map[string]string) (metricSample, bool) {
+	for _, s := range samples {
+		if s.name != name || len(s.labels) != len(labels) {
+			continue
+		}
+		match := true
+		for k, v := range labels {
+			if (s.labels[k] ?? "") != v {
+				match = false
+			}
+		}
+		if match {
+			return s, true
+		}
+	}
+	return metricSample{}, false
+}
+
+func newMeteredRouter() (*web.Router, *meter.Registry) {
+	reg := meter.NewRegistry()
+	r := web.NewRouter()
+	r.Use(meter.HTTP(reg))
+	r.Handle("GET", "/users/{id}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: ctx.Request.PathValue("id")}, nil
+	})
+	r.Handle("GET", "/moved", func(ctx *web.Context) (web.Reply, error) {
+		return web.Redirect{To: "/users/1"}, nil
+	})
+	return r, reg
+}
+
+func meteredGet(r *web.Router, path string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	return rec
+}
+
+func refusingStage() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return nil, web.Fail(web.Problem{Status: http.StatusUnauthorized, Title: "denied"})
+		}
+	}
+}
+
+func countRouteSeries(t *testing.T, text string) int {
+	t.Helper()
+	routes := map[string]bool{}
+	for _, s := range parseMetricLines(t, text) {
+		if s.name == "http_requests_total" {
+			routes[(s.labels["route"] ?? "")] = true
+		}
+	}
+	return len(routes)
+}
+
+func TestHTTPRouteLabelIsRegisteredPattern(t *testing.T) {
+	r, reg := newMeteredRouter()
+	for _, id := range []string{"1", "2", "42"} {
+		if rec := meteredGet(r, "/users/"+id); rec.Code != http.StatusOK {
+			t.Fatalf("GET /users/%s status = %d, want 200", id, rec.Code)
+		}
+	}
+	samples := parseMetricLines(t, exposition(t, reg))
+	routes := map[string]bool{}
+	count := ""
+	for _, s := range samples {
+		if s.name != "http_requests_total" {
+			continue
+		}
+		routes[(s.labels["route"] ?? "")] = true
+		if (s.labels["route"] ?? "") == "GET /users/{id}" && (s.labels["status"] ?? "") == "2xx" {
+			count = s.value
+		}
+	}
+	if len(routes) != 1 || !(routes["GET /users/{id}"] ?? false) {
+		t.Fatalf("route labels = %v, want exactly [GET /users/{id}]", routes)
+	}
+	if count != "3" {
+		t.Fatalf("http_requests_total for GET /users/{id} 2xx = %q, want 3", count)
+	}
+}
+
+func TestHTTPRecordsStatusClass(t *testing.T) {
+	r, reg := newMeteredRouter()
+	if rec := meteredGet(r, "/users/7"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /users/7 status = %d, want 200", rec.Code)
+	}
+	if rec := meteredGet(r, "/moved"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("GET /moved status = %d, want 303", rec.Code)
+	}
+	samples := parseMetricLines(t, exposition(t, reg))
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /users/{id}", "status": "2xx"}); !ok || s.value != "1" {
+		t.Fatalf("2xx series = %+v, want one", s)
+	}
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /moved", "status": "3xx"}); !ok || s.value != "1" {
+		t.Fatalf("3xx series = %+v, want one", s)
+	}
+	if s, ok := findMetric(samples, "http_request_duration_seconds_count", map[string]string{"method": "GET", "route": "GET /users/{id}", "status": "2xx"}); !ok || s.value != "1" {
+		t.Fatalf("duration count = %+v, want one observation", s)
+	}
+}
+
+func TestHTTPRecordsErrorStatuses(t *testing.T) {
+	failing := meter.NewRegistry()
+	rf := web.NewRouter()
+	rf.Use(meter.HTTP(failing))
+	rf.Handle("GET", "/conflict", func(ctx *web.Context) (web.Reply, error) {
+		return nil, web.Fail(web.Problem{Status: http.StatusConflict, Title: "stale"})
+	})
+	if rec := meteredGet(rf, "/conflict"); rec.Code != http.StatusConflict {
+		t.Fatalf("GET /conflict status = %d, want 409", rec.Code)
+	}
+	samples := parseMetricLines(t, exposition(t, failing))
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /conflict", "status": "4xx"}); !ok || s.value != "1" {
+		t.Fatalf("handler-error series = %+v, want one 4xx", s)
+	}
+
+	refused := meter.NewRegistry()
+	rr := web.NewRouter()
+	rr.Use(meter.HTTP(refused), refusingStage())
+	rr.Handle("GET", "/denied", func(ctx *web.Context) (web.Reply, error) { return web.Empty{}, nil })
+	if rec := meteredGet(rr, "/denied"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /denied status = %d, want 401", rec.Code)
+	}
+	samples = parseMetricLines(t, exposition(t, refused))
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /denied", "status": "4xx"}); !ok || s.value != "1" {
+		t.Fatalf("stage-error series = %+v, want one 4xx", s)
+	}
+}
+
+func TestUnmatchedPathAddsNoSeries(t *testing.T) {
+	r, reg := newMeteredRouter()
+	if rec := meteredGet(r, "/users/1"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /users/1 status = %d, want 200", rec.Code)
+	}
+	before := countRouteSeries(t, exposition(t, reg))
+	if rec := meteredGet(r, "/nowhere/at/all"); rec.Code != http.StatusNotFound {
+		t.Fatalf("unmatched path status = %d, want 404", rec.Code)
+	}
+	after := countRouteSeries(t, exposition(t, reg))
+	if after != before {
+		t.Fatalf("route series grew from %d to %d after an unmatched request", before, after)
+	}
+}
