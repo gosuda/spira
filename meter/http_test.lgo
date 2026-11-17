@@ -1,6 +1,7 @@
 package meter_test
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -196,6 +197,22 @@ func TestHTTPRecordsErrorStatuses(t *testing.T) {
 	samples = parseMetricLines(t, exposition(t, refused))
 	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /denied", "status": "4xx"}); !ok || s.value != "1" {
 		t.Fatalf("stage-error series = %+v, want one 4xx", s)
+	}
+}
+
+func TestHTTPRecordsServerErrorClass(t *testing.T) {
+	reg := meter.NewRegistry()
+	r := web.NewRouter()
+	r.Use(meter.HTTP(reg))
+	r.Handle("GET", "/broken", func(ctx *web.Context) (web.Reply, error) {
+		return nil, errors.New("meter test: broken")
+	})
+	if rec := meteredGet(r, "/broken"); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("GET /broken status = %d, want 500", rec.Code)
+	}
+	samples := parseMetricLines(t, exposition(t, reg))
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /broken", "status": "5xx"}); !ok || s.value != "1" {
+		t.Fatalf("unknown-error series = %+v, want one 5xx", s)
 	}
 }
 
