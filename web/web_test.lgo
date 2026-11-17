@@ -564,3 +564,24 @@ func TestStreamWritesAndFlushes(t *testing.T) {
 		t.Fatal("stream writes did not flush the response writer")
 	}
 }
+
+func TestStageSetsResponseHeaderOnEveryReply(t *testing.T) {
+	policy := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Content-Type-Options", "nosniff")
+			return next(ctx)
+		}
+	}
+	r := web.NewRouter()
+	r.Use(policy)
+	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	r.Handle("GET", "/gone", goneFail)
+	for _, path := range []string{"/ok", "/gone"} {
+		rec := call(t, r, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Fatalf("%s: X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+	}
+}

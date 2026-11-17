@@ -189,6 +189,10 @@ func (c *Context) Ctx() context.Context {
 	return c.Request.Context()
 }
 
+func (c *Context) ResponseHeader() http.Header {
+	return c.writer.Header()
+}
+
 func (c *Context) Htmx() Htmx {
 	h := c.Request.Header
 	return Htmx{
