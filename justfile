@@ -5,7 +5,7 @@ export GOROOT := logos_root
 export GOTOOLCHAIN := "local"
 export PATH := logos_root / "bin" + ":" + env_var("PATH")
 
-gate: build lint test
+gate: build lint test web
 
 build:
     logos build ./...
@@ -15,6 +15,11 @@ lint:
 
 test:
     logos test -count=1 ./...
+
+web:
+    pnpm --dir frontend install --frozen-lockfile
+    pnpm --dir frontend run check
+    pnpm --dir frontend run build
 
 eject:
     rm -rf /tmp/spira-eject
