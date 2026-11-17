@@ -165,7 +165,7 @@ func TestLoadOrdersByName(t *testing.T) {
 	}
 }
 
-func TestLoadRefusesMissingDown(t *testing.T) {
+func TestLoadRefusesDownWithoutUp(t *testing.T) {
 	_, err := migrate.Load(os.DirFS("testdata/downonly"))
 	if err == nil {
 		t.Fatal("Load accepted a .down.sql without .up.sql")
@@ -176,7 +176,7 @@ func TestLoadRefusesMissingDown(t *testing.T) {
 	}
 }
 
-func TestLoadRefusesMissingUp(t *testing.T) {
+func TestLoadRefusesUpWithoutDown(t *testing.T) {
 	fsys := fstest.MapFS{
 		"0001_only.up.sql": &fstest.MapFile{Data: []byte("CREATE TABLE only (id integer)")},
 	}
