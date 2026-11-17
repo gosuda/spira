@@ -1,0 +1,15 @@
+{"name":"slot-id-well-formed","request":{"kind":"slot-id","id":"s0123456789abcdef-0"},"response":{"valid":true},"reject":false}
+{"name":"slot-id-wrong-prefix","request":{"kind":"slot-id","id":"x0123456789abcdef-0"},"response":{"valid":false},"reject":true}
+{"name":"slot-id-fifteen-hex","request":{"kind":"slot-id","id":"s0123456789abcde-0"},"response":{"valid":false},"reject":true}
+{"name":"slot-id-uppercase-hex","request":{"kind":"slot-id","id":"s0123456789ABCDEF-0"},"response":{"valid":false},"reject":true}
+{"name":"slot-id-missing-index","request":{"kind":"slot-id","id":"s0123456789abcdef"},"response":{"valid":false},"reject":true}
+{"name":"slot-id-quote-bracket","request":{"kind":"slot-id","id":"s0123456789abcdef-0\"]"},"response":{"valid":false},"reject":true}
+{"name":"island-when-valid","request":{"kind":"island-when","when":"visible"},"response":{"accepted":true},"reject":false}
+{"name":"island-when-load","request":{"kind":"island-when","when":"load"},"response":{"accepted":true},"reject":false}
+{"name":"island-when-idle","request":{"kind":"island-when","when":"idle"},"response":{"accepted":true},"reject":false}
+{"name":"island-when-unknown","request":{"kind":"island-when","when":"hover"},"response":{"accepted":false},"reject":true}
+{"name":"island-props-object","request":{"kind":"island-props","props":"{\"count\":1}"},"response":{"accepted":true},"reject":false}
+{"name":"island-props-nested-object","request":{"kind":"island-props","props":"{\"item\":{\"label\":\"a\"}}"},"response":{"accepted":true},"reject":false}
+{"name":"island-props-malformed","request":{"kind":"island-props","props":"{\"count\":"},"response":{"accepted":false},"reject":true}
+{"name":"island-props-array","request":{"kind":"island-props","props":"[1]"},"response":{"accepted":false},"reject":true}
+{"name":"island-props-string","request":{"kind":"island-props","props":"\"count\""},"response":{"accepted":false},"reject":true}
