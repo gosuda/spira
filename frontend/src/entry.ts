@@ -1,4 +1,5 @@
 import htmx from "htmx.org";
+import "htmx-ext-sse";
 import { defineIslands, type IslandLoader, type IslandTable } from "./island";
 import { installSlotMover } from "./slots";
 
