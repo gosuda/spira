@@ -1,0 +1,73 @@
+package app
+
+import (
+	"comptime"
+	"context"
+	"errors"
+	"fmt"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+type Part interface {
+	Start(ctx context.Context) error
+	Stop(ctx context.Context) error
+}
+
+const StopTimeout = 30 * time.Second
+
+type Step struct {
+	Name  string
+	Start func(ctx context.Context) error
+	Stop  func(ctx context.Context) error
+}
+
+func Run[T any](ctx context.Context, root *T) error {
+	var steps []Step
+	const if comptime.IsStruct[T]() {
+		const for _, f := range comptime.Fields[T]() {
+			steps = StepOf[f.Type](steps, f.Name, root.[f])
+		}
+	} else {
+		comptime.Error("app.Run: root must be a struct")
+	}
+	return Supervise(ctx, steps)
+}
+
+func StepOf[F any](steps []Step, name string, field F) []Step {
+	const switch F {
+	case Part:
+		return append(steps, Step{Name: name, Start: field.Start, Stop: field.Stop})
+	}
+	return steps
+}
+
+func Supervise(ctx context.Context, steps []Step) error {
+	ctx, release := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer release()
+	for i, s := range steps {
+		if err := s.Start(ctx); err != nil {
+			return errors.Join(fmt.Errorf("app: start %s: %w", s.Name, err), stopAll(steps[:i]))
+		}
+	}
+	<-ctx.Done()
+	return stopAll(steps)
+}
+
+func stopAll(steps []Step) error {
+	var errs []error
+	for i := len(steps) - 1; i >= 0; i-- {
+		errs = append(errs, stopOne(steps[i]))
+	}
+	return errors.Join(errs...)
+}
+
+func stopOne(s Step) error {
+	ctx, cancel := context.WithTimeout(context.Background(), StopTimeout)
+	defer cancel()
+	if err := s.Stop(ctx); err != nil {
+		return fmt.Errorf("app: stop %s: %w", s.Name, err)
+	}
+	return nil
+}

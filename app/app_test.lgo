@@ -1,0 +1,96 @@
+package app_test
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"testing"
+
+	"github.com/gosuda/spira/app"
+)
+
+type recorder struct {
+	events []string
+}
+
+type part struct {
+	name      string
+	log       *recorder
+	startErr  error?
+	stopErr   error?
+	cancelRun context.CancelFunc?
+}
+
+func (p *part) Start(ctx context.Context) error {
+	p.log.events = append(p.log.events, "start "+p.name)
+	if cancel := p.cancelRun; cancel != nil {
+		cancel()
+	}
+	return p.startErr ?? nil
+}
+
+func (p *part) Stop(ctx context.Context) error {
+	p.log.events = append(p.log.events, "stop "+p.name)
+	return p.stopErr ?? nil
+}
+
+type application struct {
+	Name  string
+	First *part
+	Skip  int
+	Mid   *part
+	Last  *part
+}
+
+func TestRunStartsInFieldOrderAndStopsInReverse(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	log := &recorder{}
+	root := &application{
+		First: &part{name: "first", log: log},
+		Mid:   &part{name: "mid", log: log},
+		Last:  &part{name: "last", log: log, cancelRun: cancel},
+	}
+	if err := app.Run[application](ctx, root); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{"start first", "start mid", "start last", "stop last", "stop mid", "stop first"}
+	if !slices.Equal(log.events, want) {
+		t.Fatalf("events = %v, want %v", log.events, want)
+	}
+}
+
+func TestRunStartFailureStopsExactlyTheStartedPrefix(t *testing.T) {
+	boom := errors.New("boom")
+	log := &recorder{}
+	root := &application{
+		First: &part{name: "first", log: log},
+		Mid:   &part{name: "mid", log: log, startErr: boom},
+		Last:  &part{name: "last", log: log},
+	}
+	err := app.Run[application](t.Context(), root)
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run error = %v, want it to wrap boom", err)
+	}
+	if got := err.Error(); got != "app: start Mid: boom" {
+		t.Fatalf("Run error text = %q", got)
+	}
+	want := []string{"start first", "start mid", "stop first"}
+	if !slices.Equal(log.events, want) {
+		t.Fatalf("events = %v, want %v", log.events, want)
+	}
+}
+
+func TestRunJoinsStopErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	one, two := errors.New("one"), errors.New("two")
+	log := &recorder{}
+	root := &application{
+		First: &part{name: "first", log: log, stopErr: one},
+		Mid:   &part{name: "mid", log: log},
+		Last:  &part{name: "last", log: log, stopErr: two, cancelRun: cancel},
+	}
+	err := app.Run[application](ctx, root)
+	if !errors.Is(err, one) || !errors.Is(err, two) {
+		t.Fatalf("Run error = %v, want both stop errors", err)
+	}
+}
