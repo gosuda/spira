@@ -14,7 +14,7 @@ import (
 	"github.com/gosuda/spira/view"
 )
 
-type Reply interface { Page | Fragment | Data | Redirect | Problem | Empty | Stream }
+type Reply interface { Page | Fragment | Data | Redirect | Problem | Empty | Stream | Delegate }
 
 type Page struct {
 	Title  string
@@ -59,6 +59,10 @@ type Stream struct {
 	Write       func(w io.Writer) error
 }
 
+type Delegate struct {
+	To http.Handler
+}
+
 func (r *Router) writeReply(ctx *Context, reply Reply) error {
 	switch v := reply.(type) {
 	case Page:
@@ -75,6 +79,9 @@ func (r *Router) writeReply(ctx *Context, reply Reply) error {
 		return r.writeEmpty(ctx, v)
 	case Stream:
 		return r.writeStream(ctx, v)
+	case Delegate:
+		v.To.ServeHTTP(ctx.writer, ctx.Request)
+		return nil
 	case nil:
 		return nil
 	}
