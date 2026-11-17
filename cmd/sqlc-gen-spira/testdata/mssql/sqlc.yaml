@@ -1,0 +1,13 @@
+version: "2"
+plugins:
+  - name: capture
+    process:
+      cmd: plugin-stub.sh
+      format: json
+sql:
+  - engine: mssql
+    schema: db/migrations
+    queries: db/queries
+    codegen:
+      - plugin: capture
+        out: gen
