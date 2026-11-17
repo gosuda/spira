@@ -1,0 +1,192 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
+)
+
+const prefixBound = 256
+
+type StatusError struct {
+	Status  int
+	Problem web.Problem?
+	Prefix  string
+}
+
+func (e *StatusError) Error() string {
+	if p := e.Problem; p != nil {
+		return $"client: {e.Status} {p.Title}: {p.Detail}"
+	}
+	return $"client: status {e.Status}: {e.Prefix}"
+}
+
+type Request[In any] struct {
+	Method string
+	Path   string
+	Body   In?
+	Header http.Header
+}
+
+type Client struct {
+	Base    string
+	Policy  resilience.Policy
+	MaxBody int64 = 1 << 20
+	HTTP    *http.Client
+}
+
+func New(base string, policy resilience.Policy) *Client {
+	return &Client{Base: base, Policy: policy, HTTP: http.DefaultClient}
+}
+
+func Get[Out any](ctx context.Context, c *Client, path string) (Out, error) {
+	return Send[empty, Out](ctx, c, Request[empty]{Method: http.MethodGet, Path: path})
+}
+
+func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out, error) {
+	p, err := prepare(req)
+	if err != nil {
+		var zero Out
+		return zero, err
+	}
+	pol := c.Policy
+	if !retriable(p.method) {
+		pol.Retry = nil
+	}
+	ans, err := resilience.Do(ctx, pol, func(actx context.Context) (answer[Out], error) {
+		return call[Out](actx, c, p)
+	})
+	if err != nil {
+		var zero Out
+		return zero, fmt.Errorf("client: %s %s: %w", p.method, p.path, err)
+	}
+	if ans.refused != nil {
+		var zero Out
+		return zero, fmt.Errorf("client: %s %s: %w", p.method, p.path, ans.refused)
+	}
+	return ans.value, nil
+}
+
+type answer[Out any] struct {
+	value   Out
+	refused error
+}
+
+func callerFault(status int) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
+		return false
+	}
+	return status >= 400 && status < 500
+}
+
+type empty struct{}
+
+type prepared struct {
+	method  string
+	path    string
+	header  http.Header
+	payload []byte
+}
+
+func prepare[In any](req Request[In]) (prepared, error) {
+	p := prepared{method: strings.ToUpper(req.Method), path: req.Path, header: req.Header}
+	if b := req.Body; b != nil {
+		data, err := json.Marshal(b)
+		if err != nil {
+			return p, fmt.Errorf("client: encode body for %s %s: %w", p.method, p.path, err)
+		}
+		p.payload = data
+	}
+	return p, nil
+}
+
+func retriable(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+func call[Out any](ctx context.Context, c *Client, p prepared) (answer[Out], error) {
+	var none answer[Out]
+	var body io.Reader
+	if p.payload != nil {
+		body = bytes.NewReader(p.payload)
+	}
+	hreq, err := http.NewRequestWithContext(ctx, p.method, c.Base+p.path, body)
+	if err != nil {
+		return none, err
+	}
+	applyHeader(hreq, p.header, p.payload != nil)
+	resp, err := c.HTTP.Do(hreq)
+	if err != nil {
+		return none, err
+	}
+	defer resp.Body.Close()?
+	data, rerr := readLimited(resp.Body, c.MaxBody)
+	if rerr != nil {
+		return none, fmt.Errorf("read response: %w", rerr)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		serr := statusError(resp.StatusCode, resp.Header.Get("Content-Type"), data)
+		if callerFault(resp.StatusCode) {
+			return answer[Out]{refused: serr}, nil
+		}
+		return none, serr
+	}
+	var out Out
+	if uerr := json.Unmarshal(data, &out); uerr != nil {
+		return none, fmt.Errorf("decode: %w", uerr)
+	}
+	return answer[Out]{value: out}, nil
+}
+
+func applyHeader(hreq *http.Request, header http.Header, jsonBody bool) {
+	hreq.Header = http.Header{}
+	for name, values := range header {
+		for _, v := range values {
+			hreq.Header.Add(name, v)
+		}
+	}
+	if jsonBody {
+		hreq.Header.Set("Content-Type", "application/json")
+	}
+}
+
+func readLimited(body io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("body exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
+func statusError(status int, contentType string, data []byte) error {
+	se := &StatusError{Status: status, Prefix: bodyPrefix(data)}
+	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil && mediaType == "application/problem+json" {
+		p := web.Problem{}
+		if uerr := json.Unmarshal(data, &p); uerr == nil {
+			se.Problem = p
+		}
+	}
+	return se
+}
+
+func bodyPrefix(data []byte) string {
+	if len(data) > prefixBound {
+		data = data[:prefixBound]
+	}
+	return string(data)
+}
