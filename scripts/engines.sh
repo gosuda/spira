@@ -22,7 +22,7 @@ readonly MY_NAME="spira-engines-mysql-$$"
 readonly MS_NAME="spira-engines-mssql-$$"
 
 cleanup() {
-	docker rm -f "$PG_NAME" "$MY_NAME" "$MS_NAME" >/dev/null 2>&1 || true
+	docker rm -fv "$PG_NAME" "$MY_NAME" "$MS_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -122,7 +122,7 @@ for (( ms_attempt = 1; ms_attempt <= MSSQL_RUN_ATTEMPTS; ms_attempt++ )); do
 	fi
 	printf 'engines.sh: %s attempt %d/%d failed (state: %s)\n' \
 		"$MS_NAME" "$ms_attempt" "$MSSQL_RUN_ATTEMPTS" "$(container_state "$MS_NAME")" >&2
-	docker rm -f "$MS_NAME" >/dev/null 2>&1 || true
+	docker rm -fv "$MS_NAME" >/dev/null 2>&1 || true
 done
 if (( ms_ready == 0 )); then
 	printf 'engines.sh: %s not ready after %d attempts\n' "$MS_NAME" "$MSSQL_RUN_ATTEMPTS" >&2
