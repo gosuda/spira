@@ -73,6 +73,8 @@ func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out
 - `Send` MUST treat a status from 400 to 499 as a caller fault, except 408 and 429.
 - A caller fault MUST NOT be retried.
 - A caller fault MUST NOT open the breaker.
+- A caller fault MUST NOT count as a success for the breaker.
+- `Send` MUST report a caller fault to [resilience](resilience.md) as an `Ignored` error.
 - Every other status outside 200 to 299 MUST be an attempt error.
 - A decode failure MUST be an attempt error, so [resilience](resilience.md) may retry it.
 - An encode failure MUST be returned before any attempt.
@@ -98,6 +100,7 @@ func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out
 - `TestBodyReadUnderSizeLimit` and `TestMaxBodyLimitIsExact` prove the `MaxBody` bound, including an equal length.
 - `TestOpenBreakerStopsRequestsBeforeTheWire` proves that an open breaker sends no further request.
 - `TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker` proves that a 404 is not retried and does not open the breaker.
+- `TestClientErrorAddsNoResultToTheBreaker` proves that a 404 adds no result to the breaker window.
 - `TestTooManyRequestsIsRetried` proves that status 429 is retried.
 - `TestCallerContextCancelsRequest` proves that the caller context ends the request.
 - `TestAttemptTimeoutEndsSlowAttempt` proves the per-attempt timeout.

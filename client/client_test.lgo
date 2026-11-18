@@ -286,6 +286,38 @@ func TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker(t *testing.T) {
 	}
 }
 
+func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
+	statuses := []int{http.StatusInternalServerError, http.StatusInternalServerError, http.StatusNotFound}
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(calls.Add(1))
+		if n <= len(statuses) {
+			w.WriteHeader(statuses[n-1])
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"ok":true}`)); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	defer srv.Close()
+	brk := &resilience.Breaker{Window: 3, FailureRate: 0.5, OpenFor: time.Hour}
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Breaker: brk})
+	for range statuses {
+		if _, err := client.Get[probe](t.Context(), c, "/thing"); err == nil {
+			t.Fatal("err=nil, want the failing answer")
+		}
+	}
+	got, err := client.Get[probe](t.Context(), c, "/thing")
+	if err != nil {
+		t.Fatalf("err = %v, want the answer: two 500 answers and a 404 must not fill a window of three", err)
+		return
+	}
+	if !got.Ok {
+		t.Fatalf("got %+v, want the decoded answer", got)
+	}
+}
+
 func TestTooManyRequestsIsRetried(t *testing.T) {
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
