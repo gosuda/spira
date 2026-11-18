@@ -279,6 +279,7 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `TestCollectKeepsResponsesWithDifferentIDsApartInFirstSeenOrder` proves group order.
 - `TestCollectStartsANewResponseWhenAnIndexRestartsWithoutAnID` proves a new group on index restart.
 - `TestCollectStartsANewResponseWhenACompleteSlotIsHitAgainWithoutAnID` proves a new group on repeated complete slot.
+- `TestCollectStartsANewGroupWhenALaterSlotOpensBeforeAnEarlierSlotFinishes` proves a new group on a late earlier slot.
 - `TestCollectFinishesAnOpenSlotInPlaceWithoutAnID` proves in-place finish.
 - `TestCollectJoinsManyDeltasToTheFullText` proves long delta join.
 - `TestCollectKeepsTheLastPositiveUsageAndTheLastNamedIDAndModel` proves usage, id and model retention.
