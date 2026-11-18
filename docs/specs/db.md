@@ -203,6 +203,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestOneReturnsAbsentWithoutARow` and `TestOneReturnsTheOnlyRow` prove the absent result and the single row.
 - `TestOneRejectsTwoRows` proves the second-row error.
 - `TestQueryRejectsNullInNonOptional` proves the NULL error for a field that is not an option.
+- No test proves the option field rules. A row type with an option field does not build with LoGOs `144fcceb02`.
 - `TestQueryRejectsUnsupportedFieldBeforeRows` proves the unsupported-type error before a row is read.
 - `TestQueryServesSixteenConcurrentReaders` proves concurrent reads on one pool.
 
