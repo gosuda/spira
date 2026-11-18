@@ -7,7 +7,7 @@ Spring's server-side ideas, rebuilt in LoGOs with no container and no reflection
 spira is a web framework for applications written in [LoGOs](https://github.com/gosuda/loGos), a fork of the Go toolchain that compiles `.lgo` files. It covers what a Spring application uses on the server: routing, HTML views, htmx fragments, browser islands, SQL access, sessions, metrics and model calls. An application is ordinary statements in `main`. No container resolves parts and nothing scans annotations. Where Spring asks a type a question at run time through `reflect` or a proxy, spira asks at compile time with a LoGOs comptime generic.
 
 - **No reflection.** No `.lgo` file in the module imports `reflect`. `app.Run` walks the fields of the application struct at compile time.
-- **One runtime dependency.** `golang.org/x/crypto`, for Argon2id password hashing. The only other module in `go.mod`, `modernc.org/sqlite`, is imported by tests alone.
+- **One runtime dependency.** `golang.org/x/crypto`, for Argon2id password hashing. The other direct modules in `go.mod` are four database drivers (`modernc.org/sqlite`, `github.com/jackc/pgx/v5`, `github.com/go-sql-driver/mysql`, `github.com/microsoft/go-mssqldb`), and only tests import them.
 - **Plain Go out.** `logos eject` turns the module into Go source that upstream Go 1.27.4 builds. `just eject` checks this.
 - **Page or fragment from one handler.** A `web.Page` reply writes the whole document, or only the body when htmx asks for it.
 
