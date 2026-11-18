@@ -163,7 +163,7 @@ func Render(ctx context.Context, w io.Writer, n Node) error {
 	if e, ok := n.(Element); ok && e.tag == "html" {
 		writeRaw(w, "<!doctype html>")?
 	}
-	if err := writeNode(w, n, q); err != nil {
+	if err := writeNode(w, n, q, ""); err != nil {
 		return err
 	}
 	if f, ok := w.(http.Flusher); ok {
@@ -201,7 +201,7 @@ func (q *slotQueue) resolve(ctx context.Context, lw *lockedWriter, task slotTask
 		return
 	}
 	var buf bytes.Buffer
-	if err := writeNode(&buf, node, q); err != nil {
+	if err := writeNode(&buf, node, q, ""); err != nil {
 		q.failSlot(lw, task.id, err)
 		return
 	}
@@ -232,7 +232,7 @@ func (q *slotQueue) failSlot(lw *lockedWriter, id string, err error) {
 	q.fail(id, err)
 }
 
-func writeNode(w io.Writer, p Part, q *slotQueue) error {
+func writeNode(w io.Writer, p Part, q *slotQueue, parent string) error {
 	switch v := p.(type) {
 	case Element:
 		return writeElement(w, v, q)
@@ -241,11 +241,11 @@ func writeNode(w io.Writer, p Part, q *slotQueue) error {
 	case Trusted:
 		return writeRaw(w, v.HTML)
 	case Group:
-		return writeGroup(w, v, q)
+		return writeGroup(w, v, q, parent)
 	case *Island:
 		return writeIsland(w, v, q)
 	case *Later:
-		return writeSlot(w, v, q)
+		return writeSlot(w, v, q, parent)
 	case Attribute:
 		return nil
 	case nil:
@@ -261,7 +261,7 @@ func writeElement(w io.Writer, e Element, q *slotQueue) error {
 	if err := writeOpen(w, e); err != nil {
 		return err
 	}
-	if err := writeChildren(w, e.parts, q); err != nil {
+	if err := writeChildren(w, e.parts, q, e.tag); err != nil {
 		return err
 	}
 	return writeRaw(w, "</"+e.tag+">")
@@ -310,18 +310,18 @@ func writeValuedAttr(w io.Writer, a Attribute) error {
 	return writeRaw(w, `"`)
 }
 
-func writeChildren(w io.Writer, parts []Part, q *slotQueue) error {
+func writeChildren(w io.Writer, parts []Part, q *slotQueue, parent string) error {
 	for _, p := range parts {
-		if err := writeNode(w, p, q); err != nil {
+		if err := writeNode(w, p, q, parent); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeGroup(w io.Writer, g Group, q *slotQueue) error {
+func writeGroup(w io.Writer, g Group, q *slotQueue, parent string) error {
 	for _, n := range g.Nodes {
-		if err := writeNode(w, n, q); err != nil {
+		if err := writeNode(w, n, q, parent); err != nil {
 			return err
 		}
 	}
@@ -340,7 +340,7 @@ func writeIsland(w io.Writer, i *Island, q *slotQueue) error {
 		return err
 	}
 	if fb := i.Fallback; fb != nil {
-		if err := writeNode(w, fb, q); err != nil {
+		if err := writeNode(w, fb, q, "spira-island"); err != nil {
 			return err
 		}
 	}
@@ -383,12 +383,23 @@ func writeIslandOpen(w io.Writer, i *Island, props []byte) error {
 	return writeRaw(w, `">`)
 }
 
-func writeSlot(w io.Writer, l *Later, q *slotQueue) error {
+func parentForbidsSlot(parent string) bool {
+	switch parent {
+	case "table", "thead", "tbody", "tfoot", "tr", "colgroup", "select":
+		return true
+	}
+	return false
+}
+
+func writeSlot(w io.Writer, l *Later, q *slotQueue, parent string) error {
+	if parentForbidsSlot(parent) {
+		return fmt.Errorf("view: Later inside <%s>: a browser moves a slot element out of this parent; defer the whole <%s>", parent, parent)
+	}
 	id := q.add(l)
 	if err := writeRaw(w, `<spira-slot id="`+id+`">`); err != nil {
 		return err
 	}
-	if err := writeNode(w, l.Fallback, q); err != nil {
+	if err := writeNode(w, l.Fallback, q, parent); err != nil {
 		return err
 	}
 	return writeRaw(w, "</spira-slot>")

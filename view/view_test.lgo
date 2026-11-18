@@ -726,3 +726,63 @@ func TestRenderWriteErrorCarriesViewContext(t *testing.T) {
 	}
 }
 
+func tableRowLater() *view.Later {
+	return &view.Later{Fallback: view.T("loading"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.Tr(view.Td(view.T("row"))), nil
+	}}
+}
+
+func TestLaterInsideTableStructureIsRejected(t *testing.T) {
+	for _, parent := range []string{"table", "thead", "tbody", "tfoot", "tr", "colgroup", "select"} {
+		var b bytes.Buffer
+		err := view.Render(context.Background(), &b, view.El(parent, tableRowLater()))
+		if err == nil {
+			t.Fatalf("Later inside <%s> rendered without error", parent)
+			return
+		}
+		want := fmt.Sprintf("view: Later inside <%s>: ", parent)
+		if !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("Later inside <%s>: error %q, want %q", parent, err.Error(), want)
+			return
+		}
+		if strings.Contains(b.String(), "spira-slot") {
+			t.Fatalf("Later inside <%s> wrote a slot element despite the error", parent)
+			return
+		}
+	}
+}
+
+func TestLaterInGroupInsideTableStructureIsRejected(t *testing.T) {
+	wrapped := view.Group{Nodes: []view.Node{tableRowLater()}}
+	var b bytes.Buffer
+	err := view.Render(context.Background(), &b, view.Tbody(wrapped))
+	if err == nil {
+		t.Fatalf("Later in a Group inside tbody rendered without error")
+		return
+	}
+	want := "view: Later inside <tbody>: "
+	if !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("Group inside tbody: error %q, want %q", err.Error(), want)
+		return
+	}
+}
+
+func TestLaterInsideAllowedParentsRenders(t *testing.T) {
+	roots := []view.Node{
+		view.Td(tableRowLater()),
+		view.Th(tableRowLater()),
+		view.Div(tableRowLater()),
+		tableRowLater(),
+	}
+	for i, root := range roots {
+		out := renderNode(t, root)
+		if !strings.Contains(out, "spira-slot") {
+			t.Fatalf("allowed root %d wrote no slot element: %q", i, out)
+			return
+		}
+		if !strings.Contains(out, "<td>row</td>") {
+			t.Fatalf("allowed root %d never wrote the resolved row: %q", i, out)
+			return
+		}
+	}
+}
