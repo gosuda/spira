@@ -101,41 +101,62 @@ type memoryEntry struct {
 	expires   time.Time
 }
 
+const sweepInterval = time.Minute
+
+type memoryState struct {
+	sessions  map[string]memoryEntry
+	nextSweep time.Time
+}
+
 type memoryStore struct {
-	sessions sync.Locked[map[string]memoryEntry]
+	sessions sync.Locked[memoryState]
 }
 
 func NewMemoryStore() SessionStore {
 	store := &memoryStore{}
-	store.sessions.WithLock(func(m *map[string]memoryEntry) {
-		*m = map[string]memoryEntry{}
+	store.sessions.WithLock(func(st *memoryState) {
+		st.sessions = map[string]memoryEntry{}
+		st.nextSweep = time.Now().Add(sweepInterval)
 	})
 	return store
 }
 
 func (s *memoryStore) Load(ctx context.Context, id string) (Principal?, error) {
 	var out Principal?
-	s.sessions.WithLock(func(m *map[string]memoryEntry) {
-		e, ok := (*m)[id]
+	s.sessions.WithLock(func(st *memoryState) {
+		e, ok := st.sessions[id]
 		if ok && time.Now().Before(e.expires) {
 			out = e.principal
 		} else {
-			delete(*m, id)
+			delete(st.sessions, id)
 		}
 	})
 	return out, nil
 }
 
 func (s *memoryStore) Save(ctx context.Context, id string, p Principal, ttl time.Duration) error {
-	s.sessions.WithLock(func(m *map[string]memoryEntry) {
-		(*m)[id] = memoryEntry{principal: p, expires: time.Now().Add(ttl)}
+	s.sessions.WithLock(func(st *memoryState) {
+		now := time.Now()
+		if !now.Before(st.nextSweep) {
+			sweepExpired(st.sessions, now)
+			st.nextSweep = now.Add(sweepInterval)
+		}
+		st.sessions[id] = memoryEntry{principal: p, expires: now.Add(ttl)}
 	})
 	return nil
 }
 
+func sweepExpired(sessions map[string]memoryEntry, now time.Time) {
+	for key, entry := range sessions {
+		if !now.Before(entry.expires) {
+			delete(sessions, key)
+		}
+	}
+}
+
 func (s *memoryStore) Delete(ctx context.Context, id string) error {
-	s.sessions.WithLock(func(m *map[string]memoryEntry) {
-		delete(*m, id)
+	s.sessions.WithLock(func(st *memoryState) {
+		delete(st.sessions, id)
 	})
 	return nil
 }

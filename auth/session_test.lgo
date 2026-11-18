@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"logos/sync"
@@ -432,4 +433,63 @@ func TestFailingDeleteNeverBlocksRequestsWithoutCookie(t *testing.T) {
 	if expired.MaxAge >= 0 {
 		t.Fatalf("logout without a cookie did not expire the cookie: maxAge=%d", expired.MaxAge)
 	}
+}
+
+func TestMemoryStoreSweepsExpiredEntries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := auth.NewMemoryStore()
+		ctx := context.Background()
+		p := auth.Principal{ID: "u-1", Roles: []string{"user"}}
+		for i := range 100 {
+			if err := store.Save(ctx, fmt.Sprintf("s-%d", i), p, time.Second); err != nil {
+				t.Fatalf("save %d: %v", i, err)
+				return
+			}
+		}
+		time.Sleep(2 * time.Minute)
+		if err := store.Save(ctx, "fresh", p, time.Second); err != nil {
+			t.Fatalf("save fresh: %v", err)
+			return
+		}
+		n, ok := auth.MemoryStoreSize(store)
+		if !ok {
+			t.Fatal("MemoryStoreSize did not see a memory store")
+			return
+		}
+		if n != 1 {
+			t.Fatalf("store holds %d sessions after the sweep, want 1", n)
+		}
+	})
+}
+
+func TestMemoryStoreSweepKeepsUnexpiredEntries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := auth.NewMemoryStore()
+		ctx := context.Background()
+		p := auth.Principal{ID: "u-1", Roles: []string{"user"}}
+		if err := store.Save(ctx, "short", p, time.Second); err != nil {
+			t.Fatalf("save short: %v", err)
+			return
+		}
+		if err := store.Save(ctx, "long", p, 10*time.Minute); err != nil {
+			t.Fatalf("save long: %v", err)
+			return
+		}
+		time.Sleep(2 * time.Minute)
+		if err := store.Save(ctx, "fresh", p, time.Second); err != nil {
+			t.Fatalf("save fresh: %v", err)
+			return
+		}
+		n, ok := auth.MemoryStoreSize(store)
+		if !ok {
+			t.Fatal("MemoryStoreSize did not see a memory store")
+			return
+		}
+		if n != 2 {
+			t.Fatalf("store holds %d sessions after the sweep, want the unexpired one and the fresh one", n)
+		}
+		if got := loadSession(t, store, "long"); got == nil {
+			t.Fatal("the unexpired session was swept away")
+		}
+	})
 }
