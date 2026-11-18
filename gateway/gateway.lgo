@@ -11,8 +11,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	"logos/sync"
 
 	"github.com/gosuda/spira/resilience"
 	"github.com/gosuda/spira/web"
@@ -137,11 +138,15 @@ type relay struct {
 	timeout time.Duration
 	body    []byte
 	hops    []upstream
-	turn    atomic.Uint64
+	turn    sync.Locked[int]
 }
 
 func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
-	start := int(rl.turn.Add(1)-1) % len(rl.hops)
+	var start int
+	rl.turn.WithLock(func(next *int) {
+		start = *next
+		*next = (start + 1) % len(rl.hops)
+	})
 	again := replays(req)
 	var cause error
 	for i := range rl.hops {
