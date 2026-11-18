@@ -79,6 +79,20 @@ func (c *upgradedConn) Close() error {
 	return c.Conn.Close()
 }
 
+func (c *upgradedConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return errors.New("web: CloseRead not supported by the underlying connection")
+}
+
+func (c *upgradedConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return errors.New("web: CloseWrite not supported by the underlying connection")
+}
+
 func (u *upgrades) closeAll() error {
 	var open []*upgradedConn
 	u.state.WithLock(func(st *upgradeState) {
@@ -135,7 +149,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 	ups := newUpgrades()
-	srv := &http.Server{Handler: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, BaseContext: func(_ net.Listener) context.Context {
+	srv := &http.Server{Handler: s.Router, DisableGeneralOptionsHandler: true, ReadHeaderTimeout: s.ReadHeaderTimeout, BaseContext: func(_ net.Listener) context.Context {
 		return context.WithValue(context.Background(), upgradesKey{}, ups)
 	}}
 	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)

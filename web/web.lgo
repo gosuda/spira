@@ -94,15 +94,24 @@ func (r *Router) Routes() const []RouteInfo {
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	_, pattern := r.mux.Handler(req)
-	if pattern != "" || req.RequestURI == "*" {
+	if pattern != "" {
 		r.mux.ServeHTTP(w, req)
 		return
 	}
 	root := r.rootRouter()
-	root.unmatched(newContext(w, req, root))
+	c := newContext(w, req, root)
+	unrouted, _ := root.mux.Handler(req)
+	c.fallback = unrouted
+	root.unmatched(c)
 }
 
 func delegateUnrouted(c *Context) (Reply, error) {
+	if c.Request.RequestURI == "*" {
+		return Delegate{To: c.root.mux}, nil
+	}
+	if c.fallback != nil {
+		return Delegate{To: c.fallback}, nil
+	}
 	unrouted, _ := c.root.mux.Handler(c.Request)
 	return Delegate{To: unrouted}, nil
 }
@@ -205,10 +214,11 @@ func Set[T any](ctx *Context, k *Key[T], v T) {
 }
 
 type Context struct {
-	Request *http.Request
-	writer  *statusWriter
-	root    *Router
-	vals    sync.Locked[map[any]any]
+	Request  *http.Request
+	writer   *statusWriter
+	root     *Router
+	vals     sync.Locked[map[any]any]
+	fallback http.Handler
 }
 
 func newContext(w http.ResponseWriter, req *http.Request, root *Router) *Context {
@@ -267,6 +277,7 @@ func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if err != nil {
 		return conn, buf, err
 	}
+	s.wrote = true
 	ups, served := s.req.Context().Value(upgradesKey{}).(*upgrades)
 	if !served {
 		return conn, buf, nil
@@ -301,6 +312,10 @@ func (s *statusWriter) Write(b []byte) (int, error) {
 
 func (s *statusWriter) Flush() {
 	if f, ok := s.inner.(http.Flusher); ok {
+		if !s.wrote {
+			s.status = http.StatusOK
+			s.wrote = true
+		}
 		f.Flush()
 	}
 }
