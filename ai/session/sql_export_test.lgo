@@ -1,0 +1,22 @@
+package session
+
+import (
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/db"
+)
+
+func EncodeStoredMessage(m ai.Message) (string, error) {
+	return encodeMessage(m)
+}
+
+func DecodeStoredMessage(role string, raw string) (ai.Message?, error) {
+	return decodeMessage(role, raw)
+}
+
+func SessionUpsert(d db.Dialect) string {
+	return stmtsFor(d).upsert
+}
+
+func SessionNewestBoundary(d db.Dialect) string {
+	return stmtsFor(d).newestBoundary
+}

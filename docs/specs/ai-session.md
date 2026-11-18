@@ -1,9 +1,10 @@
 # ai/session
 
-Status: implemented. The SQL store is not in the tree yet.
+Status: implemented.
 
 Package `ai/session` keeps conversation history as an append-only event log. An application uses `Service` to create, append, expire and compact a session.
-It uses `Remember` to wrap a model, so each call loads the history and records the turn.
+It uses `Remember` to wrap a model, so each call loads the history and records the turn. `SQLStore` keeps the same log in a database through `db`.
+`Find` and `Ensure` bound each database call with a five second timeout. An unset TTL means 24 hours.
 
 The package holds behavior translated from Spring AI.
 
@@ -50,6 +51,37 @@ func (s *Service) LastN(ctx context.Context, id string, n int) ([]Event, error)
 func (s *Service) Append(ctx context.Context, id string, version int64, events ...Event) (bool, error)
 func (s *Service) Version(ctx context.Context, id string) (int64, error)
 func (s *Service) Compact(ctx context.Context, id string, version int64, boundary Boundary) (bool, error)
+
+func (s *Service) Delete(ctx context.Context, id string) error
+
+type Store interface {
+	Ensure(id string) (*Session?, error)
+	Find(id string) *Session?
+	Events(ctx context.Context, id string) ([]Event, error)
+	Active(ctx context.Context, id string) ([]ai.Message, error)
+	LastN(ctx context.Context, id string, n int) ([]Event, error)
+	Append(ctx context.Context, id string, version int64, events ...Event) (bool, error)
+	Version(ctx context.Context, id string) (int64, error)
+	Compact(ctx context.Context, id string, version int64, boundary Boundary) (bool, error)
+	Delete(ctx context.Context, id string) error
+}
+
+type SQLStore struct {
+	Pool *db.Pool
+	TTL  time.Duration
+	Now  (func() time.Time)?
+}
+
+func (s *SQLStore) Prepare(ctx context.Context) error
+func (s *SQLStore) Ensure(id string) (*Session?, error)
+func (s *SQLStore) Find(id string) *Session?
+func (s *SQLStore) Events(ctx context.Context, id string) ([]Event, error)
+func (s *SQLStore) Active(ctx context.Context, id string) ([]ai.Message, error)
+func (s *SQLStore) LastN(ctx context.Context, id string, n int) ([]Event, error)
+func (s *SQLStore) Append(ctx context.Context, id string, version int64, events ...Event) (bool, error)
+func (s *SQLStore) Version(ctx context.Context, id string) (int64, error)
+func (s *SQLStore) Compact(ctx context.Context, id string, version int64, boundary Boundary) (bool, error)
+func (s *SQLStore) Delete(ctx context.Context, id string) error
 
 func History(stored []ai.Message, request []ai.Message) []ai.Message
 func LastUserOrTool(messages []ai.Message) ai.Message?
@@ -107,6 +139,45 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `Remember` MUST append nothing when a stream fails after yielding chunks.
 - A SQL store over `db` MUST serve SQLite, PostgreSQL, MySQL and SQL Server.
 - The in-memory store MUST be a concrete type.
+- `Store` MUST expose the nine session operations with the `Service` signatures.
+- `SQLStore` MUST persist sessions and events through `db` only.
+- `Prepare` MUST create `spira_sessions`, `spira_session_events` and their index, and run again without error.
+- `Ensure` MUST open a session that `Append` accepts.
+- Reads MUST order events by the sequence column, not the timestamp.
+- Stored times MUST round-trip at nanosecond precision.
+- A stale version MUST make `Append` return false and write nothing.
+- `Delete` MUST remove one conversation and leave the others, on every store.
+- Every part kind MUST round-trip with `Skipped` kept.
+- Quotes and Unicode beyond the BMP MUST survive exactly.
+- A hostile id MUST stay data and leave the table intact.
+- A cancelled save MUST write nothing and keep the store usable.
+- `LastN` on SQL MUST extend to the turn start.
+- Conversations MUST stay isolated on every store.
+- `Compact` MUST show only the summary and later messages as active.
+- `Active` MUST return every message when no boundary exists.
+- Statements MUST use `?` on SQLite and MySQL, `$n` on Postgres and `@pn` on MSSQL.
+- Reads MUST use `LIMIT` on SQLite, Postgres and MySQL.
+- Reads on MSSQL MUST use `FETCH`.
+- Each engine case MUST skip when its DSN variable is not set.
+- `Find` MUST return none after `Delete`.
+- `Version` MUST return zero after `Delete`.
+- `Ensure` MUST reject a blank id.
+- `Append` MUST reject a system message before any version check.
+- `Append` MUST reject an empty batch.
+- `Append` MUST reject an event of another session.
+- `LastN` MUST reject a non-positive count on every store.
+- `Compact` with a stale version MUST return false on every store.
+- `Find` MUST return the live session with its times.
+- `Ensure` MUST return the live session unchanged.
+- `Delete` MUST succeed for a missing session.
+- An input edit MUST NOT reach the stored parts.
+- A read edit MUST NOT reach the next read.
+- An expired session MUST be unfound, unread and version zero.
+- `Ensure` past expiry MUST start a new generation.
+- The old version MUST NOT append to the new generation.
+- `SQLStore` MUST expire a session after 24 hours by default.
+- `SQLStore` MUST keep a session just inside its TTL.
+- `SQLStore` MUST honor a set TTL.
 
 ## Errors
 
@@ -114,6 +185,8 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `Service` MUST return an error when an append has no events.
 - `Service` MUST return an error when an event names another session.
 - `Service` MUST return an error when `LastN` gets a non-positive count.
+- `SQLStore` MUST return an error for an unknown stored part kind.
+- `SQLStore` MUST return an error for a stored message that is not JSON.
 
 ## Proof
 
@@ -164,6 +237,34 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `TestRememberRestoresAResumedCallAfterExpiry` proves an expired session still replays the call.
 - `TestAppendKeepsThePartsOfTheStoredMessage` proves an input edit leaves the stored parts alone.
 - `TestActiveKeepsThePartsOfTheReturnedMessage` proves a read edit leaves the stored parts alone.
+- `TestEngineSessionContractSQLite` proves the contract on SQLite with a repeated `Prepare`.
+- `TestEngineSessionContractMemory` proves the contract on the in-memory store.
+- `TestEngineSessionContractPostgres` proves the contract on PostgreSQL, skipping without `SPIRA_TEST_POSTGRES_DSN`.
+- `TestEngineSessionContractMySQL` proves the contract on MySQL, skipping without `SPIRA_TEST_MYSQL_DSN`.
+- `TestEngineSessionContractMSSQL` proves the contract on SQL Server, skipping without `SPIRA_TEST_MSSQL_DSN`.
+- `contractAppendOrdersBySequence` proves insertion order under equal timestamps on every store.
+- `contractLastNExtendsToTurnStart` proves the turn-start extension and the count guard on every store.
+- `contractConversationsStayIsolated` proves conversation isolation on every store.
+- `contractDeleteFreesOneConversation` proves delete frees and recreates one conversation on every store.
+- `contractEveryPartKindRoundTrips` proves every part kind round-trips on every store.
+- `contractQuotesAndUnicodeSurvive` proves quotes and Unicode survive on every store.
+- `contractHostileIDStaysData` proves a hostile id stays data on every store.
+- `contractCancelledSaveWritesNothing` proves a cancelled save writes nothing on every store.
+- `contractStaleVersionLoses` proves a stale version loses on every store.
+- `contractCompactShapesTheActiveView` proves compaction shapes the active view on every store.
+- `TestStoredPartsRoundTrip` proves every part kind, nil parts, the unknown kind and broken JSON.
+- `TestSessionStatementsUsePlaceholders` proves the per-dialect placeholders and limits.
+- `contractBlankIDIsRejected` proves the blank id error on every store.
+- `contractAppendValidationsRejectBadBatches` proves the three bad batches on every store.
+- `contractLastNMustBePositive` proves the count guard on every store.
+- `contractCompactStaleVersionLoses` proves a stale compaction loses on every store.
+- `contractFindReturnsTheLiveSession` proves Find returns the live session on every store.
+- `contractEnsureLiveSessionKeepsVersion` proves a live Ensure changes nothing on every store.
+- `contractDeleteMissingSessionSucceeds` proves a missing delete succeeds on every store.
+- `contractInputEditLeavesStoredPartsAlone` proves input edits stay out on every store.
+- `contractReadEditLeavesReturnedPartsAlone` proves read edits stay out on every store.
+- `contractDefaultTTLCoversADay` proves the 24 hour boundary on every store.
+- `contractCustomTTLCoversAMinute` proves a set TTL on every store.
 
 ## Not in scope
 
