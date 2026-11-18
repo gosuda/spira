@@ -765,15 +765,15 @@ func TestFileSourceRefusesKeysThatCollide(t *testing.T) {
 	}
 }
 
-type badParseAndMissing struct {
-	Bad  int
-	Miss string `required:"true"`
-}
-
 func TestLoaderErrPrefersParseOverMissing(t *testing.T) {
-	_, err := config.Load[badParseAndMissing](config.Map(map[string]string{"BAD": "x"}))
+	loader := config.NewLoader([]config.Source{config.Map(map[string]string{"BAD": "x"})})
+	var bad int
+	var miss string
+	loader.Set(&bad, "BAD", false)
+	loader.Set(&miss, "MISS", true)
+	err := loader.Err()
 	if err == nil {
-		t.Fatal("Load error = nil, want the parse failure")
+		t.Fatal("Loader.Err = nil, want the parse failure")
 		return
 	}
 	if strings.Contains(err.Error(), "missing keys") {
