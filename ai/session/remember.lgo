@@ -26,6 +26,22 @@ type Turn struct {
 	Limits  ai.Limits
 }
 
+type guardKey struct{}
+type guardVal struct {
+	svc *Service
+	id string
+}
+func guarded(ctx context.Context, svc *Service, id string) bool {
+	v, ok := ctx.Value(guardKey{}).(guardVal)
+	if !ok {
+		return false
+	}
+	return v.svc == svc && v.id == id
+}
+func withGuard(ctx context.Context, svc *Service, id string) context.Context {
+	return context.WithValue(ctx, guardKey{}, guardVal{svc: svc, id: id})
+}
+
 func Remember(s *Service, id string) ai.Layer {
 	return func(next ai.Model) ai.Model {
 		return remember{svc: s, id: id, next: next}
@@ -121,11 +137,15 @@ func (s *Service) directEvents(id string, stored []ai.Message, reply ai.Reply, c
 }
 
 func (r remember) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	if guarded(ctx, r.svc, r.id) {
+		return r.next.Chat(ctx, req)
+	}
+	guardedCtx := withGuard(ctx, r.svc, r.id)
 	version, prompt, err := r.prepare(ctx, req)
 	if err != nil {
 		return ai.Reply{}, err
 	}
-	reply, err := r.next.Chat(ctx, withPrompt(req, prompt))
+	reply, err := r.next.Chat(guardedCtx, withPrompt(req, prompt))
 	if err != nil {
 		return ai.Reply{}, err
 	}
@@ -136,13 +156,20 @@ func (r remember) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 }
 
 func (r remember) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	if guarded(ctx, r.svc, r.id) {
+		for chunk, err := range r.next.Stream(ctx, req) {
+			yield chunk, err
+		}
+		return
+	}
+	guardedCtx := withGuard(ctx, r.svc, r.id)
 	version, prompt, err := r.prepare(ctx, req)
 	if err != nil {
 		yield ai.Chunk{}, err
 		return
 	}
 	var chunks []ai.Chunk
-	for chunk, cerr := range r.next.Stream(ctx, withPrompt(req, prompt)) {
+	for chunk, cerr := range r.next.Stream(guardedCtx, withPrompt(req, prompt)) {
 		if cerr != nil {
 			yield ai.Chunk{}, cerr
 			return
@@ -159,7 +186,6 @@ func (r remember) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk
 		yield ai.Chunk{}, rerr
 	}
 }
-
 func withPrompt(req ai.Request, prompt []ai.Message) ai.Request {
 	out := req
 	out.Messages = prompt

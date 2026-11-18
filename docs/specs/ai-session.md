@@ -94,6 +94,7 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `Remember` MUST append the turn after an append that another call made during the call.
 - `Remember` MUST append the turn to a new session when the session expires during the call.
 - `Remember` MUST NOT store a call message that the log already holds.
+- `Remember` MUST record once when nested inside other layers for the same session.
 - `Service.Run` MUST run the tool loop through `Remember`.
 - `Service.Run` MUST store a direct tool answer without another model call.
 - `Service` MUST give each session generation its own version sequence.
@@ -102,8 +103,8 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `History` MUST keep only the result parts that answer the kept call.
 - `Remember` MUST append the trailing user or tool message and the assistant reply after the call.
 - `Remember` MUST append nothing when the call fails.
-- `Remember` MUST append once on a stream, after the stream ends.
 - `Remember` MUST append nothing when the caller stops the stream.
+- `Remember` MUST append nothing when a stream fails after yielding chunks.
 - A SQL store over `db` MUST serve SQLite, PostgreSQL, MySQL and SQL Server.
 - The in-memory store MUST be a concrete type.
 
@@ -152,12 +153,13 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `TestRememberStreamAppendsOnce` proves one record per stream.
 - `TestRememberStreamFailedCallAppendsNothing` proves a cut stream records nothing.
 - `TestRememberStreamStoppedEarlyAppendsNothing` proves a stopped stream records nothing.
+- `TestRememberStreamLateFailureAppendsNothing` proves a late stream failure records nothing.
 - `TestRememberRecordsATurnBesideAConcurrentTurn` proves the turn follows a concurrent append.
 - `TestRememberRecordsADirectToolAnswer` proves a direct answer reaches the next prompt.
 - `TestRememberKeepsAResumedToolExchangeTogether` proves a resumed call keeps its result answerable in order.
 - `TestRunStoresTheCallWithTheDirectResultAcrossAnExpiry` proves call and result store together across expiry.
 - `TestRunRefusesAModelTheSessionAlreadyWrapped` proves the double-wrap refusal.
-- `TestRunRecordsADirectAnswerAfterAConfirmResume` proves a confirm resume records the direct answer.
+- `TestRunRecordsOnceWhenRememberHidesInsideSearch` proves nested layers record once.
 - `TestCompactFromAnExpiredSessionCannotHideTheNewTurn` proves a stale compaction loses to the new turn.
 - `TestRememberRestoresAResumedCallAfterExpiry` proves an expired session still replays the call.
 - `TestAppendKeepsThePartsOfTheStoredMessage` proves an input edit leaves the stored parts alone.

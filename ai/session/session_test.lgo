@@ -17,7 +17,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
-	"sync"
+	"logos/sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -766,20 +766,20 @@ type wireReq struct {
 }
 
 type scripted struct {
-	mu     sync.Mutex
-	bodies []string
-	chat   string
+	bodies sync.Locked[[]string]
+	chat string
 	stream string
-	fail   error
+	fail error
 	during func()
 	answer func(req wireReq) string
 }
 
 func (s *scripted) requests(t *testing.T) []wireReq {
 	t.Helper()
-	s.mu.Lock()
-	bodies := slices.Clone(s.bodies)
-	s.mu.Unlock()
+	var bodies []string
+	s.bodies.WithLock(func(b *[]string) {
+		bodies = slices.Clone(*b)
+	})
 	out := make([]wireReq, 0, len(bodies))
 	for _, raw := range bodies {
 		var req wireReq
@@ -791,7 +791,6 @@ func (s *scripted) requests(t *testing.T) []wireReq {
 	}
 	return out
 }
-
 func serveModel(t *testing.T, s *scripted) *openai.Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -805,9 +804,9 @@ func serveModel(t *testing.T, s *scripted) *openai.Client {
 			t.Errorf("server decode: %v", err)
 			return
 		}
-		s.mu.Lock()
-		s.bodies = append(s.bodies, string(raw))
-		s.mu.Unlock()
+		s.bodies.WithLock(func(b *[]string) {
+			*b = append(*b, string(raw))
+		})
 		if s.during != nil {
 			s.during()
 		}
@@ -1022,14 +1021,27 @@ func TestRememberRecordsATurnBesideAConcurrentTurn(t *testing.T) {
 }
 
 func TestRememberRecordsATurnWhenTheSessionExpiresDuringTheCall(t *testing.T) {
-	now := time.Now()
-	s := &session.Service{TTL: time.Hour, Now: func() time.Time { return now }}
+	var now sync.Locked[time.Time]
+	now.WithLock(func(v *time.Time) {
+		*v = time.Now()
+	})
+	at := func() time.Time {
+		var out time.Time
+		now.WithLock(func(v *time.Time) {
+			out = *v
+		})
+		return out
+	}
+	s := &session.Service{TTL: time.Hour, Now: at}
 	ensureSession(t, s, "s1")
 	appendMsg(t, s, "s1", text("before the expiry"))
 	model := &scripted{chat: chatAnswer("Hello!")}
-	model.during = func() { now = now.Add(2 * time.Hour) }
+	model.during = func() {
+		now.WithLock(func(v *time.Time) {
+			*v = v.Add(2 * time.Hour)
+		})
+	}
 	wrapped := session.Remember(s, "s1")(serveModel(t, model))
-
 	if _, err := wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}); err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
@@ -1406,4 +1418,52 @@ func TestRunRecordsADirectAnswerAfterAConfirmResume(t *testing.T) {
 		return
 	}
 	requireCallBeforeResult(t, reqs[len(reqs)-1].Messages, "c1")
+}
+
+func TestRunRecordsOnceWhenRememberHidesInsideSearch(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{chat: chatAnswer("Hello!")}
+	client := serveModel(t, model)
+	_, searchLayer := ai.SearchTools([]ai.Tool{})
+	hidden := searchLayer(session.Remember(s, "s1")(client))
+	_, err := s.Run(t.Context(), "s1", session.Turn{
+		Model:   hidden,
+		Request: ai.Request{Messages: []ai.Message{text("Hi")}},
+		Limits:  ai.Limits{},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (user+reply), got %d", len(events))
+	}
+}
+
+func TestRememberStreamLateFailureAppendsNothing(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	partial := "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-6-astra\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n"
+	model := &scripted{stream: partial}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+	var okChunks int
+	var failures []error
+	for _, err := range wrapped.Stream(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}) {
+		if err != nil {
+			failures = append(failures, err)
+		} else {
+			okChunks++
+		}
+	}
+	if okChunks == 0 {
+		t.Fatalf("the cut stream gave no chunks before failing")
+	}
+	if len(failures) != 1 {
+		t.Fatalf("the cut stream gave %d errors, want one", len(failures))
+	}
+	if events := eventsOf(t, s, "s1"); len(events) != 0 {
+		t.Fatalf("a stream that failed after chunks left %d events, want 0", len(events))
+	}
 }
