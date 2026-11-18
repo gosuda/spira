@@ -148,10 +148,20 @@ func call[Out any](ctx context.Context, c *Client, p prepared) (answer[Out], err
 		return none, fmt.Errorf("read response: %w", rerr)
 	}
 	var out Out
+	if bodyless(p.method, resp.StatusCode) {
+		return answer[Out]{value: out}, nil
+	}
 	if uerr := json.Unmarshal(data, &out); uerr != nil {
 		return none, fmt.Errorf("decode: %w", uerr)
 	}
 	return answer[Out]{value: out}, nil
+}
+
+func bodyless(method string, status int) bool {
+	if method == http.MethodHead {
+		return true
+	}
+	return status == http.StatusNoContent || status == http.StatusResetContent
 }
 
 func applyHeader(hreq *http.Request, header http.Header, jsonBody bool) {
