@@ -760,6 +760,18 @@ func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
 	}
 }
 
+func TestProblemWithoutStatusAnswers500(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/blank", func(ctx *web.Context) (web.Reply, error) {
+		return nil, web.Fail(web.Problem{Title: "Not Found"})
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/blank", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Status != http.StatusInternalServerError {
+		t.Fatalf("problem status member %d want 500", doc.Status)
+	}
+}
+
 func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
 	seen := 0
 	watch := func(next web.Handler) web.Handler {

@@ -175,6 +175,9 @@ func (r *Router) writeRedirect(ctx *Context, d Redirect) error {
 
 func (r *Router) writeProblem(ctx *Context, p Problem) error {
 	w := ctx.writer
+	if p.Status == 0 {
+		p.Status = http.StatusInternalServerError
+	}
 	if r.ProblemView != nil {
 		w.Header().Add("Vary", "Accept")
 	}
