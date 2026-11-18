@@ -440,6 +440,7 @@ func TestPercentEncodedPathArrivesEncoded(t *testing.T) {
 		{"/api/files/a%2Fb", "/base/files/a%2Fb"},
 		{"/keep/a%2Fb%20c", "/keep/a%2Fb%20c"},
 		{"/shop/files/a%2Fb", "/files/a%2Fb"},
+		{"/shop/%2Ffiles", "/%2Ffiles"},
 		{"/a%2Fb", "/storage%2F/a%2Fb"},
 		{"/%61pi/files/a%2Fb", "/base/files/a%2Fb"},
 	} {
@@ -591,7 +592,6 @@ func TestSlashEndingPrefixServesSubpathsWithoutARedirect(t *testing.T) {
 		t.Fatalf("GET reached the upstream as %q want /x", m.Path)
 	}
 }
-
 func TestMountRefusesWildcardPrefixButStripsLiteralNeighbor(t *testing.T) {
 	for _, prefix := range []string{"/api/{rest...}", "/api/*", "/api/{id}"} {
 		func() {
@@ -599,6 +599,10 @@ func TestMountRefusesWildcardPrefixButStripsLiteralNeighbor(t *testing.T) {
 				p := recover()
 				if p == nil {
 					t.Fatalf("Mount with prefix %q did not panic", prefix)
+				}
+				msg := fmt.Sprint(p)
+				if !strings.Contains(msg, prefix) || !strings.Contains(msg, "wildcards") {
+					t.Fatalf("Mount with prefix %q panicked with %q, want the wildcard rule", prefix, msg)
 				}
 			}()
 			gateway.Mount(web.NewRouter(), []gateway.Route{{PathPrefix: prefix, StripPrefix: true, To: []string{"http://example.com"}}}, plainPolicy())
@@ -614,5 +618,23 @@ func TestMountRefusesWildcardPrefixButStripsLiteralNeighbor(t *testing.T) {
 	readBody(t, resp)
 	if n := awaitNote(t, notes); n.Path != "/x" {
 		t.Fatalf("/api/files/x reached the upstream as %q want /x", n.Path)
+	}
+}
+
+func TestCutEscapedSuffixKeepsOneLeadingSlash(t *testing.T) {
+	for _, tc := range []struct{ path, mounted, want string }{
+		{"/shop/catalog", "/shop", "/catalog"},
+		{"/shop", "/shop", "/"},
+		{"/shop/", "/shop/", "/"},
+		{"/shop/x", "/shop/", "/x"},
+		{"/shop//catalog", "/shop/", "/catalog"},
+		{"/shop//catalog", "/shop", "/catalog"},
+		{"/shop/%2Ffiles", "/shop/", "/%2Ffiles"},
+		{"/other/x", "/shop", "/other/x"},
+		{"/catalog", "/", "/catalog"},
+	} {
+		if got := gateway.CutEscapedSuffixForTest(tc.path, tc.mounted); got != tc.want {
+			t.Fatalf("cutEscapedSuffix(%q, %q) = %q want %q", tc.path, tc.mounted, got, tc.want)
+		}
 	}
 }

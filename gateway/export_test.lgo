@@ -1,0 +1,5 @@
+package gateway
+
+func CutEscapedSuffixForTest(path string, mounted string) string {
+	return cutEscapedSuffix(path, mounted)
+}

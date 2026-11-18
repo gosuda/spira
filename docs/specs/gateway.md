@@ -48,9 +48,10 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - When `StripPrefix` is true, the tail MUST be the request path without the mounted prefix.
 - When that remainder is empty, the tail MUST be `/`.
 - Otherwise the stripped tail MUST start with `/`.
+- When the stripped remainder starts with a slash, the tail MUST be that remainder.
 - When the upstream base path is empty or `/`, the upstream path MUST be the tail.
-- Otherwise the join MUST place one `/` between the base path and the tail.
 - The proxy MUST join base and tail in escaped form and MUST derive the path from that join.
+- The escaped join MUST always unescape; a failure panics as a programmer error.
 - The proxy MUST cut the stripped suffix from the escaped request path and MUST match the prefix on decoded segments.
 - The proxy MUST send the request to the upstream scheme and host.
 - Each request MUST start at the next upstream in list order.
@@ -132,6 +133,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestClientForwardedHeaderNeverReachesTheUpstream` proves that a client `Forwarded` header does not ride along.
 - `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
 - `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
+- `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
 
 ## Not in scope
 

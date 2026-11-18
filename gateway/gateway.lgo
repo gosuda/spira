@@ -261,10 +261,11 @@ func cutEscapedSuffix(path string, mounted string) string {
 		}
 	}
 	rest := segs[end:]
-	if len(rest) == 0 {
-		return "/"
+	joined := strings.Join(rest, "/")
+	if strings.HasPrefix(joined, "/") {
+		return joined
 	}
-	return "/" + strings.Join(rest, "/")
+	return "/" + joined
 }
 
 func segmentMatches(raw string, want string) bool {
