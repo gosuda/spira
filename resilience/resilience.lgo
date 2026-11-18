@@ -51,7 +51,7 @@ func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T,
 			return value, nil
 		}
 		if cause := ignoredCause(err); cause != nil {
-			return zero, cause
+			return zero, halted(ctx, cause)
 		}
 		last = err
 		if errors.Is(err, ErrOpen) || ctx.Err() != nil {

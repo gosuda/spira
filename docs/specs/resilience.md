@@ -104,6 +104,7 @@ func Ignored(err error) error
 - `ErrOpen` has the text `resilience: circuit open`.
 - When the wait stops because the caller context ends, `Do` returns `errors.Join` of the last call error and the context error.
 - When a call fails and the caller context has already ended, `Do` returns that same join.
+- After the caller context ends, `Do` MUST join an ignored cause with the context error.
 - When the caller context has not ended, `Do` returns `ErrOpen` as itself.
 
 ## Proof
@@ -120,6 +121,7 @@ func Ignored(err error) error
 - `TestCancelledProbeReleasesTheSlot` proves that a cancelled probe frees the slot.
 - `TestIgnoredErrorEndsRetriesAndReturnsItsCause` proves that an `Ignored` error is final and that `Do` returns its cause.
 - `TestIgnoredErrorIsNoResultInTheWindow` proves that an `Ignored` error adds no result to the window.
+- `TestIgnoredErrorJoinsContextErrorWhenCallerAlreadyEnded` proves that an ignored cause after cancellation is joined with the context error.
 - `TestIgnoredProbeLeavesTheBreakerHalfOpen` proves that an `Ignored` probe releases its slot and does not close the breaker.
 - `TestAttemptTimeoutCountsAsFailure` proves that an attempt timeout opens the breaker.
 - `TestPolicyAndRetryDefaultsHold` proves the timeout, attempt, base and max defaults.
