@@ -28,11 +28,14 @@ type Route struct {
 
 func Mount(r *web.Router, routes []Route, policy resilience.Policy) {
 	for i := range routes {
-		rl := newRelay(routes[i], policy)
-		h := stageChain(routes[i].Stages, proxyHandler(newProxy(rl)))
-		for _, pattern := range routePatterns(routes[i].Host, routes[i].PathPrefix) {
-			r.Handle("", pattern, h)
-		}
+		rt := routes[i]
+		h := proxyHandler(newProxy(newRelay(rt, policy)))
+		r.Group("", func(g *web.Router) {
+			g.Use(rt.Stages...)
+			for _, pattern := range routePatterns(rt.Host, rt.PathPrefix) {
+				g.Handle("", pattern, h)
+			}
+		})
 	}
 }
 
@@ -109,14 +112,6 @@ func proxyHandler(px *httputil.ReverseProxy) web.Handler {
 	return func(ctx *web.Context) (web.Reply, error) {
 		return web.Delegate{To: px}, nil
 	}
-}
-
-func stageChain(stages []web.Stage, last web.Handler) web.Handler {
-	h := last
-	for i := len(stages) - 1; i >= 0; i-- {
-		h = stages[i](h)
-	}
-	return h
 }
 
 func newProxy(rl *relay) *httputil.ReverseProxy {

@@ -52,6 +52,8 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - Route stages MUST run in list order.
 - The proxy MUST run after the route stages.
 - A stage that returns a reply MUST NOT send the request to an upstream.
+- Each route stage boundary MUST be settled as in [web](web.md).
+- A route stage MUST read the upstream status from `ctx.Status()` after `next`.
 - The proxy MUST NOT forward a client `Forwarded` header.
 
 ### Failure
@@ -98,6 +100,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestHostRouteMatchesOnlyItsHost` proves that a host route rejects another host.
 - `TestRouteStagesRunAfterRouterStagesBeforeTheProxy` proves the stage order.
 - `TestStageAnswerKeepsTheRequestFromTheUpstream` proves that a stage reply does not reach an upstream.
+- `TestSettledStagesLetTheProxyAnswer` proves that `web.Recover` and `web.AccessLog` as route stages let the upstream answer.
 - `TestMountPanicsOnBadRoutes` proves the three registration panics.
 - `TestDeadUpstreamFailsOverForGetAndNeverReplaysPost` proves failover for a bodyless request and no second try for a body.
 - `TestOpenBreakerSkipsItsUpstreamAndKeepsTheLiveOne` proves that an open breaker skips only its upstream.
