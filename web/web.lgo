@@ -31,13 +31,16 @@ type Router struct {
 	root        *Router?
 	stages      []Stage
 	routes      *routeList
+	unmatched   func(c *Context)
 	Layout      func(ctx *Context, p Page) view.Node
 	ProblemView func(p Problem) view.Node?
 	MaxBody     int64 = 1 << 20
 }
 
 func NewRouter() *Router {
-	return &Router{mux: http.NewServeMux(), routes: &routeList{}}
+	r := &Router{mux: http.NewServeMux(), routes: &routeList{}}
+	r.unmatched = chain(r, nil, delegateUnrouted)
+	return r
 }
 
 func (r *Router) rootRouter() *Router {
@@ -49,6 +52,9 @@ func (r *Router) rootRouter() *Router {
 
 func (r *Router) Use(stages ...Stage) {
 	r.stages = append(r.stages, stages...)
+	if r.root == nil {
+		r.unmatched = chain(r, r.stages, delegateUnrouted)
+	}
 }
 
 func (r *Router) Group(prefix string, build func(g *Router)) {
@@ -85,15 +91,18 @@ func (r *Router) Routes() const []RouteInfo {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	unrouted, pattern := r.mux.Handler(req)
+	_, pattern := r.mux.Handler(req)
 	if pattern != "" || req.RequestURI == "*" {
 		r.mux.ServeHTTP(w, req)
 		return
 	}
 	root := r.rootRouter()
-	served(root, root.stages, func(_ *Context) (Reply, error) {
-		return Delegate{To: unrouted}, nil
-	}).ServeHTTP(w, req)
+	root.unmatched(newContext(w, req, root))
+}
+
+func delegateUnrouted(c *Context) (Reply, error) {
+	unrouted, _ := c.root.mux.Handler(c.Request)
+	return Delegate{To: unrouted}, nil
 }
 
 func served(root *Router, stages []Stage, h Handler) http.HandlerFunc {

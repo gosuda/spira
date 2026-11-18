@@ -988,6 +988,37 @@ func TestAsteriskTargetIsRejectedWithoutARedirect(t *testing.T) {
 	}
 }
 
+func TestUnmatchedChainWrapsAStageOnlyAtUse(t *testing.T) {
+	wraps := 0
+	runs := 0
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		wraps++
+		return func(ctx *web.Context) (web.Reply, error) {
+			runs++
+			return next(ctx)
+		}
+	})
+	registered := wraps
+	for range 3 {
+		if miss := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil)); miss.Code != http.StatusNotFound {
+			t.Fatalf("unmatched path status %d want 404", miss.Code)
+		}
+	}
+	if wraps != registered || runs != 3 {
+		t.Fatalf("three unmatched requests wrapped the stage %d more times and ran it %d times, want 0 and 3", wraps-registered, runs)
+	}
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Late-Stage", "ran")
+			return next(ctx)
+		}
+	})
+	if late := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil)); late.Header().Get("X-Late-Stage") != "ran" {
+		t.Fatal("a stage added after the first unmatched request did not run")
+	}
+}
+
 func TestUnmatchedRequestsRunRootStages(t *testing.T) {
 	groupRan := false
 	r := web.NewRouter()
