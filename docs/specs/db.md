@@ -114,6 +114,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - When the cache is full, the pool MUST evict the statement whose last use is oldest.
 - A statement that a caller still holds MUST stay usable after eviction, until release.
 - Text that `In` returns MUST NOT enter the cache.
+- `QueryContext` and `ExecContext` MUST run text that starts with `/*db:nocache*/` on the handle without caching it.
 - `Tx` MUST run a cached statement with `StmtContext` on the transaction.
 - `Tx` MUST run an uncached statement on the transaction itself.
 - `Prepare` MUST prepare the given text.
@@ -193,6 +194,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
 - `TestDialectOfRejectsParseTimeInThePassword` proves that `parseTime=true` outside the query part does not count.
 - `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the bounded `Stop` and the close that finishes after it. A registered SQL function holds the statement open until the test releases it.
+- `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the shutdown probe adds no statement to the cache.
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
 - `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
 - `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.

@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -98,9 +99,15 @@ func TestPrepareChecksCachedTextAgainstTheSchema(t *testing.T) {
 		t.Fatalf("drop: %v", err)
 		return
 	}
-	err := pool.Prepare(ctx, query)
+	schemaCtx, schemaCancel := prepareCtx(t)
+	defer schemaCancel()
+	err := pool.Prepare(schemaCtx, query)
 	if err == nil {
 		t.Fatal("Prepare accepted cached text although its table is gone")
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("Prepare error = %v, want the engine rejection, not a context error", err)
 		return
 	}
 	if !strings.HasPrefix(err.Error(), "db: prepare:") {

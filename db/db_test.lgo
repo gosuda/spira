@@ -303,6 +303,29 @@ func registerBlockingFunction(ctx context.Context, started chan struct{}, releas
 	return name
 }
 
+func checkStopShutdown(t *testing.T, ctx context.Context, pool *db.Pool, stop *stopOutcome) {
+	t.Helper()
+	var serr error
+	stop.err.WithLock(func(e *error) { serr = *e })
+	if !errors.Is(serr, context.DeadlineExceeded) || !strings.HasPrefix(serr.Error(), "db: stop:") {
+		t.Fatalf("Stop error = %v, want db: stop: context deadline exceeded", serr)
+	}
+	closed := false
+	for !closed && ctx.Err() == nil {
+		_, qerr := pool.ExecContext(ctx, "/*db:nocache*/SELECT 1")
+		closed = qerr != nil && strings.Contains(qerr.Error(), "database is closed")
+		if !closed {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !closed {
+		t.Fatal("the pool stayed open after the timed-out Stop and the end of the statement")
+	}
+	if got := pool.Prepared(); got != 0 {
+		t.Fatalf("cache holds %d statements after Stop, want 0", got)
+	}
+}
+
 func TestStopReturnsByItsDeadlineWhileAStatementRuns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -344,23 +367,8 @@ func TestStopReturnsByItsDeadlineWhileAStatementRuns(t *testing.T) {
 	if !returnedInTime {
 		t.Fatal("Stop did not return by its 50ms deadline while a cached statement ran")
 	}
-	var serr error
-	stop.err.WithLock(func(e *error) { serr = *e })
-	if !errors.Is(serr, context.DeadlineExceeded) || !strings.HasPrefix(serr.Error(), "db: stop:") {
-		t.Fatalf("Stop error = %v, want db: stop: context deadline exceeded", serr)
+	checkStopShutdown(t, ctx, pool, stop)
 	}
-	closed := false
-	for !closed && ctx.Err() == nil {
-		_, qerr := pool.ExecContext(ctx, "SELECT 1")
-		closed = qerr != nil && strings.Contains(qerr.Error(), "database is closed")
-		if !closed {
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	if !closed {
-		t.Fatal("the pool stayed open after the timed-out Stop and the end of the statement")
-	}
-}
 
 func TestDialectOfMatchesEachDriverName(t *testing.T) {
 	cases := []struct {
