@@ -764,3 +764,46 @@ func TestFileSourceRefusesKeysThatCollide(t *testing.T) {
 		}
 	}
 }
+
+type badParseAndMissing struct {
+	Bad  int
+	Miss string `required:"true"`
+}
+
+func TestLoaderErrPrefersParseOverMissing(t *testing.T) {
+	_, err := config.Load[badParseAndMissing](config.Map(map[string]string{"BAD": "x"}))
+	if err == nil {
+		t.Fatal("Load error = nil, want the parse failure")
+		return
+	}
+	if strings.Contains(err.Error(), "missing keys") {
+		t.Fatalf("error = %v, want the parse failure and not the missing-key report", err)
+		return
+	}
+	if !strings.Contains(err.Error(), "BAD") {
+		t.Fatalf("error = %v, want it to name BAD", err)
+	}
+}
+
+func TestFileSourceRejectsNullDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "null.json")
+	if err := os.WriteFile(path, []byte(`null`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+		return
+	}
+	_, err := config.File(path)
+	if err == nil || !strings.Contains(err.Error(), "document is not a JSON object") {
+		t.Fatalf("File(null) error = %v, want document is not a JSON object", err)
+	}
+}
+
+func TestRemoteSourceRejectsNullDocument(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeBody(w, `null`)
+	}))
+	defer srv.Close()
+	_, err := config.Remote(t.Context(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "document is not a JSON object") {
+		t.Fatalf("Remote(null) error = %v, want document is not a JSON object", err)
+	}
+}

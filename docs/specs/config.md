@@ -96,12 +96,14 @@ func Fill[S any](ld *Loader, dst *S, prefix string)
 - `TestLoadNestedStructKeys`, `TestLoadEnvTagReplacesPath` and `TestSnakeKeysFromCamelFieldNames` prove the key rules.
 - `TestLoadEveryTypeParses` proves each accepted field type.
 - `TestLoadMalformedValueNamesTheKey` and `TestLoadReportsEveryParseFailure` prove the parse failure report.
+- `TestLoaderErrPrefersParseOverMissing` proves that parse failures replace the report of missing keys.
 - `TestLoadUnsupportedFieldTypesAreRunTimeErrors` and `TestLoadRequiresAStruct` prove the two type errors.
 - `TestFillKeepsFieldDefaultsThatNoSourceSets` proves that `Fill` keeps a value that no source sets.
 - `TestFileSourceReadsOneJSONObject`, `TestFileSourceRejectsBadDocuments`, `TestFileSourceRejectsArrayValue` and `TestFileSourceScalarsAndSkipsNulls` prove the file rules.
 - `TestFileSourceKeepsJSONNumbersExact` and `TestFileSourceExponentFormForIntMatchesEnv` prove that a number keeps its text.
 - `TestFileSourceRefusesKeysThatCollide` proves the duplicate key error for three forms of collision.
 - `TestRemoteSourceReadsOneJSONObject`, `TestRemoteSourceNestedObjectsFlatten`, `TestRemoteSourceRejectsNonObject` and `TestRemoteSourceRejectsArrayValue` prove the remote document rules.
+- `TestFileSourceRejectsNullDocument` and `TestRemoteSourceRejectsNullDocument` prove that a `null` document is refused.
 - `TestRemoteSourceRejectsNon200` and `TestRemoteSourceRejectsOversizeBody` prove the status rule and the size limit.
 - `TestRemoteSourceHonorsContextTimeout` and `TestRemoteSourceHonorsContextCancel` prove that the context bounds the request.
 - `TestProfileDefaultsToDev` and `TestProfileReadsEnvironment` prove `Profile`.
