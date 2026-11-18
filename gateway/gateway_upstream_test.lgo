@@ -3,6 +3,7 @@ package gateway_test
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -382,5 +383,68 @@ func TestClientCancelReachesUpstream(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the client call never returned")
+	}
+}
+
+func TestTimeoutCauseNamesTheHeaderWait(t *testing.T) {
+	block := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer guardClose(block)
+	t.Cleanup(up.Close)
+	logs := &mutexBuffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: 40 * time.Millisecond})
+	bounded := &http.Client{Timeout: 2 * time.Second}
+	resp, err := bounded.Get(gw.URL + "/shop/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantProblem(t, resp, "an upstream that misses the header timeout")
+	close(block)
+	if line := logs.String(); !strings.Contains(line, "gateway: upstream headers exceeded") {
+		t.Fatalf("log %q does not name the header wait as the failure cause", line)
+	}
+}
+
+func slowTailUpstream(t *testing.T, gap time.Duration) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "8")
+		if _, err := w.Write([]byte("head")); err != nil {
+			t.Errorf("upstream write head: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-time.After(gap):
+		case <-r.Context().Done():
+			return
+		}
+		if _, err := w.Write([]byte("tail")); err != nil {
+			t.Errorf("upstream write tail: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestBodyOutlivesTheHeaderTimeout(t *testing.T) {
+	up := slowTailUpstream(t, 400*time.Millisecond)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: 100 * time.Millisecond})
+	resp, err := http.Get(gw.URL + "/shop/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200", resp.StatusCode)
+	}
+	data := readBody(t, resp)
+	if data != "headtail" {
+		t.Fatalf("body=%q want headtail: the header timeout must not end the body read", data)
 	}
 }

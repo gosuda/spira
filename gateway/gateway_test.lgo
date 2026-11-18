@@ -1,11 +1,13 @@
 package gateway_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -365,6 +367,23 @@ func TestMountPanicsOnBadRoutes(t *testing.T) {
 			gateway.Mount(web.NewRouter(), []gateway.Route{tc.route}, plainPolicy())
 		})
 	}
+}
+
+type mutexBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *mutexBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *mutexBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestStrippedTailStaysAnAbsolutePath(t *testing.T) {

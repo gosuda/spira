@@ -108,6 +108,8 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestClientCancelReachesUpstream` proves that a client cancel ends the upstream request.
 - `TestSlashEndingPrefixServesSubpathsWithoutARedirect` proves that a prefix ending in a slash serves subpaths without a redirect.
 - `TestStrippedTailStaysAnAbsolutePath` proves that a stripped tail stays an absolute path for the root prefix and for a prefix that ends in a slash.
+- `TestTimeoutCauseNamesTheHeaderWait` proves that a missed header wait is reported as `gateway: upstream headers exceeded`.
+- `TestBodyOutlivesTheHeaderTimeout` proves that the header timeout does not end the body read.
 
 ## Not in scope
 

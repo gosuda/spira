@@ -184,21 +184,23 @@ func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, err
 	outctx, cancel := context.WithCancel(req.Context())
 	timer := time.AfterFunc(rl.timeout, cancel)
 	resp, err := http.DefaultTransport.RoundTrip(rl.outbound(req, base, outctx))
+	missed := !timer.Stop() && req.Context().Err() == nil
 	if err != nil {
-		timer.Stop()
 		cancel()
-		return resp, err
+		if missed {
+			return nil, fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout)
+		}
+		return nil, err
 	}
-	if upstreamFailed(resp.StatusCode) {
-		timer.Stop()
-		cancel()
-		resp.Body.Close()?
-		return nil, fmt.Errorf("gateway: upstream answered %d", resp.StatusCode)
-	}
-	if !timer.Stop() && outctx.Err() != nil {
+	if missed {
 		cancel()
 		resp.Body.Close()?
 		return nil, fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout)
+	}
+	if upstreamFailed(resp.StatusCode) {
+		cancel()
+		resp.Body.Close()?
+		return nil, fmt.Errorf("gateway: upstream answered %d", resp.StatusCode)
 	}
 	resp.Body = &releasingBody{inner: resp.Body, cancel: cancel}
 	return resp, nil
