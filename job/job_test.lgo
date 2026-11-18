@@ -593,6 +593,37 @@ func TestChunkStopsBeforeNextItemAfterContextEnds(t *testing.T) {
 	}
 }
 
+func TestChunkReportsAContextThatEndsWhileReadWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := job.Chunk[int, int]{
+		Read: func(ctx context.Context, yield func(int, error) bool) {
+			if !yield(1, nil) || !yield(2, nil) {
+				return
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+		},
+		Process: func(in int) (int, error) { return in, nil },
+		Write: func(ctx context.Context, items const []int) error {
+			cancel()
+			return nil
+		},
+		Size: 2,
+	}
+	_, err := c.Run(ctx)
+	failed := &job.ChunkError{}
+	if !errors.As(err, &failed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want a ChunkError that wraps context canceled", err)
+		return
+	}
+	if failed.Stats != (job.Stats{Items: 2, Chunks: 1}) {
+		t.Fatalf("ChunkError.Stats = %+v, want the one accepted batch of 2 items", failed.Stats)
+	}
+}
+
 func TestQueueStopRacingStartLeavesNoLiveRun(t *testing.T) {
 	race := func(i int) error {
 		q := job.NewQueue[int](8, 4, func(ctx context.Context, v int) error { return nil })

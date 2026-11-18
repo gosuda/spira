@@ -60,10 +60,8 @@ func (c Chunk[In, Out]) Run(ctx context.Context) (Stats, error) {
 		}
 		batch = batch[:0]
 	}
-	if len(batch) > 0 {
-		if err := c.writeBatch(ctx, batch, &stats); err != nil {
-			return Stats{}, &ChunkError{Stats: stats, Err: err}
-		}
+	if err := c.writeBatch(ctx, batch, &stats); err != nil {
+		return Stats{}, &ChunkError{Stats: stats, Err: err}
 	}
 	return stats, nil
 }
@@ -71,6 +69,9 @@ func (c Chunk[In, Out]) Run(ctx context.Context) (Stats, error) {
 func (c Chunk[In, Out]) writeBatch(ctx context.Context, batch []Out, stats *Stats) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if len(batch) == 0 {
+		return nil
 	}
 	if err := c.Write(ctx, batch); err != nil {
 		return err

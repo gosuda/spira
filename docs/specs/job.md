@@ -105,6 +105,7 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - A write error MUST stop the run.
 - A write error MUST NOT cause another `Write` call.
 - When `ctx` has ended, `Run` MUST NOT call `Write`.
+- When `ctx` has ended after `Read` returns, `Run` MUST return the context error, also with no open batch.
 - On a read, process or write error, the `Stats` result MUST be the zero value.
 - On an ended context before `Write`, the `Stats` result MUST be the zero value.
 - On each of those failures, the error MUST be a `*ChunkError`.
@@ -144,6 +145,7 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `TestChunkReadError` proves that a read error is a `*ChunkError` with zero stats before any write.
 - `TestChunkPassesItsContextToRead` proves that `Read` sees the end of the context of `Run`.
 - `TestChunkStopsBeforeNextItemAfterContextEnds` proves the stop before the next item.
+- `TestChunkReportsAContextThatEndsWhileReadWaits` proves the error when the context ends between batches.
 - `TestQueueStopRacingStartLeavesNoLiveRun` proves that a `Start`/`Stop` race leaves no live queue.
 - `TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick` proves that a cancelled runner does not skip the next tick after a restart.
 
