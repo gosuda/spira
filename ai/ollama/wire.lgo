@@ -40,7 +40,7 @@ type chatRequest struct {
 	Model    string         `json:"model"`
 	Messages []wireMessage  `json:"messages"`
 	Stream   bool           `json:"stream"`
-	Format   jsontext.Value `json:"format,omitempty"`
+	Format   jsontext.Value `json:"format,omitzero"`
 	Tools    []wireTool     `json:"tools,omitempty"`
 	Options  map[string]any `json:"options,omitempty"`
 }

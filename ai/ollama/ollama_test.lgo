@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"iter"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"logos/sync"
 
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/ai/ollama"
@@ -33,6 +36,9 @@ const ndjsonCutStream = `{"model":"mistral","created_at":"2026-01-01T00:00:00Z",
 {"model":"mistral","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"lo"},"done":false}
 `
 
+const ndjsonOneLine = `{"model":"llama3.2","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"Hel"},"done":false}
+`
+
 func testClient(srv *httptest.Server) *ollama.Client {
 	return &ollama.Client{
 		BaseURL: srv.URL,
@@ -44,7 +50,7 @@ func testClient(srv *httptest.Server) *ollama.Client {
 
 func serveBody(t *testing.T, status int, contentType string, body string) http.HandlerFunc {
 	t.Helper()
-	return func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", contentType)
 		if status != http.StatusOK {
 			w.WriteHeader(status)
@@ -52,7 +58,62 @@ func serveBody(t *testing.T, status int, contentType string, body string) http.H
 		if _, err := io.WriteString(w, body); err != nil {
 			t.Errorf("server write: %v", err)
 		}
-	}
+	})
+}
+
+type request struct {
+	body string
+	path string
+}
+
+type requests struct {
+	seen []request
+}
+
+func (s *requests) at(i int) request {
+	return s.seen[i]
+}
+
+type recorder struct {
+	state sync.Locked[requests]
+}
+
+func (r *recorder) add(req *http.Request, body string) {
+	r.state.WithLock(func(s *requests) {
+		s.seen = append(s.seen, request{body: body, path: req.URL.Path})
+	})
+}
+
+func (r *recorder) count() int {
+	n := 0
+	r.state.WithLock(func(s *requests) { n = len(s.seen) })
+	return n
+}
+
+func (r *recorder) body(i int) string {
+	var got request
+	r.state.WithLock(func(s *requests) { got = s.at(i) })
+	return got.body
+}
+
+func (r *recorder) path(i int) string {
+	var got request
+	r.state.WithLock(func(s *requests) { got = s.at(i) })
+	return got.path
+}
+
+func (rec *recorder) serve(t *testing.T, status int, contentType string, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		serveBody(t, status, contentType, body)(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func canonical(t *testing.T, raw []byte) string {
@@ -93,24 +154,17 @@ func wantChatBody(t *testing.T) string {
 }
 
 func TestChatRequestBodyMatchesReferenceShape(t *testing.T) {
-	var got []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/chat" {
-			t.Errorf("path = %q, want /api/chat", r.URL.Path)
-		}
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("server read body: %v", err)
-		}
-		got = data
-		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)(w, r)
-	}))
-	defer srv.Close()
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)
 	c := testClient(srv)
 	if _, err := c.Chat(context.Background(), sampleRequest()); err != nil {
 		t.Fatalf("Chat: %v", err)
+		return
 	}
-	gotJSON, wantJSON := canonical(t, got), wantChatBody(t)
+	if path := rec.path(0); path != "/api/chat" {
+		t.Fatalf("path = %q, want /api/chat", path)
+	}
+	gotJSON, wantJSON := canonical(t, []byte(rec.body(0))), wantChatBody(t)
 	if gotJSON != wantJSON {
 		t.Fatalf("request body = %s\nwant           = %s", gotJSON, wantJSON)
 	}
@@ -177,64 +231,111 @@ func TestStreamCutBeforeDoneYieldsErrorAndNoReply(t *testing.T) {
 	}
 }
 
-func TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen(t *testing.T) {
+func TestStreamCallerCancelYieldsPrefixedCancelError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonToolStream)(w, r)
+		serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonOneLine)(w, r)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	next, stop := iter.Pull2(testClient(srv).Stream(ctx, ai.Request{Model: "llama3.2"}))
+	defer stop()
+	if _, err, ok := next(); !ok || err != nil {
+		t.Fatalf("first chunk err = %v, want the data chunk", err)
+		return
+	}
+	cancel()
+	_, err, ok := next()
+	if !ok {
+		t.Fatal("expected the cancel chunk after cancel")
+	}
+	if err == nil {
+		t.Fatal("expected the cancel error after cancel")
+	}
+	if !strings.Contains(err.Error(), "ai/ollama:") {
+		t.Fatalf("cancel error = %v, want the package prefix", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel error = %v, want context.Canceled", err)
+	}
+	if _, err, ok := next(); ok {
+		t.Fatalf("pull after the cancel error = %v, want the end of the stream", err)
+	}
+}
+
+func TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen(t *testing.T) {
+	var held atomic.Int64
+	handlerDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonToolStream)(w, r)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		idle := time.Now()
+		<-r.Context().Done()
+		held.Store(int64(time.Since(idle)))
+	}))
+	defer srv.Close()
 	c := testClient(srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	start := time.Now()
 	reply := collectReply(t, c.Stream(ctx, ai.Request{Model: "llama3.2"}))
 	if reply.Finish != ai.FinishToolCall {
 		t.Fatalf("finish = %q, want tool_call", reply.Finish)
+		return
 	}
-	if waited := time.Since(start); waited > time.Second {
-		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	<-handlerDone
+	if h := time.Duration(held.Load()); h > time.Second {
+		t.Fatalf("the server waited %v for the body to close after the flush: the stream waited for the body to close", h)
 	}
 }
 
 func TestFormatGoesOutAsJSONModeOrAsASchemaObject(t *testing.T) {
-	var calls atomic.Int64
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)
+	c := testClient(srv)
 	var got struct {
 		Format jsontext.Value `json:"format"`
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("server read body: %v", err)
+	formatOf := func(t *testing.T, i int) jsontext.Value {
+		t.Helper()
+		got.Format = nil
+		if err := json.Unmarshal([]byte(rec.body(i)), &got); err != nil {
+			t.Fatalf("request body %s: %v", rec.body(i), err)
+			return nil
 		}
-		if err := json.Unmarshal(data, &got); err != nil {
-			t.Errorf("request body %s: %v", data, err)
-		}
-		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)(w, r)
-	}))
-	defer srv.Close()
-	c := testClient(srv)
+		return got.Format
+	}
 	mode := "json"
 	chatReply(t, c, ai.Request{Model: "llama3.2", Format: mode})
-	if string(got.Format) != `"json"` {
-		t.Fatalf("format = %s, want the JSON string json", got.Format)
+	if format := formatOf(t, 0); string(format) != `"json"` {
+		t.Fatalf("format = %s, want the JSON string json", format)
 	}
 	schema := `{"type":"object","required":["city"]}`
 	chatReply(t, c, ai.Request{Model: "llama3.2", Format: schema})
-	if canonical(t, got.Format) != canonical(t, []byte(schema)) {
-		t.Fatalf("format = %s, want the schema as a JSON object", got.Format)
+	if format := formatOf(t, 1); canonical(t, format) != canonical(t, []byte(schema)) {
+		t.Fatalf("format = %s, want the schema as a JSON object", format)
 	}
-	sent := calls.Load()
+	chatReply(t, c, ai.Request{Model: "llama3.2", Format: "{}"})
+	if format := formatOf(t, 2); string(format) != "{}" {
+		t.Fatalf("format = %s, want the explicit empty object", format)
+	}
+	chatReply(t, c, ai.Request{Model: "llama3.2"})
+	if body := rec.body(3); strings.Contains(body, `"format"`) {
+		t.Fatalf("request body %s contains a format member, want it absent", body)
+	}
+	sent := rec.count()
 	for _, bad := range []string{`"type"`, `{"type":`, `[1]`} {
 		if _, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2", Format: bad}); err == nil || !strings.Contains(err.Error(), "ai/ollama: format is not json") {
 			t.Fatalf("Chat with format %s: err = %v, want the format error", bad, err)
 		}
 	}
-	if calls.Load() != sent {
-		t.Fatalf("a bad format reached the server %d times", calls.Load()-sent)
+	if n := rec.count(); n != sent {
+		t.Fatalf("a bad format reached the server %d times", n-sent)
 	}
 }
 
@@ -315,23 +416,18 @@ func TestEmbedReturnsEmbeddingsInInputOrder(t *testing.T) {
 		Input    []string `json:"input"`
 		Truncate bool     `json:"truncate"`
 	}
-	var got embedRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/embed" {
-			t.Errorf("path = %q, want /api/embed", r.URL.Path)
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("server read body: %v", err)
-		}
-		if err := json.Unmarshal(body, &got); err != nil {
-			t.Errorf("embed request body: %v", err)
-		}
-		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","embeddings":[[1,2,3],[4,5,6]]}`)(w, r)
-	}))
-	defer srv.Close()
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", `{"model":"llama3.2","embeddings":[[1,2,3],[4,5,6]]}`)
 	c := testClient(srv)
 	embeddings := embedAll(t, c, []string{"first", "second"})
+	if path := rec.path(0); path != "/api/embed" {
+		t.Fatalf("path = %q, want /api/embed", path)
+	}
+	var got embedRequest
+	if err := json.Unmarshal([]byte(rec.body(0)), &got); err != nil {
+		t.Fatalf("embed request body: %v", err)
+		return
+	}
 	if len(got.Input) != 2 || got.Input[0] != "first" || got.Input[1] != "second" {
 		t.Fatalf("input = %v, want [first second]", got.Input)
 	}
@@ -408,6 +504,118 @@ func TestEmbedBodyOverItsLimitIsFinal(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("server saw %d calls, want 1: the same body would come again", calls.Load())
+	}
+}
+
+type failingAnswer struct {
+	status      int
+	contentType string
+	payload     string
+	cutConn     bool
+}
+
+func failingStatusServer(t *testing.T, rec *recorder, answer failingAnswer) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", answer.contentType)
+		w.WriteHeader(answer.status)
+		if _, werr := io.WriteString(w, answer.payload); werr != nil {
+			t.Logf("server write ended: %v", werr)
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if answer.cutConn {
+			cutBody(w, r, t)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func cutBody(w http.ResponseWriter, r *http.Request, t *testing.T) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		<-r.Context().Done()
+		return
+	}
+	conn, _, herr := hj.Hijack()
+	if herr != nil {
+		t.Logf("hijack: %v", herr)
+		<-r.Context().Done()
+		return
+	}
+	if cerr := conn.Close(); cerr != nil {
+		t.Errorf("close the cut connection: %v", cerr)
+	}
+}
+
+func TestEmbedRejectsAStalledErrorBodyAfterOneRequest(t *testing.T) {
+	rec := &recorder{}
+	srv := failingStatusServer(t, rec, failingAnswer{status: http.StatusBadRequest, contentType: "application/json", payload: strings.Repeat("x", 1<<20)})
+	c := testClient(srv)
+	c.Policy.Timeout = 10 * time.Second
+	_, err := c.Embed(context.Background(), []string{"one"})
+	if err == nil || !strings.Contains(err.Error(), "ai/ollama: 400:") {
+		t.Fatalf("err = %v, want the 400 rejection", err)
+		return
+	}
+	if n := rec.count(); n != 1 {
+		t.Fatalf("server saw %d calls, want 1: a rejection is final", n)
+	}
+}
+
+func TestEmbedKeepsTheStatusOfAFailingAnswerWhoseBodyIsCut(t *testing.T) {
+	rec := &recorder{}
+	srv := failingStatusServer(t, rec, failingAnswer{status: http.StatusBadRequest, contentType: "application/json", payload: strings.Repeat("x", 100), cutConn: true})
+	c := testClient(srv)
+	c.Policy.Timeout = 10 * time.Second
+	start := time.Now()
+	_, err := c.Embed(context.Background(), []string{"one"})
+	if err == nil || !strings.Contains(err.Error(), "ai/ollama: 400:") {
+		t.Fatalf("err = %v, want the 400 rejection", err)
+		return
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("err = %v, want the status with the read cause", err)
+		return
+	}
+	if n := rec.count(); n != 1 {
+		t.Fatalf("server saw %d calls, want 1: a rejection is final", n)
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("Embed returned after %v: a cut error body waited out the retry schedule", waited)
+	}
+}
+
+func TestStreamKeepsTheStatusOfAFailingAnswerWhoseBodyIsCut(t *testing.T) {
+	rec := &recorder{}
+	srv := failingStatusServer(t, rec, failingAnswer{status: http.StatusBadRequest, contentType: "application/x-ndjson", payload: strings.Repeat("x", 100), cutConn: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	chunks := collectAll(testClient(srv).Stream(ctx, ai.Request{Model: "llama3.2"}))
+	if len(chunks) == 0 {
+		t.Fatal("no chunks")
+	}
+	last := chunks[len(chunks)-1]
+	if last.err == nil || !strings.Contains(last.err.Error(), "ai/ollama: 400:") {
+		t.Fatalf("last error = %v, want the 400 rejection", last.err)
+		return
+	}
+	if !strings.Contains(last.err.Error(), "body read ended early") {
+		t.Fatalf("last error = %v, want the status with the read cause", last.err)
+		return
+	}
+	if n := rec.count(); n != 1 {
+		t.Fatalf("server saw %d calls, want 1", n)
 	}
 }
 

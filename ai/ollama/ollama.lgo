@@ -74,22 +74,11 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		yield ai.Chunk{}, err
 		return
 	}
+	defer closeBody(body)
 	if status < 200 || status > 299 {
-		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
-		if rerr != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/ollama: read response: %w", rerr)
-			closeBody(body)
-			return
-		}
-		yield ai.Chunk{}, statusError(status, data)
-		closeBody(body)
+		yield ai.Chunk{}, failure(status, body)
 		return
 	}
-	defer func() {
-		if cerr := body.Close(); cerr != nil {
-			return
-		}
-	}()
 	for chunk, err := range streamLines(ctx, body) {
 		yield chunk, err
 	}
@@ -158,12 +147,12 @@ func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 		return zero, err
 	}
 	defer body.Close()?
+	if status < 200 || status > 299 {
+		return zero, failure(status, body)
+	}
 	data, err := io.ReadAll(io.LimitReader(body, x.limit+1))
 	if err != nil {
 		return zero, fmt.Errorf("ai/ollama: read response: %w", err)
-	}
-	if status < 200 || status > 299 {
-		return zero, statusError(status, data[:min(len(data), replyLimit)])
 	}
 	if int64(len(data)) > x.limit {
 		return zero, fmt.Errorf("%w of %d bytes", errOversize, x.limit)
@@ -173,6 +162,14 @@ func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 		return zero, fmt.Errorf("ai/ollama: decode response: %w", err)
 	}
 	return out, nil
+}
+
+func failure(status int, body io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(body, replyLimit))
+	if err != nil {
+		return fmt.Errorf("%w: body read ended early: %w", statusError(status, data), err)
+	}
+	return statusError(status, data)
 }
 
 func (c *Client) do(ctx context.Context, path string, payload []byte) (int, io.ReadCloser, error) {
@@ -215,12 +212,12 @@ func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error]
 		if done {
 			return
 		}
-		if err != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/ollama: stream ended before done")
+		if ctx.Err() != nil {
+			yield ai.Chunk{}, fmt.Errorf("ai/ollama: /api/chat: %w", ctx.Err())
 			return
 		}
-		if ctx.Err() != nil {
-			yield ai.Chunk{}, ctx.Err()
+		if err != nil {
+			yield ai.Chunk{}, fmt.Errorf("ai/ollama: stream ended before done")
 			return
 		}
 	}
