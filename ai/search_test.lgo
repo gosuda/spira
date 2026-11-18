@@ -168,7 +168,7 @@ func TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage(t *t
 	history := append(question(),
 		ai.Message{Role: ai.RoleTool, Parts: []ai.Part{
 			ai.ToolResult{ID: "s0", Name: ai.SearchToolName, Content: "not json"},
-			ai.ToolResult{ID: "s1", Name: "SEARCH_TOOLS", Content: `["weather","ghost"]`},
+			ai.ToolResult{ID: "s1", Name: ai.SearchToolName, Content: `["weather","ghost"]`},
 			ai.ToolResult{ID: "x1", Name: "other", Content: `["stocks"]`},
 		}},
 		ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "and now?"}}},
@@ -207,5 +207,36 @@ func TestSearchToolsNamesOnlyToolsTheRequestCarries(t *testing.T) {
 	}
 	if result != "[]" {
 		t.Fatalf("search result = %q, want an empty list: the request does not carry stocks", result)
+	}
+}
+
+func TestSearchToolsReadsOnlyTheResultsOfItsExactName(t *testing.T) {
+	managed := []ai.Tool{described("weather", "Returns current weather conditions")}
+	search, narrow := ai.SearchTools(managed)
+	inventory := described("Search_Tools", "Lists the tools in the shed")
+	cases := []struct {
+		content string
+		tools   []string
+	}{
+		{`["hammer","saw"]`, []string{ai.SearchToolName, "Search_Tools"}},
+		{`["weather"]`, []string{ai.SearchToolName, "Search_Tools"}},
+	}
+	for _, c := range cases {
+		history := append(question(),
+			ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{ai.ToolCall{ID: "i1", Name: "Search_Tools", Arguments: "{}"}}},
+			ai.Message{Role: ai.RoleTool, Parts: []ai.Part{ai.ToolResult{ID: "i1", Name: "Search_Tools", Content: c.content}}})
+		model := &scripted{replies: []ai.Reply{saying("ok")}}
+		request := ai.Request{Messages: history, Tools: []ai.Tool{managed[0], search, inventory}}
+		if _, err := ai.Run(t.Context(), ai.Wrap(model, narrow), request, ai.Limits{}); err != nil {
+			t.Fatalf("Run: %v", err)
+			return
+		}
+		seen := model.seen[0]
+		requireStrings(t, "result of the tool Search_Tools", resultsOf(seen.Messages[len(seen.Messages)-1]), "i1="+c.content)
+		var names []string
+		for _, tool := range seen.Tools {
+			names = append(names, tool.Name)
+		}
+		requireStrings(t, "tools the model sees after "+c.content, names, c.tools...)
 	}
 }

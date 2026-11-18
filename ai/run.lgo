@@ -175,13 +175,13 @@ func (b *batch) unanswered(keys []string, from int, text string) {
 		if deny := b.denial(keys[i]); deny != nil {
 			content = deny
 		}
-		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: content})
+		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: content, Skipped: true})
 	}
 }
 
 func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 	if deny := b.denial(key); deny != nil {
-		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: deny})
+		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: deny, Skipped: true})
 		b.denied = true
 		return nil
 	}
@@ -189,7 +189,7 @@ func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 	count := (b.counts[call.Name] ?? 0) + 1
 	b.counts[call.Name] = count
 	if breach := b.limits.breach(call.Name, count, b.total); breach != nil {
-		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: breach.text()})
+		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: breach.text(), Skipped: true})
 		return breach
 	}
 	tool := toolNamed(b.tools, call.Name)
@@ -249,7 +249,7 @@ func priorCalls(history []Message) (map[string]int, int) {
 	total := 0
 	for _, message := range history[start:] {
 		for _, part := range message.Parts {
-			if result, isResult := part.(ToolResult); isResult {
+			if result, isResult := part.(ToolResult); isResult && !result.Skipped {
 				counts[result.Name] = (counts[result.Name] ?? 0) + 1
 				total++
 			}

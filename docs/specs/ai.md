@@ -36,6 +36,7 @@ type ToolResult struct {
 	ID      string
 	Name    string
 	Content string
+	Skipped bool
 }
 
 type Message struct {
@@ -201,6 +202,8 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `Run` MUST return the context error when the context ends during a tool call.
 - `Run` MUST wrap a model error as `ai: run: %w`.
 - `Run` MUST count only the tool results after the last user message.
+- `Run` MUST set `Skipped` on the result of a call that a denial or a limit kept from running.
+- `Run` MUST NOT count a `Skipped` result toward a limit.
 - `Run` MUST check the per-tool limit before the per-turn limit.
 - A limit breach MUST include the results already gathered in `Messages`.
 - `Run` MUST return a `LimitError` when a limit breaches.
@@ -235,6 +238,7 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `SearchTools` MUST return the search tool and the layer.
 - The caller MUST put the search tool and the tools in `Request.Tools`.
 - `SearchTools` MUST name the tool `search_tools`.
+- The narrowing layer MUST read only the results whose tool name equals `search_tools` exactly.
 - The search tool MUST search the tool names and descriptions.
 - The search tool MUST match without case.
 - The search tool MUST treat query punctuation as separators.
@@ -318,6 +322,8 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `TestRunCarriesTheAccumulatedUsageIntoTheResumedReply` proves usage across a confirmation.
 - `TestRunResolvesEveryToolBeforeAnyCallRuns` proves pre-resolution.
 - `TestRunAnswersEveryCallWhenALimitStopsTheBatch` and `TestRunAnswersEveryCallWhenATurnLimitStopsTheBatch` prove answered calls on a limit.
+- `TestRunChargesNoLimitForACallThatDidNotRun` proves that a skipped call uses no limit when the turn continues.
+- `TestSearchToolsReadsOnlyTheResultsOfItsExactName` proves that a tool named `Search_Tools` keeps its output.
 - `TestWrapRunsLayersInListOrderOncePerRoundOfTheLoop` proves layer order and rounds.
 - The `RegexToolIndexTests` cases prove the search index.
 - `TestSearchToolsMatchesByToolName` proves name match.

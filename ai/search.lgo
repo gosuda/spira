@@ -197,7 +197,7 @@ func carriedResults(messages []Message, carried map[string]bool) []Message {
 
 func carriedResult(part Part, carried map[string]bool) Part {
 	result, isResult := part.(ToolResult)
-	if !isResult || !strings.EqualFold(result.Name, SearchToolName) {
+	if !isResult || result.Name != SearchToolName {
 		return part
 	}
 	var names []string
@@ -218,7 +218,7 @@ func foundTools(messages []Message) map[string]bool {
 	for _, message := range messages {
 		for _, part := range message.Parts {
 			result, isResult := part.(ToolResult)
-			if !isResult || !strings.EqualFold(result.Name, SearchToolName) {
+			if !isResult || result.Name != SearchToolName {
 				continue
 			}
 			var names []string

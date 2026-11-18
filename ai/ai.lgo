@@ -35,6 +35,7 @@ type ToolResult struct {
 	ID      string
 	Name    string
 	Content string
+	Skipped bool
 }
 
 type Message struct {

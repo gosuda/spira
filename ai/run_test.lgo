@@ -560,3 +560,24 @@ func TestRunAnswersEveryCallWhenATurnLimitStopsTheBatch(t *testing.T) {
 	want := "Total tool call limit (1) exceeded for this turn. No further tool calls are allowed."
 	requireStrings(t, "results in the breach", resultsOf(last), "a=sunny", "b="+want, "c="+want)
 }
+
+func TestRunChargesNoLimitForACallThatDidNotRun(t *testing.T) {
+	log := &toolLog{}
+	tools := []ai.Tool{log.tool("weather", "sunny"), log.tool("ticket", "VX205-14C")}
+	model := &scripted{replies: []ai.Reply{asking(call("a", "weather"), call("b", "weather"), call("c", "ticket"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: tools}, ai.Limits{PerTool: 1})
+	breach := &ai.LimitError{}
+	if !errors.As(err, &breach) {
+		t.Fatalf("Run error = %v, want a LimitError", err)
+		return
+	}
+	requireStrings(t, "tools that ran before the limit", log.ran, "weather")
+	resumed := &scripted{replies: []ai.Reply{asking(call("d", "ticket")), saying("Booked.")}}
+
+	_, err = ai.Run(t.Context(), resumed, ai.Request{Messages: breach.Messages, Tools: tools}, ai.Limits{PerTool: 1})
+
+	if err != nil {
+		t.Fatalf("the first run of ticket in the turn: %v", err)
+	}
+	requireStrings(t, "tools that ran in the turn", log.ran, "weather", "ticket")
+}
