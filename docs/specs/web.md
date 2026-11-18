@@ -241,6 +241,10 @@ func (s *Server) Stop(ctx context.Context) error
 - `Stop` MUST wait for an in-flight request until `ShutdownGrace` ends.
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
 - `Stop` MUST close open connections when shutdown times out.
+- `Stop` MUST close each connection that a handler took over through `Hijack`.
+- `Stop` MUST close those connections after `Shutdown` returns, also when shutdown times out.
+- After that, a `Hijack` MUST fail and MUST close its connection.
+- When a handler closes its upgraded connection, the server MUST forget that connection.
 - `Stop` of a server that is not started MUST return a nil error.
 
 ## Errors
@@ -258,6 +262,8 @@ func (s *Server) Stop(ctx context.Context) error
 - `web: listen <addr>: <cause>` when the listen fails.
 - `web: serve: <cause>` when `Serve` fails with an error other than `http.ErrServerClosed`.
 - `web: shutdown: <cause>` when `Shutdown` fails. `Stop` then closes the listener and joins that error.
+- `web: server is stopping` when a handler calls `Hijack` after `Stop` closed the upgraded connections.
+- `web: close upgraded connection: <cause>` when `Stop` cannot close an upgraded connection.
 - `ProblemError.Error` returns `web: ` plus `Problem.Title`.
 - A dropped second reply is logged as `web: reply dropped, the response is already written`.
 - An encode or write failure of a reply is logged once as `web: reply write failed`, and the client gets the internal problem.
@@ -297,6 +303,9 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestServerStopReturnsWithinGraceWhenHandlerNeverReturns` proves the grace deadline.
 - `TestServerStopReturnsByTheCallerDeadline` proves the caller deadline.
 - `TestServerStopClosesOpenConnectionsWhenShutdownTimesOut` proves that a timed-out shutdown closes the request.
+- `TestServerStopClosesAnUpgradedConnection` proves that `Stop` closes a connection that a handler took over.
+- `TestServerStopClosesAnUpgradedConnectionAfterTheGrace` proves the same after a shutdown timeout, and the `Hijack` error after `Stop`.
+- `TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses` proves that a connection closed by its handler leaves the set.
 
 ## Not in scope
 

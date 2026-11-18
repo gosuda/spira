@@ -1,8 +1,11 @@
 package web_test
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -426,5 +429,171 @@ func TestServerStopClosesOpenConnectionsWhenShutdownTimesOut(t *testing.T) {
 	p.closed.WithLock(func(b *bool) { closed = *b })
 	if !closed {
 		t.Fatal("the request context of an open stream did not end within 3s after Stop timed out")
+	}
+}
+
+func holdUpgraded(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			http.Error(w, "hijack unavailable: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+				t.Errorf("upgraded close: %v", cerr)
+			}
+		}()
+		if _, err := buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n\r\n"); err != nil {
+			return
+		}
+		if err := buf.Flush(); err != nil {
+			return
+		}
+		if _, err := io.Copy(io.Discard, conn); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("upgraded read: %v", err)
+		}
+	})
+}
+
+func dialUpgraded(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("client close: %v", cerr)
+		}
+	})
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: %s\r\n\r\n", addr); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+	}
+	if got := strings.TrimSpace(line); got != "HTTP/1.1 101 Switching Protocols" {
+		t.Fatalf("status line %q want the raw 101 upgrade", got)
+	}
+	return conn, reader
+}
+
+func wantClosedByServer(t *testing.T, conn net.Conn, reader *bufio.Reader) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("read deadline: %v", err)
+	}
+	if _, err := io.ReadAll(reader); err != nil {
+		t.Fatalf("the upgraded connection is still open after Stop: %v", err)
+	}
+}
+
+func TestServerStopClosesAnUpgradedConnection(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: holdUpgraded(t)}, nil
+	})
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 2 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	conn, reader := dialUpgraded(t, addr)
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	wantClosedByServer(t, conn, reader)
+}
+
+func TestServerStopClosesAnUpgradedConnectionAfterTheGrace(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	hijacked := make(chan struct{})
+	var late sync.Locked[error]
+	lateUpgrade := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		close(entered)
+		<-release
+		_, _, err := http.NewResponseController(w).Hijack()
+		late.WithLock(func(e *error) { *e = err })
+		close(hijacked)
+	})
+	r := web.NewRouter()
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: holdUpgraded(t)}, nil
+	})
+	r.Handle("GET", "/stuck", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: lateUpgrade}, nil
+	})
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 200 * time.Millisecond}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	conn, reader := dialUpgraded(t, addr)
+	stuck, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial stuck: %v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := stuck.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("stuck close: %v", cerr)
+		}
+	})
+	if _, err := fmt.Fprintf(stuck, "GET /stuck HTTP/1.1\r\nHost: %s\r\n\r\n", addr); err != nil {
+		t.Fatalf("write stuck request: %v", err)
+	}
+	wctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := waitEntered(wctx, entered); err != nil {
+		t.Fatalf("the stuck handler did not start: %v", err)
+	}
+	stopErr := s.Stop(context.Background())
+	close(release)
+	if stopErr == nil || !strings.Contains(stopErr.Error(), "web: shutdown: ") {
+		t.Fatalf("Stop error = %v, want the shutdown timeout", stopErr)
+	}
+	wantClosedByServer(t, conn, reader)
+	if err := waitEntered(wctx, hijacked); err != nil {
+		t.Fatalf("the late Hijack did not return: %v", err)
+	}
+	var lerr error
+	late.WithLock(func(e *error) { lerr = *e })
+	if lerr == nil || !strings.Contains(lerr.Error(), "web: server is stopping") {
+		t.Fatalf("Hijack after Stop = %v, want web: server is stopping", lerr)
+	}
+}
+
+func TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: holdUpgraded(t)}, nil
+	})
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 2 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	conn, _ := dialUpgraded(t, addr)
+	if open := s.UpgradedConnections(); open != 1 {
+		t.Fatalf("the server tracks %d upgraded connections, want 1", open)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.UpgradedConnections() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the server still tracks %d upgraded connections after the handler closed its own", s.UpgradedConnections())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }

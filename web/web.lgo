@@ -1,9 +1,11 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 
@@ -210,7 +212,7 @@ type Context struct {
 }
 
 func newContext(w http.ResponseWriter, req *http.Request, root *Router) *Context {
-	c := &Context{Request: req, writer: newStatusWriter(w), root: root}
+	c := &Context{Request: req, writer: newStatusWriter(w, req), root: root}
 	c.vals.WithLock(func(m *map[any]any) {
 		*m = map[any]any{}
 	})
@@ -251,12 +253,25 @@ type Htmx struct {
 
 type statusWriter struct {
 	inner  http.ResponseWriter
+	req    *http.Request
 	status int
 	wrote  bool
 }
 
-func newStatusWriter(inner http.ResponseWriter) *statusWriter {
-	return &statusWriter{inner: inner, status: http.StatusOK}
+func newStatusWriter(inner http.ResponseWriter, req *http.Request) *statusWriter {
+	return &statusWriter{inner: inner, req: req, status: http.StatusOK}
+}
+
+func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, buf, err := http.NewResponseController(s.inner).Hijack()
+	if err != nil {
+		return conn, buf, err
+	}
+	ups, served := s.req.Context().Value(upgradesKey{}).(*upgrades)
+	if !served {
+		return conn, buf, nil
+	}
+	return ups.adopt(conn, buf)
 }
 
 func (s *statusWriter) Header() http.Header {

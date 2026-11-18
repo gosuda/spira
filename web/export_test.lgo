@@ -1,0 +1,17 @@
+package web
+
+func (s *Server) UpgradedConnections() int {
+	var held *serverRun?
+	s.state.WithLock(func(st *serverState) {
+		held = st.run
+	})
+	run := held
+	if run == nil {
+		return 0
+	}
+	open := 0
+	run.upgrades.state.WithLock(func(u *upgradeState) {
+		open = len(u.open)
+	})
+	return open
+}
