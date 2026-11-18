@@ -67,7 +67,6 @@ func (s HistogramSeries) Observe(v float64)
 - A histogram MUST NOT use the label name `le`.
 - A label name MUST NOT start with two underscores. Prometheus reserves those names.
 - A registry MUST NOT hold two metrics with the same name.
-- A histogram writes samples named `<name>_bucket`, `<name>_sum` and `<name>_count`.
 - A registry MUST NOT hold two metrics that write a sample with the same name.
 
 ### Series
