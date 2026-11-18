@@ -121,7 +121,8 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - An envelope field that is absent on the wire MUST omit through `omitempty` on `jsontext.Value`.
 - Plain and pointer fields MUST omit through `omitzero`.
 - The error member MUST be the nilable pointer `*RPCError?`.
-- The wire types MUST hold no option of a struct value, because static JSON does not decode that form (finding 31).
+- The wire types MUST hold no option of a struct value.
+- Static JSON does not decode an option of a struct value (finding 31).
 - The stdio transport MUST send one JSON-RPC message per line, with no embedded newline.
 - The stdio transport MUST skip messages that are not the response of the request it waits for.
 
