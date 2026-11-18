@@ -366,3 +366,57 @@ func TestMountPanicsOnBadRoutes(t *testing.T) {
 		})
 	}
 }
+
+func TestStrippedTailStaysAnAbsolutePath(t *testing.T) {
+	notes := make(chan upstreamNote, 4)
+	up := echoUpstream(t, notes)
+	gw := serveGateway(t, []gateway.Route{
+		{PathPrefix: "/", StripPrefix: true, To: []string{up.URL}},
+		{PathPrefix: "/shop/", StripPrefix: true, To: []string{up.URL}},
+	}, plainPolicy())
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{path: "/catalog", want: "/catalog"},
+		{path: "/shop/x", want: "/x"},
+	} {
+		resp, err := http.Get(gw.URL + tc.path)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status=%d want 200", tc.path, resp.StatusCode)
+		}
+		readBody(t, resp)
+		if n := awaitNote(t, notes); n.Path != tc.want {
+			t.Fatalf("%s reached the upstream as %q want %q", tc.path, n.Path, tc.want)
+		}
+	}
+}
+
+func TestSlashEndingPrefixServesSubpathsWithoutARedirect(t *testing.T) {
+	notes := make(chan upstreamNote, 4)
+	up := echoUpstream(t, notes)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop/", StripPrefix: true, To: []string{up.URL}}}, plainPolicy())
+	presp, err := http.Post(gw.URL+"/shop/order", "text/plain", strings.NewReader("name=ada"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody(t, presp)
+	if presp.StatusCode != http.StatusOK {
+		t.Fatalf("POST status=%d want 200", presp.StatusCode)
+	}
+	n := awaitNote(t, notes)
+	if n.Method != http.MethodPost || n.Path != "/order" || n.Body != "name=ada" {
+		t.Fatalf("POST reached the upstream as %+v; a redirect would have turned it into a GET", n)
+	}
+	resp, err := http.Get(gw.URL + "/shop/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody(t, resp)
+	if m := awaitNote(t, notes); m.Path != "/x" {
+		t.Fatalf("GET reached the upstream as %q want /x", m.Path)
+	}
+}

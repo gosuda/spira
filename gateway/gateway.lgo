@@ -98,7 +98,11 @@ func routePatterns(host string?, prefix string) []string {
 	if prefix == "/" {
 		return []string{name + "/"}
 	}
-	return []string{name + prefix, name + prefix + "/"}
+	patterns := []string{name + prefix}
+	if !strings.HasSuffix(prefix, "/") {
+		patterns = append(patterns, name+prefix+"/")
+	}
+	return patterns
 }
 
 func proxyHandler(px *httputil.ReverseProxy) web.Handler {
@@ -235,21 +239,18 @@ func (rl *relay) tail(path string) string {
 	if t == "" {
 		return "/"
 	}
+	if !strings.HasPrefix(t, "/") {
+		return "/" + t
+	}
 	return t
 }
 
 func targetPath(base string, tail string) string {
 	if base == "" || base == "/" {
-		if tail == "" {
-			return "/"
-		}
 		return tail
 	}
-	switch {
-	case strings.HasSuffix(base, "/") && strings.HasPrefix(tail, "/"):
+	if strings.HasSuffix(base, "/") {
 		return base + tail[1:]
-	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(tail, "/"):
-		return base + "/" + tail
 	}
 	return base + tail
 }

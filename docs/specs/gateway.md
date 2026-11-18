@@ -22,6 +22,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 
 - `Mount` MUST register each route with an empty method, so one registration accepts every method.
 - A prefix other than `/` MUST be registered as that path and as that path with a trailing slash.
+- When the prefix already ends in a slash, the trailing slash variant MUST be skipped.
 - A prefix of `/` MUST be registered as `/` only.
 - When `Host` is set, the pattern MUST include that host.
 - A request for another host MUST NOT select that route.
@@ -41,6 +42,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - When `StripPrefix` is false, the tail MUST be the request path.
 - When `StripPrefix` is true, the tail MUST be the request path without `PathPrefix`.
 - When that remainder is empty, the tail MUST be `/`.
+- Otherwise the stripped tail MUST start with `/`.
 - When the upstream base path is empty or `/`, the upstream path MUST be the tail.
 - Otherwise the join MUST place one `/` between the base path and the tail.
 - The proxy MUST send the request to the upstream scheme and host.
@@ -104,6 +106,8 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestTimeoutBeforeHeadersCountsAsFailed` proves that the header wait is bounded.
 - `TestFirstChunkStreamsBeforeUpstreamFinishes` proves that the first chunk arrives before the upstream finishes.
 - `TestClientCancelReachesUpstream` proves that a client cancel ends the upstream request.
+- `TestSlashEndingPrefixServesSubpathsWithoutARedirect` proves that a prefix ending in a slash serves subpaths without a redirect.
+- `TestStrippedTailStaysAnAbsolutePath` proves that a stripped tail stays an absolute path for the root prefix and for a prefix that ends in a slash.
 
 ## Not in scope
 
