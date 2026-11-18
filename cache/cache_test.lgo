@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"logos/rt"
+	"math"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -612,3 +614,128 @@ func TestDeleteDuringLoadKeepsTheKeyAbsent(t *testing.T) {
 		t.Fatalf("index and order differ in size after a Delete during a load")
 	}
 }
+
+func TestNaNKeyPutEvictionTerminates(t *testing.T) {
+	c := cache.NewMemory[float64, int](1, time.Minute)
+	done := make(chan struct{})
+	g, _ := rt.NewGroup(t.Context(), 1)
+	g.Go(func(ctx context.Context) error {
+		c.Put(math.NaN(), 1)
+		c.Put(1, 11)
+		c.Put(2, 22)
+		close(done)
+		return nil
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Put sequence with a NaN key never returned: eviction is stuck")
+		return
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	if got := c.Get(math.NaN()); got != nil {
+		t.Fatalf("Get(NaN) = ?, want absent")
+	}
+	if got := c.Get(1); got != nil {
+		t.Fatalf("Get(1) = ?, want evicted by the capacity-1 store")
+	}
+	if got := c.Get(2); !optInt(got, 22) {
+		t.Fatalf("Get(2) = ?, want 22")
+	}
+	if n := cache.EntriesLenFloat(c); n != 1 {
+		t.Fatalf("the store holds %d entries, want 1: a NaN key left an entry that no call can remove", n)
+	}
+}
+
+func TestNaNKeyLoadRunsLoadEveryTime(t *testing.T) {
+	c := cache.NewMemory[float64, int](1, time.Minute)
+	var calls atomic.Int64
+	load := func(lctx context.Context) (int, error) {
+		calls.Add(1)
+		return 5, nil
+	}
+	vals := make([]int, 2)
+	errs := make([]error, 2)
+	done := make(chan struct{})
+	g, _ := rt.NewGroup(t.Context(), 1)
+	g.Go(func(ctx context.Context) error {
+		for i := range 2 {
+			vals[i], errs[i] = cache.Load(ctx, c, math.NaN(), load)
+		}
+		close(done)
+		return nil
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Load with a NaN key never returned: eviction is stuck")
+		return
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	for i := range 2 {
+		if errs[i] != nil {
+			t.Fatalf("Load %d: %v", i, errs[i])
+			return
+		}
+		if vals[i] != 5 {
+			t.Fatalf("Load %d = %d, want 5", i, vals[i])
+			return
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("load ran %d times for a NaN key, want 2: nothing is cached", calls.Load())
+	}
+	if got := c.Get(math.NaN()); got != nil {
+		t.Fatalf("Get(NaN) after Load = ?, want absent")
+	}
+}
+
+func TestNaNKeyLoadNeverJoinsAFlight(t *testing.T) {
+	c := cache.NewMemory[float64, int](1, time.Minute)
+	var calls atomic.Int64
+	release := make(chan struct{})
+	load := func(lctx context.Context) (int, error) {
+		calls.Add(1)
+		<-release
+		return 41, nil
+	}
+	vals := make([]int, 2)
+	errs := make([]error, 2)
+	g, _ := rt.NewGroup(t.Context(), 2)
+	for i := range 2 {
+		g.Go(func(ctx context.Context) error {
+			vals[i], errs[i] = cache.Load(ctx, c, math.NaN(), load)
+			return nil
+		})
+	}
+	settled := waitUntil(func() bool { return calls.Load() == 2 && cache.FlightsLenFloat(c) == 0 }, 5*time.Second)
+	if !settled {
+		t.Fatalf("in-flight loads = %d, registered flights = %d: a NaN key must not register a flight", calls.Load(), cache.FlightsLenFloat(c))
+		return
+	}
+	close(release)
+	if err := g.Wait(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	for i := range 2 {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+			return
+		}
+		if vals[i] != 41 {
+			t.Fatalf("caller %d = %d, want 41", i, vals[i])
+			return
+		}
+	}
+	if cache.FlightsLenFloat(c) != 0 {
+		t.Fatalf("registered flights = %d after both loads, want 0", cache.FlightsLenFloat(c))
+	}
+}
+

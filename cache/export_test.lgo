@@ -19,3 +19,19 @@ func IndexMatchesOrder(c *Memory[string, int]) bool {
 	})
 	return same
 }
+
+func FlightsLenFloat(c *Memory[float64, int]) int {
+	n := 0
+	c.store.WithLock(func(s *store[float64, int]) {
+		n = len(s.flights)
+	})
+	return n
+}
+
+func EntriesLenFloat(c *Memory[float64, int]) int {
+	n := 0
+	c.store.WithLock(func(s *store[float64, int]) {
+		n = len(s.entries)
+	})
+	return n
+}

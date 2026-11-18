@@ -90,6 +90,9 @@ func (s *store[K, V]) drop(k K) {
 }
 
 func (s *store[K, V]) insert(it *item[K, V]) {
+	if it.key != it.key {
+		return
+	}
 	s.drop(it.key)
 	s.entries[it.key] = s.order.PushFront(it)
 	for s.order.Len() > s.capacity {
@@ -97,7 +100,8 @@ func (s *store[K, V]) insert(it *item[K, V]) {
 		if oldest == nil {
 			break
 		}
-		s.drop(oldest.Value.(*item[K, V]).key)
+		s.order.Remove(oldest)
+		delete(s.entries, oldest.Value.(*item[K, V]).key)
 	}
 }
 
@@ -122,6 +126,9 @@ func (c *Memory[K, V]) Delete(k K) {
 }
 
 func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load func(ctx context.Context) (V, error)) (V, error) {
+	if k != k {
+		return load(ctx)
+	}
 	nf := &flight[K, V]{}
 	lead := false
 	hit := false
