@@ -373,6 +373,44 @@ func chatReply(t *testing.T, c *ollama.Client, req ai.Request) ai.Reply {
 	return reply
 }
 
+func embedBody(vectors int, dims int) string {
+	row := "[" + strings.Repeat("0.12345678,", dims-1) + "0.12345678]"
+	return `{"model":"llama3.2","embeddings":[` + strings.Repeat(row+",", vectors-1) + row + `]}`
+}
+
+func TestEmbedAcceptsABatchLargerThanOneMebibyte(t *testing.T) {
+	body := embedBody(128, 1024)
+	if len(body) <= 1<<20 {
+		t.Fatalf("test body holds %d bytes, want more than 1 MiB", len(body))
+	}
+	srv := httptest.NewServer(serveBody(t, http.StatusOK, "application/json", body))
+	defer srv.Close()
+	embeddings := embedAll(t, testClient(srv), make([]string, 128))
+	if len(embeddings) != 128 || len(embeddings[127]) != 1024 || embeddings[127][1023] != float32(0.12345678) {
+		t.Fatalf("got %d vectors, want 128 vectors of 1024 values that end in 0.12345678", len(embeddings))
+	}
+}
+
+func TestEmbedBodyOverItsLimitIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	body := embedBody(1, 200000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if _, werr := io.WriteString(w, body); werr != nil {
+			t.Logf("server write ended when the client stopped at its limit: %v", werr)
+		}
+	}))
+	defer srv.Close()
+	_, err := testClient(srv).Embed(context.Background(), []string{"one"})
+	if err == nil || !strings.Contains(err.Error(), "ai/ollama: response exceeds the size limit of 1179648 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1 MiB plus 128 KiB", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("server saw %d calls, want 1: the same body would come again", calls.Load())
+	}
+}
+
 func embedAll(t *testing.T, c *ollama.Client, texts []string) [][]float32 {
 	t.Helper()
 	embeddings, err := c.Embed(context.Background(), texts)

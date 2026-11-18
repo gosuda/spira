@@ -31,6 +31,10 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - Usage MUST come from `prompt_eval_count` and `eval_count`.
 - `Embed` MUST send `POST <BaseURL>/api/embed`.
 - `Embed` MUST return the vectors in input order.
+- `Chat` MUST accept a response body of at most 1 MiB.
+- `Embed` MUST accept a response body of at most 1 MiB plus 128 KiB for each input text.
+- A larger body MUST end the call after one attempt.
+- The body of a failing status MUST be cut at 1 MiB.
 - `Chat` and `Embed` MUST run each attempt under `resilience.Do` with `Policy`.
 - A 4xx answer other than 408 and 429 MUST end the call after one attempt.
 - That answer MUST NOT count as a failure or as a success for the breaker.
@@ -50,6 +54,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `ai/ollama: tool call <name>: arguments are not a JSON object: <cause>` for bad arguments in a message.
 - `ai/ollama: format is not json and not a JSON object` when `Format` is any other text.
 - `ai/ollama: encode request: <cause>`, `ai/ollama: read response: <cause>` and `ai/ollama: decode response: <cause>` for the JSON and body steps.
+- `ai/ollama: response exceeds the size limit of <n> bytes` when a body is larger than its limit.
 
 ## Proof
 
@@ -61,6 +66,8 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestServerErrorIsRetried` proves that a 500 answer is retried.
 - `TestClientErrorAddsNoResultToTheBreaker` proves that a 400 answer adds no result to the breaker window.
 - `TestEmbedReturnsEmbeddingsInInputOrder` proves the embed path and the vector order.
+- `TestEmbedAcceptsABatchLargerThanOneMebibyte` proves that 128 vectors of 1024 values decode.
+- `TestEmbedBodyOverItsLimitIsFinal` proves the size limit and that the call is not repeated.
 - `TestFormatGoesOutAsJSONModeOrAsASchemaObject` proves the two wire forms of `Format` and the error for any other text.
 - No test needs a key or the network.
 

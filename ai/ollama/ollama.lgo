@@ -45,7 +45,7 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	if err != nil {
 		return ai.Reply{}, fmt.Errorf("ai/ollama: encode request: %w", err)
 	}
-	out, err := send[chatResponse](ctx, c, "/api/chat", payload)
+	out, err := send[chatResponse](ctx, c, exchange{path: "/api/chat", payload: payload, limit: replyLimit})
 	if err != nil {
 		return ai.Reply{}, err
 	}
@@ -75,7 +75,7 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		return
 	}
 	if status < 200 || status > 299 {
-		data, rerr := io.ReadAll(io.LimitReader(body, 1<<20))
+		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
 		if rerr != nil {
 			yield ai.Chunk{}, fmt.Errorf("ai/ollama: read response: %w", rerr)
 			closeBody(body)
@@ -108,21 +108,34 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 	if err != nil {
 		return nil, fmt.Errorf("ai/ollama: encode request: %w", err)
 	}
-	out, err := send[embedResponse](ctx, c, "/api/embed", payload)
+	limit := replyLimit + int64(len(texts))*embedVectorLimit
+	out, err := send[embedResponse](ctx, c, exchange{path: "/api/embed", payload: payload, limit: limit})
 	if err != nil {
 		return nil, err
 	}
 	return out.Embeddings, nil
 }
 
-func send[T any](ctx context.Context, c *Client, path string, payload []byte) (T, error) {
+const replyLimit = 1 << 20
+
+const embedVectorLimit = 128 << 10
+
+var errOversize = errors.New("ai/ollama: response exceeds the size limit")
+
+type exchange struct {
+	path    string
+	payload []byte
+	limit   int64
+}
+
+func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	var zero T
 	return resilience.Do[T](ctx, c.Policy, func(actx context.Context) (T, error) {
-		value, err := post[T](actx, c, path, payload)
+		value, err := post[T](actx, c, x)
 		if err == nil {
 			return value, nil
 		}
-		if callerFault(err) {
+		if callerFault(err) || errors.Is(err, errOversize) {
 			return zero, resilience.Ignored(err)
 		}
 		return zero, err
@@ -138,19 +151,22 @@ func callerFault(err error) bool {
 	return s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests
 }
 
-func post[T any](ctx context.Context, c *Client, path string, payload []byte) (T, error) {
+func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	var zero T
-	status, body, err := c.do(ctx, path, payload)
+	status, body, err := c.do(ctx, x.path, x.payload)
 	if err != nil {
 		return zero, err
 	}
 	defer body.Close()?
-	data, err := io.ReadAll(io.LimitReader(body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(body, x.limit+1))
 	if err != nil {
 		return zero, fmt.Errorf("ai/ollama: read response: %w", err)
 	}
 	if status < 200 || status > 299 {
-		return zero, statusError(status, data)
+		return zero, statusError(status, data[:min(len(data), replyLimit)])
+	}
+	if int64(len(data)) > x.limit {
+		return zero, fmt.Errorf("%w of %d bytes", errOversize, x.limit)
 	}
 	var out T
 	if err := json.Unmarshal(data, &out); err != nil {
