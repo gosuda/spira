@@ -145,11 +145,17 @@ func flattenValue(key string, v jsontext.Value, out map[string]string) error {
 		if err := json.Unmarshal(v, &s); err != nil {
 			return fmt.Errorf("%s: %w", upper, err)
 		}
-		out[upper] = s
-		return nil
+		return setOnce(out, upper, s)
 	case jsontext.KindBeginArray:
 		return fmt.Errorf("%s: array value", upper)
 	}
-	out[upper] = string(v)
+	return setOnce(out, upper, string(v))
+}
+
+func setOnce(out map[string]string, key string, value string) error {
+	if _, held := out[key]; held {
+		return fmt.Errorf("%s: duplicate key", key)
+	}
+	out[key] = value
 	return nil
 }

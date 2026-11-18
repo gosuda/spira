@@ -738,3 +738,29 @@ func TestFileSourceExponentFormForIntMatchesEnv(t *testing.T) {
 		t.Fatalf("file error = %v, want it to name COUNT", fileErr)
 	}
 }
+
+func TestFileSourceRefusesKeysThatCollide(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "the same key twice", body: `{"port": 1, "port": 2}`, want: "duplicate"},
+		{name: "keys that differ only by case", body: `{"port": 1, "PORT": 2}`, want: "PORT: duplicate key"},
+		{name: "a nested key and its flat spelling", body: `{"db_port": 1, "db": {"port": 2}}`, want: "DB_PORT: duplicate key"},
+	} {
+		path := filepath.Join(t.TempDir(), "collide.json")
+		if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+			return
+		}
+		_, err := config.File(path)
+		if err == nil {
+			t.Fatalf("%s: File accepted %s", tc.name, tc.body)
+			return
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: error = %v, want it to hold %q", tc.name, err, tc.want)
+		}
+	}
+}
