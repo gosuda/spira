@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"logos/rt"
@@ -20,8 +18,11 @@ type Server struct {
 	ReadHeaderTimeout time.Duration = 5 * time.Second
 	ShutdownGrace     time.Duration = 20 * time.Second
 
-	started atomic.Bool
-	run     atomic.Pointer[serverRun]
+	state sync.Locked[serverState]
+}
+
+type serverState struct {
+	run *serverRun?
 }
 
 type serverRun struct {
@@ -36,27 +37,37 @@ type joinState struct {
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	if s.started.Load() {
-		return fmt.Errorf("web: server already started")
+	busy := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run != nil {
+			busy = true
+		}
+	})
+	if busy {
+		return errors.New("web: server already started")
 	}
 	if s.Router == nil {
-		return fmt.Errorf("web: server needs a router")
+		return errors.New("web: server needs a router")
 	}
 	l, err := net.Listen("tcp", s.Addr)
 	if err != nil {
 		return fmt.Errorf("web: listen %s: %w", s.Addr, err)
 	}
-	if !s.started.CompareAndSwap(false, true) {
-		if cerr := l.Close(); cerr != nil {
-			slog.Error("web: listener close failed", "error", cerr)
+	run := s.serve(ctx, l)
+	stored := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run == nil {
+			st.run = run
+			stored = true
 		}
-		return fmt.Errorf("web: server already started")
+	})
+	if !stored {
+		return errors.Join(errors.New("web: server already started"), run.stop(ctx, s.ShutdownGrace))
 	}
-	s.serve(ctx, l)
 	return nil
 }
 
-func (s *Server) serve(startCtx context.Context, l net.Listener) {
+func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 	srv := &http.Server{Handler: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout}
 	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
 	g.Go(func(_ context.Context) error {
@@ -73,32 +84,38 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) {
 		})
 		close(js.done)
 	})
-	s.run.Store(&serverRun{srv: srv, join: js, joinCancel: joinCancel})
+	return &serverRun{srv: srv, join: js, joinCancel: joinCancel}
 }
 
 func (s *Server) Stop(ctx context.Context) error {
-	if !s.started.Swap(false) {
-		return nil
+	var held *serverRun?
+	s.state.WithLock(func(st *serverState) {
+		held = st.run
+		st.run = nil
+	})
+	current := held
+	if current != nil {
+		return current.stop(ctx, s.ShutdownGrace)
 	}
-	r := s.run.Load()
-	if r == nil {
-		return nil
-	}
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.ShutdownGrace)
+	return nil
+}
+
+func (r *serverRun) stop(ctx context.Context, grace time.Duration) error {
+	sctx, cancel := context.WithTimeout(ctx, grace)
 	defer cancel()
 	shutdownErr := r.srv.Shutdown(sctx)
+	if shutdownErr != nil {
+		shutdownErr = errors.Join(fmt.Errorf("web: shutdown: %w", shutdownErr), r.srv.Close())
+	}
 	r.joinCancel()
 	select {
 	case <-r.join.done:
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Join(shutdownErr, ctx.Err())
 	}
 	var joinErr error
 	r.join.err.WithLock(func(e *error) {
 		joinErr = *e
 	})
-	if shutdownErr != nil {
-		return errors.Join(joinErr, fmt.Errorf("web: shutdown: %w", shutdownErr))
-	}
-	return joinErr
+	return errors.Join(joinErr, shutdownErr)
 }
