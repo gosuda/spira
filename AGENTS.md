@@ -1,6 +1,6 @@
 # spira
 
-spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). It copies ideas, never code, from the clones under `.references/`.
+spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). It is licensed under Apache-2.0 (`LICENSE`, `NOTICE`). It MAY copy code and tests from the clones under `.references/`; the section "Copying from the reference clones" gives the rules.
 
 ## Module rules
 
@@ -44,12 +44,22 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 
 Follow these steps in order before a new exported name lands. [Christopher Alexander]
 
-1. Survey: read how two or more of the clones under `.references/` solve the problem. Record in the commit body what spira keeps and what it drops. [Richard Feynman]
+1. Survey: read how two or more of the clones under `.references/` solve the problem. Record in the commit body what spira keeps, what it copies and what it drops. [Richard Feynman]
 2. Lexicon: name every exported identifier with a word the application author already uses for the thing (`Route`, `Stage`, `Slot`, `Island`). A name that needs a comment to explain it is the wrong name. [Kenya Hara]
 3. Caller first: write the file an application author would write, in `example/` or in a test, before the package. It MUST fail to build for the missing names only. [Tony Hoare]
 4. One layer: the caller file reaches the standard library through one spira call at most. A second spira layer between them needs a reason in the commit body. [Dieter Rams]
 5. Probe: build every LoGOs form the design needs in a scratch module before a brief or a package uses it. A form that fails is a finding. [Richard Feynman]
 6. Signature freeze: a signature that a later plan step names changes only together with that step text. [David Parnas]
+
+## Copying from the reference clones
+
+- spira MAY copy or translate code from a clone under `.references/` when the licence of that clone is Apache-2.0, MIT, BSD or 0BSD. Read the licence file of the clone before you copy. [Richard Feynman]
+- Do not copy from a clone that has another licence or no licence file at its root. Today these are `spring-projects/spring-tools` (EPL-1.0) and `spring-projects/spring-ai-examples`, `spring-projects/spring-batch-extensions`, `spring-projects/spring-integration-samples`, `spring-projects/spring-security-samples` and `spring-projects/spring-ws-samples` (no licence file found). [Tony Hoare]
+- Copy the tests with the code. When a package copies or mirrors a behavior of a reference, port the test cases of the reference for that behavior into the `_test.lgo` files of the package: the inputs and the expected results. An expected result that comes from a reference test is an independent oracle. [Richard Feynman]
+- A copy is LoGOs code that obeys every rule in this file. Translate it; do not transliterate it. Leave out reflection, containers, annotations, class hierarchies and mocks. If the copied unit cannot work without them, copy the algorithm and the test cases only. [Dieter Rams]
+- Keep the notices. A file that is mostly a translation of one source file starts with a comment that names the source project, the source path and the copyright line of the source, and says that spira translated and changed it. This comment is a legal notice, so a rule against comments does not apply to it. [Tony Hoare]
+- Record each source project once in `NOTICE` at the repository root: the project name, its licence, its copyright line, and the text of its own `NOTICE` file when it ships one. [Tony Hoare]
+- Name the source in the commit body: the repository, the path and the revision (`git -C .references/<clone> rev-parse HEAD`) of each copied unit. [Richard Feynman]
 
 ## Wire contract
 
