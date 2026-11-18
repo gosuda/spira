@@ -62,6 +62,7 @@ The subcommand `spira new` is specified and is not in the tree yet.
 - SIGINT MUST stop the server process group and the frontend process group.
 - SIGTERM MUST stop the server process group and the frontend process group.
 - After that stop, the command MUST reap those processes.
+- The frontend start MUST return nil only when the start error wraps `context.Canceled`.
 
 ### Restart
 
@@ -111,3 +112,6 @@ The subcommand `spira new` is specified and is not in the tree yet.
 - `TestWatchCancelReapsAllChildren` proves that cancel reaps the child processes.
 - `TestWatchRejectsRootThatIsNotADirectory` proves the directory error and that no process starts.
 - `TestWatchGivesTheViteOriginToTheServer` proves `SPIRA_VITE_ORIGIN` is `http://localhost:5173` even when the parent holds another value.
+- `TestFrontendCancelDuringStartupReturnsNil` proves that a cancel during startup returns nil and leaves no child.
+- `TestFrontendLaunchFailureWithLiveContextReturnsError` proves that a launch failure with a live context returns the start error.
+- `TestFrontendLaunchFailureRacingCancelReturnsError` proves that a launch failure racing a cancel returns the start error.

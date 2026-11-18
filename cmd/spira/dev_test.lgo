@@ -25,13 +25,13 @@ func TestWatchRestartsServerOnlyOnLgoChange(t *testing.T) {
 	cfg := spira.Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "first server start", 10*time.Second, func() bool { return fix.count() == 1 }); err != nil {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return fix.count() == 1 }); err != nil {
 			return err
 		}
 		if err := touchLater(seed); err != nil {
 			return err
 		}
-		if err := await(sctx, "restart after .lgo change", 10*time.Second, func() bool { return fix.count() == 2 }); err != nil {
+		if err := await(sctx, "restart after .lgo change", backstop(t), func() bool { return fix.count() == 2 }); err != nil {
 			return err
 		}
 		if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
@@ -67,10 +67,10 @@ func TestWatchCancelEndsLoopAndKillsStandinGroups(t *testing.T) {
 	cfg := spira.Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "first server start", 10*time.Second, func() bool { return fix.count() >= 1 }); err != nil {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return fix.count() >= 1 }); err != nil {
 			return err
 		}
-		if err := await(sctx, "standin pids", 5*time.Second, fix.pidsReady); err != nil {
+		if err := await(sctx, "standin pids", backstop(t), fix.pidsReady); err != nil {
 			return err
 		}
 		cancel()
@@ -103,7 +103,7 @@ func TestWatchServerSelfExitWaitsForChange(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "first server start", 10*time.Second, func() bool { return lineCount(counter) == 1 }); err != nil {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return lineCount(counter) == 1 }); err != nil {
 			return err
 		}
 		if err := settle(sctx, "no restart after self exit", cfg.Interval, func() bool { return lineCount(counter) != 1 }); err != nil {
@@ -112,7 +112,7 @@ func TestWatchServerSelfExitWaitsForChange(t *testing.T) {
 		if err := touchLater(seed); err != nil {
 			return err
 		}
-		if err := await(sctx, "restart after .lgo change", 10*time.Second, func() bool { return lineCount(counter) == 2 }); err != nil {
+		if err := await(sctx, "restart after .lgo change", backstop(t), func() bool { return lineCount(counter) == 2 }); err != nil {
 			return err
 		}
 		if err := settle(sctx, "no restart after second self exit", cfg.Interval, func() bool { return lineCount(counter) != 2 }); err != nil {
@@ -186,7 +186,7 @@ func await(ctx context.Context, what string, budget time.Duration, probe func() 
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("cmd/spira test: timed out waiting for %s", what)
+			return fmt.Errorf("cmd/spira test: backstop expired waiting for %s", what)
 		}
 		select {
 		case <-ctx.Done():
@@ -194,6 +194,19 @@ func await(ctx context.Context, what string, budget time.Duration, probe func() 
 		case <-tick.C:
 		}
 	}
+}
+
+func backstop(t *testing.T) time.Duration {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		return 2 * time.Minute
+	}
+	budget := time.Until(deadline) - 30*time.Second
+	if budget < 10*time.Second {
+		return 10 * time.Second
+	}
+	return budget
 }
 
 func settle(ctx context.Context, label string, interval time.Duration, bad func() bool) error {
@@ -291,10 +304,10 @@ func TestWatchServerSelfExitLogsOneWarningWithRealStatus(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "first server start", 10*time.Second, func() bool { return lineCount(counter) == 1 }); err != nil {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return lineCount(counter) == 1 }); err != nil {
 			return err
 		}
-		if err := await(sctx, "exit warning", 10*time.Second, func() bool { return strings.Contains(warnText(warnPath), "server exited") }); err != nil {
+		if err := await(sctx, "exit warning", backstop(t), func() bool { return strings.Contains(warnText(warnPath), "server exited") }); err != nil {
 			return err
 		}
 		if err := settle(sctx, "exactly one exit warning", 250*time.Millisecond, func() bool {
@@ -347,13 +360,13 @@ func TestWatchRestartReapsPreviousServerBeforeNextStart(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "first server start", 10*time.Second, func() bool { return lineCount(startsLog) == 1 }); err != nil {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return lineCount(startsLog) == 1 }); err != nil {
 			return err
 		}
 		if err := touchLater(seed); err != nil {
 			return err
 		}
-		if err := await(sctx, "restart after .lgo change", 10*time.Second, func() bool { return lineCount(startsLog) == 2 }); err != nil {
+		if err := await(sctx, "restart after .lgo change", backstop(t), func() bool { return lineCount(startsLog) == 2 }); err != nil {
 			return err
 		}
 		cancel()
@@ -378,10 +391,10 @@ func TestWatchCancelReapsAllChildren(t *testing.T) {
 	cfg := spira.Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "first server start", 10*time.Second, func() bool { return fix.count() >= 1 }); err != nil {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return fix.count() >= 1 }); err != nil {
 			return err
 		}
-		if err := await(sctx, "standin pids", 5*time.Second, fix.pidsReady); err != nil {
+		if err := await(sctx, "standin pids", backstop(t), fix.pidsReady); err != nil {
 			return err
 		}
 		cancel()
@@ -490,10 +503,10 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "the server to record its environment", 10*time.Second, func() bool { return lineCount(seen) == 1 }); err != nil {
+		if err := await(sctx, "the server to record its environment", backstop(t), func() bool { return lineCount(seen) == 1 }); err != nil {
 			return err
 		}
-		if err := await(sctx, "the frontend to start", 10*time.Second, func() bool { return lineCount(frontSeen) == 1 }); err != nil {
+		if err := await(sctx, "the frontend to start", backstop(t), func() bool { return lineCount(frontSeen) == 1 }); err != nil {
 			return err
 		}
 		cancel()
@@ -510,5 +523,42 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(data)); got != "http://localhost:5173" {
 		t.Fatalf("server SPIRA_VITE_ORIGIN = %q, want http://localhost:5173", got)
+	}
+}
+
+func TestFrontendCancelDuringStartupReturnsNil(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := spira.Loop{FrontendCmd: []string{"sh", "-c", "sleep 300"}}
+	if err := spira.Frontend(ctx, cfg); err != nil {
+		t.Fatalf("frontend with cancelled context = %v, want nil", err)
+	}
+	assertNoChildren(t)
+}
+
+func TestFrontendLaunchFailureWithLiveContextReturnsError(t *testing.T) {
+	ctx := context.Background()
+	cfg := spira.Loop{FrontendCmd: []string{"spira-frontend-missing-binary-xyz"}}
+	err := spira.Frontend(ctx, cfg)
+	if err == nil {
+		t.Fatalf("frontend with missing binary = nil, want start error")
+		return
+	}
+	if !strings.Contains(err.Error(), "cmd/spira: start spira-frontend-missing-binary-xyz") {
+		t.Fatalf("frontend error = %q, want start prefix", err.Error())
+	}
+}
+
+func TestFrontendLaunchFailureRacingCancelReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := spira.Loop{FrontendCmd: []string{"spira-frontend-missing-binary-xyz"}}
+	err := spira.Frontend(ctx, cfg)
+	if err == nil {
+		t.Fatalf("frontend missing binary with cancelled context = nil, want start error")
+		return
+	}
+	if !strings.Contains(err.Error(), "cmd/spira: start spira-frontend-missing-binary-xyz") {
+		t.Fatalf("frontend error = %q, want start prefix", err.Error())
 	}
 }

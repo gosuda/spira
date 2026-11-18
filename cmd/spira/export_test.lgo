@@ -1,3 +1,4 @@
 package main
 
 var Watch = watch
+var Frontend = frontend
