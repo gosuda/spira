@@ -65,6 +65,7 @@ func (s HistogramSeries) Observe(v float64)
 - Each later character of a label name MUST be `_`, an ASCII letter, or a digit.
 - One metric MUST NOT repeat a label name.
 - A histogram MUST NOT use the label name `le`.
+- A label name MUST NOT start with two underscores. Prometheus reserves those names.
 - A registry MUST NOT hold two metrics with the same name.
 
 ### Series
@@ -138,6 +139,7 @@ func (s HistogramSeries) Observe(v float64)
 - `meter: duplicate label name <quoted>` when a label name repeats.
 - `meter: duplicate metric name <name>` when the registry already has that name. This text does not quote the name.
 - `meter: label name le is reserved on histograms` when a histogram label is `le`.
+- `meter: label name <quoted> is reserved` when a label name starts with two underscores.
 - `meter: histogram needs at least one bucket` when the bound list is empty.
 - `meter: invalid bucket bound <text>` when a bound is NaN or infinite. The text uses `strconv.FormatFloat` with verb `g`, precision -1 and bit size 64.
 - `meter: buckets must be strictly increasing` when a bound is less than or equal to the bound before it.
@@ -150,6 +152,7 @@ func (s HistogramSeries) Observe(v float64)
 - `TestHistogramNoLabelsManyBuckets` and `TestHistogramThreeLabelsTwelveBuckets` prove cumulative bounds and the `+Inf` bucket.
 - `TestRejectsHistogramLeLabel` proves the reserved label `le`.
 - `TestRejectsColonInLabelName` proves that a label name cannot contain `:`.
+- `TestRejectsLabelNameStartingWithTwoUnderscores` proves that `__name__` is refused.
 - `TestEscapesHelpText` and `TestEscapesLabelValues` prove the two escape rules.
 - `TestDistinctLastLabelSeries` and `TestDistinctLabelSetsDoNotCollide` prove that distinct label sets stay apart.
 - `TestLabelCountMismatchPanics` proves the value-count panic.

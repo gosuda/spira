@@ -96,6 +96,9 @@ func checkLabels(labels []string) {
 		if l == "" || !labelNameStart(l[0]) {
 			panic("meter: invalid label name " + strconv.Quote(l))
 		}
+		if len(l) > 1 && l[0] == '_' && l[1] == '_' {
+			panic("meter: label name " + strconv.Quote(l) + " is reserved")
+		}
 		for j := 1; j < len(l); j++ {
 			if !labelNameChar(l[j]) {
 				panic("meter: invalid label name " + strconv.Quote(l))

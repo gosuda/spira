@@ -408,3 +408,13 @@ func TestContentType(t *testing.T) {
 		t.Fatalf("Content-Type = %q", ct)
 	}
 }
+
+func TestRejectsLabelNameStartingWithTwoUnderscores(t *testing.T) {
+	reg := meter.NewRegistry()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for the label name __name__")
+		}
+	}()
+	reg.Counter("c", "help", "__name__")
+}
