@@ -67,6 +67,8 @@ func (s HistogramSeries) Observe(v float64)
 - A histogram MUST NOT use the label name `le`.
 - A label name MUST NOT start with two underscores. Prometheus reserves those names.
 - A registry MUST NOT hold two metrics with the same name.
+- A histogram writes samples named `<name>_bucket`, `<name>_sum` and `<name>_count`.
+- A registry MUST NOT hold two metrics that write a sample with the same name.
 
 ### Series
 
@@ -138,6 +140,7 @@ func (s HistogramSeries) Observe(v float64)
 - `meter: invalid label name <quoted>` when a label name is empty or has a bad character.
 - `meter: duplicate label name <quoted>` when a label name repeats.
 - `meter: duplicate metric name <name>` when the registry already has that name. This text does not quote the name.
+- `meter: metric <name> collides with <other> on the sample name <sample>` when two metrics write one sample name.
 - `meter: label name le is reserved on histograms` when a histogram label is `le`.
 - `meter: label name <quoted> is reserved` when a label name starts with two underscores.
 - `meter: histogram needs at least one bucket` when the bound list is empty.
@@ -158,6 +161,7 @@ func (s HistogramSeries) Observe(v float64)
 - `TestLabelCountMismatchPanics` proves the value-count panic.
 - `TestConcurrentAdds` proves that concurrent `Add` calls all count.
 - `TestRejectsDuplicateMetricName` proves the duplicate name panic.
+- `TestRejectsCounterNameCollidingWithHistogramSamples` and `TestRejectsHistogramNameCollidingWithCounterSamples` prove the sample name rule in both orders.
 - `TestRejectsUnsortedBuckets` and `TestRejectsEmptyBuckets` prove the bound rules.
 - `TestContentType` proves the exposition content type.
 - `TestHTTPRouteLabelIsRegisteredPattern` proves that the route label is the registered pattern.
