@@ -402,6 +402,55 @@ func readCorpus(t *testing.T) []corpusLine {
 	return lines
 }
 
+var requiredCorpusCases = []string{
+	"slot-id-well-formed",
+	"slot-id-wrong-prefix",
+	"slot-id-fifteen-hex",
+	"slot-id-uppercase-hex",
+	"slot-id-missing-index",
+	"slot-id-quote-bracket",
+	"island-when-valid",
+	"island-when-load",
+	"island-when-idle",
+	"island-when-unknown",
+	"island-props-object",
+	"island-props-nested-object",
+	"island-props-malformed",
+	"island-props-array",
+	"island-props-string",
+}
+
+func ownedCorpusKind(kind string) bool {
+	switch kind {
+	case "slot-id", "island-when", "island-props":
+		return true
+	}
+	return false
+}
+
+func requireCorpusCoverage(t *testing.T, lines const []corpusLine) {
+	t.Helper()
+	seen := map[string]bool{}
+	for _, line := range lines {
+		if ownedCorpusKind(line.Request.Kind) {
+			if seen[line.Name] ?? false {
+				t.Fatalf("duplicate corpus case %q", line.Name)
+			}
+			seen[line.Name] = true
+		}
+	}
+	for _, name := range requiredCorpusCases {
+		if !(seen[name] ?? false) {
+			t.Fatalf("wire/corpus.jsonl lacks required case %q", name)
+		}
+	}
+	for name := range seen {
+		if !slices.Contains(requiredCorpusCases, name) {
+			t.Fatalf("corpus case %q is not in the required list", name)
+		}
+	}
+}
+
 func TestWireCorpus(t *testing.T) {
 	out := renderSlots(t, 1, func(i int) time.Duration { return 0 })
 	produced := idSet(slotWrittenRe, out)
@@ -413,7 +462,9 @@ func TestWireCorpus(t *testing.T) {
 			t.Fatalf("produced id %q violates the wire contract", id)
 		}
 	}
-	for _, line := range readCorpus(t) {
+	lines := readCorpus(t)
+	requireCorpusCoverage(t, lines)
+	for _, line := range lines {
 		checkCorpusLine(t, line)
 	}
 }
