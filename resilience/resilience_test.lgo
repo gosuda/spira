@@ -153,6 +153,7 @@ func probeWhileOthersCall(ctx context.Context, pol resilience.Policy, callers in
 	drained := make(chan struct{})
 	probeResult := make(chan error, 1)
 	var rejected atomic.Int64
+	var drainedOnce atomic.Bool
 	if err := func() error {
 		go group (ctx) {
 			go {
@@ -174,7 +175,7 @@ func probeWhileOthersCall(ctx context.Context, pol resilience.Policy, callers in
 					if errors.Is(err, resilience.ErrOpen) {
 						rejected.Add(1)
 					}
-					if rejected.Load() == int64(callers) {
+					if rejected.Load() == int64(callers) && drainedOnce.CompareAndSwap(false, true) {
 						close(drained)
 					}
 				}
