@@ -1,0 +1,159 @@
+package ai_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type structuredItem struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+
+func TestStructuredDecodesBareDocument(t *testing.T) {
+	got, err := ai.Structured[structuredItem](`{"name":"ada","count":3}`)
+	if err != nil {
+		t.Fatalf("Structured bare: %v", err)
+		return
+	}
+	if got.Name != "ada" || got.Count != 3 {
+		t.Fatalf("Structured bare = %+v, want {ada 3}", got)
+	}
+}
+
+func TestStructuredDecodesJsonFence(t *testing.T) {
+	text := "```json\n{\"name\":\"ada\",\"count\":3}\n```"
+	got, err := ai.Structured[structuredItem](text)
+	if err != nil {
+		t.Fatalf("Structured json fence: %v", err)
+		return
+	}
+	if got.Name != "ada" || got.Count != 3 {
+		t.Fatalf("Structured json fence = %+v, want {ada 3}", got)
+	}
+}
+
+func TestStructuredDecodesBareFence(t *testing.T) {
+	single, err := ai.Structured[structuredItem]("```{\"name\":\"ada\",\"count\":3}```")
+	if err != nil {
+		t.Fatalf("Structured single-line fence: %v", err)
+		return
+	}
+	if single.Name != "ada" || single.Count != 3 {
+		t.Fatalf("Structured single-line fence = %+v, want {ada 3}", single)
+	}
+	multi, merr := ai.Structured[structuredItem]("```\n{\"name\":\"ada\",\"count\":3}\n```")
+	if merr != nil {
+		t.Fatalf("Structured multi-line fence: %v", merr)
+		return
+	}
+	if multi.Name != "ada" || multi.Count != 3 {
+		t.Fatalf("Structured multi-line fence = %+v, want {ada 3}", multi)
+	}
+}
+
+func TestStructuredExtractsFenceFromProse(t *testing.T) {
+	text := "Here is your object:\n```json\n{\"name\":\"ada\",\"count\":3}\n```\nHope that helps."
+	got, err := ai.Structured[structuredItem](text)
+	if err != nil {
+		t.Fatalf("Structured prose fence: %v", err)
+		return
+	}
+	if got.Name != "ada" || got.Count != 3 {
+		t.Fatalf("Structured prose fence = %+v, want {ada 3}", got)
+	}
+}
+
+func TestStructuredTrimsSurroundingWhitespace(t *testing.T) {
+	got, err := ai.Structured[structuredItem]("\n\t {\"name\":\"ada\",\"count\":3} \n")
+	if err != nil {
+		t.Fatalf("Structured whitespace: %v", err)
+		return
+	}
+	if got.Name != "ada" || got.Count != 3 {
+		t.Fatalf("Structured whitespace = %+v, want {ada 3}", got)
+	}
+}
+
+func TestStructuredUsesFirstFence(t *testing.T) {
+	text := "first:\n```json\n{\"name\":\"one\",\"count\":1}\n```\nsecond:\n```json\n{\"name\":\"two\",\"count\":2}\n```"
+	got, err := ai.Structured[structuredItem](text)
+	if err != nil {
+		t.Fatalf("Structured two fences: %v", err)
+		return
+	}
+	if got.Name != "one" || got.Count != 1 {
+		t.Fatalf("Structured two fences = %+v, want {one 1}", got)
+	}
+}
+
+func TestStructuredRefusesUnterminatedFence(t *testing.T) {
+	_, err := ai.Structured[structuredItem]("```json\n{\"name\":\"ada\",\"count\":3}\n")
+	if err == nil {
+		t.Fatal("Structured unterminated fence: expected an error")
+		return
+	}
+	if !errors.Is(err, ai.ErrUnterminatedFence) {
+		t.Fatalf("Structured unterminated fence error = %v, want ErrUnterminatedFence", err)
+	}
+}
+
+func TestStructuredRefusesTrailingText(t *testing.T) {
+	_, err := ai.Structured[structuredItem](`{"name":"ada","count":3} trailing`)
+	if err == nil {
+		t.Fatal("Structured trailing text: expected an error")
+		return
+	}
+	if !strings.HasPrefix(err.Error(), "ai: structured: ") {
+		t.Fatalf("Structured trailing text error = %q, want the ai: structured: prefix", err.Error())
+	}
+}
+
+func TestStructuredRefusesEmptyAnswer(t *testing.T) {
+	_, err := ai.Structured[structuredItem]("   ")
+	if err == nil {
+		t.Fatal("Structured empty answer: expected an error")
+		return
+	}
+	if !errors.Is(err, ai.ErrEmpty) {
+		t.Fatalf("Structured empty answer error = %v, want ErrEmpty", err)
+	}
+}
+
+func TestStructuredIgnoresUnknownFields(t *testing.T) {
+	got, err := ai.Structured[structuredItem](`{"name":"ada","count":3,"color":"red"}`)
+	if err != nil {
+		t.Fatalf("Structured unknown fields: %v", err)
+		return
+	}
+	if got.Name != "ada" || got.Count != 3 {
+		t.Fatalf("Structured unknown fields = %+v, want {ada 3}", got)
+	}
+}
+
+func TestStructuredRefusesOversizeInput(t *testing.T) {
+	_, err := ai.Structured[structuredItem](strings.Repeat(" ", (1<<20)+1))
+	if err == nil {
+		t.Fatal("Structured oversize input: expected an error")
+		return
+	}
+	if !errors.Is(err, ai.ErrTooLarge) {
+		t.Fatalf("Structured oversize input error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestFormatInstructionOmitsSchema(t *testing.T) {
+	inst := ai.FormatInstruction()
+	if !strings.HasPrefix(inst, "Your response should be in JSON format.") {
+		t.Fatalf("FormatInstruction = %q, want the JSON format opening", inst)
+	}
+	if !strings.Contains(inst, "Do not include markdown code blocks in your response.") {
+		t.Fatalf("FormatInstruction = %q, want the markdown ban", inst)
+	}
+	if strings.Contains(inst, "JSON Schema") {
+		t.Fatalf("FormatInstruction = %q, must not embed a JSON Schema", inst)
+	}
+}

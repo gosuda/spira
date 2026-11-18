@@ -149,6 +149,13 @@ func Wrap(m Model, layers ...Layer) Model
 func SearchTools(all const []Tool) (Tool, Layer)
 func (n narrowing) Chat(ctx context.Context, req Request) (Reply, error)
 func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, error]
+
+var ErrEmpty = errors.New("ai: structured: empty answer")
+var ErrTooLarge = errors.New("ai: structured: answer exceeds the size limit of 1048576 bytes")
+var ErrUnterminatedFence = errors.New("ai: structured: unterminated code fence")
+
+func FormatInstruction() string
+func Structured[T any](text string) (T, error)
 ```
 
 ## Requirements
@@ -258,6 +265,22 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - The layer MUST NOT add a tool that the request does not carry.
 - The layer MUST remove from each search result the names of tools that the request does not carry.
 
+### Structured output
+
+- `Structured` MUST decode a bare JSON document into the typed value.
+- `Structured` MUST strip one wrapping markdown fence before decoding.
+- `Structured` MUST accept a fence with a language tag or a bare fence.
+- `Structured` MUST extract the first fence when prose surrounds fences.
+- `Structured` MUST ignore a second fence after the first fence.
+- `Structured` MUST trim surrounding whitespace before decoding.
+- `Structured` MUST ignore unknown JSON fields during decoding.
+- `Structured` MUST refuse text beyond 1048576 bytes with `ErrTooLarge`.
+- `Structured` MUST refuse blank text with `ErrEmpty`.
+- `Structured` MUST refuse an unterminated fence with `ErrUnterminatedFence`.
+- `Structured` MUST refuse trailing text after JSON with a decode error.
+- `FormatInstruction` MUST ask for JSON without explanations or markdown fences.
+- `FormatInstruction` MUST NOT embed a JSON Schema instance.
+
 ## Errors
 
 - `ai: collect: %w` when the chunk stream fails.
@@ -274,6 +297,10 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `ai: run: tool calls wait for a decision: <keys>` from `ConfirmError.Error`.
 - `ai: run: Tool call limit (<n>) exceeded for tool '<name>'. No further calls to this tool are allowed in this turn.` from `LimitError.Error`.
 - `ai: run: Total tool call limit (<n>) exceeded for this turn. No further tool calls are allowed.` from `LimitError.Error`.
+- `ai: structured: empty answer` when the answer holds no JSON text.
+- `ai: structured: answer exceeds the size limit of 1048576 bytes` when the answer is too large.
+- `ai: structured: unterminated code fence` when a fence never closes.
+- `ai: structured: decode: <cause>` when JSON parsing fails.
 
 ## Proof
 
@@ -339,6 +366,19 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `TestSearchToolsShowsTheModelOnlyTheSearchToolAndWhatEarlierSearchesFound` proves layer narrowing.
 - `TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage` proves ignored results.
 - `TestSearchToolsNamesOnlyToolsTheRequestCarries` proves the search scope.
+- The `BeanOutputConverterTest` and `MarkdownCodeBlockCleanerTest` cases prove the structured output rules.
+- `TestStructuredDecodesBareDocument` proves the bare JSON document.
+- `TestStructuredDecodesJsonFence` proves the fence with a language tag.
+- `TestStructuredDecodesBareFence` proves the bare fence in both shapes.
+- `TestStructuredExtractsFenceFromProse` proves the fence inside prose.
+- `TestStructuredTrimsSurroundingWhitespace` proves the whitespace trim.
+- `TestStructuredUsesFirstFence` proves that the first fence wins.
+- `TestStructuredRefusesUnterminatedFence` proves the unterminated fence error.
+- `TestStructuredRefusesTrailingText` proves the trailing text error.
+- `TestStructuredRefusesEmptyAnswer` proves the empty answer error.
+- `TestStructuredIgnoresUnknownFields` proves that unknown fields are ignored.
+- `TestStructuredRefusesOversizeInput` proves the size bound.
+- `TestFormatInstructionOmitsSchema` proves the instruction without a schema.
 
 ## Not in scope
 
@@ -348,3 +388,5 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - The fluent builder, ordered integers, the safeguard advisor and the logger advisor. Layers replace them.
 - Lucene, vector-store and decision tool indexes. Each needs a library or a second model call.
 - Tool schemas from Go types and structured output decoding. They wait for `schema`.
+- JSON Schema generation for the format instruction. It waits for the `schema` package.
+- Thinking-tag removal. The listed rules cover fences and whitespace only.
