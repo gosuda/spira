@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # engines_test.sh: prove scripts/engines.sh without spira code.
-#  1. engines.sh runs a command that checks the three DSNs, their ports and
-#     that spira_test exists in each engine.
-#  2. After engines.sh returns, no spira-engines- container is left.
+#  1. engines.sh runs a command that checks the three DSNs, their ports,
+#     that spira_test exists in each engine, and records the mounts of
+#     each container by inspect while they run (one inspected line per
+#     container, one volume line per mount).
+#  2. After engines.sh returns, no spira-engines- container is left and
+#     none of the recorded volumes is left. The postgres and mysql
+#     containers must each show a volume; the mssql container may not.
 #  3. engines.sh false exits nonzero and leaves no container.
 #  4. engines.sh with no argument exits 2.
 #  5. With SPIRA_ENGINES_MSSQL_IMAGE pointing at busybox (its default command
@@ -24,29 +28,33 @@ leftovers() {
 	docker ps -a --filter name=spira-engines- --format '{{.Names}}'
 }
 
-# The daemon reports each container it creates and each volume a container
-# mounts. The volumes of the spira-engines- containers are the ones to check;
-# a count of all unused volumes would also see other workloads.
-events="$(mktemp)"
-docker events --filter type=container --filter type=volume --filter event=create --filter event=mount \
-	--format '{{.Type}}|{{.Actor.ID}}|{{index .Actor.Attributes "name"}}|{{index .Actor.Attributes "container"}}' >"$events" &
-events_pid=$!
-stop_events() {
-	kill "$events_pid" 2>/dev/null || true
-	rm -f "$events"
+# The volumes to check are the mounts of the three engine containers.
+# CHECKS records them by inspect while the containers run, one
+# "inspected <container>" line per container and one
+# "volume <container> <name>" line per mount, so a mounted volume
+# cannot be missed the way a late docker events listener missed one.
+volumes_list="$(mktemp)"
+cleanup_files() {
+	rm -f "$volumes_list"
 }
-trap stop_events EXIT
+trap cleanup_files EXIT
 
-engine_volumes() {
-	awk -F'|' '
-		$1 == "container" && $3 ~ /^spira-engines-/ { ours[$2] = 1 }
-		$1 == "volume" && ($4 in ours) { print $2 }
-	' "$events" | sort -u
+inspected() {
+	grep -q "^inspected spira-engines-$1-" "$volumes_list"
+}
+
+kind_volumes() {
+	awk -v kind="spira-engines-$1-" '$1 == "volume" && index($2, kind) == 1 { print $3 }' "$volumes_list"
+}
+
+recorded_volumes() {
+	awk '$1 == "volume" { print $3 }' "$volumes_list"
 }
 
 leaked_volumes() {
 	local volume
-	engine_volumes | while IFS= read -r volume; do
+	recorded_volumes | while IFS= read -r volume; do
+		[ -n "$volume" ] || continue
 		if docker volume inspect "$volume" >/dev/null 2>&1; then
 			printf '%s\n' "$volume"
 		fi
@@ -54,6 +62,8 @@ leaked_volumes() {
 }
 
 # --- 1. DSNs, ports and spira_test in each engine ---
+VOLUMES_FILE="$volumes_list"
+export VOLUMES_FILE
 "$ENGINES" bash -s <<'CHECKS'
 set -euo pipefail
 : "${SPIRA_TEST_POSTGRES_DSN:?missing}"
@@ -85,13 +95,34 @@ docker exec "$SPIRA_MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -NBe 
 
 docker exec "$SPIRA_MSSQL_CONTAINER" sh -c \
 	'/opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$MSSQL_SA_PASSWORD" -b -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name='"'"'spira_test'"'"'"' | grep -qx spira_test
+
+for container in "$SPIRA_PG_CONTAINER" "$SPIRA_MYSQL_CONTAINER" "$SPIRA_MSSQL_CONTAINER"; do
+	if ! mounts="$(docker inspect --format '{{range .Mounts}}{{.Name}}{{"\n"}}{{end}}' "$container")"; then
+		printf 'inspect of %s failed\n' "$container" >&2
+		exit 1
+	fi
+	printf 'inspected %s\n' "$container"
+	printf '%s\n' "$mounts" | while IFS= read -r name; do
+		[ -n "$name" ] || continue
+		printf 'volume %s %s\n' "$container" "$name"
+	done
+done >"$VOLUMES_FILE"
 CHECKS
 
-[ -n "$(engine_volumes)" ] || fail 'the docker events name no volume of an engine container'
+for kind in postgres mysql mssql; do
+	if ! inspected "$kind"; then
+		fail "no inspect record for the spira-engines-$kind container"
+	fi
+done
+for kind in postgres mysql; do
+	if [ -z "$(kind_volumes "$kind")" ]; then
+		fail "no volume recorded for the spira-engines-$kind container"
+	fi
+done
 [ -z "$(leaked_volumes)" ] || fail "docker volumes of the engine containers left: $(leaked_volumes)"
 
 [ -z "$(leftovers)" ] || fail "containers left after success: $(leftovers)"
-printf 'engines_test.sh: PASS: DSNs, ports and spira_test verified; containers removed\n'
+printf 'engines_test.sh: PASS: DSNs, ports and spira_test verified; volumes recorded and removed\n'
 
 # --- 2. failure propagates and cleans up ---
 if "$ENGINES" false; then
