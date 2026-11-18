@@ -24,12 +24,36 @@ leftovers() {
 	docker ps -a --filter name=spira-engines- --format '{{.Names}}'
 }
 
-# --- 1. DSNs, ports and spira_test in each engine ---
-dangling_volumes() {
-	docker volume ls -q --filter dangling=true | wc -l | tr -d '[:space:]'
+# The daemon reports each container it creates and each volume a container
+# mounts. The volumes of the spira-engines- containers are the ones to check;
+# a count of all unused volumes would also see other workloads.
+events="$(mktemp)"
+docker events --filter type=container --filter type=volume --filter event=create --filter event=mount \
+	--format '{{.Type}}|{{.Actor.ID}}|{{index .Actor.Attributes "name"}}|{{index .Actor.Attributes "container"}}' >"$events" &
+events_pid=$!
+stop_events() {
+	kill "$events_pid" 2>/dev/null || true
+	rm -f "$events"
+}
+trap stop_events EXIT
+
+engine_volumes() {
+	awk -F'|' '
+		$1 == "container" && $3 ~ /^spira-engines-/ { ours[$2] = 1 }
+		$1 == "volume" && ($4 in ours) { print $2 }
+	' "$events" | sort -u
 }
 
-volumes_before="$(dangling_volumes)"
+leaked_volumes() {
+	local volume
+	engine_volumes | while IFS= read -r volume; do
+		if docker volume inspect "$volume" >/dev/null 2>&1; then
+			printf '%s\n' "$volume"
+		fi
+	done
+}
+
+# --- 1. DSNs, ports and spira_test in each engine ---
 "$ENGINES" bash -s <<'CHECKS'
 set -euo pipefail
 : "${SPIRA_TEST_POSTGRES_DSN:?missing}"
@@ -63,9 +87,8 @@ docker exec "$SPIRA_MSSQL_CONTAINER" sh -c \
 	'/opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1,1433 -U sa -P "$MSSQL_SA_PASSWORD" -b -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name='"'"'spira_test'"'"'"' | grep -qx spira_test
 CHECKS
 
-volumes_after="$(dangling_volumes)"
-[ "$volumes_after" -eq "$volumes_before" ] || \
-	fail "dangling docker volumes grew across engines.sh: $volumes_before -> $volumes_after"
+[ -n "$(engine_volumes)" ] || fail 'the docker events name no volume of an engine container'
+[ -z "$(leaked_volumes)" ] || fail "docker volumes of the engine containers left: $(leaked_volumes)"
 
 [ -z "$(leftovers)" ] || fail "containers left after success: $(leftovers)"
 printf 'engines_test.sh: PASS: DSNs, ports and spira_test verified; containers removed\n'
@@ -96,7 +119,6 @@ printf '%s\n' "$ms_log" | grep -q 'exit code' || fail "failure output names no e
 [ -z "$(leftovers)" ] || fail "containers left after fast-fail: $(leftovers)"
 printf 'engines_test.sh: PASS: fast-exit mssql image failed in %ss, exit code reported, no containers left\n' "$elapsed"
 
-[ "$(dangling_volumes)" -eq "$volumes_before" ] || \
-	fail "dangling docker volumes left after all runs: $volumes_before -> $(dangling_volumes)"
+[ -z "$(leaked_volumes)" ] || fail "docker volumes of the engine containers left after all runs: $(leaked_volumes)"
 
 printf 'engines_test.sh: all checks passed\n'
