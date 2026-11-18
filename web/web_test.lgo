@@ -573,11 +573,14 @@ func TestDelegateHandsEveryMethodToTheHandlerBehindTheStages(t *testing.T) {
 			t.Errorf("upstream write: %v", err)
 		}
 	})
+	seen := map[string]int{}
 	r := web.NewRouter()
 	r.Use(func(next web.Handler) web.Handler {
 		return func(ctx *web.Context) (web.Reply, error) {
 			ctx.ResponseHeader().Set("X-Stage", "ran")
-			return next(ctx)
+			_, err := next(ctx)
+			seen[ctx.Request.Method] = ctx.Status()
+			return nil, err
 		}
 	})
 	r.Handle("", "/any/", func(ctx *web.Context) (web.Reply, error) {
@@ -593,6 +596,9 @@ func TestDelegateHandsEveryMethodToTheHandlerBehindTheStages(t *testing.T) {
 		}
 		if rec.Header().Get("X-Upstream") != "yes" || rec.Header().Get("X-Stage") != "ran" {
 			t.Fatalf("%s headers %v lack the handler's or the stage's header", method, rec.Header())
+		}
+		if got := seen[method] ?? 0; got != http.StatusAccepted {
+			t.Fatalf("%s: stage read status %d for the delegated handler, want 202", method, got)
 		}
 	}
 }
@@ -642,3 +648,134 @@ func TestStageReadsTheWrittenStatus(t *testing.T) {
 		t.Fatalf("status seen for /gone = %d, want 404", got)
 	}
 }
+
+func TestStageReplyWithoutNextIsWritten(t *testing.T) {
+	ran := false
+	shortcut := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return web.Redirect{To: "/login"}, nil
+		}
+	}
+	r := web.NewRouter()
+	r.Use(shortcut)
+	r.Handle("GET", "/guarded", func(ctx *web.Context) (web.Reply, error) {
+		ran = true
+		return web.Data{Value: "reached"}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/guarded", nil))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("redirect status %d want 303", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "/login" {
+		t.Fatalf("Location %q want /login", got)
+	}
+	if ran {
+		t.Fatal("handler ran behind a stage that answered without calling next")
+	}
+	dataStage := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return web.Data{Value: map[string]string{"early": "yes"}}, nil
+		}
+	}
+	r2 := web.NewRouter()
+	r2.Use(dataStage)
+	r2.Handle("GET", "/early", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "reached"}, nil
+	})
+	rec2 := call(t, r2, httptest.NewRequest(http.MethodGet, "/early", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("data status %d want 200", rec2.Code)
+	}
+	if body := rec2.Body.String(); !strings.Contains(body, `"early":"yes"`) {
+		t.Fatalf("data body %q lacks the stage's value", body)
+	}
+}
+
+func TestStageProblemSetsStatusForOuterStages(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{}))
+	seen := 0
+	denied := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return nil, web.Fail(web.Problem{Status: http.StatusForbidden, Title: "forbidden"})
+		}
+	}
+	watch := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			_, err := next(ctx)
+			seen = ctx.Status()
+			return nil, err
+		}
+	}
+	r := web.NewRouter()
+	r.Use(watch, web.AccessLog(logger), denied)
+	r.Handle("GET", "/secret", okReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/secret", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d want 403", rec.Code)
+	}
+	if seen != http.StatusForbidden {
+		t.Fatalf("outer stage read status %d want 403", seen)
+	}
+	if !strings.Contains(buf.String(), "status=403") {
+		t.Fatalf("access log %q lacks status=403", buf.String())
+	}
+}
+
+func TestDataEncodeFailureAnswersProblem(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(prev)
+	r := web.NewRouter()
+	r.Handle("GET", "/bad", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: make(chan int)}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/bad", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Status != http.StatusInternalServerError {
+		t.Fatalf("problem status member %d want 500", doc.Status)
+	}
+	if n := strings.Count(buf.String(), "web: reply write failed"); n != 1 {
+		t.Fatalf("encode failure logged %d times, want 1: %q", n, buf.String())
+	}
+}
+
+func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/joined", func(ctx *web.Context) (web.Reply, error) {
+		return nil, errors.Join(web.Fail(web.Problem{Title: "Conflict", Status: http.StatusConflict}), errors.New("x"))
+	})
+	r.Handle("GET", "/wrapped", func(ctx *web.Context) (web.Reply, error) {
+		return nil, fmt.Errorf("wrap: %w", web.Fail(web.Problem{Title: "Conflict", Status: http.StatusConflict}))
+	})
+	for _, path := range []string{"/joined", "/wrapped"} {
+		rec := call(t, r, httptest.NewRequest(http.MethodGet, path, nil))
+		doc := assertProblemJSON(t, rec, http.StatusConflict)
+		if doc.Title != "Conflict" {
+			t.Fatalf("%s title %q want Conflict", path, doc.Title)
+		}
+	}
+}
+
+func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
+	seen := 0
+	watch := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			_, err := next(ctx)
+			seen = ctx.Status()
+			return nil, err
+		}
+	}
+	r := web.NewRouter()
+	r.Use(watch, web.Recover())
+	r.Handle("GET", "/odd", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: 1, Status: 42}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/odd", nil))
+	assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if seen != http.StatusInternalServerError {
+		t.Fatalf("outer stage read status %d want 500", seen)
+	}
+}
+

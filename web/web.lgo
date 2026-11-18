@@ -64,7 +64,7 @@ func (r *Router) Group(prefix string, build func(g *Router)) {
 func (r *Router) Handle(method string, pattern string, h Handler) {
 	full := r.prefix + pattern
 	r.record(method, full)
-	r.mux.Handle(method+" "+full, routeHandler(r.rootRouter(), r.stages, h))
+	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
 }
 
 func (r *Router) record(method string, pattern string) {
@@ -86,55 +86,71 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mux.ServeHTTP(w, req)
 }
 
-func compose(stages []Stage, h Handler) Handler {
-	for i := len(stages) - 1; i >= 0; i-- {
-		h = stages[i](h)
-	}
-	return h
-}
-
-func routeHandler(root *Router, stages []Stage, h Handler) http.HandlerFunc {
+func served(root *Router, stages []Stage, h Handler) http.HandlerFunc {
+	run := chain(root, stages, h)
 	return func(w http.ResponseWriter, req *http.Request) {
-		ctx := newContext(w, req, root)
-		finish := func(c *Context) (Reply, error) {
-			reply, err := h(c)
-			if err != nil {
-				writeHandlerError(root, c, err)
-				return nil, nil
-			}
-			if werr := root.writeReply(c, reply); werr != nil {
-				slog.Error("web: reply write failed", "error", werr)
-			}
-			return nil, nil
-		}
-		if _, serr := compose(stages, finish)(ctx); serr != nil {
-			writeHandlerError(root, ctx, serr)
-		}
+		run(newContext(w, req, root))
 	}
 }
 
-func writeHandlerError(root *Router, ctx *Context, err error) {
-	if pe := problemIn(err); pe != nil {
-		writeProblemQuietly(root, ctx, pe.Problem)
+func chain(root *Router, stages []Stage, h Handler) func(c *Context) {
+	run := settle(root, h)
+	for i := len(stages) - 1; i >= 0; i-- {
+		inner := run
+		run = settle(root, stages[i](func(c *Context) (Reply, error) {
+			inner(c)
+			return nil, nil
+		}))
+	}
+	return run
+}
+
+func settle(root *Router, h Handler) func(c *Context) {
+	return func(c *Context) {
+		reply, err := h(c)
+		if err != nil {
+			root.answerError(c, err)
+			return
+		}
+		root.answerReply(c, reply)
+	}
+}
+
+func (r *Router) answerReply(c *Context, reply Reply) {
+	if reply == nil {
 		return
 	}
-	slog.Error("web: handler failed", "method", ctx.Request.Method, "path", ctx.Request.URL.Path, "error", err)
-	writeProblemQuietly(root, ctx, internalProblem())
+	if c.writer.wrote {
+		slog.Error("web: reply dropped, the response is already written", "method", c.Request.Method, "path", c.Request.URL.Path)
+		return
+	}
+	if werr := r.writeReply(c, reply); werr != nil {
+		slog.Error("web: reply write failed", "error", werr)
+		r.answerProblem(c, internalProblem())
+	}
 }
 
-func writeProblemQuietly(root *Router, ctx *Context, p Problem) {
-	if perr := root.writeProblem(ctx, p); perr != nil {
+func (r *Router) answerError(c *Context, err error) {
+	if c.writer.wrote {
+		slog.Error("web: error after the response was written", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
+		return
+	}
+	pe := &ProblemError{}
+	if errors.As(err, &pe) {
+		r.answerProblem(c, pe.Problem)
+		return
+	}
+	slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
+	r.answerProblem(c, internalProblem())
+}
+
+func (r *Router) answerProblem(c *Context, p Problem) {
+	if c.writer.wrote {
+		return
+	}
+	if perr := r.writeProblem(c, p); perr != nil {
 		slog.Error("web: problem write failed", "error", perr)
 	}
-}
-
-func problemIn(err error) *ProblemError? {
-	for e := err; e != nil; e = errors.Unwrap(e) {
-		if pe, ok := e.(*ProblemError); ok {
-			return pe
-		}
-	}
-	return nil
 }
 
 func internalProblem() Problem {
@@ -169,7 +185,7 @@ func Set[T any](ctx *Context, k *Key[T], v T) {
 
 type Context struct {
 	Request *http.Request
-	writer  http.ResponseWriter
+	writer  *statusWriter
 	root    *Router
 	vals    sync.Locked[map[any]any]
 }
@@ -232,9 +248,9 @@ func (s *statusWriter) WriteHeader(code int) {
 	if s.wrote {
 		return
 	}
+	s.inner.WriteHeader(code)
 	s.status = code
 	s.wrote = true
-	s.inner.WriteHeader(code)
 }
 
 func (s *statusWriter) Write(b []byte) (int, error) {

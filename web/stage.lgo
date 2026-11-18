@@ -23,18 +23,15 @@ func Recover() Stage {
 	}
 }
 
-func guarded(ctx *Context, next Handler) (reply Reply, err error) {
+func guarded(ctx *Context, next Handler) (Reply, error) {
 	defer func() {
 		if p := recover(); p != nil {
 			slog.Error("web: panic recovered", "value", fmt.Sprint(p))
-			writeProblemQuietly(ctx.root, ctx, internalProblem())
+			ctx.root.answerProblem(ctx, internalProblem())
 		}
 	}()
-	reply, err = next(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return reply, nil
+	_, err := next(ctx)
+	return nil, err
 }
 
 func RequestID() Stage {
@@ -92,7 +89,7 @@ func AccessLog(log *slog.Logger) Stage {
 	return func(next Handler) Handler {
 		return func(ctx *Context) (Reply, error) {
 			start := time.Now()
-			reply, err := next(ctx)
+			_, err := next(ctx)
 			log.Info("web: request",
 				"method", ctx.Request.Method,
 				"route", routeName(ctx.Request),
@@ -100,10 +97,7 @@ func AccessLog(log *slog.Logger) Stage {
 				"duration", time.Since(start).String(),
 				"request_id", ctx.writer.Header().Get("X-Request-Id"),
 			)
-			if err != nil {
-				return nil, err
-			}
-			return reply, nil
+			return nil, err
 		}
 	}
 }
@@ -116,10 +110,7 @@ func routeName(req *http.Request) string {
 }
 
 func (c *Context) Status() int {
-	if sw, ok := c.writer.(*statusWriter); ok {
-		return sw.status
-	}
-	return http.StatusOK
+	return c.writer.status
 }
 
 var cacheControlKey = NewKey[string]("web.cache-control")
