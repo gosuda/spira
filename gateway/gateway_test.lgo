@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"logos/sync"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -371,21 +371,19 @@ func TestMountPanicsOnBadRoutes(t *testing.T) {
 	}
 }
 
-type mutexBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+type lockedBuffer struct {
+	buf sync.Locked[bytes.Buffer]
 }
 
-func (b *mutexBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
+func (b *lockedBuffer) Write(p []byte) (n int, err error) {
+	b.buf.WithLock(func(buf *bytes.Buffer) { n, err = buf.Write(p) })
+	return n, err
 }
 
-func (b *mutexBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
+func (b *lockedBuffer) String() string {
+	var text string
+	b.buf.WithLock(func(buf *bytes.Buffer) { text = buf.String() })
+	return text
 }
 
 func TestStrippedTailStaysAnAbsolutePath(t *testing.T) {

@@ -395,7 +395,7 @@ func TestTimeoutCauseNamesTheHeaderWait(t *testing.T) {
 	}))
 	defer guardClose(block)
 	t.Cleanup(up.Close)
-	logs := &mutexBuffer{}
+	logs := &lockedBuffer{}
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
