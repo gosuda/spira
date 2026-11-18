@@ -21,6 +21,7 @@ import (
 type upstreamNote struct {
 	Method    string
 	Path      string
+	Escaped   string
 	Query     string
 	Body      string
 	XFF       string
@@ -38,6 +39,7 @@ func echoUpstream(t *testing.T, notes chan<- upstreamNote) *httptest.Server {
 		note := upstreamNote{
 			Method: r.Method,
 			Path:   r.URL.Path,
+			Escaped: r.URL.EscapedPath(),
 			Query:  r.URL.RawQuery,
 			Body:   string(b),
 			XFF:       r.Header.Get("X-Forwarded-For"),
@@ -419,6 +421,28 @@ func TestMountInsideAGroupStripsTheGroupPrefixAndKeepsTheHost(t *testing.T) {
 	}
 	if len(notes) != 0 {
 		t.Fatalf("the upstream saw %d more requests, want none for the other host", len(notes))
+	}
+}
+
+func TestPercentEncodedPathArrivesEncoded(t *testing.T) {
+	notes := make(chan upstreamNote, 2)
+	up := echoUpstream(t, notes)
+	gw := serveGateway(t, []gateway.Route{
+		{PathPrefix: "/api", StripPrefix: true, To: []string{up.URL + "/base"}},
+		{PathPrefix: "/keep", To: []string{up.URL}},
+	}, plainPolicy())
+	for _, tc := range []struct {
+		path string
+		want string
+	}{{"/api/files/a%2Fb", "/base/files/a%2Fb"}, {"/keep/a%2Fb%20c", "/keep/a%2Fb%20c"}} {
+		resp, err := http.Get(gw.URL + tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBody(t, resp)
+		if n := awaitNote(t, notes); n.Escaped != tc.want {
+			t.Fatalf("%s reached the upstream as %q want %q", tc.path, n.Escaped, tc.want)
+		}
 	}
 }
 

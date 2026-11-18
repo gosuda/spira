@@ -47,6 +47,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - Otherwise the stripped tail MUST start with `/`.
 - When the upstream base path is empty or `/`, the upstream path MUST be the tail.
 - Otherwise the join MUST place one `/` between the base path and the tail.
+- The upstream path MUST keep the percent-encoding of the request path.
 - The proxy MUST send the request to the upstream scheme and host.
 - Each request MUST start at the next upstream in list order.
 - After the last upstream, the next request MUST start at the first.
@@ -97,6 +98,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestMethodBodyQueryAndHeaderArriveUnchanged` proves that method, body, query and a caller header arrive unchanged.
 - `TestPrefixStrippedOrKeptByFlagAndShoppingNotRouted` proves strip, a kept prefix, and that `/shopping` does not select `/shop`.
 - `TestUpstreamBasePathIsJoinedBeforeTheStrippedTail` proves the base-path join.
+- `TestPercentEncodedPathArrivesEncoded` proves that an encoded slash stays encoded, with and without strip.
 - `TestForwardedHeadersHoldInboundValuesAndDropForgedOnes` proves the three forwarded headers and that a forged value is dropped.
 - `TestUpstreamsTakeTurns` proves the rotation across the upstream list.
 - `TestHostRouteMatchesOnlyItsHost` proves that a host route rejects another host.

@@ -221,7 +221,7 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	target.Scheme = base.Scheme
 	target.Host = base.Host
 	target.Path = targetPath(base.Path, rl.tail(req.URL.Path, req.Pattern))
-	target.RawPath = ""
+	target.RawPath = targetPath(base.EscapedPath(), rl.tail(req.URL.EscapedPath(), req.Pattern))
 	out := req.WithContext(actx)
 	out.URL = &target
 	out.Host = ""
