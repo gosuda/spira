@@ -37,14 +37,15 @@ type Transport interface {
 
 func NewStdio(r io.Reader, w io.Writer) *Stdio
 type Stdio struct {
-	source io.Reader
-	sink   io.Writer
-	reader *bufio.Reader
+	source  io.Reader
+	sink    io.Writer
+	reader  *bufio.Reader
+	pending []byte
+	broken  bool
 }
 func (s *Stdio) Notify(ctx context.Context, msg Envelope) error
 func (s *Stdio) Request(ctx context.Context, msg Envelope) (Envelope, error)
 func (s *Stdio) Close() error
-
 func NewHTTP(endpoint string, client *http.Client) *HTTP
 type HTTP struct {
 	endpoint string
@@ -130,6 +131,10 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - An HTTP request MUST return the matching response while the server keeps its event stream open.
 - A stdio read or write on a pipe that carries a deadline MUST end at the context deadline.
 - A pipe without deadline support MAY block a read or a write until the peer writes or closes its end.
+- A stdio write that sends part of a line MUST poison the transport; later sends MUST fail without writing.
+- A stdio read that ends at the deadline MUST keep its bytes; the next request MUST finish the line.
+- A stdio line held past a deadline MUST fit in 4 MiB; beyond that later sends MUST fail without writing.
+- Deadline setup that answers `os.ErrNoDeadline` MUST fall back to blocking I/O.
 
 ## Errors
 
@@ -154,6 +159,10 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountCallNonObjectArguments` and `TestClientCallNonObjectArguments` pin the object shape of `arguments` on the server and on the client.
 - `TestMountCallEmptyText` pins the `text` member of an empty result.
 - `TestStdioDeadlineWithoutReply` pins a read that ends at the context deadline on a pipe, with both ends open.
+- `TestStdioPartialWritePoisonsTransport` pins the poisoned transport and the missing second frame.
+- `TestStdioSplitReplyAcrossDeadline` pins a reply split across a deadline.
+- `TestStdioWithoutDeadlineSupport` pins requests over descriptors without deadline support.
+- `TestStdioPendingBound` pins the refusal after an overlong newline-less peer.
 - `TestMountInitialize`, `TestMountToolsList` and `TestMountCall` replay the specification's example requests (`lifecycle/initialize-request.json`, `tools/tools-call-request.json`) at the server and check the response members the seam can carry.
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
