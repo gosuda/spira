@@ -1,0 +1,170 @@
+package mcp_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/mcp"
+)
+
+type captured struct {
+	method  string
+	params  string
+	accept  string
+	session string
+	version string
+}
+
+type httpSpy struct {
+	fake   *fakeServer
+	sse    map[string]bool
+	inbox  []captured
+	session string
+}
+
+func newHTTPSpy(t *testing.T, steps []step, sse map[string]bool) *httpSpy {
+	return &httpSpy{fake: &fakeServer{t: t, steps: steps}, sse: sse}
+}
+
+func (s *httpSpy) handler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		var msg mcp.Envelope
+		if err := json.Unmarshal(body, &msg); err != nil {
+			http.Error(w, "parse error", http.StatusBadRequest)
+			return
+		}
+		s.inbox = append(s.inbox, captured{
+			method:  msg.Method,
+			params:  mustNormalize(msg.Params),
+			accept:  r.Header.Get("Accept"),
+			session: r.Header.Get("MCP-Session-Id"),
+			version: r.Header.Get("MCP-Protocol-Version"),
+		})
+		s.serve(t, w, msg)
+	})
+}
+
+func (s *httpSpy) serve(t *testing.T, w http.ResponseWriter, msg mcp.Envelope) {
+	reply, ok := s.fake.handle(msg)
+	if strings.HasPrefix(msg.Method, "notifications/") {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	st := s.fake.steps[s.fake.next-1]
+	if s.sse[st.method] ?? false {
+		s.writeStream(w, st, reply)
+		return
+	}
+	if st.method == "initialize" {
+		s.session = "sess-1868a90c"
+		w.Header().Set("MCP-Session-Id", s.session)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := fmt.Fprint(w, reply); err != nil {
+		return
+	}
+}
+
+func (s *httpSpy) writeStream(w http.ResponseWriter, st step, reply string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	if st.inject != "" {
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", st.inject); err != nil {
+			return
+		}
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", reply); err != nil {
+		return
+	}
+	flusher.Flush()
+}
+
+func TestHTTPTransportNorms(t *testing.T) {
+	spy := newHTTPSpy(t, replaySteps(), nil)
+	server := httptest.NewServer(spy.handler(t))
+	defer server.Close()
+	c := mcp.NewClient(mcp.NewHTTP(server.URL, server.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	if err := c.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize: %v", err)
+		return
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatalf("tools: %v", err)
+		return
+	}
+	if len(spy.inbox) < 2 {
+		t.Fatalf("captured %d requests, want at least 2", len(spy.inbox))
+		return
+	}
+	if first := spy.inbox[0]; first.session != "" {
+		t.Errorf("initialize carried session %q before the server assigned one", first.session)
+	}
+	for i, got := range spy.inbox {
+		if !strings.Contains(got.accept, "application/json") || !strings.Contains(got.accept, "text/event-stream") {
+			t.Errorf("request %d Accept %q misses a required type", i, got.accept)
+		}
+		if got.version != "2025-11-25" {
+			t.Errorf("request %d MCP-Protocol-Version %q", i, got.version)
+		}
+	}
+	for _, got := range spy.inbox[1:] {
+		if got.session != "sess-1868a90c" {
+			t.Errorf("%s carried session %q, want the initialize value", got.method, got.session)
+		}
+	}
+}
+
+func TestHTTPStreamResponse(t *testing.T) {
+	steps := []step{
+		{method: "initialize", reply: "lifecycle/initialize-response.json"},
+		{method: "tools/list", reply: "tools/tools-list-response-page2.json", inject: canonFixture(t, "tools/tools-list-changed-notification.json")},
+	}
+	spy := newHTTPSpy(t, steps, map[string]bool{"tools/list": true})
+	server := httptest.NewServer(spy.handler(t))
+	defer server.Close()
+	c := mcp.NewClient(mcp.NewHTTP(server.URL, server.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	if err := c.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize: %v", err)
+		return
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatalf("tools over a stream: %v", err)
+		return
+	}
+	var names []string
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	want := []string{"calculate_sum", "get_current_time"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("tool names %v, want %v", names, want)
+	}
+}

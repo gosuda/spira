@@ -1,0 +1,149 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/web"
+)
+
+const maxMessage = 4 << 20
+
+func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage) {
+	if guard == nil {
+		panic("mcp: Mount requires a guard stage")
+	}
+	serve := func(ctx *web.Context) (web.Reply, error) {
+		return handlePost(ctx, tools)
+	}
+	r.Group("", func(g *web.Router) {
+		g.Use(guard)
+		g.Handle("POST", path, serve)
+	})
+}
+
+func handlePost(ctx *web.Context, tools []ai.Tool) (web.Reply, error) {
+	req := ctx.Request
+	if !originAllowed(req) {
+		return fail(nil, http.StatusForbidden, -32000, "forbidden origin")
+	}
+	if v := req.Header.Get("MCP-Protocol-Version"); v != "" && v != ProtocolVersion {
+		return fail(nil, http.StatusBadRequest, -32600, "unsupported protocol version")
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxMessage))
+	if err != nil {
+		return nil, fmt.Errorf("mcp: read request body: %w", err)
+	}
+	msg, err := decodeEnvelope(body)
+	if err != nil {
+		return fail(nil, http.StatusBadRequest, -32700, "parse error")
+	}
+	if len(msg.ID) == 0 || msg.Method == "" {
+		return web.Empty{Status: http.StatusAccepted}, nil
+	}
+	return dispatch(ctx.Ctx(), tools, msg)
+}
+
+func originAllowed(req *http.Request) bool {
+	origin := req.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return strings.EqualFold(u.Host, req.Host)
+}
+
+func dispatch(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, error) {
+	switch msg.Method {
+	case "initialize":
+		return respond(msg.ID, initializeResult{
+			ProtocolVersion: ProtocolVersion,
+			Capabilities:    serverCapabilities{Tools: toolsCapability{ListChanged: true}},
+			ServerInfo:      Implementation{Name: "spira", Version: "0.1.0"},
+		})
+	case "tools/list":
+		return respond(msg.ID, listTools(tools))
+	case "tools/call":
+		return callTool(ctx, tools, msg)
+	}
+	return fail(msg.ID, http.StatusOK, -32601, "Method not found")
+}
+
+func listTools(tools []ai.Tool) listResult {
+	result := listResult{Tools: make([]wireTool, 0, len(tools))}
+	for _, tool := range tools {
+		schema := tool.Schema
+		if schema == "" {
+			schema = `{"type":"object"}`
+		}
+		result.Tools = append(result.Tools, wireTool{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: jsontext.Value(schema),
+		})
+	}
+	return result
+}
+
+func callTool(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, error) {
+	var params callParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil || params.Name == "" {
+		return fail(msg.ID, http.StatusOK, -32602, "Invalid params")
+	}
+	for i := range tools {
+		if tools[i].Name != params.Name {
+			continue
+		}
+		arguments := string(params.Arguments)
+		if strings.TrimSpace(arguments) == "" {
+			arguments = "{}"
+		}
+		content, err := tools[i].Call(ctx, arguments)
+		if err != nil {
+			return toolErrReply(msg.ID, tools[i].Name, err)
+		}
+		return respond(msg.ID, callResult{
+			Content: []contentItem{{Type: "text", Text: content}},
+		})
+	}
+	return fail(msg.ID, http.StatusOK, -32602, "Unknown tool: "+params.Name)
+}
+
+func toolErrReply(id jsontext.Value, name string, err error) (web.Reply, error) {
+	message := err.Error()
+	if strings.TrimSpace(message) == "" {
+		message = "tool " + name + " failed"
+	}
+	return respond(id, callResult{
+		Content: []contentItem{{Type: "text", Text: message}},
+		IsError: true,
+	})
+}
+
+func respond(id jsontext.Value, result any) (web.Reply, error) {
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("mcp: encode result: %w", err)
+	}
+	return web.Data{Value: Envelope{JSONRPC: "2.0", ID: id, Result: raw}}, nil
+}
+
+func fail(id jsontext.Value, status int, code int32, message string) (web.Reply, error) {
+	return web.Data{
+		Value:  Envelope{JSONRPC: "2.0", ID: id, Error: &RPCError{Code: code, Message: message}},
+		Status: status,
+	}, nil
+}

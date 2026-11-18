@@ -1,7 +1,5 @@
 # ai/ollama
 
-Status: specified; the package is not in the tree yet.
-
 Package `ai/ollama` is the Ollama provider. It implements [`ai.Model`](ai.md) and [`ai.Embedder`](ai.md) over the local API.
 
 The package holds behavior translated from Spring AI.

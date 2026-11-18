@@ -1,0 +1,101 @@
+package mcp
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"encoding/json/jsontext"
+)
+
+type Implementation struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type clientCapabilities struct{}
+
+type initializeParams struct {
+	ProtocolVersion string             `json:"protocolVersion"`
+	Capabilities    clientCapabilities `json:"capabilities"`
+	ClientInfo      Implementation     `json:"clientInfo"`
+}
+
+type initializeResult struct {
+	ProtocolVersion string             `json:"protocolVersion"`
+	Capabilities    serverCapabilities `json:"capabilities,omitzero"`
+	ServerInfo      Implementation     `json:"serverInfo,omitzero"`
+}
+
+type serverCapabilities struct {
+	Tools toolsCapability `json:"tools,omitzero"`
+}
+
+type toolsCapability struct {
+	ListChanged bool `json:"listChanged,omitzero"`
+}
+
+type listParams struct {
+	Cursor string `json:"cursor,omitzero"`
+}
+
+type wireTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitzero"`
+	InputSchema jsontext.Value `json:"inputSchema,omitzero"`
+}
+
+type listResult struct {
+	Tools      []wireTool `json:"tools"`
+	NextCursor string     `json:"nextCursor,omitzero"`
+}
+
+type callParams struct {
+	Name      string         `json:"name"`
+	Arguments jsontext.Value `json:"arguments"`
+}
+
+type contentItem struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitzero"`
+}
+
+type callResult struct {
+	Content []contentItem `json:"content"`
+	IsError bool          `json:"isError,omitzero"`
+}
+
+func (r callResult) text() string {
+	var texts []string
+	for _, item := range r.Content {
+		if item.Type == "text" {
+			texts = append(texts, item.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+func callArguments(name string, arguments string) (jsontext.Value, error) {
+	if strings.TrimSpace(arguments) == "" {
+		return jsontext.Value("{}"), nil
+	}
+	var probe map[string]jsontext.Value
+	if err := json.Unmarshal(jsontext.Value(arguments), &probe); err != nil {
+		return nil, fmt.Errorf("mcp: tools/call %s arguments: %w", name, err)
+	}
+	return jsontext.Value(arguments), nil
+}
+
+func resultOf[T any](reply Envelope) (T, error) {
+	var out T
+	if e := reply.Error; e != nil {
+		return out, e
+	}
+	if len(reply.Result) == 0 {
+		return out, fmt.Errorf("mcp: reply holds no result")
+	}
+	if err := json.Unmarshal(reply.Result, &out); err != nil {
+		return out, fmt.Errorf("mcp: decode result: %w", err)
+	}
+	return out, nil
+}

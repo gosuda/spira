@@ -1,0 +1,9 @@
+package mcp
+
+import "context"
+
+type Transport interface {
+	Notify(ctx context.Context, msg Envelope) error
+	Request(ctx context.Context, msg Envelope) (Envelope, error)
+	Close() error
+}

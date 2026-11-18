@@ -1,0 +1,143 @@
+package mcp_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/mcp"
+)
+
+type fakeServer struct {
+	t           *testing.T
+	steps       []step
+	next        int
+	initialized bool
+}
+
+func (s *fakeServer) handle(msg mcp.Envelope) (string, bool) {
+	if msg.Method == "notifications/initialized" {
+		s.initialized = true
+		assertInitializedFixture(s.t, msg)
+		return "", false
+	}
+	if strings.HasPrefix(msg.Method, "notifications/") {
+		return "", false
+	}
+	if msg.Method != "initialize" && !s.initialized {
+		return s.reject(msg, -32600, "not initialized"), true
+	}
+	if s.next >= len(s.steps) || s.steps[s.next].method != msg.Method {
+		return s.reject(msg, -32602, "unexpected method "+msg.Method), true
+	}
+	st := s.steps[s.next]
+	if st.params != "" && mustNormalizeText(st.params) != mustNormalize(msg.Params) {
+		return s.reject(msg, -32602, "unexpected params for "+msg.Method), true
+	}
+	s.next++
+	return st.respond(s.t, msg)
+}
+
+func (s *fakeServer) reject(req mcp.Envelope, code int32, message string) string {
+	s.t.Errorf("fake server rejected a message: %d %s", code, message)
+	reply := mcp.Envelope{JSONRPC: "2.0", ID: req.ID, Error: &mcp.RPCError{Code: code, Message: message}}
+	out, err := json.Marshal(reply)
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+func assertInitializedFixture(t *testing.T, msg mcp.Envelope) {
+	t.Helper()
+	out, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+		return
+	}
+	if got, want := canon(t, out), canonFixture(t, "lifecycle/initialized-notification.json"); got != want {
+		t.Errorf("initialized notification %s, want %s", got, want)
+	}
+}
+
+type stdioPump struct {
+	fake   *fakeServer
+	client *os.File
+	server *os.File
+	sink   *os.File
+	pending []byte
+}
+
+func newStdioTransport(t *testing.T, steps []step) (mcp.Transport, func()) {
+	t.Helper()
+	serverRead, clientWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return nil, nil
+	}
+	clientRead, serverWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return nil, nil
+	}
+	pump := &stdioPump{fake: &fakeServer{t: t, steps: steps}, client: clientRead, server: serverRead, sink: serverWrite}
+	transport := mcp.NewStdio(pump, clientWrite)
+	if transport == nil {
+		t.Fatal("no stdio transport")
+		return nil, nil
+	}
+	return transport, func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close stdio transport: %v", err)
+		}
+	}
+}
+
+func (p *stdioPump) Read(b []byte) (int, error) {
+	p.pump()
+	return p.client.Read(b)
+}
+
+func (p *stdioPump) pump() {
+	chunk := make([]byte, 64*1024)
+	n, err := p.server.Read(chunk)
+	if n > 0 {
+		p.pending = append(p.pending, chunk[:n]...)
+	}
+	if err != nil && n == 0 {
+		return
+	}
+	for {
+		i := bytes.IndexByte(p.pending, '\n')
+		if i < 0 {
+			return
+		}
+		line := strings.TrimSpace(string(p.pending[:i]))
+		p.pending = p.pending[i+1:]
+		p.line(line)
+	}
+}
+
+func (p *stdioPump) line(line string) {
+	if line == "" {
+		return
+	}
+	var msg mcp.Envelope
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		p.reply(p.fake.reject(mcp.Envelope{}, -32700, "parse error"))
+		return
+	}
+	reply, ok := p.fake.handle(msg)
+	if ok {
+		p.reply(reply)
+	}
+}
+
+func (p *stdioPump) reply(line string) {
+	if _, err := fmt.Fprintf(p.sink, "%s\n", line); err != nil {
+		p.fake.t.Errorf("stdio fake write: %v", err)
+	}
+}

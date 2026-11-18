@@ -1,0 +1,166 @@
+package mcp
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+)
+
+type HTTP struct {
+	endpoint string
+	client   *http.Client
+	session  string
+}
+
+func NewHTTP(endpoint string, client *http.Client) *HTTP {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &HTTP{endpoint: endpoint, client: client}
+}
+
+func (h *HTTP) Notify(ctx context.Context, msg Envelope) error {
+	reply, err := h.post(ctx, msg)
+	if err != nil {
+		return err
+	}
+	if !okStatus(reply.status) {
+		return statusError(reply.status, reply.payload)
+	}
+	return nil
+}
+
+func (h *HTTP) Request(ctx context.Context, msg Envelope) (Envelope, error) {
+	reply, err := h.post(ctx, msg)
+	if err != nil {
+		return Envelope{}, err
+	}
+	if !okStatus(reply.status) {
+		return Envelope{}, statusError(reply.status, reply.payload)
+	}
+	media, _, err := mime.ParseMediaType(reply.media)
+	if err != nil {
+		return Envelope{}, fmt.Errorf("mcp: http content type: %w", err)
+	}
+	switch media {
+	case "application/json":
+		return decodeEnvelope(reply.payload)
+	case "text/event-stream":
+		return streamReply(ctx, msg, bytes.NewReader(reply.payload))
+	}
+	return Envelope{}, fmt.Errorf("mcp: http content type %q", media)
+}
+
+type httpReply struct {
+	status  int
+	media   string
+	payload []byte
+}
+
+func (h *HTTP) post(ctx context.Context, msg Envelope) (httpReply, error) {
+	body, err := encodeEnvelope(msg)
+	if err != nil {
+		return httpReply{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return httpReply{}, fmt.Errorf("mcp: http request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", ProtocolVersion)
+	if h.session != "" {
+		req.Header.Set("MCP-Session-Id", h.session)
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return httpReply{}, fmt.Errorf("mcp: http post: %w", err)
+	}
+	if sid := resp.Header.Get("MCP-Session-Id"); sid != "" {
+		h.session = sid
+	}
+	payload, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return httpReply{}, fmt.Errorf("mcp: http read body: %w", readErr)
+	}
+	if closeErr != nil {
+		return httpReply{}, fmt.Errorf("mcp: http close body: %w", closeErr)
+	}
+	return httpReply{status: resp.StatusCode, media: resp.Header.Get("Content-Type"), payload: payload}, nil
+}
+
+func (h *HTTP) Close() error {
+	h.client.CloseIdleConnections()
+	return nil
+}
+
+func okStatus(status int) bool {
+	return status >= 200 && status < 300
+}
+
+func statusError(status int, payload []byte) error {
+	if reply, err := decodeEnvelope(payload); err == nil {
+		if e := reply.Error; e != nil {
+			return e
+		}
+	}
+	return fmt.Errorf("mcp: http status %d: %s", status, clip(payload))
+}
+
+func clip(payload []byte) string {
+	text := strings.TrimSpace(string(payload))
+	if len(text) > 200 {
+		return text[:200]
+	}
+	return text
+}
+
+func streamReply(ctx context.Context, sent Envelope, body io.Reader) (Envelope, error) {
+	want := idKey(sent.ID)
+	reader := bufio.NewReader(body)
+	for {
+		if err := ctx.Err(); err != nil {
+			return Envelope{}, fmt.Errorf("mcp: http stream: %w", err)
+		}
+		event, err := nextEvent(reader)
+		if err != nil {
+			return Envelope{}, fmt.Errorf("mcp: http stream: %w", err)
+		}
+		if event == "" {
+			continue
+		}
+		reply, err := decodeEnvelope([]byte(event))
+		if err != nil {
+			continue
+		}
+		if isResponse(reply) && idKey(reply.ID) == want {
+			return reply, nil
+		}
+	}
+}
+
+func nextEvent(reader *bufio.Reader) (string, error) {
+	var data []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		switch {
+		case line == "":
+			if len(data) > 0 {
+				return strings.Join(data, "\n"), nil
+			}
+		case strings.HasPrefix(line, ":"):
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+}

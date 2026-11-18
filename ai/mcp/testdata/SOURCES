@@ -1,0 +1,55 @@
+Specification revision 2025-11-25 of the Model Context Protocol.
+Ground truth for ai/mcp. The fixtures hold the example messages of the
+pages below, copied verbatim except that the site's "theme={null}"
+marker after each code fence is dropped. JSON has no comment syntax,
+so this file carries the provenance a header comment would.
+
+Fetched 2026-11-18.
+
+Page https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle.md
+
+  lifecycle/initialize-request.json        initialize request example
+  lifecycle/initialize-response.json       initialize response example
+  lifecycle/initialized-notification.json  notifications/initialized example
+  lifecycle/initialize-error.json          initialization error example
+
+Page https://modelcontextprotocol.io/specification/2025-11-25/basic/transports.md
+
+  The page defines the HTTP wire behavior in prose and holds no
+  JSON-RPC example messages, so it has no fixture files. The norms its
+  text fixes, which the HTTP transport tests pin: every client message
+  is a POST to one endpoint; Accept lists both application/json and
+  text/event-stream; a notification or response POST is answered 202
+  with no body; a request POST is answered with Content-Type
+  application/json (one JSON object) or text/event-stream (the
+  response may follow other messages on the stream); the client
+  includes MCP-Session-Id on every request after initialize, echoing
+  the value initialize returned; the client includes
+  MCP-Protocol-Version on HTTP requests. Fetched 2026-11-18.
+
+Page https://modelcontextprotocol.io/specification/2025-11-25/server/tools.md
+
+  tools/tools-capability.json              tools capability block
+  tools/tools-list-request.json            tools/list request example
+  tools/tools-list-response.json           tools/list response example
+  tools/tools-call-request.json            tools/call request example
+  tools/tools-call-response.json           tools/call response example
+  tools/tools-list-changed-notification.json  list changed notification
+  tools/tools-call-protocol-error.json     protocol error example
+  tools/tools-call-execution-error.json    tool execution error example
+  tools/tools-call-structured-response.json   structured content example
+  tools/content-text.json                  text content item
+  tools/content-image.json                 image content item
+  tools/content-audio.json                 audio content item
+  tools/content-resource-link.json         resource link item
+  tools/content-embedded-resource.json     embedded resource item
+
+Derived fixture, assembled from the same page (not verbatim):
+
+  tools/tools-list-response-page2.json     second tools/list page for
+    the cursor test. The page's tools/list response example carries
+    nextCursor, so following the cursor to the end needs a final page
+    whose result has no nextCursor, and the page defines no such
+    example. Its two tools are the page's own schema examples
+    (calculate_sum and get_current_time) placed in a tools/list
+    response envelope. Fetched 2026-11-18.
