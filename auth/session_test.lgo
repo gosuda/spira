@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"logos/sync"
 
 	"github.com/gosuda/spira/auth"
 	"github.com/gosuda/spira/web"
@@ -262,5 +265,171 @@ func assertSlot(t *testing.T, store auth.SessionStore, i int) {
 	}
 	if p.ID != fmt.Sprintf("user-%d", i) {
 		t.Fatalf("slot %d: id %s", i, p.ID)
+	}
+}
+
+type flakyDeleteStore struct {
+	failDelete bool
+	sessions   sync.Locked[map[string]auth.Principal]
+}
+
+func newFlakyDeleteStore() *flakyDeleteStore {
+	s := &flakyDeleteStore{}
+	s.sessions.WithLock(func(m *map[string]auth.Principal) {
+		*m = map[string]auth.Principal{}
+	})
+	return s
+}
+
+func (s *flakyDeleteStore) Load(ctx context.Context, id string) (auth.Principal?, error) {
+	var out auth.Principal?
+	s.sessions.WithLock(func(m *map[string]auth.Principal) {
+		p, ok := (*m)[id]
+		if ok {
+			out = p
+		}
+	})
+	return out, nil
+}
+
+func (s *flakyDeleteStore) Save(ctx context.Context, id string, p auth.Principal, ttl time.Duration) error {
+	s.sessions.WithLock(func(m *map[string]auth.Principal) {
+		(*m)[id] = p
+	})
+	return nil
+}
+
+func (s *flakyDeleteStore) Delete(ctx context.Context, id string) error {
+	if s.failDelete {
+		return fmt.Errorf("store unavailable")
+	}
+	s.sessions.WithLock(func(m *map[string]auth.Principal) {
+		delete(*m, id)
+	})
+	return nil
+}
+
+func (s *flakyDeleteStore) size() int {
+	n := 0
+	s.sessions.WithLock(func(m *map[string]auth.Principal) {
+		n = len(*m)
+	})
+	return n
+}
+
+func captureAuthRoute(s *auth.Sessions, loginErr *string, logoutErr *string) *web.Router {
+	r := web.NewRouter()
+	r.Handle("POST", "/login", func(ctx *web.Context) (web.Reply, error) {
+		cookie, err := s.Login(ctx, auth.Principal{ID: "u-1", Roles: []string{"user"}})
+		if err != nil {
+			*loginErr = err.Error()
+			return nil, err
+		}
+		if cookie == nil {
+			return nil, fmt.Errorf("auth: login returned no cookie")
+		}
+		ctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+		return web.Empty{}, nil
+	})
+	r.Handle("POST", "/logout", func(ctx *web.Context) (web.Reply, error) {
+		cookie, err := s.Logout(ctx)
+		if err != nil {
+			*logoutErr = err.Error()
+			return nil, err
+		}
+		if cookie == nil {
+			return nil, fmt.Errorf("auth: logout returned no cookie")
+		}
+		ctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+		return web.Empty{}, nil
+	})
+	return r
+}
+
+func TestLogoutFailsClosedWhenDeleteFails(t *testing.T) {
+	store := newFlakyDeleteStore()
+	store.failDelete = true
+	s := &auth.Sessions{Store: store}
+	var loginErr, logoutErr string
+	r := captureAuthRoute(s, &loginErr, &logoutErr)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodPost, "/login", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("login without a cookie: status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+	c1 := sessionCookie(t, rec)
+	if c1 == nil {
+		return
+	}
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.AddCookie(c1)
+	out := callAuth(t, r, req)
+	if out.Code != http.StatusInternalServerError {
+		t.Fatalf("logout with a failing delete: status %d want 500 body %s", out.Code, out.Body.String())
+	}
+	if len(out.Result().Cookies()) != 0 {
+		t.Fatalf("logout with a failing delete issued a cookie")
+	}
+	if !strings.Contains(logoutErr, "auth: session delete:") {
+		t.Fatalf("logout error %q lacks the session delete wrap", logoutErr)
+	}
+	if p := loadSession(t, store, hashSessionKey(t, c1.Value)); p == nil {
+		t.Fatalf("session disappeared although its delete failed")
+	}
+}
+
+func TestLoginFailsClosedWhenDeleteFails(t *testing.T) {
+	store := newFlakyDeleteStore()
+	store.failDelete = true
+	s := &auth.Sessions{Store: store}
+	var loginErr, logoutErr string
+	r := captureAuthRoute(s, &loginErr, &logoutErr)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodPost, "/login", nil))
+	c1 := sessionCookie(t, rec)
+	if c1 == nil {
+		return
+	}
+	again := httptest.NewRequest(http.MethodPost, "/login", nil)
+	again.AddCookie(c1)
+	out := callAuth(t, r, again)
+	if out.Code != http.StatusInternalServerError {
+		t.Fatalf("re-login with a failing delete: status %d want 500 body %s", out.Code, out.Body.String())
+	}
+	if len(out.Result().Cookies()) != 0 {
+		t.Fatalf("re-login with a failing delete issued a cookie")
+	}
+	if !strings.Contains(loginErr, "auth: session delete:") {
+		t.Fatalf("login error %q lacks the session delete wrap", loginErr)
+	}
+	if store.size() != 1 {
+		t.Fatalf("store holds %d sessions after the failed re-login, want only the old one", store.size())
+	}
+	if p := loadSession(t, store, hashSessionKey(t, c1.Value)); p == nil {
+		t.Fatalf("old session disappeared although its delete failed")
+	}
+}
+
+func TestFailingDeleteNeverBlocksRequestsWithoutCookie(t *testing.T) {
+	store := newFlakyDeleteStore()
+	store.failDelete = true
+	s := &auth.Sessions{Store: store}
+	var loginErr, logoutErr string
+	r := captureAuthRoute(s, &loginErr, &logoutErr)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodPost, "/login", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("login without a cookie: status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+	out := callAuth(t, r, httptest.NewRequest(http.MethodPost, "/logout", nil))
+	if out.Code != http.StatusNoContent {
+		t.Fatalf("logout without a cookie: status %d want 204 body %s", out.Code, out.Body.String())
+	}
+	expired := sessionCookie(t, out)
+	if expired == nil {
+		return
+	}
+	if expired.MaxAge >= 0 {
+		t.Fatalf("logout without a cookie did not expire the cookie: maxAge=%d", expired.MaxAge)
 	}
 }

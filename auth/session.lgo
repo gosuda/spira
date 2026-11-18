@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -44,7 +43,9 @@ func (s *Sessions) Authenticator() Authenticator {
 
 func (s *Sessions) Login(ctx *web.Context, p Principal) (*http.Cookie?, error) {
 	id := newSessionID()?
-	s.dropCookieSession(ctx)
+	if derr := s.dropCookieSession(ctx); derr != nil {
+		return nil, fmt.Errorf("auth: session delete: %w", derr)
+	}
 	if serr := s.Store.Save(ctx.Ctx(), hashSessionID(id), p, s.TTL); serr != nil {
 		return nil, fmt.Errorf("auth: session save: %w", serr)
 	}
@@ -59,7 +60,9 @@ func (s *Sessions) Login(ctx *web.Context, p Principal) (*http.Cookie?, error) {
 }
 
 func (s *Sessions) Logout(ctx *web.Context) (*http.Cookie?, error) {
-	s.dropCookieSession(ctx)
+	if derr := s.dropCookieSession(ctx); derr != nil {
+		return nil, fmt.Errorf("auth: session delete: %w", derr)
+	}
 	return &http.Cookie{
 		Name:     s.Cookie,
 		Value:    "",
@@ -72,14 +75,12 @@ func (s *Sessions) Logout(ctx *web.Context) (*http.Cookie?, error) {
 	}, nil
 }
 
-func (s *Sessions) dropCookieSession(ctx *web.Context) {
+func (s *Sessions) dropCookieSession(ctx *web.Context) error {
 	cookie, err := ctx.Request.Cookie(s.Cookie)
 	if err != nil {
-		return
+		return nil
 	}
-	if derr := s.Store.Delete(ctx.Ctx(), hashSessionID(cookie.Value)); derr != nil {
-		slog.Error("auth: session delete failed", "error", derr)
-	}
+	return s.Store.Delete(ctx.Ctx(), hashSessionID(cookie.Value))
 }
 
 func newSessionID() (string, error) {
