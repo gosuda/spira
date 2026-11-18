@@ -144,9 +144,14 @@ func pause(t *testing.T, log *toolLog, calls ...ai.ToolCall) *ai.ConfirmError? {
 	return paused
 }
 
-func resume(log *toolLog, paused *ai.ConfirmError, decisions ...ai.Decision) (*scripted, ai.Reply, error) {
+func resume(t *testing.T, log *toolLog, paused *ai.ConfirmError, decisions ...ai.Decision) (*scripted, ai.Reply, error) {
+	t.Helper()
 	model := &scripted{replies: []ai.Reply{saying("Done.")}}
-	reply, err := ai.Run(context.Background(), model, ai.Request{Messages: paused.Messages, Tools: log.tools(), Decisions: decisions}, ai.Limits{})
+	request := ai.Request{Messages: paused.Messages, Tools: log.tools(), Decisions: decisions}
+	if paused.Reply.Usage != (ai.Usage{}) || paused.Reply.ID != "" || paused.Reply.Model != "" {
+		request.Resume = &paused.Reply
+	}
+	reply, err := ai.Run(t.Context(), model, request, ai.Limits{})
 	return model, reply, err
 }
 
@@ -169,7 +174,7 @@ func TestRunResumesAnAllowedCallAndHoldsTheReplyOnce(t *testing.T) {
 	if paused == nil {
 		return
 	}
-	model, reply, err := resume(log, paused, ai.Decision{Call: "c1"})
+	model, reply, err := resume(t, log, paused, ai.Decision{Call: "c1"})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 		return
@@ -194,7 +199,7 @@ func TestRunAnswersADeniedCallWithItsMessageWithoutRunningIt(t *testing.T) {
 	if paused == nil {
 		return
 	}
-	model, _, err := resume(log, paused, ai.Decision{Call: "c1", Deny: "Too expensive."})
+	model, _, err := resume(t, log, paused, ai.Decision{Call: "c1", Deny: "Too expensive."})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 		return
@@ -209,13 +214,13 @@ func TestRunNeedsADecisionForEveryCallOfTheReply(t *testing.T) {
 	if paused == nil {
 		return
 	}
-	_, _, err := resume(log, paused, ai.Decision{Call: "c1", Deny: ""})
+	_, _, err := resume(t, log, paused, ai.Decision{Call: "c1", Deny: ""})
 	if err == nil || !strings.Contains(err.Error(), "missing: [c2]") {
 		t.Fatalf("error = %v, want one that names the missing decision for c2", err)
 		return
 	}
 	requireStrings(t, "ran after the refused resume", log.ran)
-	model, _, rerr := resume(log, paused, ai.Decision{Call: "c1", Deny: ""}, ai.Decision{Call: "c2"})
+	model, _, rerr := resume(t, log, paused, ai.Decision{Call: "c1", Deny: ""}, ai.Decision{Call: "c2"})
 	if rerr != nil {
 		t.Fatalf("resume: %v", rerr)
 		return
@@ -230,7 +235,7 @@ func TestRunRefusesADecisionAboutACallTheReplyDoesNotHold(t *testing.T) {
 	if paused == nil {
 		return
 	}
-	_, _, err := resume(log, paused, ai.Decision{Call: "other"})
+	_, _, err := resume(t, log, paused, ai.Decision{Call: "other"})
 	if err == nil || !strings.Contains(err.Error(), "'other'") {
 		t.Fatalf("error = %v, want one that names the key 'other'", err)
 	}
@@ -243,7 +248,7 @@ func TestRunRefusesTwoDecisionsAboutOneCall(t *testing.T) {
 	if paused == nil {
 		return
 	}
-	_, _, err := resume(log, paused, ai.Decision{Call: "c1"}, ai.Decision{Call: "c1", Deny: "No."})
+	_, _, err := resume(t, log, paused, ai.Decision{Call: "c1"}, ai.Decision{Call: "c1", Deny: "No."})
 	if err == nil || !strings.Contains(err.Error(), "two decisions") {
 		t.Fatalf("error = %v, want one that refuses two decisions for c1", err)
 	}
@@ -291,7 +296,7 @@ func TestRunReturnsToolResultsDirectlyOnlyWhenEveryCallRanAndAskedForIt(t *testi
 	if alone == nil {
 		return
 	}
-	model, reply, err := resume(log, alone, ai.Decision{Call: "c1"})
+	model, reply, err := resume(t, log, alone, ai.Decision{Call: "c1"})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 		return
@@ -308,7 +313,7 @@ func TestRunReturnsToolResultsDirectlyOnlyWhenEveryCallRanAndAskedForIt(t *testi
 	if mixed == nil {
 		return
 	}
-	again, final, merr := resume(log, mixed, ai.Decision{Call: "c1"}, ai.Decision{Call: "c2", Deny: "No."})
+	again, final, merr := resume(t, log, mixed, ai.Decision{Call: "c1"}, ai.Decision{Call: "c2", Deny: "No."})
 	if merr != nil {
 		t.Fatalf("resume: %v", merr)
 		return
@@ -326,7 +331,7 @@ func TestRunNamesACallByItsPositionWhenItsIDIsMissingSharedOrLooksLikeAPosition(
 		return
 	}
 	requireStrings(t, "waiting", paused.Waiting, "#1")
-	model, _, err := resume(log, paused, ai.Decision{Call: "c1"}, ai.Decision{Call: "#1"})
+	model, _, err := resume(t, log, paused, ai.Decision{Call: "c1"}, ai.Decision{Call: "#1"})
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 		return
@@ -339,7 +344,7 @@ func TestRunNamesACallByItsPositionWhenItsIDIsMissingSharedOrLooksLikeAPosition(
 		return
 	}
 	requireStrings(t, "waiting for calls that share an id", shared.Waiting, "#0", "#2")
-	_, _, serr := resume(log, shared, ai.Decision{Call: "c1"})
+	_, _, serr := resume(t, log, shared, ai.Decision{Call: "c1"})
 	if serr == nil || !strings.Contains(serr.Error(), "no tool call has the key 'c1'") {
 		t.Fatalf("error = %v, want one that refuses the shared id as a key", serr)
 	}
@@ -466,4 +471,92 @@ func TestRunWrapsTheModelError(t *testing.T) {
 	if !errors.Is(err, errModelDown) || !strings.HasPrefix(err.Error(), "ai: run: ") {
 		t.Fatalf("error = %v, want the model error behind the ai: run: prefix", err)
 	}
+}
+
+func TestRunNeverCallsAToolWhenTheContextEndedBeforeTheBatch(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather"))}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := ai.Run(ctx, model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want the context error", err)
+	}
+	requireStrings(t, "ran", log.ran)
+}
+
+func TestRunCarriesUsageAndReplyStateAcrossAConfirmation(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	if want := (ai.Usage{Input: 10, Output: 2, Total: 12}); paused.Reply.Usage != want {
+		t.Fatalf("paused usage = %+v, want the usage of the model round %+v", paused.Reply.Usage, want)
+	}
+	if paused.Reply.ID != "r1" || paused.Reply.Model != "m" {
+		t.Fatalf("paused reply id %q model %q, want r1 and m", paused.Reply.ID, paused.Reply.Model)
+	}
+}
+
+func TestRunCarriesTheAccumulatedUsageIntoTheResumedReply(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "ticket"))
+	if paused == nil {
+		return
+	}
+	_, reply, err := resume(t, log, paused, ai.Decision{Call: "c1"})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+		return
+	}
+	if want := (ai.Usage{Input: 10, Output: 2, Total: 12}); reply.Usage != want {
+		t.Fatalf("direct reply usage = %+v, want the paused round's usage %+v", reply.Usage, want)
+	}
+}
+
+func TestRunResolvesEveryToolBeforeAnyCallRuns(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather"), call("c2", "nope"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{})
+	if err == nil || !strings.Contains(err.Error(), `no tool named "nope"`) {
+		t.Fatalf("error = %v, want one that names the unknown tool", err)
+	}
+	requireStrings(t, "ran", log.ran)
+}
+
+func TestRunAnswersEveryCallWhenALimitStopsTheBatch(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("a", "weather"), call("b", "weather"), call("c", "ticket"))}}
+	unconfirmed := []ai.Tool{log.tool("weather", "sunny"), log.tool("ticket", "VX205-14C")}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: unconfirmed}, ai.Limits{PerTool: 1})
+	breach := &ai.LimitError{}
+	if !errors.As(err, &breach) {
+		t.Fatalf("error = %v, want a LimitError", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "weather")
+	last := breach.Messages[len(breach.Messages)-1]
+	wantPerTool := "Tool call limit (1) exceeded for tool 'weather'. No further calls to this tool are allowed in this turn."
+	requireStrings(t, "results in the breach", resultsOf(last),
+		"a=sunny",
+		"b="+wantPerTool,
+		"c="+wantPerTool,
+	)
+}
+
+func TestRunAnswersEveryCallWhenATurnLimitStopsTheBatch(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("a", "weather"), call("b", "ticket"), call("c", "weather"))}}
+	unconfirmed := []ai.Tool{log.tool("weather", "sunny"), log.tool("ticket", "VX205-14C")}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: unconfirmed}, ai.Limits{PerTurn: 1})
+	breach := &ai.LimitError{}
+	if !errors.As(err, &breach) {
+		t.Fatalf("error = %v, want a LimitError", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "weather")
+	last := breach.Messages[len(breach.Messages)-1]
+	want := "Total tool call limit (1) exceeded for this turn. No further tool calls are allowed."
+	requireStrings(t, "results in the breach", resultsOf(last), "a=sunny", "b="+want, "c="+want)
 }

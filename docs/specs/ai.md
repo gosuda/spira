@@ -68,6 +68,7 @@ type Request struct {
 	Stop        []string
 	Format      string?
 	Decisions   []Decision
+	Resume      *Reply?
 }
 
 type Finish string
@@ -128,6 +129,7 @@ type Limits struct {
 type ConfirmError struct {
 	Waiting  []string
 	Messages []Message
+	Reply    Reply
 }
 
 func (e *ConfirmError) Error() string
@@ -205,7 +207,11 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `Run` MUST return a `ConfirmError` before any call runs when a tool needs confirmation and `Decisions` is empty.
 - `Run` MUST name only the calls whose tools need confirmation in `ConfirmError.Waiting`.
 - `Run` MUST use each decision for one resumed batch only.
-- `Run` MUST NOT send `Decisions` to the model.
+- `Run` MUST NOT send `Decisions` or `Resume` to the model.
+- `Run` MUST carry the usage and the last reply id and model of a paused turn into `ConfirmError.Reply`.
+- `Run` MUST seed its usage and last reply from `Request.Resume` when it is set.
+- `Run` MUST resolve every tool of a batch before any call runs.
+- `Run` MUST answer every call of a batch that a limit stops, not only the calls that ran.
 - `Run` MUST require one decision for every call of a resumed reply.
 - `Run` MUST name a call by its id when that id is unique, non-blank and not a position.
 - `Run` MUST name other calls by `#` and the call index.
@@ -307,6 +313,11 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `TestRunTurnsAToolErrorIntoTheResultOfThatCall` proves tool error text.
 - `TestRunEndsWhenTheContextEndsDuringATool` proves context end.
 - `TestRunWrapsTheModelError` proves model error wrap.
+- `TestRunNeverCallsAToolWhenTheContextEndedBeforeTheBatch` proves the pre-batch context check.
+- `TestRunCarriesUsageAndReplyStateAcrossAConfirmation` proves the paused reply state.
+- `TestRunCarriesTheAccumulatedUsageIntoTheResumedReply` proves usage across a confirmation.
+- `TestRunResolvesEveryToolBeforeAnyCallRuns` proves pre-resolution.
+- `TestRunAnswersEveryCallWhenALimitStopsTheBatch` and `TestRunAnswersEveryCallWhenATurnLimitStopsTheBatch` prove answered calls on a limit.
 - `TestWrapRunsLayersInListOrderOncePerRoundOfTheLoop` proves layer order and rounds.
 - The `RegexToolIndexTests` cases prove the search index.
 - `TestSearchToolsMatchesByToolName` proves name match.

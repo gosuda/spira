@@ -30,6 +30,7 @@ type Limits struct {
 type ConfirmError struct {
 	Waiting  []string
 	Messages []Message
+	Reply    Reply
 }
 
 func (e *ConfirmError) Error() string {
@@ -56,8 +57,14 @@ func (e *LimitError) text() string {
 func Run(ctx context.Context, m Model, req Request, limits Limits) (Reply, error) {
 	messages := slices.Clone(req.Messages)
 	decisions := req.Decisions
+	resume := req.Resume
+	req.Resume = nil
 	var usage Usage
 	var last Reply
+	if resume != nil {
+		usage = resume.Usage
+		last = Reply{Usage: resume.Usage, ID: resume.ID, Model: resume.Model}
+	}
 	for {
 		calls := pendingCalls(messages)
 		if len(calls) == 0 {
@@ -77,7 +84,7 @@ func Run(ctx context.Context, m Model, req Request, limits Limits) (Reply, error
 			}
 			messages = append(messages, reply.Message)
 		}
-		b := batch{tools: req.Tools, limits: limits, decisions: decisions, calls: calls, history: messages}
+		b := batch{tools: req.Tools, limits: limits, decisions: decisions, calls: calls, history: messages, usage: usage, last: last}
 		results, err := b.run(ctx)
 		if err != nil {
 			return Reply{}, err
@@ -127,25 +134,49 @@ type batch struct {
 	direct    bool
 	ran       int
 	denied    bool
+	usage     Usage
+	last      Reply
 }
 
 func (b *batch) run(ctx context.Context) (Message, error) {
 	keys := callKeys(b.calls)
 	if len(b.decisions) == 0 {
 		if waiting := b.waiting(keys); len(waiting) > 0 {
-			return Message{}, &ConfirmError{Waiting: waiting, Messages: b.history}
+			return Message{}, &ConfirmError{Waiting: waiting, Messages: b.history, Reply: Reply{Usage: b.usage, ID: b.last.ID, Model: b.last.Model}}
 		}
 	} else if err := b.checkDecisions(keys); err != nil {
 		return Message{}, err
+	}
+	for i, call := range b.calls {
+		if b.denial(keys[i]) == nil && toolNamed(b.tools, call.Name) == nil {
+			return Message{}, fmt.Errorf("ai: run: no tool named %q", call.Name)
+		}
 	}
 	b.counts, b.total = priorCalls(b.history)
 	b.direct = true
 	for i, call := range b.calls {
 		if err := b.one(ctx, call, keys[i]); err != nil {
-			return Message{}, err
+			limit, ok := err.(*LimitError)
+			if !ok {
+				return Message{}, err
+			}
+			b.unanswered(keys, i+1, limit.text())
+			limit.Messages = append(slices.Clone(b.history), Message{Role: RoleTool, Parts: b.results})
+			return Message{}, limit
 		}
 	}
 	return Message{Role: RoleTool, Parts: b.results}, nil
+}
+
+func (b *batch) unanswered(keys []string, from int, text string) {
+	for i := from; i < len(b.calls); i++ {
+		call := b.calls[i]
+		content := text
+		if deny := b.denial(keys[i]); deny != nil {
+			content = deny
+		}
+		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: content})
+	}
 }
 
 func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
@@ -159,7 +190,6 @@ func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 	b.counts[call.Name] = count
 	if breach := b.limits.breach(call.Name, count, b.total); breach != nil {
 		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: breach.text()})
-		breach.Messages = append(slices.Clone(b.history), Message{Role: RoleTool, Parts: b.results})
 		return breach
 	}
 	tool := toolNamed(b.tools, call.Name)
@@ -177,6 +207,9 @@ func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 }
 
 func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
+	if cerr := ctx.Err(); cerr != nil {
+		return "", fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr)
+	}
 	arguments := call.Arguments
 	if strings.TrimSpace(arguments) == "" {
 		arguments = "{}"
