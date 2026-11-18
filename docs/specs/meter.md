@@ -131,7 +131,8 @@ func (s HistogramSeries) Observe(v float64)
 - After the inner handler returns, the status MUST be the value from `ctx.Status()`.
 - `HTTP` MUST add one to the counter for each request that enters the stage.
 - `HTTP` MUST observe that request duration in seconds.
-- A panic in the inner handler MUST be counted with status class `5xx`.
+- A panic in the inner handler before the status is written MUST be counted with status class `5xx`.
+- A panic after the status is written MUST be counted with the class of that status.
 
 ## Errors
 
@@ -168,6 +169,7 @@ func (s HistogramSeries) Observe(v float64)
 - `TestHTTPRecordsErrorStatuses` and `TestHTTPRecordsServerErrorClass` prove the `4xx` and `5xx` classes.
 - `TestRouteMissesAreCountedUnderOneRouteLabel` proves the `unmatched` label for a miss and for status 405.
 - `TestRecoveredPanicIsCountedAsServerError` proves that a recovered panic counts as `5xx`.
+- `TestPanicAfterTheStatusIsCountedAsThatStatus` proves that a panic behind a sent 200 counts as `2xx`.
 
 ## Not in scope
 

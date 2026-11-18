@@ -113,6 +113,10 @@ func (c *Context) Status() int {
 	return c.writer.status
 }
 
+func (c *Context) Wrote() bool {
+	return c.writer.wrote
+}
+
 var cacheControlKey = NewKey[string]("web.cache-control")
 
 func CacheControl(directive string) Stage {

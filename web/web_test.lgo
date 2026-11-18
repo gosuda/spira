@@ -642,6 +642,24 @@ func TestStageSetsResponseHeaderOnEveryReply(t *testing.T) {
 	}
 }
 
+func TestWroteTurnsTrueWhenTheStatusIsWritten(t *testing.T) {
+	var before, after bool
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			before = ctx.Wrote()
+			reply, err := next(ctx)
+			after = ctx.Wrote()
+			return reply, err
+		}
+	})
+	r.Handle("GET", "/x", okReply)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if before || !after {
+		t.Fatalf("Wrote before next = %v and after next = %v, want false and true", before, after)
+	}
+}
+
 func TestStageReadsTheWrittenStatus(t *testing.T) {
 	seen := map[string]int{}
 	record := func(next web.Handler) web.Handler {

@@ -92,6 +92,7 @@ type Context struct {
 func (c *Context) Ctx() context.Context
 func (c *Context) ResponseHeader() http.Header
 func (c *Context) Status() int
+func (c *Context) Wrote() bool
 func (c *Context) Htmx() Htmx
 
 type Htmx struct {
@@ -149,6 +150,7 @@ func (s *Server) Stop(ctx context.Context) error
 - The router MUST write an error at the stage that returns it.
 - `next` MUST return `nil, nil`.
 - A stage MUST read the written status from `Context.Status`.
+- `Context.Wrote` MUST report whether the status is written.
 - A stage that does not call `next` MUST NOT run the inner handler.
 - A stage reply MUST be written when no status has been written yet.
 - The router MUST drop a second reply when the response is already written.
@@ -282,6 +284,7 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestStreamWritesAndFlushes` proves the stream body and the flush.
 - `TestDelegateHandsEveryMethodToTheHandlerBehindTheStages` and `TestDelegateHijackUpgrade` prove `Delegate`, including a raw 101 upgrade.
 - `TestStageSetsResponseHeaderOnEveryReply`, `TestStageReadsTheWrittenStatus`, `TestStageReplyWithoutNextIsWritten` and `TestStageProblemSetsStatusForOuterStages` prove the stage boundary.
+- `TestWroteTurnsTrueWhenTheStatusIsWritten` proves `Context.Wrote` before and after `next`.
 - `TestProblemWithoutStatusAnswers500` and `TestInvalidReplyStatusBecomesProblemUnderRecover` prove status 0 and an invalid status.
 - `TestLayoutPanicUnderRecoverIsProblem` proves a `Layout` panic.
 - `TestBannedSlotAnswersProblemBeforeAnyPageByte` proves the slot check for a page, a page body and a fragment.
