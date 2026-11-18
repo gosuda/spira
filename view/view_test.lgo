@@ -708,3 +708,21 @@ func TestEachConstView(t *testing.T) {
 		t.Fatalf("pointer callback rendered %q", ptrOut)
 	}
 }
+
+func TestRenderWriteErrorCarriesViewContext(t *testing.T) {
+	w := &failingWriter{log: &eventLog{}, failOn: func(b []byte) bool { return true }}
+	err := view.Render(context.Background(), w, view.Div(view.T("content")))
+	if err == nil {
+		t.Fatalf("Render into a failing writer returned nil")
+		return
+	}
+	if !strings.HasPrefix(err.Error(), "view: ") {
+		t.Fatalf("write error %q does not start with view:", err.Error())
+		return
+	}
+	if !errors.Is(err, errBrokenWriter) {
+		t.Fatalf("write error %q does not wrap the writer error", err.Error())
+		return
+	}
+}
+

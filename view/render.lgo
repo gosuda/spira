@@ -62,7 +62,9 @@ func isVoid(tag string) bool {
 }
 
 func writeRaw(w io.Writer, s string) error {
-	io.WriteString(w, s)?
+	if _, err := io.WriteString(w, s); err != nil {
+		return fmt.Errorf("view: write: %w", err)
+	}
 	return nil
 }
 
