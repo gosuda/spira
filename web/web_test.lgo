@@ -123,8 +123,8 @@ func TestPageReplyRespectsHtmxHeaders(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status %d want 200", rec.Code)
 			}
-			if got := rec.Header().Get("Vary"); got != "HX-Request" {
-				t.Fatalf("Vary %q want HX-Request", got)
+			if got := rec.Header().Get("Vary"); got != "HX-Request, HX-Boosted, HX-History-Restore-Request" {
+				t.Fatalf("Vary %q want the htmx cache keys", got)
 			}
 			if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 				t.Fatalf("content type %q want text/html; charset=utf-8", ct)
@@ -778,6 +778,27 @@ func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
 	assertProblemJSON(t, rec, http.StatusInternalServerError)
 	if seen != http.StatusInternalServerError {
 		t.Fatalf("outer stage read status %d want 500", seen)
+	}
+}
+
+func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
+	withView := web.NewRouter()
+	withView.ProblemView = func(p web.Problem) view.Node? {
+		var node view.Node = view.P(view.T("problem-view"))
+		return node
+	}
+	withView.Handle("GET", "/thing", goneFail)
+	for _, accept := range []string{"application/json", "text/html"} {
+		rec := call(t, withView, reqWithHeaders("/thing", http.Header{"Accept": []string{accept}}))
+		if got := rec.Header().Get("Vary"); got != "Accept" {
+			t.Fatalf("accept %q Vary %q want Accept", accept, got)
+		}
+	}
+	plain := web.NewRouter()
+	plain.Handle("GET", "/thing", goneFail)
+	rec := call(t, plain, httptest.NewRequest(http.MethodGet, "/thing", nil))
+	if got := rec.Header().Get("Vary"); got != "" {
+		t.Fatalf("Vary %q set without a problem view", got)
 	}
 }
 
