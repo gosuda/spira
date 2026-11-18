@@ -225,13 +225,13 @@ func prefersHTML(accept string) bool {
 			continue
 		}
 		q := acceptQ(params)
-		if q <= bestQ {
+		if q == 0 || q <= bestQ {
 			continue
 		}
 		if mt == "text/html" {
 			best, bestQ = "html", q
 		}
-		if mt == "application/json" {
+		if mt == "application/json" || mt == "application/problem+json" {
 			best, bestQ = "json", q
 		}
 	}

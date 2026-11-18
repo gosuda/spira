@@ -831,6 +831,42 @@ func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
 	}
 }
 
+func TestProblemNegotiationTable(t *testing.T) {
+	r := web.NewRouter()
+	r.ProblemView = func(p web.Problem) view.Node? {
+		var node view.Node = view.P(view.T("problem-view"))
+		return node
+	}
+	r.Handle("GET", "/thing", goneFail)
+	cases := []struct {
+		accept string
+		html   bool
+	}{
+		{"application/problem+json, text/html;q=0", false},
+		{"text/html;q=0", false},
+		{"text/html", true},
+		{"application/problem+json;q=0.5, text/html;q=0.9", true},
+		{"text/html;q=0.5, application/problem+json;q=0.9", false},
+		{"application/json, text/html", false},
+		{"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", true},
+		{"", false},
+	}
+	for _, tc := range cases {
+		headers := http.Header{}
+		if tc.accept != "" {
+			headers.Set("Accept", tc.accept)
+		}
+		rec := call(t, r, reqWithHeaders("/thing", headers))
+		ct := rec.Header().Get("Content-Type")
+		if tc.html && !strings.HasPrefix(ct, "text/html") {
+			t.Fatalf("accept %q chose %q, want html", tc.accept, ct)
+		}
+		if !tc.html && ct != "application/problem+json" {
+			t.Fatalf("accept %q chose %q, want problem json", tc.accept, ct)
+		}
+	}
+}
+
 func TestDelegateHijackUpgrade(t *testing.T) {
 	upgrader := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		rc := http.NewResponseController(w)
