@@ -769,3 +769,125 @@ func TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick(t *testing.T) 
 		t.Fatalf("final Stop: %v", err)
 	}
 }
+
+func holdFirstRun(entered chan struct{}, release chan struct{}, calls *atomic.Int64) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		calls.Add(1)
+		select {
+		case entered <- struct{}{}:
+		case <-ctx.Done():
+		}
+		if calls.Load() == 1 {
+			select {
+			case <-release:
+			case <-time.After(30 * time.Second):
+			}
+		}
+		return nil
+	}
+}
+
+func mustStart(t *testing.T, s *job.Scheduler) {
+	t.Helper()
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+func mustStop(t *testing.T, s *job.Scheduler) {
+	t.Helper()
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestSchedulerSkipsWhileAnEarlierStartStillRuns(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	s.Every("held", time.Second, holdFirstRun(entered, release, &calls))
+	mustStart(t, &s)
+	sendTick(t, ticks)
+	waitRun(t, entered, "the first run to start")
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer stopCancel()
+	if err := s.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop error = %v, want the deadline while the run is still active", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	mustStart(t, &s)
+	sendTick(t, ticks)
+	time.Sleep(100 * time.Millisecond)
+	if got := s.Skipped(); got != 1 {
+		t.Fatalf("Skipped = %d after one tick on the restart, want 1: the earlier run still holds the job", got)
+	}
+	select {
+	case <-entered:
+		t.Fatal("the job ran on the restart while the earlier run was still active")
+	default:
+	}
+	close(release)
+	time.Sleep(100 * time.Millisecond)
+	sendTick(t, ticks)
+	waitRun(t, entered, "the run after the earlier run finished")
+	mustStop(t, &s)
+}
+
+type cancelledContext struct{}
+
+func (cancelledContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (cancelledContext) Done() <-chan struct{}      { return make(chan struct{}) }
+func (cancelledContext) Err() error                 { return context.Canceled }
+func (cancelledContext) Value(key any) any          { return nil }
+
+func awaitRun(t *testing.T, runs chan struct{}) bool {
+	t.Helper()
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer waitCancel()
+	select {
+	case <-runs:
+		return true
+	case <-waitCtx.Done():
+		return false
+	}
+}
+
+func restartRunsJob(t *testing.T, s *job.Scheduler, ticks chan time.Time, runs chan struct{}) {
+	t.Helper()
+	mustStart(t, s)
+	ran := false
+	for range 3 {
+		sendTick(t, ticks)
+		if awaitRun(t, runs) {
+			ran = true
+			break
+		}
+	}
+	if !ran {
+		t.Fatal("the job did not run after a restart: a cancelled pump leaked its busy mark")
+	}
+	mustStop(t, s)
+}
+
+func TestSchedulerDoesNotLeakABusyMarkFromACancelledPump(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	runs := make(chan struct{}, 8)
+	s.Every("held", time.Second, func(ctx context.Context) error {
+		select {
+		case runs <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	mustStart(t, &s)
+	mustStop(t, &s)
+	if !job.DeliverTick(&s, "held", cancelledContext{}, 1) {
+		t.Fatal("DeliverTick did not find the job")
+	}
+	restartRunsJob(t, &s, ticks, runs)
+}

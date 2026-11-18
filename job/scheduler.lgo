@@ -160,8 +160,19 @@ func (s *Scheduler) pump(ctx context.Context, loop jobLoop) error {
 	}
 }
 
+type claimState int
+
+const (
+	claimBusy claimState = iota
+	claimClaimed
+	claimCancelled
+)
+
 func (s *Scheduler) deliver(ctx context.Context, loop jobLoop) bool {
-	if !s.claim(loop) {
+	switch s.claim(ctx, loop) {
+	case claimCancelled:
+		return false
+	case claimBusy:
 		s.life.WithLock(func(l *schedLife) {
 			l.skipped++
 		})
@@ -169,22 +180,34 @@ func (s *Scheduler) deliver(ctx context.Context, loop jobLoop) bool {
 	}
 	select {
 	case loop.tick <- struct{}{}:
-		return true
+		if ctx.Err() == nil {
+			return true
+		}
+		select {
+		case <-loop.tick:
+			s.release(loop)
+		default:
+		}
+		return false
 	case <-ctx.Done():
 		s.release(loop)
 		return false
 	}
 }
 
-func (s *Scheduler) claim(loop jobLoop) bool {
-	ok := false
+func (s *Scheduler) claim(ctx context.Context, loop jobLoop) claimState {
+	state := claimBusy
 	s.life.WithLock(func(l *schedLife) {
+		if ctx.Err() != nil {
+			state = claimCancelled
+			return
+		}
 		if loop.entry.claimedBy == 0 {
 			loop.entry.claimedBy = loop.start
-			ok = true
+			state = claimClaimed
 		}
 	})
-	return ok
+	return state
 }
 
 func (s *Scheduler) release(loop jobLoop) {
