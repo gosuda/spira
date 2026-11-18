@@ -157,6 +157,8 @@ func (s *Server) Stop(ctx context.Context) error
 - An unmatched path MUST then answer with the mux 404 handler.
 - A wrong method MUST run the root stages.
 - A wrong method MUST then answer with the mux 405 handler.
+- A request whose target is `*` and that matches no route MUST get the mux answer 400.
+- That request MUST NOT get a redirect.
 - A group stage MUST NOT run for a request that misses that group.
 - `Delegate` MUST call `To.ServeHTTP` after the stages of that route.
 - `Delegate` MUST pass a writer that unwraps to the response writer.
@@ -282,6 +284,7 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestLayoutPanicUnderRecoverIsProblem` proves a `Layout` panic.
 - `TestBannedSlotAnswersProblemBeforeAnyPageByte` proves the slot check for a page, a page body and a fragment.
 - `TestUnmatchedRequestsRunRootStages` proves the 404 and 405 path.
+- `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*`.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
 - `TestServerServesAfterStartContextCancel` proves that a cancelled start context does not stop the server.

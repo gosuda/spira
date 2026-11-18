@@ -86,7 +86,7 @@ func (r *Router) Routes() const []RouteInfo {
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	unrouted, pattern := r.mux.Handler(req)
-	if pattern != "" {
+	if pattern != "" || req.RequestURI == "*" {
 		r.mux.ServeHTTP(w, req)
 		return
 	}

@@ -973,6 +973,21 @@ func TestDelegateHijackUpgrade(t *testing.T) {
 	}
 }
 
+func TestAsteriskTargetIsRejectedWithoutARedirect(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/users", okReply)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RequestURI = "*"
+	req.URL.Path = "*"
+	rec := call(t, r, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("asterisk target status %d want 400", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Fatalf("asterisk target got a redirect to %q", loc)
+	}
+}
+
 func TestUnmatchedRequestsRunRootStages(t *testing.T) {
 	groupRan := false
 	r := web.NewRouter()
