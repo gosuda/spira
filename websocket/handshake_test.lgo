@@ -1,0 +1,354 @@
+package websocket_test
+
+import (
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func validHandshakeRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/chat", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	return req
+}
+
+func TestAcceptKeyMatchesRFC6455Vector(t *testing.T) {
+	got := websocket.ExposedHandshakeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==")
+	want := "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+	if got != want {
+		t.Fatalf("acceptKey = %q, want %q", got, want)
+	}
+}
+
+func TestAcceptKeyTrimsOuterWhitespace(t *testing.T) {
+	got := websocket.ExposedHandshakeAcceptKey("  dGhlIHNhbXBsZSBub25jZQ==\t")
+	want := "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+	if got != want {
+		t.Fatalf("acceptKey padded = %q, want %q", got, want)
+	}
+}
+
+func TestCheckUpgradeAcceptsValidRequest(t *testing.T) {
+	if err := websocket.ExposedHandshakeCheckUpgrade(validHandshakeRequest()); err != nil {
+		t.Fatalf("checkUpgrade valid request = %v, want nil", err)
+	}
+}
+
+func TestCheckUpgradeRefusesNonGet(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Method = http.MethodPost
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeMethodError() {
+		t.Fatalf("checkUpgrade POST = %v, want method error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesOldProtocol(t *testing.T) {
+	req := validHandshakeRequest()
+	req.ProtoMajor = 1
+	req.ProtoMinor = 0
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeProtocolError() {
+		t.Fatalf("checkUpgrade HTTP/1.0 = %v, want protocol error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesMissingConnection(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Connection", "keep-alive")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeConnectionError() {
+		t.Fatalf("checkUpgrade keep-alive = %v, want connection error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesWrongUpgrade(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Upgrade", "h2c")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeUpgradeError() {
+		t.Fatalf("checkUpgrade h2c = %v, want upgrade error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesWrongVersion(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Version", "12")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeVersionError() {
+		t.Fatalf("checkUpgrade version 12 = %v, want version error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesMissingVersion(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Del("Sec-WebSocket-Version")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeVersionError() {
+		t.Fatalf("checkUpgrade missing version = %v, want version error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesDuplicateVersion(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Add("Sec-WebSocket-Version", "13")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeVersionError() {
+		t.Fatalf("checkUpgrade duplicate version = %v, want version error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesBadKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Key", "not valid base64!!!")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade bad key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesMissingKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Del("Sec-WebSocket-Key")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade missing key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesDuplicateKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Add("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade duplicate key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesShortKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(make([]byte, 15)))
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade 15-byte key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesLongKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(make([]byte, 17)))
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade 17-byte key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeRefusesUnpaddedKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Key", base64.RawStdEncoding.EncodeToString(make([]byte, 16)))
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade unpadded key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeAcceptsPaddedOuterWhitespaceKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Key", "  dGhlIHNhbXBsZSBub25jZQ==\t")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != nil {
+		t.Fatalf("checkUpgrade padded key = %v, want nil", err)
+		return
+	}
+}
+
+func TestCheckUpgradeRefusesInnerWhitespaceKey(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZ Q==")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != websocket.ExposedHandshakeKeyError() {
+		t.Fatalf("checkUpgrade inner-space key = %v, want key error", err)
+	}
+}
+
+func TestCheckUpgradeAcceptsMixedCaseTokens(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Add("Connection", "UpGrAdE")
+	req.Header.Set("Upgrade", "WebSocket")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != nil {
+		t.Fatalf("checkUpgrade mixed case tokens = %v, want nil", err)
+		return
+	}
+}
+
+func TestCheckUpgradeAcceptsSplitUpgradeLines(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Del("Upgrade")
+	req.Header.Add("Upgrade", "h2c")
+	req.Header.Add("Upgrade", "WebSocket")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != nil {
+		t.Fatalf("checkUpgrade split upgrade = %v, want nil", err)
+		return
+	}
+}
+
+func TestCheckUpgradeAcceptsCommaTokens(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Connection", "keep-alive, upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != nil {
+		t.Fatalf("checkUpgrade comma tokens = %v, want nil", err)
+		return
+	}
+}
+
+func TestCheckUpgradeAcceptsSpacedCommaTokens(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Set("Connection", "keep-alive ,  upgrade")
+	if err := websocket.ExposedHandshakeCheckUpgrade(req); err != nil {
+		t.Fatalf("checkUpgrade spaced commas = %v, want nil", err)
+		return
+	}
+}
+
+func TestUpgradeStatusCodes(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"nil", nil, http.StatusSwitchingProtocols},
+		{"version", websocket.ExposedHandshakeVersionError(), http.StatusUpgradeRequired},
+		{"method", websocket.ExposedHandshakeMethodError(), http.StatusMethodNotAllowed},
+		{"connection", websocket.ExposedHandshakeConnectionError(), http.StatusBadRequest},
+		{"upgrade", websocket.ExposedHandshakeUpgradeError(), http.StatusBadRequest},
+		{"key", websocket.ExposedHandshakeKeyError(), http.StatusBadRequest},
+		{"protocol", websocket.ExposedHandshakeProtocolError(), http.StatusBadRequest},
+		{"subprotocol", websocket.ExposedHandshakeSubprotocolError(), http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		if got := websocket.ExposedHandshakeUpgradeStatus(tc.err); got != tc.want {
+			t.Fatalf("upgradeStatus %s = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestFailureHeadersSetsVersionOn426(t *testing.T) {
+	h := websocket.ExposedHandshakeFailureHeaders(websocket.ExposedHandshakeVersionError())
+	if got := h.Get("Sec-WebSocket-Version"); got != "13" {
+		t.Fatalf("failure headers version = %q, want 13", got)
+	}
+}
+
+func TestFailureHeadersEmptyOtherwise(t *testing.T) {
+	h := websocket.ExposedHandshakeFailureHeaders(websocket.ExposedHandshakeKeyError())
+	if got := h.Get("Sec-WebSocket-Version"); got != "" {
+		t.Fatalf("failure headers version = %q, want empty", got)
+	}
+}
+
+func TestUpgradeHeadersRoundTrip(t *testing.T) {
+	h, herr := websocket.ExposedHandshakeUpgradeHeaders("dGhlIHNhbXBsZSBub25jZQ==", "chat")
+	if herr != nil {
+		t.Fatalf("upgradeHeaders error = %v, want nil", herr)
+		return
+	}
+	if got := h.Get("Upgrade"); got != "websocket" {
+		t.Fatalf("Upgrade = %q, want websocket", got)
+	}
+	if got := h.Get("Connection"); got != "Upgrade" {
+		t.Fatalf("Connection = %q, want Upgrade", got)
+	}
+	if got := h.Get("Sec-WebSocket-Accept"); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("Sec-WebSocket-Accept = %q, want RFC vector", got)
+	}
+	if got := h.Get("Sec-WebSocket-Protocol"); got != "chat" {
+		t.Fatalf("Sec-WebSocket-Protocol = %q, want chat", got)
+	}
+}
+
+func TestUpgradeHeadersOmitsEmptySubprotocol(t *testing.T) {
+	h, herr := websocket.ExposedHandshakeUpgradeHeaders("dGhlIHNhbXBsZSBub25jZQ==", "")
+	if herr != nil {
+		t.Fatalf("upgradeHeaders error = %v, want nil", herr)
+		return
+	}
+	if got := h.Get("Sec-WebSocket-Protocol"); got != "" {
+		t.Fatalf("Sec-WebSocket-Protocol = %q, want empty", got)
+	}
+}
+
+func TestUpgradeHeadersRefusesCRLFInjection(t *testing.T) {
+	_, herr := websocket.ExposedHandshakeUpgradeHeaders("dGhlIHNhbXBsZSBub25jZQ==", "a\r\nB: c")
+	if herr != websocket.ExposedHandshakeSubprotocolError() {
+		t.Fatalf("upgradeHeaders injection = %v, want subprotocol error", herr)
+	}
+}
+
+func TestPickSubprotocolPrefersServerOrder(t *testing.T) {
+	req := validHandshakeRequest()
+	req.Header.Add("Sec-WebSocket-Protocol", "chat, super")
+	req.Header.Add("Sec-WebSocket-Protocol", "json")
+	got, perr := websocket.ExposedHandshakePickSubprotocol(req.Header.Values("Sec-WebSocket-Protocol"), []string{"super", "chat"})
+	if perr != nil {
+		t.Fatalf("pickSubprotocol error = %v, want nil", perr)
+		return
+	}
+	if got != "super" {
+		t.Fatalf("pickSubprotocol = %q, want super", got)
+	}
+}
+
+func TestPickSubprotocolFallsBackToSecond(t *testing.T) {
+	got, perr := websocket.ExposedHandshakePickSubprotocol([]string{"chat"}, []string{"super", "chat"})
+	if perr != nil {
+		t.Fatalf("pickSubprotocol error = %v, want nil", perr)
+		return
+	}
+	if got != "chat" {
+		t.Fatalf("pickSubprotocol = %q, want chat", got)
+	}
+}
+
+func TestPickSubprotocolReturnsEmptyOnNoMatch(t *testing.T) {
+	got, perr := websocket.ExposedHandshakePickSubprotocol([]string{"chat, super"}, []string{"other"})
+	if perr != nil {
+		t.Fatalf("pickSubprotocol error = %v, want nil", perr)
+		return
+	}
+	if got != "" {
+		t.Fatalf("pickSubprotocol = %q, want empty", got)
+	}
+}
+
+func TestPickSubprotocolNeverPicksUnoffered(t *testing.T) {
+	got, perr := websocket.ExposedHandshakePickSubprotocol([]string{"chat"}, []string{"super"})
+	if perr != nil {
+		t.Fatalf("pickSubprotocol error = %v, want nil", perr)
+		return
+	}
+	if got != "" {
+		t.Fatalf("pickSubprotocol = %q, want empty", got)
+	}
+}
+
+func TestPickSubprotocolTrimsSupportedName(t *testing.T) {
+	got, perr := websocket.ExposedHandshakePickSubprotocol([]string{"chat"}, []string{" chat "})
+	if perr != nil {
+		t.Fatalf("pickSubprotocol error = %v, want nil", perr)
+		return
+	}
+	if got != "chat" {
+		t.Fatalf("pickSubprotocol = %q, want chat", got)
+	}
+}
+
+func TestPickSubprotocolIgnoresBlankNames(t *testing.T) {
+	got, perr := websocket.ExposedHandshakePickSubprotocol([]string{""}, []string{""})
+	if perr != nil {
+		t.Fatalf("pickSubprotocol error = %v, want nil", perr)
+		return
+	}
+	if got != "" {
+		t.Fatalf("pickSubprotocol blank = %q, want empty", got)
+	}
+}
+
+func TestPickSubprotocolRefusesCRLFInjection(t *testing.T) {
+	_, perr := websocket.ExposedHandshakePickSubprotocol([]string{"chat"}, []string{"a\r\nB: c"})
+	if perr != websocket.ExposedHandshakeSubprotocolError() {
+		t.Fatalf("pickSubprotocol injection = %v, want subprotocol error", perr)
+	}
+}
