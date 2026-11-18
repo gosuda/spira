@@ -781,6 +781,23 @@ func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
 	}
 }
 
+func TestLayoutPanicUnderRecoverIsProblem(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(web.Recover())
+	r.Layout = func(ctx *web.Context, p web.Page) view.Node {
+		panic("layout exploded")
+	}
+	r.Handle("GET", "/page", pageReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/page", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Title != "Internal Server Error" {
+		t.Fatalf("title %q want Internal Server Error", doc.Title)
+	}
+	if strings.Contains(rec.Body.String(), "catalog-body") {
+		t.Fatalf("page bytes %q leaked into the problem answer", rec.Body.String())
+	}
+}
+
 func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
 	withView := web.NewRouter()
 	withView.ProblemView = func(p web.Problem) view.Node? {

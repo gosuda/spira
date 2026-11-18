@@ -102,8 +102,9 @@ func (r *Router) writePage(ctx *Context, p Page) error {
 		missing := Problem{Title: "Internal Server Error", Status: http.StatusInternalServerError, Detail: "web: page reply has no layout; set Router.Layout"}
 		return r.writeProblem(ctx, missing)
 	}
+	document := r.Layout(ctx, p)
 	writeHead(ctx, pageStatus(p.Status))
-	return renderReply(ctx, w, r.Layout(ctx, p), "web: render page layout")
+	return renderReply(ctx, w, document, "web: render page layout")
 }
 
 func pageStatus(status int) int {
