@@ -87,6 +87,8 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `Tools` MUST set `Schema` from the wire `inputSchema` text.
 - A result with `isError` MUST become the tool's result text, not a Go error.
 - A protocol error MUST become a Go error of the form `mcp: protocol error <code>: <message>`.
+- An HTTP JSON reply that is not a response MUST be a Go error.
+- An HTTP JSON reply whose id differs from the request id MUST be a Go error.
 - `Mount` MUST serve `initialize`, `tools/list` and `tools/call` on one `POST` endpoint behind the guard.
 - `Mount` MUST answer a notification with 202 and an empty body.
 - `Mount` MUST validate `Origin`: an absent `Origin` is allowed.
@@ -125,6 +127,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - The wire types MUST hold no option of a struct value, which static JSON does not decode.
 - The stdio transport MUST send one JSON-RPC message per line, with no embedded newline.
 - The stdio transport MUST skip messages that are not the response of the request it waits for.
+- An HTTP request MUST return the matching response while the server keeps its event stream open.
 - A stdio read or write on a pipe that carries a deadline MUST end at the context deadline.
 - A pipe without deadline support MAY block a read or a write until the peer writes or closes its end.
 
@@ -145,6 +148,8 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestHTTPTransportNorms` pins the Accept header, the 202 answer for notifications and the session id echo.
 - `TestHTTPTransportNorms` also pins the protocol version header.
 - `TestHTTPStreamResponse` pins the stream reply path with a `notifications/tools/list_changed` message before the response.
+- `TestHTTPStreamReplyWhileOpen` pins a reply that arrives while the server keeps the stream open.
+- `TestHTTPReplyIDMismatch` pins the refused reply whose id does not match.
 - `TestMountInitialize` pins `listChanged` false.
 - `TestMountCallNonObjectArguments` and `TestClientCallNonObjectArguments` pin the object shape of `arguments` on the server and on the client.
 - `TestMountCallEmptyText` pins the `text` member of an empty result.

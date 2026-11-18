@@ -3,6 +3,7 @@ package mcp_test
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gosuda/spira/ai/mcp"
 )
@@ -166,5 +168,110 @@ func TestHTTPStreamResponse(t *testing.T) {
 	want := []string{"calculate_sum", "get_current_time"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("tool names %v, want %v", names, want)
+	}
+}
+
+func TestHTTPStreamReplyWhileOpen(t *testing.T) {
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		var msg mcp.Envelope
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		reply, err := json.Marshal(mcp.Envelope{JSONRPC: "2.0", ID: msg.ID, Result: jsontext.Value(`{"tools":[]}`)})
+		if err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", reply); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+    transport := mcp.NewHTTP(server.URL, server.Client())
+    defer func() {
+        if err := transport.Close(); err != nil {
+            t.Errorf("close transport: %v", err)
+        }
+    }()
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply, err := transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("7"), Method: "tools/list"})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("request over an open stream: %v", err)
+		return
+	}
+	if string(reply.ID) != "7" {
+		t.Errorf("reply id %s, want 7", reply.ID)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("request took %v with the stream still open, want the reply at once", elapsed)
+	}
+	select {
+	case <-handlerDone:
+		t.Error("handler finished before the client returned, so the reply did not arrive early")
+	default:
+	}
+	close(release)
+	<-handlerDone
+}
+
+func TestHTTPReplyIDMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		var msg mcp.Envelope
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		reply := mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("4"), Result: jsontext.Value(`{"tools":[]}`)}
+		if string(msg.ID) == "4" {
+			reply.ID = msg.ID
+		}
+		raw, err := json.Marshal(reply)
+		if err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write(raw); err != nil {
+			return
+		}
+	}))
+	defer server.Close()
+    transport := mcp.NewHTTP(server.URL, server.Client())
+    defer func() {
+        if err := transport.Close(); err != nil {
+            t.Errorf("close transport: %v", err)
+        }
+    }()
+    ctx := context.Background()
+	if _, err := transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("5"), Method: "tools/list"}); err == nil {
+		t.Fatal("accepted a reply numbered 4 for request 5")
+	} else if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("error %q does not name the id mismatch", err)
+	}
+	reply, err := transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("4"), Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("matching reply refused: %v", err)
+		return
+	}
+	if string(reply.ID) != "4" {
+		t.Errorf("reply id %s, want 4", reply.ID)
 	}
 }

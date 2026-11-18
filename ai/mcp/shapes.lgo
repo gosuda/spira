@@ -100,6 +100,16 @@ func argumentsObject(raw jsontext.Value) bool {
 	return probe != nil
 }
 
+func matchReply(sent Envelope, reply Envelope) (Envelope, error) {
+	if !isResponse(reply) {
+		return Envelope{}, fmt.Errorf("mcp: reply is not a response")
+	}
+	if idKey(reply.ID) != idKey(sent.ID) {
+		return Envelope{}, fmt.Errorf("mcp: reply id %s does not match request id %s", reply.ID, sent.ID)
+	}
+	return reply, nil
+}
+
 func resultOf[T any](reply Envelope) (T, error) {
 	var out T
 	if e := reply.Error; e != nil {

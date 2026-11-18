@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -30,9 +31,13 @@ func (h *HTTP) Notify(ctx context.Context, msg Envelope) error {
 		return err
 	}
 	if !okStatus(reply.status) {
-		return statusError(reply.status, reply.payload)
+		payload, err := readBody(reply.body)
+		if err != nil {
+			return err
+		}
+		return statusError(reply.status, payload)
 	}
-	return nil
+	return closeBody(reply.body)
 }
 
 func (h *HTTP) Request(ctx context.Context, msg Envelope) (Envelope, error) {
@@ -41,25 +46,58 @@ func (h *HTTP) Request(ctx context.Context, msg Envelope) (Envelope, error) {
 		return Envelope{}, err
 	}
 	if !okStatus(reply.status) {
-		return Envelope{}, statusError(reply.status, reply.payload)
+		return Envelope{}, failureOf(reply)
 	}
 	media, _, err := mime.ParseMediaType(reply.media)
 	if err != nil {
-		return Envelope{}, fmt.Errorf("mcp: http content type: %w", err)
+		return Envelope{}, joinClose(reply.body, fmt.Errorf("mcp: http content type: %w", err))
 	}
+	return decodeReply(ctx, msg, media, reply.body)
+}
+
+func failureOf(reply httpReply) error {
+	payload, err := readBody(reply.body)
+	if err != nil {
+		return err
+	}
+	return statusError(reply.status, payload)
+}
+
+func decodeReply(ctx context.Context, msg Envelope, media string, body io.ReadCloser) (Envelope, error) {
 	switch media {
 	case "application/json":
-		return decodeEnvelope(reply.payload)
+		payload, err := readBody(body)
+		if err != nil {
+			return Envelope{}, err
+		}
+		decoded, err := decodeEnvelope(payload)
+		if err != nil {
+			return Envelope{}, err
+		}
+		return matchReply(msg, decoded)
 	case "text/event-stream":
-		return streamReply(ctx, msg, bytes.NewReader(reply.payload))
+		streamed, streamErr := streamReply(ctx, msg, body)
+		closeErr := closeBody(body)
+		if streamErr != nil || closeErr != nil {
+			return Envelope{}, errors.Join(streamErr, closeErr)
+		}
+		return streamed, nil
 	}
-	return Envelope{}, fmt.Errorf("mcp: http content type %q", media)
+	return Envelope{}, joinClose(body, fmt.Errorf("mcp: http content type %q", media))
+}
+
+func joinClose(body io.Closer, err error) error {
+	closeErr := closeBody(body)
+	if closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	return err
 }
 
 type httpReply struct {
-	status  int
-	media   string
-	payload []byte
+	status int
+	media  string
+	body   io.ReadCloser
 }
 
 func (h *HTTP) post(ctx context.Context, msg Envelope) (httpReply, error) {
@@ -84,15 +122,32 @@ func (h *HTTP) post(ctx context.Context, msg Envelope) (httpReply, error) {
 	if sid := resp.Header.Get("MCP-Session-Id"); sid != "" {
 		h.session = sid
 	}
-	payload, readErr := io.ReadAll(resp.Body)
-	closeErr := resp.Body.Close()
+	return httpReply{status: resp.StatusCode, media: resp.Header.Get("Content-Type"), body: resp.Body}, nil
+}
+
+func readBody(body io.ReadCloser) ([]byte, error) {
+	if body == nil {
+		return nil, fmt.Errorf("mcp: http reply holds no body")
+	}
+	payload, readErr := io.ReadAll(body)
+	closeErr := body.Close()
 	if readErr != nil {
-		return httpReply{}, fmt.Errorf("mcp: http read body: %w", readErr)
+		return nil, fmt.Errorf("mcp: http read body: %w", readErr)
 	}
 	if closeErr != nil {
-		return httpReply{}, fmt.Errorf("mcp: http close body: %w", closeErr)
+		return nil, fmt.Errorf("mcp: http close body: %w", closeErr)
 	}
-	return httpReply{status: resp.StatusCode, media: resp.Header.Get("Content-Type"), payload: payload}, nil
+	return payload, nil
+}
+
+func closeBody(body io.Closer) error {
+	if body == nil {
+		return nil
+	}
+	if err := body.Close(); err != nil {
+		return fmt.Errorf("mcp: http close body: %w", err)
+	}
+	return nil
 }
 
 func (h *HTTP) Close() error {
