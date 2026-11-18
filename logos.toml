@@ -9,5 +9,5 @@ portability = "deny"
 pedantic = "warn"
 
 [capabilities]
-transitive_exec_allowlist = ["golang.org/x/sys/unix/**", "modernc.org/libc/**"]
-transitive_net_allowlist = ["golang.org/x/sys/unix/**", "modernc.org/libc/**"]
+transitive_exec_allowlist = ["golang.org/x/sys/unix", "modernc.org/libc"]
+transitive_net_allowlist = ["golang.org/x/sys/unix", "modernc.org/libc"]
