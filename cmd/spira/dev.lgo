@@ -105,6 +105,9 @@ func superviseExit(ctx context.Context, cmd *exec.Cmd, exited <-chan error, rest
 func frontend(ctx context.Context, cfg Loop) error {
 	cmd, err := startProc(ctx, cfg.FrontendCmd, nil)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	if cmd == nil {

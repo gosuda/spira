@@ -479,16 +479,21 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	t.Setenv("SPIRA_VITE_ORIGIN", "inherited")
 	dir := t.TempDir()
 	seen := filepath.Join(dir, "server.env")
+	frontSeen := filepath.Join(dir, "frontend.env")
 	script := fmt.Sprintf("printf '%%s\\n' \"$SPIRA_VITE_ORIGIN\" > '%s'\nsleep 300\n", seen)
+	frontScript := fmt.Sprintf("printf 'started\\n' > '%s'\nsleep 300\n", frontSeen)
 	cfg := spira.Loop{
 		ServerCmd:   []string{"sh", "-c", script},
-		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		FrontendCmd: []string{"sh", "-c", frontScript},
 		Root:        dir,
 		Interval:    20 * time.Millisecond,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
 		if err := await(sctx, "the server to record its environment", 10*time.Second, func() bool { return lineCount(seen) == 1 }); err != nil {
+			return err
+		}
+		if err := await(sctx, "the frontend to start", 10*time.Second, func() bool { return lineCount(frontSeen) == 1 }); err != nil {
 			return err
 		}
 		cancel()
