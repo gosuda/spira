@@ -1,0 +1,32 @@
+Ported inputs for ai/rag, from the Spring AI clone at revision
+4cce4caa9653092624b20ae1113633b3ad97d256.
+
+- spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/filter/FilterExpressionTextParserTests.java
+  The first block of the table `accepted` in filter_test.lgo holds the parse
+  calls of that class: testEQ, testIntegerLiterals, tesEqAndGte, tesIn,
+  testNe, testGroup, tesBoolean, tesNot, tesNotNin, tesNotNin2, tesNestedNot,
+  testDecimal, testLong, testIdentifiers,
+  testUnescapedIdentifierWithUnderscores and testStringEscaping. The cache
+  assertions of the reference are not ported.
+
+- spring-ai-vector-store/src/main/antlr4/org/springframework/ai/vectorstore/filter/antlr4/Filters.g4
+  The second block of `accepted` and the table `rejected` come from the
+  grammar: NOT as an operand of AND, IS NULL and IS NOT NULL, a sign with
+  white space before the number, decimals without a digit on one side of
+  the dot, and the exact-case keywords.
+
+- spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/FilterExpressionTextParser.java
+  The top-level group is removed. A quoted string loses the backslash before
+  its quote character and before a backslash. An optional WHERE word is
+  accepted.
+
+- spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/SimpleVectorStore.java
+- spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/SimpleVectorStoreFilterExpressionEvaluator.java
+- spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/SimpleVectorStoreTests.java
+- spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/SimpleVectorStoreFilterExpressionEvaluatorTests.java
+- spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/SimpleVectorStoreSimilarityTests.java
+  The table `evaluated` in memory_test.lgo. A missing key compares as less
+  than every constant, as the evaluator documents. The cosine order oracle is
+  written in memory_test.lgo. Changes from the reference: Add refuses a
+  blank id and an empty, zero or non-finite vector; equal scores come in id
+  order; delete by filter, save and load are not built.
