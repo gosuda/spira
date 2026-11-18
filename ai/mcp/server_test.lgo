@@ -144,8 +144,8 @@ func TestMountInitialize(t *testing.T) {
 	if result.ProtocolVersion != "2025-11-25" {
 		t.Errorf("protocolVersion %q", result.ProtocolVersion)
 	}
-	if !result.Capabilities.Tools.ListChanged {
-		t.Error("capabilities.tools.listChanged is not true")
+	if result.Capabilities.Tools.ListChanged {
+		t.Error("capabilities.tools.listChanged is true, want false")
 	}
 	if result.ServerInfo.Name == "" || result.ServerInfo.Version == "" {
 		t.Errorf("serverInfo %+v", result.ServerInfo)
@@ -452,5 +452,94 @@ func TestMountClientServer(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("tool calls %d, want 1", calls)
+	}
+}
+
+func TestMountCallNonObjectArguments(t *testing.T) {
+	for _, args := range []string{"null", "[1,2]", "5", `"x"`} {
+		var calls int
+		ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+		status, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"get_weather","arguments":`+args+`}}`, nil)
+		if status != http.StatusOK {
+			t.Fatalf("arguments %s: status %d, body %s", args, status, raw)
+		}
+		env := decodeEnvelope(t, raw)
+		rpcErr := env.Error
+		if rpcErr == nil {
+			t.Errorf("arguments %s: no error, want invalid params", args)
+			continue
+		}
+		if rpcErr.Code != -32602 {
+			t.Errorf("arguments %s: error code %d, want -32602", args, rpcErr.Code)
+			continue
+		}
+		if rpcErr.Message != "Invalid params" {
+			t.Errorf("arguments %s: message %q, want Invalid params", args, rpcErr.Message)
+		}
+		if calls != 0 {
+			t.Errorf("arguments %s: tool ran %d times, want none", args, calls)
+		}
+	}
+}
+
+func TestClientCallNonObjectArguments(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("client sent a request with non-object arguments")
+	}))
+	defer ts.Close()
+	c := mcp.NewClient(mcp.NewHTTP(ts.URL, ts.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	for _, args := range []string{"null", "[1,2]", "5", `"x"`} {
+		_, err := c.Call(context.Background(), "get_weather", args)
+		if err == nil {
+			t.Errorf("arguments %s accepted", args)
+			continue
+		}
+		prefix := "mcp: tools/call get_weather arguments:"
+		if !strings.Contains(err.Error(), prefix) {
+			t.Errorf("arguments %s: error %q does not carry %q", args, err, prefix)
+			continue
+		}
+		if args == "null" && !strings.Contains(err.Error(), "not a JSON object") {
+			t.Errorf("arguments null: error %q does not name the shape", err)
+		}
+	}
+}
+
+func TestMountCallEmptyText(t *testing.T) {
+	tools := []ai.Tool{
+		{
+			Name:   "empty",
+			Schema: "",
+			Call: func(_ context.Context, _ string) (string, error) {
+				return "", nil
+			},
+		},
+	}
+	ts := mountServer(t, tools, (&countingGuard{}).stage())
+	status, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"empty","arguments":{}}}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status %d, body %s", status, raw)
+	}
+	if !strings.Contains(string(raw), `"text":""`) {
+		t.Errorf("reply %s omits the text member for an empty result", raw)
+	}
+	env := decodeEnvelope(t, raw)
+	var result struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(env.Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+		return
+	}
+	if len(result.Content) != 1 || result.Content[0].Type != "text" || result.Content[0].Text != "" {
+		t.Errorf("content %+v, want one text item with an empty text", result.Content)
 	}
 }

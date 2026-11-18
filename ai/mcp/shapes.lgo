@@ -28,11 +28,11 @@ type initializeResult struct {
 }
 
 type serverCapabilities struct {
-	Tools toolsCapability `json:"tools,omitzero"`
+	Tools toolsCapability `json:"tools"`
 }
 
 type toolsCapability struct {
-	ListChanged bool `json:"listChanged,omitzero"`
+	ListChanged bool `json:"listChanged"`
 }
 
 type listParams struct {
@@ -57,7 +57,7 @@ type callParams struct {
 
 type contentItem struct {
 	Type string `json:"type"`
-	Text string `json:"text,omitzero"`
+	Text string `json:"text"`
 }
 
 type callResult struct {
@@ -83,7 +83,21 @@ func callArguments(name string, arguments string) (jsontext.Value, error) {
 	if err := json.Unmarshal(jsontext.Value(arguments), &probe); err != nil {
 		return nil, fmt.Errorf("mcp: tools/call %s arguments: %w", name, err)
 	}
+	if probe == nil {
+		return nil, fmt.Errorf("mcp: tools/call %s arguments: not a JSON object", name)
+	}
 	return jsontext.Value(arguments), nil
+}
+
+func argumentsObject(raw jsontext.Value) bool {
+	if strings.TrimSpace(string(raw)) == "" {
+		return true
+	}
+	var probe map[string]jsontext.Value
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	return probe != nil
 }
 
 func resultOf[T any](reply Envelope) (T, error) {

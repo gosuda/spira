@@ -71,7 +71,7 @@ func dispatch(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, er
 	case "initialize":
 		return respond(msg.ID, initializeResult{
 			ProtocolVersion: ProtocolVersion,
-			Capabilities:    serverCapabilities{Tools: toolsCapability{ListChanged: true}},
+			Capabilities:    serverCapabilities{Tools: toolsCapability{ListChanged: false}},
 			ServerInfo:      Implementation{Name: "spira", Version: "0.1.0"},
 		})
 	case "tools/list":
@@ -106,6 +106,9 @@ func callTool(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, er
 	for i := range tools {
 		if tools[i].Name != params.Name {
 			continue
+		}
+		if !argumentsObject(params.Arguments) {
+			return fail(msg.ID, http.StatusOK, -32602, "Invalid params")
 		}
 		arguments := string(params.Arguments)
 		if strings.TrimSpace(arguments) == "" {

@@ -97,7 +97,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `Mount` MUST take a guard as `ops` and `admin` do.
 - The guard MUST run before any protocol method.
 - A refused request MUST never reach a tool.
-- The `initialize` answer MUST carry `capabilities.tools.listChanged` true.
+- The `initialize` answer MUST carry `capabilities.tools.listChanged` false. The tool list is fixed at `Mount` time, so the server never emits `notifications/tools/list_changed`.
 - The `initialize` answer MUST carry `serverInfo` `spira` `0.1.0`.
 - The `initialize` answer MUST echo the request id.
 - `Mount` MUST serve every tool in one `tools/list` page and no `nextCursor`.
@@ -112,6 +112,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - A `Call` error MUST become a result whose `isError` is true and whose text is the error text.
 - Blank error text MUST become `tool <name> failed` in the result text.
 - A result MUST be one `text` content item.
+- The `text` member MUST be present on the wire, also for an empty result.
 - `text` content items MUST be joined with `\n` in arrival order.
 - Joined text content items MUST become the tool result text.
 - `image`, `audio`, `resource_link` and `resource` content items MUST carry no text.
@@ -142,6 +143,9 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestHTTPTransportNorms` pins the Accept header, the 202 answer for notifications and the session id echo.
 - `TestHTTPTransportNorms` also pins the protocol version header.
 - `TestHTTPStreamResponse` pins the stream reply path with a `notifications/tools/list_changed` message before the response.
+- `TestMountInitialize` pins `listChanged` false.
+- `TestMountCallNonObjectArguments` and `TestClientCallNonObjectArguments` pin the object shape of `arguments` on the server and on the client.
+- `TestMountCallEmptyText` pins the `text` member of an empty result.
 - `TestMountInitialize`, `TestMountToolsList` and `TestMountCall` replay the specification's example requests (`lifecycle/initialize-request.json`, `tools/tools-call-request.json`) at the server and check the response members the seam can carry.
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
