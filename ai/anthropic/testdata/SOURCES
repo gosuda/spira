@@ -1,0 +1,49 @@
+Wire fixtures for ai/anthropic, copied verbatim from the provider
+reference pages listed below. Every page was fetched on 2026-11-18.
+
+- https://platform.claude.com/docs/en/api/messages
+  The Messages API reference. message-response.json is the Response (200)
+  example of the "Create a Message" section, copied verbatim. The docs
+  render responses as a table and a JSON block; the JSON block is the
+  fixture. It is also the shape oracle for request fields: the "Example"
+  curl of the same section pins model, max_tokens, messages, stream,
+  system, tools and input_schema names, the anthropic-version value
+  2026-10-21, and shows system as an array of text blocks. The API
+  accepts a plain string for system ("optional string or array of
+  TextBlockParam", request body field list), and this package sends the
+  string form. The example pins that version 2026-10-21 removed the
+  temperature, top_p and top_k request parameters, so this package
+  never sends them.
+
+- https://platform.claude.com/docs/en/build-with-claude/streaming
+  The streaming guide. stream-plain.txt is the full plain-text SSE
+  trace of the "Simple text response" example (message_start through
+  message_stop), copied verbatim. stream-tool.txt is the full SSE trace
+  of the "Streaming request with tool use" example, copied verbatim;
+  it shows content_block_start for a tool_use block, six
+  input_json_delta fragments whose first partial_json is the empty
+  string, and content_block_stop. The same page documents the stream
+  error event, whose example body
+  {"type": "error", "error": {"type": "overloaded_error",
+  "message": "Overloaded"}} is copied verbatim into
+  TestStreamErrorEvent, and documents that message_delta usage values
+  are cumulative, so the stream keeps the latest value.
+
+- https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+  The tool use guide. No fixture is copied from it. It confirms the
+  tool_use and tool_result block shapes and that a tool_result block
+  rides inside a user message with role "user".
+
+- https://platform.claude.com/docs/en/api/errors
+  The error reference. No fixture is copied from it. It pins the error
+  envelope {"type": "error", "error": {"type": ..., "message": ...}}
+  used in the HTTP status tests and lists 529 as overloaded_error.
+
+- https://platform.claude.com/docs/en/api/versioning
+  The version reference. No fixture is copied from it. It pins the
+  current anthropic-version value 2026-10-21 that the client sends.
+
+message-error.json is assembled, not copied: the error envelope comes
+from the errors page shape and the stream error example, and the
+request_id value comes from a request-id example on the errors page.
+No single page shows the whole object.

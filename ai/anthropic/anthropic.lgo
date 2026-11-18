@@ -1,0 +1,333 @@
+// Translated and changed by spira from Spring AI,
+// models/spring-ai-anthropic/src/main/java/org/springframework/ai/anthropic/AnthropicChatModel.java
+// (chat call, stream pump and retry classification).
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package anthropic
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/resilience"
+)
+
+const (
+	apiPath          = "/v1/messages"
+	apiVersion       = "2026-10-21"
+	replyLimit       = 1 << 20
+	defaultMaxTokens = 4096
+)
+
+type Client struct {
+	BaseURL   string
+	Key       string
+	HTTP      *http.Client
+	Policy    resilience.Policy
+	MaxTokens int
+}
+
+func (c *Client) http() *http.Client {
+	if h := c.HTTP; h != nil {
+		return h
+	}
+	return http.DefaultClient
+}
+
+func (c *Client) payload(req ai.Request, stream bool) ([]byte, error) {
+	fallback := defaultMaxTokens
+	if c.MaxTokens > 0 {
+		fallback = c.MaxTokens
+	}
+	wire, err := encodeChat(req, fallback, stream)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(wire)
+	if err != nil {
+		return nil, fmt.Errorf("ai/anthropic: encode request: %w", err)
+	}
+	return payload, nil
+}
+
+func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	payload, err := c.payload(req, false)
+	if err != nil {
+		return ai.Reply{}, err
+	}
+	out, err := resilience.Do[chatResponse](ctx, c.Policy, func(actx context.Context) (chatResponse, error) {
+		value, err := c.post(actx, payload)
+		if err == nil {
+			return value, nil
+		}
+		if callerFault(err) || errors.Is(err, errOversize) {
+			return chatResponse{}, resilience.Ignored(err)
+		}
+		return chatResponse{}, err
+	})
+	if err != nil {
+		return ai.Reply{}, err
+	}
+	return replyOf(&out), nil
+}
+
+func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	payload, err := c.payload(req, true)
+	if err != nil {
+		yield ai.Chunk{}, err
+		return
+	}
+	status, body, err := c.do(ctx, payload)
+	if err != nil {
+		yield ai.Chunk{}, err
+		return
+	}
+	if status < 200 || status > 299 {
+		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
+		if rerr != nil {
+			yield ai.Chunk{}, fmt.Errorf("ai/anthropic: read response: %w", rerr)
+			closeBody(body)
+			return
+		}
+		yield ai.Chunk{}, statusError(status, data)
+		closeBody(body)
+		return
+	}
+	defer func() {
+		if cerr := body.Close(); cerr != nil {
+			return
+		}
+	}()
+	for chunk, cerr := range streamEvents(ctx, body) {
+		yield chunk, cerr
+	}
+}
+
+func closeBody(body io.Closer) {
+	if err := body.Close(); err != nil {
+		return
+	}
+}
+
+var errOversize = errors.New("ai/anthropic: response exceeds the size limit")
+
+func callerFault(err error) bool {
+	answer := &statusAnswer{}
+	if !errors.As(err, &answer) {
+		return false
+	}
+	s := answer.status
+	return s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests
+}
+
+func (c *Client) post(ctx context.Context, payload []byte) (chatResponse, error) {
+	status, body, err := c.do(ctx, payload)
+	if err != nil {
+		return chatResponse{}, err
+	}
+	defer body.Close()?
+	data, err := io.ReadAll(io.LimitReader(body, replyLimit+1))
+	if err != nil {
+		return chatResponse{}, fmt.Errorf("ai/anthropic: read response: %w", err)
+	}
+	if status < 200 || status > 299 {
+		return chatResponse{}, statusError(status, data[:min(len(data), replyLimit)])
+	}
+	if len(data) > replyLimit {
+		return chatResponse{}, fmt.Errorf("%w of %d bytes", errOversize, replyLimit)
+	}
+	var out chatResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return chatResponse{}, fmt.Errorf("ai/anthropic: decode response: %w", err)
+	}
+	return out, nil
+}
+
+func (c *Client) do(ctx context.Context, payload []byte) (int, io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+apiPath, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, fmt.Errorf("ai/anthropic: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", apiVersion)
+	if c.Key != "" {
+		req.Header.Set("x-api-key", c.Key)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("ai/anthropic: %s: %w", apiPath, err)
+	}
+	return resp.StatusCode, resp.Body, nil
+}
+
+type statusAnswer struct {
+	status int
+	body   string
+}
+
+func (a *statusAnswer) Error() string {
+	return fmt.Sprintf("ai/anthropic: %d: %s", a.status, a.body)
+}
+
+func statusError(status int, body []byte) error {
+	return &statusAnswer{status: status, body: string(body)}
+}
+
+func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
+	reader := bufio.NewReader(body)
+	state := &streamState{tools: map[int32]*toolBlock{}}
+	for {
+		line, rerr := reader.ReadString('\n')
+		for chunk, err := range state.line(strings.TrimRight(line, "\r\n"), rerr != nil) {
+			yield chunk, err
+		}
+		if state.ended {
+			return
+		}
+		if rerr != nil {
+			yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream ended before message_stop")
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			yield ai.Chunk{}, err
+			return
+		}
+	}
+}
+
+type toolBlock struct {
+	id        string
+	name      string
+	arguments strings.Builder
+}
+
+type streamState struct {
+	ended  bool
+	data   strings.Builder
+	id     string
+	model  string
+	input  int32
+	output int32
+	finish string
+	tools  map[int32]*toolBlock
+}
+
+func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
+	if name, isEvent := strings.CutPrefix(line, "event:"); isEvent && strings.TrimSpace(name) == "message_stop" {
+		s.ended = true
+		yield s.final(), nil
+		return
+	}
+	if value, isData := strings.CutPrefix(line, "data:"); isData {
+		s.data.WriteString(value)
+		s.data.WriteByte('\n')
+	}
+	if line != "" && !last {
+		return
+	}
+	data := s.data.String()
+	s.data.Reset()
+	if strings.TrimSpace(data) == "" {
+		return
+	}
+	var ev wireEvent
+	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		s.ended = true
+		yield ai.Chunk{}, fmt.Errorf("ai/anthropic: decode stream event: %w", err)
+		return
+	}
+	for chunk, err := range s.event(ev) {
+		yield chunk, err
+	}
+}
+
+func (s *streamState) event(ev wireEvent) iter.Seq2[ai.Chunk, error] {
+	switch ev.Type {
+	case "message_start":
+		s.id = ev.Message.ID
+		s.model = ev.Message.Model
+		s.input = inputTokens(ev.Message.Usage)
+		s.output = ev.Message.Usage.OutputTokens
+		yield ai.Chunk{ID: s.id, Model: s.model, Usage: s.usage()}, nil
+	case "content_block_start":
+		if ev.ContentBlock.Type == "tool_use" {
+			s.tools[ev.Index] = &toolBlock{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+		}
+	case "content_block_delta":
+		for chunk, err := range s.delta(ev) {
+			yield chunk, err
+		}
+	case "content_block_stop":
+		for chunk, err := range s.blockStop(ev.Index) {
+			yield chunk, err
+		}
+	case "message_delta":
+		s.messageDelta(ev)
+	case "message_stop":
+		s.ended = true
+		yield s.final(), nil
+	case "error":
+		s.ended = true
+		yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream: %s: %s", ev.Error.Type, ev.Error.Message)
+	}
+}
+
+func (s *streamState) delta(ev wireEvent) iter.Seq2[ai.Chunk, error] {
+	switch ev.Delta.Type {
+	case "text_delta":
+		yield ai.Chunk{Part: ai.Part(ai.Text{Text: ev.Delta.Text}), Index: int(ev.Index), Partial: true}, nil
+	case "thinking_delta":
+		yield ai.Chunk{Part: ai.Part(ai.Reasoning{Text: ev.Delta.Thinking}), Index: int(ev.Index), Partial: true}, nil
+	case "input_json_delta":
+		if tool := s.tools[ev.Index]; tool != nil {
+			tool.arguments.WriteString(ev.Delta.PartialJSON)
+		}
+	}
+}
+
+func (s *streamState) blockStop(index int32) iter.Seq2[ai.Chunk, error] {
+	tool := s.tools[index]
+	if tool == nil {
+		return
+	}
+	delete(s.tools, index)
+	yield ai.Chunk{Part: ai.Part(ai.ToolCall{ID: tool.id, Name: tool.name, Arguments: tool.arguments.String()}), Index: int(index)}, nil
+}
+
+func (s *streamState) messageDelta(ev wireEvent) {
+	if ev.Delta.StopReason != "" {
+		s.finish = ev.Delta.StopReason
+	}
+	if ev.Usage.InputTokens > 0 {
+		s.input = inputTokens(ev.Usage)
+	}
+	if ev.Usage.OutputTokens > 0 {
+		s.output = ev.Usage.OutputTokens
+	}
+}
+
+func (s *streamState) usage() ai.Usage {
+	return ai.Usage{Input: int(s.input), Output: int(s.output), Total: int(s.input + s.output)}
+}
+
+func (s *streamState) final() ai.Chunk {
+	finish := ai.FinishOther
+	if s.finish != "" {
+		finish = ai.FinishOf(s.finish)
+	}
+	return ai.Chunk{ID: s.id, Model: s.model, Usage: s.usage(), Finish: finish}
+}
+
+func inputTokens(u wireUsage) int32 {
+	return u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+}

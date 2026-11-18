@@ -1,0 +1,862 @@
+// Test cases translated and changed by spira from Spring AI,
+// models/spring-ai-anthropic/src/test/java/org/springframework/ai/anthropic/AnthropicChatModelTests.java
+// and models/spring-ai-anthropic/src/test/java/org/springframework/ai/anthropic/AnthropicChatModelStreamingHttpTests.java,
+// replayed against the wire bodies recorded in testdata/SOURCES.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package anthropic_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"io"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/anthropic"
+	"github.com/gosuda/spira/resilience"
+)
+
+func fixture(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile("testdata/" + name)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return string(data)
+}
+
+func testClient(srv *httptest.Server) *anthropic.Client {
+	return &anthropic.Client{
+		BaseURL: srv.URL,
+		Key:     "test-key",
+		HTTP:    srv.Client(),
+		Policy:  resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}},
+	}
+}
+
+type recorder struct {
+	mu     sync.Mutex
+	bodies []string
+	keys   []string
+	vers   []string
+	paths  []string
+}
+
+func (r *recorder) add(req *http.Request, body string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bodies = append(r.bodies, body)
+	r.keys = append(r.keys, req.Header.Get("x-api-key"))
+	r.vers = append(r.vers, req.Header.Get("anthropic-version"))
+	r.paths = append(r.paths, req.URL.Path)
+}
+
+func (r *recorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.bodies)
+}
+
+func (r *recorder) body(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bodies[i]
+}
+
+func (r *recorder) key(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.keys[i]
+}
+
+func (r *recorder) version(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.vers[i]
+}
+
+func (rec *recorder) serve(t *testing.T, status int, contentType string, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", contentType)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func canonical(t *testing.T, raw string) string {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	out, err := json.Marshal(v, json.Deterministic(true))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return string(out)
+}
+
+func gather(seq iter.Seq2[ai.Chunk, error]) ([]ai.Chunk, error) {
+	var out []ai.Chunk
+	var first error
+	for chunk, err := range seq {
+		if err != nil && first == nil {
+			first = err
+		}
+		out = append(out, chunk)
+	}
+	return out, first
+}
+
+func userTurn(text string) ai.Message {
+	return ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: text}}}
+}
+
+func TestChatReplies(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Hi, what is your name?")},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" || reply.Model != "claude-opus-5-5" {
+		t.Fatalf("reply identity: %+v", reply)
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if reply.Usage != (ai.Usage{Input: 6197, Output: 503, Total: 6700}) {
+		t.Fatalf("usage: %+v", reply.Usage)
+	}
+	if len(reply.Message.Parts) != 1 {
+		t.Fatalf("parts: %+v", reply.Message.Parts)
+	}
+	if text, ok := reply.Message.Parts[0].(ai.Text); !ok || text.Text != "Hi! My name is Claude." {
+		t.Fatalf("text part: %+v", reply.Message.Parts[0])
+	}
+	if rec.paths[0] != "/v1/messages" {
+		t.Fatalf("path: %s", rec.paths[0])
+	}
+	if rec.key(0) != "test-key" || rec.version(0) != "2026-10-21" {
+		t.Fatalf("headers: key=%q version=%q", rec.key(0), rec.version(0))
+	}
+}
+
+func TestChatRequestWithToolIsTheReferenceOracle(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	tool := ai.Tool{
+		Name:        "get_weather",
+		Description: "Get the weather of a city",
+		Schema:      `{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`,
+	}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: "You are a helpful assistant."}}},
+			userTurn("What is the weather in Seoul?"),
+		},
+		Tools: []ai.Tool{tool},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	want := canonical(t, `{
+	  "model": "claude-opus-5-5",
+	  "max_tokens": 1024,
+	  "system": "You are a helpful assistant.",
+	  "messages": [{"role":"user","content":[{"type":"text","text":"What is the weather in Seoul?"}]}],
+	  "stream": false,
+	  "tools": [{"name":"get_weather","description":"Get the weather of a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]
+	}`)
+	if got := canonical(t, rec.body(0)); got != want {
+		t.Fatalf("request body:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestChatRequestTurnsToolResultsIntoUserBlocks(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			{Role: ai.RoleAssistant, Parts: []ai.Part{
+				ai.ToolCall{ID: "toolu_01", Name: "get_weather", Arguments: `{"city":"Seoul"}`},
+			}},
+			{Role: ai.RoleTool, Parts: []ai.Part{
+				ai.ToolResult{ID: "toolu_01", Name: "get_weather", Content: "sunny, 20C"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	want := canonical(t, `{
+	  "model": "claude-opus-5-5",
+	  "max_tokens": 1024,
+	  "messages": [
+	    {"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Seoul"}}]},
+	    {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"sunny, 20C"}]}
+	  ],
+	  "stream": false
+	}`)
+	if got := canonical(t, rec.body(0)); got != want {
+		t.Fatalf("request body:\n got %s\nwant %s", got, want)
+	}
+}
+
+func sentMaxTokens(t *testing.T, c *anthropic.Client, rec *recorder) int32 {
+	t.Helper()
+	before := rec.count()
+	if _, err := c.Chat(context.Background(), ai.Request{
+		Model:    "claude-opus-5-5",
+		Messages: []ai.Message{userTurn("hi")},
+	}); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	var body struct {
+		MaxTokens int32 `json:"max_tokens"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(before)), &body); err != nil {
+		t.Fatalf("request body: %v", err)
+	}
+	return body.MaxTokens
+}
+
+func TestDefaultMaxTokensIsSent(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	if got := sentMaxTokens(t, c, rec); got != 4096 {
+		t.Fatalf("max_tokens = %d, want the documented default 4096", got)
+	}
+	c.MaxTokens = 512
+	if got := sentMaxTokens(t, c, rec); got != 512 {
+		t.Fatalf("max_tokens = %d, want the 512 of the client", got)
+	}
+}
+
+func TestSystemMessagesJoinIntoTheSystemField(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	system := func(text string) ai.Message {
+		return ai.Message{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: text}}}
+	}
+	if _, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:    "claude-opus-5-5",
+		Messages: []ai.Message{system("Answer in one word."), system("  "), userTurn("hi"), system("Use English.")},
+	}); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	var body struct {
+		System   string `json:"system"`
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &body); err != nil {
+		t.Fatalf("request body: %v", err)
+	}
+	if body.System != "Answer in one word.\n\nUse English." || len(body.Messages) != 1 || body.Messages[0].Role != "user" {
+		t.Fatalf("system = %q with %d messages, want the two texts joined by a blank line and the user turn only", body.System, len(body.Messages))
+	}
+}
+
+func TestStreamCollectsTheReferenceReply(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", fixture(t, "stream-plain.txt"))
+	c := testClient(srv)
+	reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	var text strings.Builder
+	for _, p := range reply.Message.Parts {
+		if t, ok := p.(ai.Text); ok {
+			text.WriteString(t.Text)
+		}
+	}
+	if text.String() != "Hello!" {
+		t.Fatalf("stream text: %q", text.String())
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if reply.Usage != (ai.Usage{Input: 25, Output: 15, Total: 40}) {
+		t.Fatalf("usage: %+v", reply.Usage)
+	}
+	if reply.ID != "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY" || reply.Model != "claude-opus-5-5" {
+		t.Fatalf("reply identity: %+v", reply)
+	}
+	if rec.paths[0] != "/v1/messages" {
+		t.Fatalf("path: %s", rec.paths[0])
+	}
+	var sent struct {
+		Stream bool `json:"stream"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &sent); err != nil || !sent.Stream {
+		t.Fatalf("stream flag: %s err=%v", rec.body(0), err)
+	}
+}
+
+func TestStreamToolCallAssemblesFragments(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", fixture(t, "stream-tool.txt"))
+	c := testClient(srv)
+	reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			userTurn("What is the weather in San Francisco, CA?"),
+		},
+		Tools: []ai.Tool{{
+			Name:        "get_weather",
+			Description: "Get the weather of a city",
+			Schema:      `{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}`,
+		}},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	call := calls[0]
+	if call.ID != "toolu_01T1x1fJ34qAmk2tNTrN7Up6" || call.Name != "get_weather" {
+		t.Fatalf("assembled call: %+v", call)
+	}
+	var args map[string]any
+	err = json.Unmarshal([]byte(call.Arguments), &args)
+	if err != nil {
+		t.Fatalf("arguments %q: %v", call.Arguments, err)
+		return
+	}
+	value, found := args["location"]
+	if !found || value != "San Francisco, CA" {
+		t.Fatalf("arguments %q: location %v", call.Arguments, value)
+	}
+}
+
+func TestStreamEndsAtMessageStopWhileTheBodyStaysOpen(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, fixture(t, "stream-plain.txt")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply, err := ai.Collect(c.Stream(ctx, ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	}
+}
+
+func TestCutStreamYieldsErrorChunkAndNoReply(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", `event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}
+
+`)
+	c := testClient(srv)
+	_, err := gather(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err == nil {
+		t.Fatal("expected an error chunk")
+	}
+	if !strings.Contains(err.Error(), "message_stop") {
+		t.Fatalf("error: %v", err)
+	}
+	if _, cerr := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	})); cerr == nil {
+		t.Fatal("collect over a cut stream returned no error")
+	}
+}
+
+func TestStreamErrorEvent(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", "event: error\ndata: "+strings.TrimSpace(fixture(t, "message-error.json"))+"\n\n")
+	c := testClient(srv)
+	var errs []error
+	chunks := 0
+	for _, err := range c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	}) {
+		chunks++
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) != 1 || chunks != 1 {
+		t.Fatalf("the stream gave %d chunks and the errors %v, want the one error chunk of the event", chunks, errs)
+	}
+	if got := errs[0].Error(); got != "ai/anthropic: stream: overloaded_error: Overloaded" {
+		t.Fatalf("error = %q, want the type and the message of the event", got)
+	}
+}
+
+func TestBadRequestIsFinal(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusBadRequest, "application/json", `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: Field required"}}`)
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:    "claude-opus-5-5",
+		Messages: []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.HasPrefix(err.Error(), "ai/anthropic: 400: ") {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("400 was retried: %d requests", rec.count())
+	}
+}
+
+func TestServerErrorIsRetried(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if rec.count() == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"internal"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat after retry: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d", rec.count())
+	}
+}
+
+func TestRateLimitedIsRetried(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if rec.count() == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat after retry: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d", rec.count())
+	}
+}
+
+func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
+	statuses := []int{http.StatusInternalServerError, http.StatusInternalServerError, http.StatusBadRequest}
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		n := rec.count()
+		w.Header().Set("Content-Type", "application/json")
+		if n <= len(statuses) {
+			w.WriteHeader(statuses[n-1])
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"refused"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second, Breaker: &resilience.Breaker{Window: 3, FailureRate: 0.5, OpenFor: time.Hour}}
+	req := ai.Request{Model: "claude-opus-5-5", MaxTokens: 1024, Messages: []ai.Message{userTurn("hi")}}
+	for range statuses {
+		if _, err := c.Chat(context.Background(), req); err == nil {
+			t.Fatal("err=nil, want the failing answer")
+		}
+	}
+	reply, err := c.Chat(context.Background(), req)
+	if err != nil {
+		t.Fatalf("err = %v, want a reply: two 500 answers and a 400 must not fill a window of three", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 4 {
+		t.Fatalf("server saw %d calls, want 4: two 500 answers and a 400 must not fill a window of three", rec.count())
+	}
+}
+
+func TestBodyOverTheLimitIsFinal(t *testing.T) {
+	body := `{"id":"msg_big","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"` + strings.Repeat("x", (1<<20)+64) + `"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Logf("server write ended when the client stopped at its limit: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected the size limit error")
+	}
+	if !strings.Contains(err.Error(), "ai/anthropic: response exceeds the size limit of 1048576 bytes") {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("oversize body was retried: %d requests", rec.count())
+	}
+}
+
+func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
+	body := strings.Repeat("x", (1<<20)+(512<<10))
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		rec.add(r, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Logf("server write ended when the client stopped at its limit: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 30 * time.Second, Retry: resilience.Retry{Attempts: 2}}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("err=nil, want a failing status")
+	}
+	if !strings.HasPrefix(err.Error(), "ai/anthropic: 500: ") {
+		t.Fatalf("error does not classify the status: %q", err.Error()[:64])
+	}
+	if got, want := len(err.Error()), len("ai/anthropic: 500: ")+(1<<20); got != want {
+		t.Fatalf("error holds %d bytes, want %d: the prefix and one mebibyte of body", got, want)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("server saw %d calls, want 2: the 500 is retried, not a caller fault", rec.count())
+	}
+}
+
+func TestKeyNeverAppearsInError(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusUnauthorized, "application/json", `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+	c := testClient(srv)
+	c.Key = "sk-ant-super-secret-value"
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "sk-ant-super-secret-value") {
+		t.Fatalf("error leaks the key: %v", err)
+	}
+	if rec.key(0) != "sk-ant-super-secret-value" {
+		t.Fatalf("x-api-key header: %s", rec.key(0))
+	}
+}
+
+func partTexts(parts []ai.Part) (reasoning string, text string) {
+	for _, p := range parts {
+		switch v := p.(type) {
+		case ai.Reasoning:
+			reasoning += v.Text
+		case ai.Text:
+			text += v.Text
+		}
+	}
+	return reasoning, text
+}
+
+func TestThinkingBlockBecomesAReasoningPartAndIsNotSentBack(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", `{"id":"msg_think","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"thinking","thinking":"Two and two.","signature":"c2ln"},{"type":"text","text":"4"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":7}}`)
+	reply, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			userTurn("2+2?"),
+			{Role: ai.RoleAssistant, Parts: []ai.Part{ai.Reasoning{Text: "An earlier thought."}, ai.Text{Text: "Let me see."}}},
+			userTurn("Go on."),
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reasoning, text := partTexts(reply.Message.Parts); reasoning != "Two and two." || text != "4" || len(reply.Message.Parts) != 2 {
+		t.Fatalf("parts = %+v, want one reasoning part and one text part", reply.Message.Parts)
+	}
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &sent); err != nil {
+		t.Fatalf("request body: %v", err)
+		return
+	}
+	if len(sent.Messages) != 3 || len(sent.Messages[1].Content) != 1 || sent.Messages[1].Content[0].Type != "text" || sent.Messages[1].Content[0].Text != "Let me see." {
+		t.Fatalf("request messages = %+v, want the assistant turn with its text block only", sent.Messages)
+	}
+}
+
+const thinkingStream = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_think","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"usage":{"input_tokens":9,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Two and "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"two."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"4"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+func TestStreamThinkingDeltasBecomeOneReasoningPart(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", thinkingStream)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("2+2?")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reasoning, text := partTexts(reply.Message.Parts); reasoning != "Two and two." || text != "4" {
+		t.Fatalf("parts = %+v, want the reasoning text and the answer", reply.Message.Parts)
+	}
+	if reply.Finish != ai.FinishCompleted || reply.Usage != (ai.Usage{Input: 9, Output: 7, Total: 16}) {
+		t.Fatalf("finish %v usage %+v", reply.Finish, reply.Usage)
+	}
+}
+
+func TestStreamRecordThatIsNotJSONIsAnError(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\n\nevent: message_stop\n")
+	var errs []error
+	chunks := 0
+	for _, err := range testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}) {
+		chunks++
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) != 1 || !strings.HasPrefix(errs[0].Error(), "ai/anthropic: decode stream event: ") {
+		t.Fatalf("errors = %v, want the one decode error of the stream record", errs)
+	}
+	if chunks != 1 {
+		t.Fatalf("the stream gave %d chunks, want only the error chunk: nothing follows a record that is not JSON", chunks)
+	}
+}
+
+func TestStreamEndsAtAMessageStopRecordWithoutEventLines(t *testing.T) {
+	body := `data: {"type":"message_start","message":{"id":"msg_plain","model":"claude-opus-5-5","usage":{"input_tokens":3,"output_tokens":1}}}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}` + "\n\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply, err := ai.Collect(testClient(srv).Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishTruncated || reply.Usage != (ai.Usage{Input: 3, Output: 5, Total: 8}) {
+		t.Fatalf("finish %v usage %+v, want truncated and 3 + 5", reply.Finish, reply.Usage)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	}
+}
