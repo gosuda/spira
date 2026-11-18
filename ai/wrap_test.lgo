@@ -1,0 +1,48 @@
+package ai_test
+
+import (
+	"context"
+	"iter"
+	"slices"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type recording struct {
+	name string
+	next ai.Model
+	log  *[]string
+}
+
+func (r recording) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	*r.log = append(*r.log, r.name+" before")
+	reply, err := r.next.Chat(ctx, req)
+	*r.log = append(*r.log, r.name+" after")
+	return reply, err
+}
+
+func (r recording) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	for chunk, err := range r.next.Stream(ctx, req) {
+		yield chunk, err
+	}
+}
+
+func recorder(name string, log *[]string) ai.Layer {
+	return func(next ai.Model) ai.Model {
+		return recording{name: name, next: next, log: log}
+	}
+}
+
+func TestWrapRunsLayersInListOrderOncePerRoundOfTheLoop(t *testing.T) {
+	var order []string
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather")), saying("ok")}}
+	wrapped := ai.Wrap(model, recorder("outer", &order), recorder("inner", &order))
+	if _, err := ai.Run(t.Context(), wrapped, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{}); err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	round := []string{"outer before", "inner before", "inner after", "outer after"}
+	requireStrings(t, "layer calls", order, append(slices.Clone(round), round...)...)
+}
