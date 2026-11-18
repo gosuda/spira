@@ -217,6 +217,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - No test proves the option field rules. A row type with an option field does not build with LoGOs `144fcceb02`.
 - `TestQueryRejectsUnsupportedFieldBeforeRows` proves the unsupported-type error before a row is read.
 - `TestQueryServesSixteenConcurrentReaders` proves concurrent reads on one pool.
+- `TestEnginePostgres`, `TestEngineMySQL` and `TestEngineMSSQL` prove a round trip, a commit, a rollback and `Prepare` on each engine. `just engines` starts the three engines. Each test skips when its DSN variable is not set.
 
 ## Not in scope
 

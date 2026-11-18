@@ -25,3 +25,6 @@ eject:
     rm -rf /tmp/spira-eject
     logos eject -o /tmp/spira-eject
     cd /tmp/spira-eject && env -u GOROOT -u GOTOOLCHAIN {{upstream_go}} build ./...
+
+engines:
+    ./scripts/engines.sh logos test -count=1 -v -run Engine ./db/...
