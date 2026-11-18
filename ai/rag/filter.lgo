@@ -112,6 +112,7 @@ const (
 	tokIdent
 	tokQuoted
 	tokInt
+	tokLong
 	tokDecimal
 	tokEq
 	tokNe
@@ -139,6 +140,7 @@ var keywords = map[string]tokenKind{
 	"null": tokNull, "NULL": tokNull,
 	"true": tokTrue, "TRUE": tokTrue,
 	"false": tokFalse, "FALSE": tokFalse,
+	"l": tokLong, "L": tokLong,
 }
 
 var symbols = map[string]tokenKind{
@@ -324,6 +326,9 @@ func (p *filterParser) parseConst() (Const, error) {
 		if err != nil {
 			return Const{}, fmt.Errorf("integer %s: %w", tok.text, err)
 		}
+		if p.tok.kind == tokLong {
+			p.next()
+		}
 		return Const{Integer: n}, nil
 	case tokDecimal:
 		d, err := strconv.ParseFloat(tok.text, 64)
@@ -423,9 +428,6 @@ func (p *filterParser) lexNumber() token {
 	if whole == "" {
 		return token{kind: tokBad, text: sign}
 	}
-	if p.pos < len(p.src) && (p.src[p.pos] == 'l' || p.src[p.pos] == 'L') {
-		p.pos++
-	}
 	return token{kind: tokInt, text: sign + whole}
 }
 
@@ -519,7 +521,7 @@ func evalComparison(e Expression, meta map[string]Value) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("%s needs a constant on the right", e.Type)
 	}
-	n, err := compareValue(meta[key.Name], constValue(c))
+	n, err := compareConst(meta[key.Name], c)
 	if err != nil {
 		return false, fmt.Errorf("key %q: %w", key.Name, err)
 	}
@@ -545,7 +547,7 @@ func evalInclusion(e Expression, meta map[string]Value) (bool, error) {
 		return false, fmt.Errorf("%s needs a list on the right", e.Type)
 	}
 	for _, item := range list.Items {
-		n, err := compareValue(meta[key.Name], constValue(item))
+		n, err := compareConst(meta[key.Name], item)
 		if err != nil {
 			return false, fmt.Errorf("key %q: %w", key.Name, err)
 		}
@@ -568,40 +570,48 @@ func operands(e Expression) (Key, Filter, error) {
 	return key, right, nil
 }
 
-func constValue(c Const) Value {
-	if text := c.Text; text != nil {
-		return Text{Text: text}
-	}
-	if integer := c.Integer; integer != nil {
-		return Number{Number: float64(integer)}
-	}
-	if decimal := c.Decimal; decimal != nil {
-		return Number{Number: decimal}
-	}
-	return Flag{Flag: c.Flag ?? false}
-}
-
-func compareValue(held Value?, want Value) (int, error) {
+func compareConst(held Value?, want Const) (int, error) {
 	if held == nil {
 		return -1, nil
 	}
 	switch have := held.(type) {
 	case Text:
-		if w, ok := want.(Text); ok {
-			return strings.Compare(have.Text, w.Text), nil
+		if text := want.Text; text != nil {
+			return strings.Compare(have.Text, text), nil
 		}
 	case Number:
-		if w, ok := want.(Number); ok {
-			return cmp.Compare(have.Number, w.Number), nil
-		}
+		return compareNumber(have.Number, want)
 	case Flag:
-		if w, ok := want.(Flag); ok {
-			return cmp.Compare(rank(have.Flag), rank(w.Flag)), nil
+		if flag := want.Flag; flag != nil {
+			return cmp.Compare(rank(have.Flag), rank(flag)), nil
 		}
 	case nil:
 		return -1, nil
 	}
-	return 0, errors.New("the metadata value and the constant have different types")
+	return 0, errConstType
+}
+
+var errConstType = errors.New("the metadata value and the constant have different types")
+
+func compareNumber(have float64, want Const) (int, error) {
+	if integer := want.Integer; integer != nil {
+		return compareInteger(have, integer), nil
+	}
+	if decimal := want.Decimal; decimal != nil {
+		return cmp.Compare(have, decimal), nil
+	}
+	return 0, errConstType
+}
+
+func compareInteger(have float64, want int64) int {
+	nearest := float64(want)
+	if n := cmp.Compare(have, nearest); n != 0 {
+		return n
+	}
+	if nearest >= 1<<63 {
+		return 1
+	}
+	return cmp.Compare(int64(nearest), want)
 }
 
 func rank(flag bool) int {

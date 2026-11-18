@@ -10,46 +10,84 @@ package rag_test
 import (
 	"cmp"
 	"context"
-	"errors"
+	"encoding/json/v2"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/gosuda/spira/ai/openai"
 	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/resilience"
 )
 
-type mapEmbed struct {
-	vectors map[string][]float32
+type embedInput struct {
+	Input []string `json:"input"`
 }
 
-func (e mapEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
-	out := make([][]float32, len(texts))
-	for i, text := range texts {
-		vector, ok := e.vectors[text]
+type embedRow struct {
+	Index     int64     `json:"index"`
+	Embedding []float32 `json:"embedding"`
+}
+
+type embedOutput struct {
+	Data []embedRow `json:"data"`
+}
+
+type provider struct {
+	vectors map[string][]float32
+	omitted int
+	calls   atomic.Int64
+}
+
+func (p *provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.calls.Add(1)
+	var in embedInput
+	if err := json.UnmarshalRead(r.Body, &in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out := embedOutput{Data: make([]embedRow, 0, len(in.Input))}
+	for i, text := range in.Input[:len(in.Input)-p.omitted] {
+		vector, ok := p.vectors[text]
 		if !ok {
-			return nil, fmt.Errorf("no vector for %q", text)
+			http.Error(w, "no vector for "+text, http.StatusBadRequest)
+			return
 		}
-		out[i] = vector
+		out.Data = append(out.Data, embedRow{Index: int64(i), Embedding: vector})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.MarshalWrite(w, &out); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func serve(t *testing.T, p *provider) *rag.Memory {
+	t.Helper()
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	return &rag.Memory{Embed: &openai.Client{BaseURL: srv.URL, Model: "text-embedding-3-small", HTTP: srv.Client(), Policy: resilience.Policy{}}}
+}
+
+func newStore(t *testing.T, vectors map[string][]float32) *rag.Memory {
+	t.Helper()
+	return serve(t, &provider{vectors: vectors})
+}
+
+type fixedEmbed struct {
+	vector []float32
+}
+
+func (e fixedEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = e.vector
 	}
 	return out, nil
-}
-
-type errEmbed struct{}
-
-func (errEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
-	return nil, errors.New("embedder down")
-}
-
-type shortEmbed struct{}
-
-func (shortEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
-	return make([][]float32, len(texts)-1), nil
-}
-
-func newStore(vectors map[string][]float32) *rag.Memory {
-	return &rag.Memory{Embed: mapEmbed{vectors: vectors}}
 }
 
 func add(t *testing.T, store *rag.Memory, docs ...rag.Document) {
@@ -134,7 +172,7 @@ func bruteOrder(query []float32, docs []rag.Document, vectors map[string][]float
 }
 
 func TestMemorySearchOrderEqualsABruteForceComputation(t *testing.T) {
-	store := newStore(orderVectors)
+	store := newStore(t, orderVectors)
 	add(t, store, orderDocs...)
 
 	docs := search(t, store, rag.Search{Query: "q", TopK: 6})
@@ -155,7 +193,7 @@ func TestMemorySearchOrderEqualsABruteForceComputation(t *testing.T) {
 }
 
 func TestMemoryDefaultIsFourDocumentsAndNoThreshold(t *testing.T) {
-	store := newStore(orderVectors)
+	store := newStore(t, orderVectors)
 	add(t, store, orderDocs...)
 
 	if got, want := ids(search(t, store, rag.Search{Query: "q"})), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
@@ -167,7 +205,7 @@ func TestMemoryDefaultIsFourDocumentsAndNoThreshold(t *testing.T) {
 }
 
 func TestMemoryThresholdIsInclusive(t *testing.T) {
-	store := newStore(orderVectors)
+	store := newStore(t, orderVectors)
 	add(t, store, orderDocs...)
 
 	if got, want := ids(search(t, store, rag.Search{Query: "q", TopK: 6, Threshold: 0.6})), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
@@ -178,8 +216,27 @@ func TestMemoryThresholdIsInclusive(t *testing.T) {
 	}
 }
 
+func TestMemoryThresholdOneKeepsAnEqualVector(t *testing.T) {
+	for _, vector := range [][]float32{{1, 1}, {0.1, 0.2, 0.3}, {3, 5, 7, 11}} {
+		other := slices.Clone(vector)
+		other[0] += 0.5
+		store := newStore(t, map[string][]float32{"q": vector, "same": vector, "other": other})
+		add(t, store, rag.Document{ID: "same", Text: "same"}, rag.Document{ID: "other", Text: "other"})
+
+		docs := search(t, store, rag.Search{Query: "q", Threshold: 1})
+
+		if got := ids(docs); !slices.Equal(got, []string{"same"}) {
+			t.Errorf("vector %v at threshold 1: %v, want the equal vector alone", vector, got)
+			continue
+		}
+		if score := docs[0].Score ?? -1; score != 1 {
+			t.Errorf("vector %v: the score of the equal vector is %v, want 1", vector, score)
+		}
+	}
+}
+
 func TestMemoryTopKZeroGivesNoDocument(t *testing.T) {
-	store := newStore(orderVectors)
+	store := newStore(t, orderVectors)
 	add(t, store, orderDocs...)
 
 	if docs := search(t, store, rag.Search{Query: "q", TopK: 0}); len(docs) != 0 {
@@ -188,7 +245,7 @@ func TestMemoryTopKZeroGivesNoDocument(t *testing.T) {
 }
 
 func TestMemorySearchOfAnEmptyStoreGivesNoDocument(t *testing.T) {
-	store := newStore(orderVectors)
+	store := newStore(t, orderVectors)
 
 	if docs := search(t, store, rag.Search{Query: "q"}); len(docs) != 0 {
 		t.Errorf("an empty store gave %v", ids(docs))
@@ -201,8 +258,6 @@ func TestMemoryAddRefusesBadDocuments(t *testing.T) {
 		"two":   {1, 0},
 		"zero":  {0, 0, 0},
 		"empty": {},
-		"nan":   {float32(math.NaN()), 0, 0},
-		"huge":  {float32(math.Inf(1)), 0, 0},
 	}
 	cases := []struct {
 		name string
@@ -213,20 +268,44 @@ func TestMemoryAddRefusesBadDocuments(t *testing.T) {
 		{"blank id", []rag.Document{{ID: " ", Text: "good"}}, "needs an id"},
 		{"empty embedding", []rag.Document{{ID: "d1", Text: "empty"}}, "empty embedding"},
 		{"zero vector", []rag.Document{{ID: "d1", Text: "zero"}}, "zero vector"},
-		{"value that is not a number", []rag.Document{{ID: "d1", Text: "nan"}}, "not finite"},
-		{"infinite value", []rag.Document{{ID: "d1", Text: "huge"}}, "not finite"},
 		{"mixed dimensions", []rag.Document{{ID: "d1", Text: "good"}, {ID: "d2", Text: "two"}}, "dimensions"},
 	}
 	for _, c := range cases {
-		err := newStore(vectors).Add(t.Context(), c.docs)
+		err := newStore(t, vectors).Add(t.Context(), c.docs)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: Add error = %v, want one with %q", c.name, err, c.want)
 		}
 	}
 }
 
+func TestMemoryAddRefusesAVectorThatIsNotFinite(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		store := &rag.Memory{Embed: fixedEmbed{vector: []float32{float32(value), 0, 0}}}
+
+		err := store.Add(t.Context(), []rag.Document{{ID: "d1", Text: "t"}})
+
+		if err == nil || !strings.Contains(err.Error(), "not finite") {
+			t.Errorf("value %v: Add error = %v, want one with \"not finite\"", value, err)
+		}
+	}
+}
+
+func TestMemoryAddSendsNoTextOfABatchWithABlankId(t *testing.T) {
+	p := &provider{vectors: map[string][]float32{"good": {1, 0, 0}}}
+	store := serve(t, p)
+
+	err := store.Add(t.Context(), []rag.Document{{ID: "d1", Text: "good"}, {ID: " ", Text: "good"}})
+
+	if err == nil || !strings.Contains(err.Error(), "needs an id") {
+		t.Errorf("Add error = %v, want one with \"needs an id\"", err)
+	}
+	if calls := p.calls.Load(); calls != 0 {
+		t.Errorf("the embedder received %d requests for a batch with a blank id, want 0", calls)
+	}
+}
+
 func TestMemoryAddStoresNoDocumentOfARefusedBatch(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "good": {1, 0, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "good": {1, 0, 0}})
 
 	err := store.Add(t.Context(), []rag.Document{{ID: "good", Text: "good"}, {ID: "", Text: "good"}})
 
@@ -239,7 +318,7 @@ func TestMemoryAddStoresNoDocumentOfARefusedBatch(t *testing.T) {
 }
 
 func TestMemoryAddRefusesAChangeOfDimensions(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "v3": {1, 0, 0}, "v2": {1, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "v3": {1, 0, 0}, "v2": {1, 0}})
 	add(t, store, rag.Document{ID: "d1", Text: "v3"})
 
 	err := store.Add(t.Context(), []rag.Document{{ID: "d2", Text: "v2"}})
@@ -253,18 +332,18 @@ func TestMemoryAddRefusesAChangeOfDimensions(t *testing.T) {
 }
 
 func TestMemoryGivesTheErrorOfTheEmbedder(t *testing.T) {
-	store := &rag.Memory{Embed: errEmbed{}}
+	store := newStore(t, map[string][]float32{})
 
-	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "t"}}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed documents: embedder down") {
+	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "t"}}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed documents: ai/openai: 400: no vector for t") {
 		t.Errorf("Add error = %v", err)
 	}
-	if _, err := store.Search(t.Context(), rag.Search{Query: "t"}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed query: embedder down") {
+	if _, err := store.Search(t.Context(), rag.Search{Query: "t"}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed query: ai/openai: 400: no vector for t") {
 		t.Errorf("Search error = %v", err)
 	}
 }
 
 func TestMemoryRefusesAnEmbedderThatGivesTooFewVectors(t *testing.T) {
-	store := &rag.Memory{Embed: shortEmbed{}}
+	store := serve(t, &provider{vectors: map[string][]float32{"a": {1, 0}, "b": {0, 1}}, omitted: 1})
 
 	err := store.Add(t.Context(), []rag.Document{{ID: "d1", Text: "a"}, {ID: "d2", Text: "b"}})
 
@@ -288,7 +367,7 @@ func TestMemoryNeedsAnEmbedder(t *testing.T) {
 }
 
 func TestMemorySearchRefusesBadRequests(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "qzero": {0, 0, 0}, "q2": {1, 0}, "d": {1, 0, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "qzero": {0, 0, 0}, "q2": {1, 0}, "d": {1, 0, 0}})
 	add(t, store, rag.Document{ID: "d", Text: "d"})
 	cases := []struct {
 		name string
@@ -310,7 +389,7 @@ func TestMemorySearchRefusesBadRequests(t *testing.T) {
 }
 
 func TestMemoryAddOfAStoredIdReplacesTheDocument(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "old": {0, 1, 0}, "new": {2, 0, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "old": {0, 1, 0}, "new": {2, 0, 0}})
 	add(t, store, rag.Document{ID: "1", Text: "old", Metadata: map[string]rag.Value{"version": txt("1")}})
 	add(t, store, rag.Document{ID: "1", Text: "new", Metadata: map[string]rag.Value{"version": txt("2")}})
 
@@ -326,7 +405,7 @@ func TestMemoryAddOfAStoredIdReplacesTheDocument(t *testing.T) {
 }
 
 func TestMemoryDeleteKeepsTheOtherDocumentsWhole(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "a": {1, 0, 0}, "b": {3, 4, 0}, "c": {0, 1, 0}, "c2": {1, 1, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "a": {1, 0, 0}, "b": {3, 4, 0}, "c": {0, 1, 0}, "c2": {1, 1, 0}})
 	add(t, store, rag.Document{ID: "a", Text: "a"}, rag.Document{ID: "b", Text: "b"}, rag.Document{ID: "c", Text: "c"})
 
 	if err := store.Delete(t.Context(), []string{"a", "missing"}); err != nil {
@@ -357,7 +436,7 @@ func TestMemoryDeleteKeepsTheOtherDocumentsWhole(t *testing.T) {
 
 func TestMemoryCopiesMetadataInAndOut(t *testing.T) {
 	original := map[string]rag.Value{"key": txt("original")}
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "text": {1, 0, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "text": {1, 0, 0}})
 	add(t, store, rag.Document{ID: "d", Text: "text", Metadata: original})
 
 	original["key"] = txt("changed by the caller")
@@ -374,7 +453,7 @@ func TestMemoryCopiesMetadataInAndOut(t *testing.T) {
 }
 
 func TestMemoryKeepsEachKindOfMetadataValue(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "text": {1, 0, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "text": {1, 0, 0}})
 	add(t, store, rag.Document{ID: "d", Text: "text", Metadata: map[string]rag.Value{"s": txt("BG"), "n": num(2.5), "b": flag(true)}})
 
 	docs := search(t, store, rag.Search{Query: "q"})
@@ -446,7 +525,7 @@ var evaluated = []struct {
 func TestMemoryFilterKeepsWhatTheReferenceEvaluatorKeeps(t *testing.T) {
 	vectors := map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}}
 	for _, c := range evaluated {
-		store := newStore(vectors)
+		store := newStore(t, vectors)
 		add(t, store, rag.Document{ID: "d", Text: "d", Metadata: c.meta})
 		filter, err := rag.ParseFilter(c.filter)
 		if err != nil {
@@ -455,6 +534,47 @@ func TestMemoryFilterKeepsWhatTheReferenceEvaluatorKeeps(t *testing.T) {
 		}
 		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
 			t.Errorf("filter %q on %v kept the document = %v, want %v", c.filter, c.meta, got, c.want)
+		}
+	}
+}
+
+func TestMemoryFilterComparesAnIntegerConstantExactly(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{
+		"n":    num(9007199254740992),
+		"high": num(9223372036854775808),
+		"low":  num(-9223372036854775808),
+		"half": num(2.5),
+	}})
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{"n == 9007199254740992", true},
+		{"n == 9007199254740993", false},
+		{"n != 9007199254740993", true},
+		{"n < 9007199254740993", true},
+		{"n >= 9007199254740993", false},
+		{"n > 9007199254740991", true},
+		{"n in [9007199254740993, 9007199254740991]", false},
+		{"n nin [9007199254740993]", true},
+		{"high == 9223372036854775807", false},
+		{"high > 9223372036854775807", true},
+		{"low == -9223372036854775808", true},
+		{"low < -9223372036854775807", true},
+		{"low == -9223372036854775807", false},
+		{"half > 2", true},
+		{"half < 3", true},
+		{"half == 2", false},
+	}
+	for _, c := range cases {
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q kept the document = %v, want %v", c.filter, got, c.want)
 		}
 	}
 }
@@ -471,7 +591,7 @@ func TestMemoryFilterOfDifferentTypesIsAnError(t *testing.T) {
 	}
 	vectors := map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}}
 	for _, c := range cases {
-		store := newStore(vectors)
+		store := newStore(t, vectors)
 		add(t, store, rag.Document{ID: "d", Text: "d", Metadata: c.meta})
 		filter, err := rag.ParseFilter(c.filter)
 		if err != nil {
@@ -486,7 +606,7 @@ func TestMemoryFilterOfDifferentTypesIsAnError(t *testing.T) {
 }
 
 func TestMemoryFilterOfAHandBuiltTreeWithoutAKeyIsAnError(t *testing.T) {
-	store := newStore(map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
 	add(t, store, rag.Document{ID: "d", Text: "d"})
 	keyless := rag.Expression{Type: rag.OpEq, Left: rag.Const{Text: "x"}, Right: rag.Filter(rag.Const{Text: "x"})}
 
@@ -505,7 +625,7 @@ func TestMemoryAddAndSearchAtTheSameTime(t *testing.T) {
 		vectors[id] = []float32{1, 0, 0}
 		want = append(want, id)
 	}
-	store := newStore(vectors)
+	store := newStore(t, vectors)
 
 	if err := addWhileSearching(t.Context(), store, want); err != nil {
 		t.Fatalf("add beside search: %v", err)

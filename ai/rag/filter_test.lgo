@@ -104,6 +104,11 @@ var accepted = []struct {
 	{"temperature == .5", `(EQ [temperature] 0.5d)`},
 	{"temperature == -.5", `(EQ [temperature] -0.5d)`},
 	{"temperature == 5.", `(EQ [temperature] 5d)`},
+	{"year == 3 L", `(EQ [year] 3)`},
+	{"year == 3l", `(EQ [year] 3)`},
+	{"year == 3L AND open == true", `(AND (EQ [year] 3) (EQ [open] true))`},
+	{"id in [3L, 4 l]", `(IN [id] list(3 4))`},
+	{"Lima == 1", `(EQ [Lima] 1)`},
 }
 
 var rejected = []string{
@@ -139,6 +144,12 @@ var rejected = []string{
 	"year == .",
 	"year == 5 6",
 	"year == 9223372036854775808",
+	"year == 3LAND open == true",
+	"year == 3LL",
+	"year == 3.5L",
+	"year == L",
+	"L == 1",
+	"l == 1",
 }
 
 func TestParseFilterGivesTheTreeOfTheReference(t *testing.T) {

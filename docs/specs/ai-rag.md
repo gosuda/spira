@@ -1,6 +1,6 @@
 # ai/rag
 
-Status: partially implemented. `ParseFilter`, the filter tree, `Search`, `Store` and `Memory` are in the tree. `Augment`, `Split`, `ReadText`, `ReadJSON` and `Pgvector` are not.
+Status: partially implemented. `ParseFilter`, the filter tree, `Search` and `Memory` are in the tree. `Augment`, `Split`, `ReadText`, `ReadJSON` and `Pgvector` are not. The `Store` interface arrives with `Pgvector`, its second implementation.
 
 Package `ai/rag` provides retrieval over documents. The application author parses filters, searches a store, and augments a model with retrieved context.
 
@@ -33,6 +33,22 @@ type Flag struct {
 }
 
 type Op string
+
+const (
+	OpAnd       Op = "AND"
+	OpOr        Op = "OR"
+	OpEq        Op = "EQ"
+	OpNe        Op = "NE"
+	OpGt        Op = "GT"
+	OpGte       Op = "GTE"
+	OpLt        Op = "LT"
+	OpLte       Op = "LTE"
+	OpIn        Op = "IN"
+	OpNin       Op = "NIN"
+	OpNot       Op = "NOT"
+	OpIsNull    Op = "ISNULL"
+	OpIsNotNull Op = "ISNOTNULL"
+)
 
 type Filter interface {
 	// closed tree: Expression, Group, Key, Const, Array
@@ -70,12 +86,6 @@ type Search struct {
 	Filter    Filter?
 }
 
-type Store interface {
-	Add(ctx context.Context, docs []Document) error
-	Delete(ctx context.Context, ids const []string) error
-	Search(ctx context.Context, q Search) ([]Document, error)
-}
-
 type Memory struct {
 	Embed ai.Embedder
 	// unexported fields
@@ -109,23 +119,29 @@ func ReadJSON(...)
 - `NOT` MUST negate the whole expression that follows it, as the reference grammar does.
 - `ParseFilter` MUST accept an optional `WHERE` word before the expression.
 - A keyword MUST match in lower case or in upper case only.
+- `ParseFilter` MUST read a lone `l` or `L` as the long suffix of the integer before it.
+- `ParseFilter` MUST refuse a lone `l` or `L` in each other position, as the reference grammar does.
 - `ParseFilter` MUST return a closed tree.
 - No store MUST receive filter text.
 - `Search` MUST default `TopK` to 4.
 - `Search` MUST default threshold to 0.
 - `Memory` MUST rank by cosine similarity.
-- `Memory` MUST keep the vectors in one `float32` slice and the length of each vector beside it.
+- `Memory` MUST keep the vectors in one `float32` slice and the squared length of each vector beside it.
+- `Memory` MUST give the score 1 to a stored vector that equals the query vector.
 - The scoring loop of `Memory` MUST NOT allocate.
 - `Memory` MUST find a stored id without a scan of the documents.
 - `Memory` MUST order equal scores by document id ascending.
 - `Memory.Add` MUST refuse an empty list, a blank id, and an empty, zero or non-finite vector.
+- `Memory.Add` MUST refuse a blank id before it calls the embedder.
 - `Memory.Add` MUST refuse a vector whose dimensions differ from the dimensions of the store.
 - `Memory.Add` MUST store no document of a refused batch.
 - `Memory.Add` of a stored id MUST replace the text, the metadata and the vector of that document.
 - `Memory` MUST copy document metadata, so a change by the caller does not change stored rows.
+- `Memory.Delete` MUST release the text and the metadata of each deleted document.
 - `Memory` MUST apply the filter to the metadata of each document before it scores the document.
 - A missing metadata key MUST compare as less than every constant, as in the reference.
 - A comparison of a metadata value with a constant of another type MUST be an error.
+- `Memory` MUST compare a metadata number with an integer constant without rounding of the constant.
 - `IS NULL` MUST be true for a missing metadata key only.
 - `Pgvector` MUST run over `db.Pool`.
 - `Pgvector` MUST ship the table and HNSW index as a migration pair.
@@ -150,10 +166,16 @@ func ReadJSON(...)
 ## Proof
 
 - `TestParseFilterGivesTheTreeOfTheReference` proves the accepted inputs of `FilterExpressionTextParserTests` and of the grammar, tree by tree.
-- `TestParseFilterRefusesWhatTheGrammarRefuses` proves the rejected inputs.
+- `TestParseFilterRefusesWhatTheGrammarRefuses` proves the rejected inputs. The two tests prove the long suffix.
 - `TestMemorySearchOrderEqualsABruteForceComputation` proves the cosine order against a computation in the test.
 - `TestMemoryDefaultIsFourDocumentsAndNoThreshold` and `TestMemoryThresholdIsInclusive` prove the defaults and the threshold.
+- `TestMemoryThresholdOneKeepsAnEqualVector` proves the score 1 of an equal vector.
 - `TestMemoryAddRefusesBadDocuments` and `TestMemoryAddRefusesAChangeOfDimensions` prove the refusals of `Add`.
+- `TestMemoryAddRefusesAVectorThatIsNotFinite` proves the refusal of a non-finite vector.
+- `TestMemoryAddSendsNoTextOfABatchWithABlankId` proves that a blank id costs no embedding request.
+- `TestDropReleasesTheTextAndMetadataOfTheRemovedDocument` proves the release after `Delete`.
+- `TestMemoryFilterComparesAnIntegerConstantExactly` proves the comparison with integers above 2^53.
+- The `Memory` tests embed through `openai.Client` and a `net/http/httptest` server.
 - `TestMemoryAddStoresNoDocumentOfARefusedBatch` proves that a refused batch stores nothing.
 - `TestMemoryAddOfAStoredIdReplacesTheDocument` and `TestMemoryDeleteKeepsTheOtherDocumentsWhole` prove replacement and deletion.
 - `TestMemoryCopiesMetadataInAndOut` proves the metadata copies.
