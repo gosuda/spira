@@ -16,6 +16,8 @@ import (
 
 const txCallTimeout = 5 * time.Second
 
+const txLoadBackstop = 2 * time.Minute
+
 const txCacheLimit = 256
 
 func txPoolKey(t *testing.T) string {
@@ -124,12 +126,20 @@ func txQueryText(i int) string {
 }
 
 func txRunOne(t *testing.T, pool *db.Pool, i int, calls int) error {
-	ctx, cancel := context.WithTimeout(t.Context(), txCallTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), txLoadBackstop)
 	defer cancel()
 	for j := 0; j < calls; j++ {
-		q := txQueryText(i*calls + j)
-		if _, err := db.Exec(ctx, pool, q); err != nil {
+		n := int64(i*calls + j)
+		q := txQueryText(int(n))
+		rows, err := db.Query[int64](ctx, pool, q)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return fmt.Errorf("backstop %s exceeded at call %d query %q: %w", txLoadBackstop, j, q, err)
+			}
 			return fmt.Errorf("call %d query %q: %w", j, q, err)
+		}
+		if len(rows) != 1 || rows[0] != n {
+			return fmt.Errorf("call %d query %q = %v, want [%d]", j, q, rows, n)
 		}
 	}
 	return nil
