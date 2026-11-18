@@ -42,6 +42,7 @@ func Hx(name string, value string) Attribute
 func When(cond bool, n Node) Group
 func Each[T any](items const []T, row func(item const T) Node) Group
 func Render(ctx context.Context, w io.Writer, n Node) error
+func CheckSlots(n Node) error
 
 func Html(parts ...Part) Element
 func Head(parts ...Part) Element
@@ -137,6 +138,10 @@ area base br col embed hr img input link meta param source track wbr
 - `Render` MUST return the joined slot errors after every queued slot is written.
 - A `Later` inside `table`, `thead`, `tbody`, `tfoot`, `tr`, `colgroup` or `select` MUST be an error.
 - That parent name MUST match in any letter case.
+- `CheckSlots` MUST return that error for a `Later` in the given tree.
+- `CheckSlots` MUST also inspect each fallback.
+- `CheckSlots` MUST NOT run a resolver.
+- `CheckSlots` MUST NOT inspect the result of a resolver.
 - A `Later` inside a `Group` under one of those parents MUST use that parent in the error.
 - A `Later` inside `td`, `th`, `div` or at the root MUST render.
 
@@ -169,6 +174,7 @@ area base br col embed hr img input link meta param source track wbr
 - `TestLaterInsideTableStructureIsRejected` and `TestLaterInGroupInsideTableStructureIsRejected` prove the banned parents, in lower and upper case.
 - `TestLaterInsideAllowedParentsRenders` proves `td`, `th`, `div` and a root `Later`.
 - `TestSlotInsideAFailedResultNeverRuns` proves that a failed result runs none of its nested resolvers.
+- `TestCheckSlotsFindsABannedParentWithoutResolving` proves `CheckSlots` through an element, a group, a fallback and an island.
 
 ## Not in scope
 

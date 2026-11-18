@@ -183,6 +183,8 @@ func (s *Server) Stop(ctx context.Context) error
 - A `Page` or `Fragment` whose `Status` is 0 MUST use status 200.
 - A `Page`, a `Fragment` and an HTML problem MUST use `text/html; charset=utf-8`.
 - A full page with no `Layout` MUST answer 500.
+- The router MUST run `view.CheckSlots` on a page or a fragment before it writes the status.
+- When that check fails, the router MUST answer 500 and MUST NOT write a byte of the view.
 - A `Fragment` MUST set `Vary` to `HX-Request`.
 - A set `Retarget` MUST write `HX-Retarget`.
 - A set `Reswap` MUST write `HX-Reswap`.
@@ -278,6 +280,7 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestStageSetsResponseHeaderOnEveryReply`, `TestStageReadsTheWrittenStatus`, `TestStageReplyWithoutNextIsWritten` and `TestStageProblemSetsStatusForOuterStages` prove the stage boundary.
 - `TestProblemWithoutStatusAnswers500` and `TestInvalidReplyStatusBecomesProblemUnderRecover` prove status 0 and an invalid status.
 - `TestLayoutPanicUnderRecoverIsProblem` proves a `Layout` panic.
+- `TestBannedSlotAnswersProblemBeforeAnyPageByte` proves the slot check for a page, a page body and a fragment.
 - `TestUnmatchedRequestsRunRootStages` proves the 404 and 405 path.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
 - `TestSecondStartOnTakenPortFails` proves the listen error.

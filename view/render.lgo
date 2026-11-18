@@ -406,7 +406,7 @@ func parentForbidsSlot(parent string) bool {
 
 func writeSlot(w io.Writer, l *Later, q *slotQueue, parent string) error {
 	if parentForbidsSlot(parent) {
-		return fmt.Errorf("view: Later inside <%s>: a browser moves a slot element out of this parent; defer the whole <%s>", parent, parent)
+		return laterInside(parent)
 	}
 	id := q.add(l)
 	if err := writeRaw(w, `<spira-slot id="`+id+`">`); err != nil {
@@ -416,4 +416,52 @@ func writeSlot(w io.Writer, l *Later, q *slotQueue, parent string) error {
 		return err
 	}
 	return writeRaw(w, "</spira-slot>")
+}
+
+func laterInside(parent string) error {
+	return fmt.Errorf("view: Later inside <%s>: a browser moves a slot element out of this parent; defer the whole <%s>", parent, parent)
+}
+
+func CheckSlots(n Node) error {
+	return slotPlacement(n, "")
+}
+
+func slotPlacement(p Part, parent string) error {
+	switch v := p.(type) {
+	case Element:
+		return elementSlots(v)
+	case Group:
+		return groupSlots(v, parent)
+	case *Island:
+		if fb := v.Fallback; fb != nil {
+			return slotPlacement(fb, "spira-island")
+		}
+	case *Later:
+		if parentForbidsSlot(parent) {
+			return laterInside(parent)
+		}
+		return slotPlacement(v.Fallback, parent)
+	case Text:
+	case Trusted:
+	case Attribute:
+	case nil:
+	}
+	return nil
+}
+
+func elementSlots(e Element) error {
+	if isVoid(e.tag) {
+		return nil
+	}
+	for _, p := range e.parts {
+		slotPlacement(p, e.tag)?
+	}
+	return nil
+}
+
+func groupSlots(g Group, parent string) error {
+	for _, n := range g.Nodes {
+		slotPlacement(n, parent)?
+	}
+	return nil
 }

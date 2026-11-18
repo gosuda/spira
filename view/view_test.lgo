@@ -791,6 +791,35 @@ func TestSlotInsideAFailedResultNeverRuns(t *testing.T) {
 	}
 }
 
+func TestCheckSlotsFindsABannedParentWithoutResolving(t *testing.T) {
+	ran := false
+	later := &view.Later{Fallback: view.T("f"), Resolve: func(ctx context.Context) (view.Node, error) {
+		ran = true
+		return view.T("x"), nil
+	}}
+	for _, ok := range []view.Node{view.Div(later), view.Table(view.Tr(view.Td(later))), view.El("img", later), later} {
+		if err := view.CheckSlots(ok); err != nil {
+			t.Fatalf("CheckSlots of an allowed slot: %v", err)
+		}
+	}
+	var islandFallback view.Node = view.Table(later)
+	banned := map[string]view.Node{
+		"tr":     view.Div(view.Table(view.Tr(later))),
+		"tbody":  view.Tbody(view.Group{Nodes: []view.Node{later}}),
+		"thead":  view.Div(&view.Later{Fallback: view.El("thead", later), Resolve: later.Resolve}),
+		"table":  &view.Island{Entry: "x", Fallback: islandFallback},
+	}
+	for parent, n := range banned {
+		err := view.CheckSlots(n)
+		if err == nil || !strings.HasPrefix(err.Error(), "view: Later inside <"+parent+">: ") {
+			t.Fatalf("CheckSlots under <%s> = %v, want the rejection of that parent", parent, err)
+		}
+	}
+	if ran {
+		t.Fatal("CheckSlots ran a resolver")
+	}
+}
+
 func TestLaterInsideAllowedParentsRenders(t *testing.T) {
 	roots := []view.Node{
 		view.Td(tableRowLater()),

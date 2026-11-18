@@ -826,6 +826,36 @@ func TestLayoutPanicUnderRecoverIsProblem(t *testing.T) {
 	}
 }
 
+func TestBannedSlotAnswersProblemBeforeAnyPageByte(t *testing.T) {
+	later := &view.Later{Fallback: view.T("loading"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.Tr(view.Td(view.T("row"))), nil
+	}}
+	body := view.Div(view.T("before-table"), view.Table(view.Tbody(later)))
+	r := web.NewRouter()
+	r.Layout = func(ctx *web.Context, p web.Page) view.Node {
+		return view.Html(view.Body(p.Body, view.P(view.T("footer"))))
+	}
+	r.Handle("GET", "/page", func(ctx *web.Context) (web.Reply, error) {
+		return web.Page{Body: body}, nil
+	})
+	r.Handle("GET", "/fragment", func(ctx *web.Context) (web.Reply, error) {
+		return web.Fragment{Body: body}, nil
+	})
+	for name, req := range map[string]*http.Request{
+		"page layout": httptest.NewRequest(http.MethodGet, "/page", nil),
+		"page body":   reqWithHeaders("/page", http.Header{"HX-Request": []string{"true"}}),
+		"fragment":    httptest.NewRequest(http.MethodGet, "/fragment", nil),
+	} {
+		rec := call(t, r, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s: status %d want 500", name, rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "before-table") {
+			t.Errorf("%s: page bytes %q came before the problem", name, rec.Body.String())
+		}
+	}
+}
+
 func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
 	withView := web.NewRouter()
 	withView.ProblemView = func(p web.Problem) view.Node? {
