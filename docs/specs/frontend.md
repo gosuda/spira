@@ -10,7 +10,7 @@ File layout:
 - `vite.config.ts`, `vitest.config.ts`
 - `src/entry.ts`, `src/island.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
-- `test/island.test.ts`, `test/wasm.test.ts`, `test/corpus.test.ts`
+- `test/island.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/corpus.test.ts`
 - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`
 
 Scripts in `package.json`:
@@ -79,7 +79,7 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - The React adapter MUST call `createRoot(target).render(createElement(component, props))`.
 - The Svelte adapter MUST call Svelte 5 `mount` with `target` and `props`.
 - The Solid adapter MUST call `render` with the component and `target`.
-- A `.wasm` entry MUST load `/islands/wasm_exec.js` one time.
+- A `.wasm` entry MUST load `/islands/wasm_exec.js` once and MUST request it again after a failed load.
 - A `.wasm` entry MUST instantiate `/islands/` plus the file name of the entry.
 - The wasm mount MUST set `globalThis.__spiraIsland` to `{ hostId, props }`.
 - `hostId` MUST be the element id.
@@ -100,6 +100,7 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
 - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
+- `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
 - `test/corpus.test.ts` checks the slot and island lines of `wire/corpus.jsonl` against the client.
 
 ## Not in scope

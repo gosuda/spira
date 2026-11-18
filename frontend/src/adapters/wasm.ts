@@ -24,6 +24,8 @@ function loadWasmExec(): Promise<GoConstructor> {
 			script.addEventListener("load", () => {
 				const loaded = asGoConstructor(Reflect.get(globalThis, "Go"));
 				if (loaded === null) {
+					wasmExec = null;
+					script.remove();
 					reject(
 						new Error(
 							"spira-island: /islands/wasm_exec.js loaded without the Go class",
@@ -34,6 +36,8 @@ function loadWasmExec(): Promise<GoConstructor> {
 				resolve(loaded);
 			});
 			script.addEventListener("error", () => {
+				wasmExec = null;
+				script.remove();
 				reject(new Error("spira-island: failed to load /islands/wasm_exec.js"));
 			});
 			document.head.append(script);
