@@ -854,3 +854,63 @@ func TestLeaderOrdinaryFailureStillReachesWaiters(t *testing.T) {
 		t.Fatalf("load ran %d times, want 1", calls.Load())
 	}
 }
+
+type endedBeforeAdmission struct {
+	context.Context
+	ended atomic.Bool
+}
+
+func (e *endedBeforeAdmission) Err() error {
+	if e.ended.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestRestartedWaiterWithAnEndedContextDoesNotLoad(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	defer leaderCancel()
+	waiterCtx := &endedBeforeAdmission{Context: context.Background()}
+	var calls atomic.Int64
+	load := func(lctx context.Context) (int, error) {
+		if calls.Add(1) > 1 {
+			return 41, nil
+		}
+		<-lctx.Done()
+		waiterCtx.ended.Store(true)
+		return 0, lctx.Err()
+	}
+	var leaderErr, waiterErr error
+	g, _ := rt.NewGroup(t.Context(), 3)
+	g.Go(func(ctx context.Context) error {
+		_, leaderErr = cache.Load(leaderCtx, c, "k", load)
+		return nil
+	})
+	g.Go(func(ctx context.Context) error {
+		if !waitUntil(func() bool { return calls.Load() == 1 }, 5*time.Second) {
+			return errors.New("cache test: the leader never started its load")
+		}
+		_, waiterErr = cache.Load(waiterCtx, c, "k", load)
+		return nil
+	})
+	g.Go(func(ctx context.Context) error {
+		return cancelWhenJoined(c, 1, leaderCancel)
+	})
+	if err := g.Wait(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	if !errors.Is(leaderErr, context.Canceled) {
+		t.Fatalf("leader error = %v, want its own context.Canceled", leaderErr)
+	}
+	if !errors.Is(waiterErr, context.Canceled) {
+		t.Fatalf("waiter error = %v: its context ended before it could lead the restarted flight, want context.Canceled", waiterErr)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("load ran %d times, want 1: an ended context must not start a load", calls.Load())
+	}
+	if got := c.Get("k"); got != nil {
+		t.Fatalf("the cache holds a value stored for a caller whose context had ended")
+	}
+}
