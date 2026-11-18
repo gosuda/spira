@@ -225,13 +225,59 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	target := *req.URL
 	target.Scheme = base.Scheme
 	target.Host = base.Host
-	target.Path = targetPath(base.Path, rl.tail(req.URL.Path, req.Pattern))
-	target.RawPath = targetPath(base.EscapedPath(), rl.tail(req.URL.EscapedPath(), req.Pattern))
+	joined := targetPath(base.EscapedPath(), rl.escapedTail(req.URL.EscapedPath(), req.Pattern))
+	target.Path = unescapedOr(joined, targetPath(base.Path, rl.tail(req.URL.Path, req.Pattern)))
+	target.RawPath = joined
 	target.RawQuery = joinedQuery(base.RawQuery, req.URL.RawQuery)
 	out := req.WithContext(actx)
 	out.URL = &target
 	out.Host = ""
 	return out
+}
+
+func (rl *relay) escapedTail(path string, pattern string) string {
+	if !rl.strip {
+		return path
+	}
+	return cutEscapedSuffix(path, rl.mounted(pattern))
+}
+
+func cutEscapedSuffix(path string, mounted string) string {
+	segs := strings.Split(path, "/")
+	want := strings.Split(mounted, "/")
+	end := len(want)
+	if strings.HasSuffix(mounted, "/") {
+		end = end - 1
+	}
+	for i := 1; i < end; i++ {
+		if i >= len(segs) {
+			return path
+		}
+		if !segmentMatches(segs[i], want[i]) {
+			return path
+		}
+	}
+	rest := segs[end:]
+	if len(rest) == 0 {
+		return "/"
+	}
+	return "/" + strings.Join(rest, "/")
+}
+
+func segmentMatches(raw string, want string) bool {
+	dec, err := url.PathUnescape(raw)
+	if err != nil {
+		return raw == want
+	}
+	return dec == want
+}
+
+func unescapedOr(joined string, fallback string) string {
+	dec, err := url.PathUnescape(joined)
+	if err != nil {
+		return fallback
+	}
+	return dec
 }
 
 func (rl *relay) tail(path string, pattern string) string {

@@ -425,16 +425,24 @@ func TestMountInsideAGroupStripsTheGroupPrefixAndKeepsTheHost(t *testing.T) {
 }
 
 func TestPercentEncodedPathArrivesEncoded(t *testing.T) {
-	notes := make(chan upstreamNote, 2)
+	notes := make(chan upstreamNote, 8)
 	up := echoUpstream(t, notes)
 	gw := serveGateway(t, []gateway.Route{
 		{PathPrefix: "/api", StripPrefix: true, To: []string{up.URL + "/base"}},
 		{PathPrefix: "/keep", To: []string{up.URL}},
+		{PathPrefix: "/shop/", StripPrefix: true, To: []string{up.URL}},
+		{PathPrefix: "/", To: []string{up.URL + "/storage%2F"}},
 	}, plainPolicy())
 	for _, tc := range []struct {
 		path string
 		want string
-	}{{"/api/files/a%2Fb", "/base/files/a%2Fb"}, {"/keep/a%2Fb%20c", "/keep/a%2Fb%20c"}} {
+	}{
+		{"/api/files/a%2Fb", "/base/files/a%2Fb"},
+		{"/keep/a%2Fb%20c", "/keep/a%2Fb%20c"},
+		{"/shop/files/a%2Fb", "/files/a%2Fb"},
+		{"/a%2Fb", "/storage%2F/a%2Fb"},
+		{"/%61pi/files/a%2Fb", "/base/files/a%2Fb"},
+	} {
 		resp, err := http.Get(gw.URL + tc.path)
 		if err != nil {
 			t.Fatal(err)
