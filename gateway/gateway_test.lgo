@@ -388,6 +388,40 @@ func TestSettledStagesLetTheProxyAnswer(t *testing.T) {
 	}
 }
 
+func TestMountInsideAGroupStripsTheGroupPrefixAndKeepsTheHost(t *testing.T) {
+	notes := make(chan upstreamNote, 2)
+	up := echoUpstream(t, notes)
+	gw := serveRoutes(t, func(r *web.Router) {
+		r.Group("/edge", func(g *web.Router) {
+			gateway.Mount(g, []gateway.Route{{Host: "shop.example", PathPrefix: "/api", StripPrefix: true, To: []string{up.URL}}}, plainPolicy())
+		})
+	})
+	for _, tc := range []struct {
+		host string
+		want int
+	}{{"shop.example", http.StatusOK}, {"other.example", http.StatusNotFound}} {
+		req, err := http.NewRequest(http.MethodGet, gw.URL+"/edge/api/x", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = tc.host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBody(t, resp)
+		if resp.StatusCode != tc.want {
+			t.Fatalf("host %s status=%d want %d", tc.host, resp.StatusCode, tc.want)
+		}
+	}
+	if n := awaitNote(t, notes); n.Path != "/x" {
+		t.Fatalf("the upstream saw %q, want /x without the group prefix and the path prefix", n.Path)
+	}
+	if len(notes) != 0 {
+		t.Fatalf("the upstream saw %d more requests, want none for the other host", len(notes))
+	}
+}
+
 func TestMountPanicsOnBadRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

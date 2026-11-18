@@ -192,6 +192,22 @@ func TestStageAfterGroupSkipsInnerRoutes(t *testing.T) {
 	}
 }
 
+func TestGroupPrefixFollowsTheHostOfAPattern(t *testing.T) {
+	r := web.NewRouter()
+	r.Group("/edge", func(g *web.Router) {
+		g.Handle("GET", "shop.example/x", okReply)
+	})
+	if rec := call(t, r, httptest.NewRequest(http.MethodGet, "http://shop.example/edge/x", nil)); rec.Code != http.StatusNoContent {
+		t.Fatalf("host route inside a group status %d want 204", rec.Code)
+	}
+	if rec := call(t, r, httptest.NewRequest(http.MethodGet, "http://other.example/edge/x", nil)); rec.Code != http.StatusNotFound {
+		t.Fatalf("other host status %d want 404", rec.Code)
+	}
+	if got := r.Routes()[0].Pattern; got != "shop.example/edge/x" {
+		t.Fatalf("recorded pattern %q want shop.example/edge/x", got)
+	}
+}
+
 func TestRedirectUnderHtmxAndPlain(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/go", func(ctx *web.Context) (web.Reply, error) {

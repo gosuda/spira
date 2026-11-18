@@ -40,7 +40,9 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - The proxy MUST NOT keep a client value for those three headers.
 - The proxy MUST keep a caller header that is not one of those three.
 - When `StripPrefix` is false, the tail MUST be the request path.
-- When `StripPrefix` is true, the tail MUST be the request path without `PathPrefix`.
+- Inside a `Group`, the mounted prefix MUST be the group prefix plus `PathPrefix`.
+- Outside a `Group`, the mounted prefix MUST be `PathPrefix`.
+- When `StripPrefix` is true, the tail MUST be the request path without the mounted prefix.
 - When that remainder is empty, the tail MUST be `/`.
 - Otherwise the stripped tail MUST start with `/`.
 - When the upstream base path is empty or `/`, the upstream path MUST be the tail.
@@ -98,6 +100,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestForwardedHeadersHoldInboundValuesAndDropForgedOnes` proves the three forwarded headers and that a forged value is dropped.
 - `TestUpstreamsTakeTurns` proves the rotation across the upstream list.
 - `TestHostRouteMatchesOnlyItsHost` proves that a host route rejects another host.
+- `TestMountInsideAGroupStripsTheGroupPrefixAndKeepsTheHost` proves strip and a host route inside a `Group`.
 - `TestRouteStagesRunAfterRouterStagesBeforeTheProxy` proves the stage order.
 - `TestStageAnswerKeepsTheRequestFromTheUpstream` proves that a stage reply does not reach an upstream.
 - `TestSettledStagesLetTheProxyAnswer` proves that `web.Recover` and `web.AccessLog` as route stages let the upstream answer.

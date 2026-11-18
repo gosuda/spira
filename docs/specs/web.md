@@ -144,6 +144,7 @@ func (s *Server) Stop(ctx context.Context) error
 - A `Use` after `Group` MUST NOT apply to a route inside that group.
 - `Routes` MUST list each route in registration order.
 - A route inside a group MUST use the parent prefix plus the inner pattern.
+- When the inner pattern starts with a host, the parent prefix MUST follow that host.
 - The router MUST write a reply at the stage that returns it.
 - The router MUST write an error at the stage that returns it.
 - `next` MUST return `nil, nil`.
@@ -271,6 +272,7 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestCacheControlSetsHeaderOnSuccessOnly` proves the 2xx limit.
 - `TestAccessLogRecordsRequestFields` proves the log fields.
 - `TestRoutesListsRegistrationOrder` proves route order, including a group prefix.
+- `TestGroupPrefixFollowsTheHostOfAPattern` proves a host pattern inside a group.
 - `TestStreamWritesAndFlushes` proves the stream body and the flush.
 - `TestDelegateHandsEveryMethodToTheHandlerBehindTheStages` and `TestDelegateHijackUpgrade` prove `Delegate`, including a raw 101 upgrade.
 - `TestStageSetsResponseHeaderOnEveryReply`, `TestStageReadsTheWrittenStatus`, `TestStageReplyWithoutNextIsWritten` and `TestStageProblemSetsStatusForOuterStages` prove the stage boundary.

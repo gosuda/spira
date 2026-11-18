@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"logos/sync"
 
@@ -62,7 +63,8 @@ func (r *Router) Group(prefix string, build func(g *Router)) {
 }
 
 func (r *Router) Handle(method string, pattern string, h Handler) {
-	full := r.prefix + pattern
+	host := pattern[:max(strings.IndexByte(pattern, '/'), 0)]
+	full := host + r.prefix + pattern[len(host):]
 	r.record(method, full)
 	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
 }

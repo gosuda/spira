@@ -220,7 +220,7 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	target := *req.URL
 	target.Scheme = base.Scheme
 	target.Host = base.Host
-	target.Path = targetPath(base.Path, rl.tail(req.URL.Path))
+	target.Path = targetPath(base.Path, rl.tail(req.URL.Path, req.Pattern))
 	target.RawPath = ""
 	out := req.WithContext(actx)
 	out.URL = &target
@@ -228,18 +228,23 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	return out
 }
 
-func (rl *relay) tail(path string) string {
+func (rl *relay) tail(path string, pattern string) string {
 	if !rl.strip {
 		return path
 	}
-	t := strings.TrimPrefix(path, rl.prefix)
-	if t == "" {
-		return "/"
-	}
+	t := strings.TrimPrefix(path, rl.mounted(pattern))
 	if !strings.HasPrefix(t, "/") {
 		return "/" + t
 	}
 	return t
+}
+
+func (rl *relay) mounted(pattern string) string {
+	path := pattern[max(strings.IndexByte(pattern, '/'), 0):]
+	if strings.HasSuffix(rl.prefix, "/") {
+		return path
+	}
+	return strings.TrimSuffix(path, "/")
 }
 
 func targetPath(base string, tail string) string {
