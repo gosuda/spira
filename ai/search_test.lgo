@@ -180,3 +180,32 @@ func TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage(t *t
 	}
 	requireStrings(t, "tools", toolNames(model.seen[0]), "weather", ai.SearchToolName)
 }
+
+func TestSearchToolsNamesOnlyToolsTheRequestCarries(t *testing.T) {
+	managed := []ai.Tool{described("weather", "Returns current weather conditions"), described("stocks", "Fetches stock price data")}
+	search, narrow := ai.SearchTools(managed)
+	model := &scripted{replies: []ai.Reply{
+		asking(ai.ToolCall{ID: "s1", Name: ai.SearchToolName, Arguments: `{"query":"stock"}`}),
+		saying("No stocks here."),
+	}}
+	request := ai.Request{Messages: question(), Tools: []ai.Tool{search, managed[0]}}
+	if _, err := ai.Run(t.Context(), ai.Wrap(model, narrow), request, ai.Limits{}); err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	if len(model.seen) != 2 {
+		t.Fatalf("model saw %d requests, want 2", len(model.seen))
+		return
+	}
+	var result string
+	for _, part := range model.seen[1].Messages {
+		for _, p := range part.Parts {
+			if r, isResult := p.(ai.ToolResult); isResult && r.Name == ai.SearchToolName {
+				result = r.Content
+			}
+		}
+	}
+	if result != "[]" {
+		t.Fatalf("search result = %q, want an empty list: the request does not carry stocks", result)
+	}
+}

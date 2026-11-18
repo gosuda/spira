@@ -168,6 +168,11 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 }
 
 func (n narrowing) narrow(req Request) Request {
+	carried := map[string]bool{}
+	for _, tool := range req.Tools {
+		carried[tool.Name] = true
+	}
+	req.Messages = carriedResults(req.Messages, carried)
 	found := foundTools(req.Messages)
 	var visible []Tool
 	for _, tool := range req.Tools {
@@ -177,6 +182,35 @@ func (n narrowing) narrow(req Request) Request {
 	}
 	req.Tools = visible
 	return req
+}
+
+func carriedResults(messages []Message, carried map[string]bool) []Message {
+	out := slices.Clone(messages)
+	for i, message := range out {
+		out[i].Parts = slices.Clone(message.Parts)
+		for j, part := range out[i].Parts {
+			out[i].Parts[j] = carriedResult(part, carried)
+		}
+	}
+	return out
+}
+
+func carriedResult(part Part, carried map[string]bool) Part {
+	result, isResult := part.(ToolResult)
+	if !isResult || !strings.EqualFold(result.Name, SearchToolName) {
+		return part
+	}
+	var names []string
+	if err := json.Unmarshal([]byte(result.Content), &names); err != nil {
+		return part
+	}
+	kept := slices.DeleteFunc(names, func(name string) bool { return !(carried[name] ?? false) })
+	content, err := json.Marshal(kept)
+	if err != nil {
+		return part
+	}
+	result.Content = string(content)
+	return result
 }
 
 func foundTools(messages []Message) map[string]bool {

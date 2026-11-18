@@ -245,6 +245,7 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - The layer MUST keep managed tools that an earlier search result names.
 - The layer MUST drop managed tools that no search result names.
 - The layer MUST NOT add a tool that the request does not carry.
+- The layer MUST remove from each search result the names of tools that the request does not carry.
 
 ## Errors
 
@@ -319,6 +320,7 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `TestSearchToolsRefusesArgumentsThatAreNotJSON` proves argument refusal.
 - `TestSearchToolsShowsTheModelOnlyTheSearchToolAndWhatEarlierSearchesFound` proves layer narrowing.
 - `TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage` proves ignored results.
+- `TestSearchToolsNamesOnlyToolsTheRequestCarries` proves the search scope.
 
 ## Not in scope
 
