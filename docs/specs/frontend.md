@@ -10,7 +10,7 @@ File layout:
 - `vite.config.ts`, `vitest.config.ts`
 - `src/entry.ts`, `src/island.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
-- `test/island.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/corpus.test.ts`
+- `test/island.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`
 - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`
 
 Scripts in `package.json`:
@@ -66,6 +66,7 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 
 - `entry.ts` MUST import `htmx.org` and `htmx-ext-sse`.
 - `entry.ts` MUST set `htmx.config.allowEval` to false.
+- The `sse` extension MUST be registered with htmx when `entry.ts` loads.
 - The island glob MUST be `../../example/**/islands/*.{svelte,react.tsx,solid.tsx}`.
 - An island key MUST be the module path with the `../../` prefix removed.
 - The client MUST follow the island and slot rules in [wire-contract](wire-contract.md).
@@ -101,6 +102,7 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
 - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
+- `test/entry.test.ts` proves `spira-island` is defined and the `sse` extension is registered after `entry.ts` loads.
 - `test/corpus.test.ts` checks the slot and island lines of `wire/corpus.jsonl` against the client.
 
 ## Not in scope
