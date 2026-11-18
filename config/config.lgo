@@ -2,13 +2,13 @@ package config
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -102,7 +102,7 @@ func Profile() string {
 }
 
 func decodeObject(body []byte) (map[string]string, error) {
-	var parsed map[string]any
+	var parsed map[string]jsontext.Value
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
@@ -110,44 +110,46 @@ func decodeObject(body []byte) (map[string]string, error) {
 		return nil, errors.New("document is not a JSON object")
 	}
 	values := make(map[string]string, len(parsed))
-	if err := flatten("", parsed, values); err != nil {
+	if err := flattenMembers("", parsed, values); err != nil {
 		return nil, err
 	}
 	return values, nil
 }
 
-func flatten(prefix string, m map[string]any, out map[string]string) error {
+func flattenMembers(prefix string, m map[string]jsontext.Value, out map[string]string) error {
 	for k, v := range m {
 		key := k
 		if prefix != "" {
 			key = prefix + "_" + k
 		}
-		if child, ok := v.(map[string]any); ok {
-			if err := flatten(key, child, out); err != nil {
-				return err
-			}
-			continue
+		if err := flattenValue(key, v, out); err != nil {
+			return err
 		}
-		if v == nil {
-			continue
-		}
-		s, ok := scalarString(v)
-		if !ok {
-			return fmt.Errorf("%s: array value", strings.ToUpper(key))
-		}
-		out[strings.ToUpper(key)] = s
 	}
 	return nil
 }
 
-func scalarString(v any) (string, bool) {
-	switch value := v.(type) {
-	case string:
-		return value, true
-	case bool:
-		return strconv.FormatBool(value), true
-	case float64:
-		return strconv.FormatFloat(value, 'f', -1, 64), true
+func flattenValue(key string, v jsontext.Value, out map[string]string) error {
+	upper := strings.ToUpper(key)
+	switch v.Kind() {
+	case jsontext.KindBeginObject:
+		var child map[string]jsontext.Value
+		if err := json.Unmarshal(v, &child); err != nil {
+			return fmt.Errorf("%s: %w", upper, err)
+		}
+		return flattenMembers(key, child, out)
+	case jsontext.KindNull:
+		return nil
+	case jsontext.KindString:
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return fmt.Errorf("%s: %w", upper, err)
+		}
+		out[upper] = s
+		return nil
+	case jsontext.KindBeginArray:
+		return fmt.Errorf("%s: array value", upper)
 	}
-	return "", false
+	out[upper] = string(v)
+	return nil
 }

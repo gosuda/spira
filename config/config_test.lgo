@@ -663,3 +663,78 @@ func TestFillKeepsFieldDefaultsThatNoSourceSets(t *testing.T) {
 		t.Fatalf("Port = %d, want the field default 8080", cfg.Port)
 	}
 }
+
+type jsonNumbers struct {
+	Huge  int64
+	Ratio float64
+	On    bool
+	DB    struct {
+		Port int
+	}
+}
+
+func TestFileSourceKeepsJSONNumbersExact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "numbers.json")
+	body := `{"huge": 9007199254740993, "ratio": 0.1, "on": true, "db": {"port": 5432}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+		return
+	}
+	src, err := config.File(path)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+		return
+	}
+	cfg, err := config.Load[jsonNumbers](src)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Huge != 9007199254740993 {
+		t.Fatalf("Huge = %d, want 9007199254740993: a JSON number must keep its exact text", cfg.Huge)
+		return
+	}
+	if cfg.Ratio != 0.1 {
+		t.Fatalf("Ratio = %v, want 0.1", cfg.Ratio)
+		return
+	}
+	if !cfg.On {
+		t.Fatal("On = false, want true")
+		return
+	}
+	if cfg.DB.Port != 5432 {
+		t.Fatalf("DB.Port = %d, want 5432: a nested object key must still flatten to DB_PORT", cfg.DB.Port)
+	}
+}
+
+type countOnly struct {
+	Count int
+}
+
+func TestFileSourceExponentFormForIntMatchesEnv(t *testing.T) {
+	_, envErr := config.Load[countOnly](config.Map(map[string]string{"COUNT": "1e3"}))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "exp.json")
+	if err := os.WriteFile(path, []byte(`{"count": 1e3}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+		return
+	}
+	src, err := config.File(path)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+		return
+	}
+	_, fileErr := config.Load[countOnly](src)
+	if envErr == nil {
+		t.Fatal("env source accepted COUNT=1e3 for an int field, want a refusal")
+		return
+	}
+	if fileErr == nil {
+		t.Fatal("JSON source accepted 1e3 for an int field: the number's literal text must reach the setter like the env source")
+		return
+	}
+	if !strings.Contains(fileErr.Error(), "COUNT") {
+		t.Fatalf("file error = %v, want it to name COUNT", fileErr)
+	}
+}
