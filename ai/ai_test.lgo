@@ -8,10 +8,10 @@ import (
 
 func TestFinishOfMapsEveryRawProviderString(t *testing.T) {
 	cases := map[ai.Finish][]string{
-		ai.FinishCompleted: {"stop", "end_turn", "STOP", "stop_sequence"},
-		ai.FinishTruncated: {"length", "max_tokens", "MAX_TOKENS", "context_window_exceeded"},
-		ai.FinishToolCall:  {"tool_calls", "tool_call", "tool_use", "TOOL_CALLS"},
-		ai.FinishFiltered:  {"content_filter", "SAFETY", "RECITATION", "refusal", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST"},
+		ai.FinishCompleted: {"stop", "end_turn", "STOP", "stop_sequence", "END_TURN", "STOP_SEQUENCE"},
+		ai.FinishTruncated: {"length", "max_tokens", "MAX_TOKENS", "context_window_exceeded", "LENGTH", "model_context_window_exceeded"},
+		ai.FinishToolCall:  {"tool_calls", "tool_call", "tool_use", "TOOL_CALLS", "TOOL_CALL", "TOOL_USE"},
+		ai.FinishFiltered:  {"content_filter", "SAFETY", "RECITATION", "refusal", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "CONTENT_FILTER", "safety", "guardrailRefusal", "GUARDRAILREFUSAL"},
 	}
 	for want, raws := range cases {
 		for _, raw := range raws {
@@ -22,8 +22,24 @@ func TestFinishOfMapsEveryRawProviderString(t *testing.T) {
 	}
 }
 
+func TestFinishOfNormalizesCaseAndWhitespace(t *testing.T) {
+	cases := map[string]ai.Finish{
+		"  STOP  ":                          ai.FinishCompleted,
+		"  End_Turn  ":                      ai.FinishCompleted,
+		"\tMAX_TOKENS\n":                    ai.FinishTruncated,
+		"  Content_Filter  ":                ai.FinishFiltered,
+		"  Tool_Use  ":                      ai.FinishToolCall,
+		"  model_context_window_exceeded  ": ai.FinishTruncated,
+	}
+	for raw, want := range cases {
+		if got := ai.FinishOf(raw); got != want {
+			t.Errorf("FinishOf(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestFinishOfNeverCallsAnUnknownStringCompleted(t *testing.T) {
-	for _, raw := range []string{"", "Stop", "done", "eos", "end", "error", "tool"} {
+	for _, raw := range []string{"", "   ", "\t", "done", "eos", "end", "error", "tool", "unknown_reason", "custom_stop", "model_specific", "foo_bar"} {
 		if got := ai.FinishOf(raw); got != ai.FinishOther {
 			t.Errorf("FinishOf(%q) = %q, want %q", raw, got, ai.FinishOther)
 		}

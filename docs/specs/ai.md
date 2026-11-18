@@ -155,10 +155,11 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `Role` MUST be `system`, `user`, `assistant` or `tool`.
 - `Part` MUST be text, reasoning, tool call or tool result.
 - `Finish` MUST be completed, truncated, tool call, filtered or other.
-- `FinishOf` MUST map `stop`, `end_turn`, `STOP` and `stop_sequence` to completed.
-- `FinishOf` MUST map `length`, `max_tokens`, `MAX_TOKENS` and `context_window_exceeded` to truncated.
-- `FinishOf` MUST map `tool_calls`, `tool_call`, `tool_use` and `TOOL_CALLS` to tool call.
-- `FinishOf` MUST map `content_filter`, `SAFETY`, `RECITATION`, `refusal`, `PROHIBITED_CONTENT`, `SPII` and `BLOCKLIST` to filtered.
+- `FinishOf` MUST match the raw finish reason without case and without surrounding whitespace.
+- `FinishOf` MUST map `stop`, `end_turn` and `stop_sequence` to completed.
+- `FinishOf` MUST map `length`, `max_tokens`, `context_window_exceeded` and `model_context_window_exceeded` to truncated.
+- `FinishOf` MUST map `tool_calls`, `tool_call` and `tool_use` to tool call.
+- `FinishOf` MUST map `content_filter`, `safety`, `recitation`, `prohibited_content`, `spii`, `blocklist`, `refusal` and `guardrailrefusal` to filtered.
 - `FinishOf` MUST return other for every other string, including an empty string.
 - `Request` MUST give no numeric default to `Model`, `Temperature`, `TopP`, `TopK`, `MaxTokens` or `Format`.
 - A caller MAY set `Format` to a JSON Schema text for structured output.
@@ -265,6 +266,7 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 ## Proof
 
 - `TestFinishOfMapsEveryRawProviderString` and `TestFinishOfNeverCallsAnUnknownStringCompleted` prove the finish mapping.
+- `TestFinishOfNormalizesCaseAndWhitespace` proves the case and whitespace normalization.
 - The `MessageAggregatorTests` cases prove the stream merge rules.
 - `TestCollectJoinsUnindexedTextAndPutsCompleteCallsAfterIt` proves text order and complete calls.
 - `TestCollectCarriesAnUnindexedCompleteReasoningBeforeTheText` proves reasoning order.
