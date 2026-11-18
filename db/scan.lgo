@@ -36,13 +36,9 @@ func Query[T any](ctx context.Context, q Querier, query string, args ...any) ([]
 		plan.Count = 1
 	}
 	var out []T
-	checked := false
+	CheckScan(cols, plan)?
 	for rows.Next() {
 		var row T
-		if !checked {
-			checked = true
-			CheckScan(cols, plan)?
-		}
 		ScanRow[T](&row, rows, plan)?
 		out = append(out, row)
 	}
@@ -69,13 +65,13 @@ func One[T any](ctx context.Context, q Querier, query string, args ...any) (foun
 		ScanField[T](&probe, plan.Type, &dests)?
 		plan.Count = 1
 	}
+	CheckScan(cols, plan)?
 	var out T?
 	seen := false
 	for rows.Next() {
 		if seen {
 			return nil, fmt.Errorf("db: %s: query returned more than one row", plan.Type)
 		}
-		CheckScan(cols, plan)?
 		var row T
 		ScanRow[T](&row, rows, plan)?
 		out = row

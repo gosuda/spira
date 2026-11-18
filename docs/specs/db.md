@@ -139,8 +139,8 @@ func (d *OptionDest[V]) Scan(src any) error
 - `SnakeName` MUST write every letter in lower case.
 - `SnakeName` MUST insert `_` before an uppercase letter that follows a non-uppercase character.
 - `SnakeName` MUST insert `_` before an uppercase letter when the next character is lowercase.
-- `Query` and `One` MUST compare columns when the first row arrives.
-- `Query` and `One` MUST NOT compare columns when the query returns no row.
+- `Query` and `One` MUST compare columns before they read a row.
+- A query that returns no rows MUST still report a column mismatch.
 - `Query` MUST return an empty slice when the query returns no row.
 - `One` MUST return an absent value when the query returns no row.
 - `One` MUST reject a second row.
@@ -200,6 +200,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestPreparedStatementSurvivesEvictionUnderConcurrentLoad`, `TestEvictedHeldStatementStaysUsableUntilRelease` and `TestOpenRowsSurviveStatementEviction` prove that a held statement stays usable after eviction.
 - `TestQueryAndExecErrorsWrapOnce` proves that a driver error is wrapped once.
 - `TestQueryRejectsWrongColumnOrder`, `TestQueryRejectsExtraColumn`, `TestQueryRejectsMissingColumn` and `TestQueryRejectsWrongNestedOrder` prove the column count and the column name. The oracle is the query text.
+- `TestQueryRejectsMismatchedColumnsWithoutRows` and `TestOneRejectsMismatchedColumnsWithoutRows` prove the column check for a query with no rows.
 - `TestQueryExpectsSnakeCaseWithoutTag` proves the snake-case name when the `col` tag is empty.
 - `TestQueryFlattensNestedStructs` proves nested field order against a direct `rows.Scan`.
 - `TestQueryScansScalarColumns` and `TestQueryScansEveryPlainKind` prove a one-column scan and each plain field type. The oracle is a direct `rows.Scan`.

@@ -446,6 +446,26 @@ func TestQueryRejectsMissingColumn(t *testing.T) {
 	}
 }
 
+func TestQueryRejectsMismatchedColumnsWithoutRows(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE pairs (a TEXT, b TEXT)")
+	_, err := db.Query[pairRow](t.Context(), pool, "SELECT a, b, a AS c FROM pairs")
+	want := "db: db_test.pairRow has 2 fields, query returned 3 columns"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestOneRejectsMismatchedColumnsWithoutRows(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE pairs (a TEXT, b TEXT)")
+	_, err := db.One[pairRow](t.Context(), pool, "SELECT b, a FROM pairs")
+	want := `db: column 0 is "b", field db_test.pairRow.A expects "a"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
 type strictRow struct {
 	ID int64  `col:"id"`
 	S  string `col:"s"`
