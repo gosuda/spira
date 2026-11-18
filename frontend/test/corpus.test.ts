@@ -7,7 +7,9 @@ import reactFixture from "./fixtures/Counter.react";
 type CorpusRequest =
 	| { kind: "slot-id"; id: string }
 	| { kind: "island-when"; when: string }
-	| { kind: "island-props"; props: string };
+	| { kind: "island-props"; props: string }
+	| { kind: "sse-event-name" }
+	| { kind: "sse-field" };
 
 type CorpusLine = {
 	name: string;
@@ -35,6 +37,9 @@ function parseCorpusRequest(value: unknown): CorpusRequest {
 	}
 	if (kind === "island-props" && typeof value.props === "string") {
 		return { kind, props: value.props };
+	}
+	if (kind === "sse-event-name" || kind === "sse-field") {
+		return { kind };
 	}
 	throw new Error(`unknown request kind ${JSON.stringify(value)}`);
 }
@@ -174,6 +179,9 @@ describe("wire corpus", () => {
 					return;
 				case "island-props":
 					await checkProps(line.request.props, line.response.accepted ?? false);
+					return;
+				case "sse-event-name":
+				case "sse-field":
 					return;
 			}
 		},

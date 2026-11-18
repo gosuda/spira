@@ -13,3 +13,9 @@
 {"name":"island-props-malformed","request":{"kind":"island-props","props":"{\"count\":"},"response":{"accepted":false},"reject":true}
 {"name":"island-props-array","request":{"kind":"island-props","props":"[1]"},"response":{"accepted":false},"reject":true}
 {"name":"island-props-string","request":{"kind":"island-props","props":"\"count\""},"response":{"accepted":false},"reject":true}
+{"name":"sse-event-name-plain","request":{"kind":"sse-event-name","name":"price-change"},"response":{"valid":true},"reject":false}
+{"name":"sse-event-name-newline","request":{"kind":"sse-event-name","name":"price\nchange"},"response":{"valid":false},"reject":true}
+{"name":"sse-event-name-carriage-return","request":{"kind":"sse-event-name","name":"price\rchange"},"response":{"valid":false},"reject":true}
+{"name":"sse-field-event","request":{"kind":"sse-field","field":"event"},"response":{"emitted":true},"reject":false}
+{"name":"sse-field-data","request":{"kind":"sse-field","field":"data"},"response":{"emitted":true},"reject":false}
+{"name":"sse-field-heartbeat","request":{"kind":"sse-field","field":":"},"response":{"emitted":true},"reject":false}

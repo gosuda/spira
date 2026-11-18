@@ -426,6 +426,7 @@ func checkCorpusLine(t *testing.T, line corpusLine) {
 		checkCorpusWhen(t, line)
 	case "island-props":
 		checkCorpusProps(t, line)
+	case "sse-event-name", "sse-field":
 	default:
 		t.Fatalf("%s: unknown corpus kind %q", line.Name, line.Request.Kind)
 	}
