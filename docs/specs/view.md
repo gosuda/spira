@@ -130,6 +130,8 @@ area base br col embed hr img input link meta param source track wbr
 - After the root, `Render` MUST flush when `w` is an `http.Flusher`.
 - `Render` MUST run slot resolvers in one group with limit 8.
 - A `Later` found inside a resolved node MUST join that same queue.
+- That `Later` MUST join only after the template of the resolved node is written.
+- When a resolved node fails to render, a `Later` inside that node MUST NOT run.
 - The set of written template ids MUST equal the set of slot ids.
 - A resolver error MUST still write `<template data-spira-slot="ID"><spira-error></spira-error></template>`.
 - `Render` MUST return the joined slot errors after every queued slot is written.
@@ -166,6 +168,7 @@ area base br col embed hr img input link meta param source track wbr
 - `TestEachConstView` proves row order for a named callback and a lambda.
 - `TestLaterInsideTableStructureIsRejected` and `TestLaterInGroupInsideTableStructureIsRejected` prove the banned parents, in lower and upper case.
 - `TestLaterInsideAllowedParentsRenders` proves `td`, `th`, `div` and a root `Later`.
+- `TestSlotInsideAFailedResultNeverRuns` proves that a failed result runs none of its nested resolvers.
 
 ## Not in scope
 

@@ -767,6 +767,30 @@ func TestLaterInGroupInsideTableStructureIsRejected(t *testing.T) {
 	}
 }
 
+func TestSlotInsideAFailedResultNeverRuns(t *testing.T) {
+	summaryRan := false
+	summary := &view.Later{Fallback: view.T("sf"), Resolve: func(ctx context.Context) (view.Node, error) {
+		summaryRan = true
+		return view.T("summary"), nil
+	}}
+	outer := &view.Later{Fallback: view.T("of"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.Group{Nodes: []view.Node{summary, view.Table(tableRowLater())}}, nil
+	}}
+	var b bytes.Buffer
+	err := view.Render(context.Background(), &b, view.Div(outer))
+	if err == nil || !strings.Contains(err.Error(), "Later inside <table>") {
+		t.Fatalf("Render error = %v, want the table rejection", err)
+		return
+	}
+	if summaryRan {
+		t.Fatal("the summary resolver ran although its parent slot failed")
+		return
+	}
+	if got := strings.Count(b.String(), "data-spira-slot="); got != 1 {
+		t.Fatalf("output %q holds %d slot templates, want only the failed parent", b.String(), got)
+	}
+}
+
 func TestLaterInsideAllowedParentsRenders(t *testing.T) {
 	roots := []view.Node{
 		view.Td(tableRowLater()),
