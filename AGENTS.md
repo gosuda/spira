@@ -63,7 +63,7 @@ Follow these steps in order before a new exported name lands. [Christopher Alexa
 
 ## Wire contract
 
-The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A change to one side changes the other side and the corpus in the same commit. [Claude Shannon]
+The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A change to one side changes the other side and the corpus in the same commit. The full contract is [docs/specs/wire-contract.md](docs/specs/wire-contract.md); [docs/specs/README.md](docs/specs/README.md) lists the specification of every package. [Claude Shannon]
 
 - Slot id: `s<16 hex digits>-<n>`. The 16 digits are random for each `Render` call; `n` counts slots from 0 in that call. [Claude Shannon]
 - Slot match: the client compares the `id` attribute byte for byte. It MUST NOT build a selector from an id. [Tony Hoare]
