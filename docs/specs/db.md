@@ -85,7 +85,9 @@ func (d *OptionDest[V]) Scan(src any) error
 - `DialectOf` MUST return `SQLite` for the driver name `sqlite`.
 - `DialectOf` MUST return `Postgres` for the driver name `pgx`.
 - `DialectOf` MUST return `Postgres` for the driver name `postgres`.
-- If the driver name is `mysql` and the DSN contains `parseTime=true`, `DialectOf` MUST return `MySQL`.
+- If the driver name is `mysql`, `DialectOf` MUST read `parseTime` from the query part of the DSN only.
+- The query part MUST be the text after the first `?` that follows the last `/`.
+- If `parseTime` there is `true`, `1`, `t` or `T`, `DialectOf` MUST return `MySQL`. `true` matches in any letter case.
 - `DialectOf` MUST return `MSSQL` for the driver name `sqlserver`.
 - `Open` MUST record the dialect that `DialectOf` returns for that driver and DSN.
 - `Pool` MUST implement [app.Part](app.md).
@@ -157,7 +159,7 @@ func (d *OptionDest[V]) Scan(src any) error
 ## Errors
 
 - `db: unknown driver "<name>"` when the driver name is not one of the four names above.
-- `db: mysql DSN needs parseTime=true` when a `mysql` DSN lacks that text.
+- `db: mysql DSN needs parseTime=true` when the query part of a `mysql` DSN does not turn `parseTime` on.
 - `db: open <driver>: <cause>` when `sql.Open` fails.
 - `db: ping: <cause>` when `Start` cannot ping.
 - `db: close: <cause>` when the handle close fails. The cause joins the statement close error and the handle error.
@@ -183,6 +185,7 @@ func (d *OptionDest[V]) Scan(src any) error
 
 - `TestDialectOfMatchesEachDriverName` proves the four driver names.
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
+- `TestDialectOfRejectsParseTimeInThePassword` proves that `parseTime=true` outside the query part does not count.
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
 - `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
 - `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.

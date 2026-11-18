@@ -260,6 +260,16 @@ func TestOpenRejectsMysqlWithoutParseTime(t *testing.T) {
 	}
 }
 
+func TestDialectOfRejectsParseTimeInThePassword(t *testing.T) {
+	_, err := db.DialectOf("mysql", "user:parseTime=true@tcp(localhost:3306)/db")
+	if err == nil {
+		t.Fatal("DialectOf accepted parseTime in the password")
+	}
+	if err.Error() != "db: mysql DSN needs parseTime=true" {
+		t.Fatalf("error = %q, want db: mysql DSN needs parseTime=true", err.Error())
+	}
+}
+
 func TestDialectOfMatchesEachDriverName(t *testing.T) {
 	cases := []struct {
 		driver string

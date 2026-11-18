@@ -34,7 +34,8 @@ func DialectOf(driver string, dsn string) (Dialect, error) {
 	case "pgx", "postgres":
 		return Postgres{}, nil
 	case "mysql":
-		if !strings.Contains(dsn, "parseTime=true") {
+		value, found := dsnParam(mysqlQueryPart(dsn), "parseTime")
+		if !found || !parseTimeOn(value) {
 			return nil, errors.New("db: mysql DSN needs parseTime=true")
 		}
 		return MySQL{}, nil
@@ -43,6 +44,30 @@ func DialectOf(driver string, dsn string) (Dialect, error) {
 	default:
 		return nil, fmt.Errorf("db: unknown driver %q", driver)
 	}
+}
+
+func mysqlQueryPart(dsn string) string {
+	tail := dsn[strings.LastIndexByte(dsn, '/')+1:]
+	if q := strings.IndexByte(tail, '?'); q >= 0 {
+		return tail[q+1:]
+	}
+	return ""
+}
+
+func dsnParam(query string, key string) (string, bool) {
+	for query != "" {
+		var pair string
+		pair, query, _ = strings.Cut(query, "&")
+		name, value, ok := strings.Cut(pair, "=")
+		if ok && name == key {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func parseTimeOn(value string) bool {
+	return strings.EqualFold(value, "true") || value == "1" || value == "t" || value == "T"
 }
 
 func Open(driver string, dsn string) (*Pool?, error) {
