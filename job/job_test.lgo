@@ -673,6 +673,47 @@ func TestQueueStopRacingStartLeavesNoLiveRun(t *testing.T) {
 	}
 }
 
+func TestSchedulerKeepsABusyMarkAgainstARunnerOfAnEarlierStart(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	runs := make(chan struct{}, 4)
+	s.Every("held", time.Second, func(ctx context.Context) error {
+		select {
+		case runs <- struct{}{}:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("restart Start: %v", err)
+	}
+	if !job.MarkEntryBusy(&s, "held") {
+		t.Fatal("MarkEntryBusy did not find the job")
+	}
+	job.ReleaseAsEarlierStart(&s, "held")
+	for range 3 {
+		sendTick(t, ticks)
+	}
+	if got := s.Skipped(); got < 2 {
+		t.Fatalf("Skipped = %d after three ticks, want the first two skipped: the later Start holds the job", got)
+	}
+	select {
+	case <-runs:
+		t.Fatal("the job ran although the later Start held its busy mark")
+	default:
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("final Stop: %v", err)
+	}
+}
+
 func sendTick(t *testing.T, ticks chan time.Time) {
 	t.Helper()
 	select {

@@ -13,11 +13,23 @@ func MarkEntryBusy(s *Scheduler, name string) bool {
 	s.life.WithLock(func(l *schedLife) {
 		for i := range s.jobs {
 			if s.jobs[i].name == name {
-				s.jobs[i].busy = true
+				s.jobs[i].claimedBy = l.starts
 				found = true
 				return
 			}
 		}
 	})
 	return found
+}
+
+func ReleaseAsEarlierStart(s *Scheduler, name string) {
+	var earlier uint64
+	s.life.WithLock(func(l *schedLife) {
+		earlier = l.starts - 1
+	})
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			s.release(jobLoop{entry: &s.jobs[i], start: earlier})
+		}
+	}
 }

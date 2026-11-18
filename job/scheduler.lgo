@@ -11,10 +11,10 @@ import (
 )
 
 type jobEntry struct {
-	name     string
-	interval time.Duration
-	run      func(ctx context.Context) error
-	busy     bool
+	name      string
+	interval  time.Duration
+	run       func(ctx context.Context) error
+	claimedBy uint64
 }
 
 type joinState struct {
@@ -30,6 +30,7 @@ type schedRun struct {
 
 type schedLife struct {
 	started bool
+	starts  uint64
 	run     *schedRun?
 	skipped uint64
 }
@@ -69,9 +70,10 @@ func (s *Scheduler) Start(ctx context.Context) error {
 			return
 		}
 		l.started = true
+		l.starts++
 		g, _ := rt.NewGroup(runCtx, 0)
 		for i := range s.jobs {
-			s.spawn(g, &s.jobs[i])
+			s.spawn(g, &s.jobs[i], l.starts)
 		}
 		js := &joinState{done: make(chan struct{})}
 		joinCtx, joinCancel := context.WithCancel(context.Background())
@@ -122,79 +124,87 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 	return err
 }
 
-func (s *Scheduler) spawn(g *rt.Group, j *jobEntry) {
-	tick := make(chan struct{}, 1)
+type jobLoop struct {
+	entry *jobEntry
+	tick  chan struct{}
+	start uint64
+}
+
+func (s *Scheduler) spawn(g *rt.Group, j *jobEntry, start uint64) {
+	loop := jobLoop{entry: j, tick: make(chan struct{}, 1), start: start}
 	g.Go(func(ctx context.Context) error {
-		return s.pump(ctx, j, tick)
+		return s.pump(ctx, loop)
 	})
 	g.Go(func(ctx context.Context) error {
-		return s.runner(ctx, j, tick)
+		return s.runner(ctx, loop)
 	})
 }
 
-func (s *Scheduler) pump(ctx context.Context, j *jobEntry, tick chan struct{}) error {
+func (s *Scheduler) pump(ctx context.Context, loop jobLoop) error {
 	ticks := s.tick
 	if ticks == nil {
-		ticker := time.NewTicker(j.interval)
+		ticker := time.NewTicker(loop.entry.interval)
 		defer ticker.Stop()
 		ticks = func(time.Duration) <-chan time.Time { return ticker.C }
 	}
-	source := ticks(j.interval)
+	source := ticks(loop.entry.interval)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-source:
-			if !s.deliver(ctx, j, tick) {
+			if !s.deliver(ctx, loop) {
 				return nil
 			}
 		}
 	}
 }
 
-func (s *Scheduler) deliver(ctx context.Context, j *jobEntry, tick chan struct{}) bool {
-	if !s.claim(j) {
+func (s *Scheduler) deliver(ctx context.Context, loop jobLoop) bool {
+	if !s.claim(loop) {
 		s.life.WithLock(func(l *schedLife) {
 			l.skipped++
 		})
 		return true
 	}
 	select {
-	case tick <- struct{}{}:
+	case loop.tick <- struct{}{}:
 		return true
 	case <-ctx.Done():
-		s.release(j)
+		s.release(loop)
 		return false
 	}
 }
 
-func (s *Scheduler) claim(j *jobEntry) bool {
+func (s *Scheduler) claim(loop jobLoop) bool {
 	ok := false
 	s.life.WithLock(func(l *schedLife) {
-		if !j.busy {
-			j.busy = true
+		if loop.entry.claimedBy == 0 {
+			loop.entry.claimedBy = loop.start
 			ok = true
 		}
 	})
 	return ok
 }
 
-func (s *Scheduler) release(j *jobEntry) {
+func (s *Scheduler) release(loop jobLoop) {
 	s.life.WithLock(func(l *schedLife) {
-		j.busy = false
+		if loop.entry.claimedBy == loop.start {
+			loop.entry.claimedBy = 0
+		}
 	})
 }
 
-func (s *Scheduler) runner(ctx context.Context, j *jobEntry, tick chan struct{}) error {
-	defer s.release(j)
+func (s *Scheduler) runner(ctx context.Context, loop jobLoop) error {
+	defer s.release(loop)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-tick:
+		case <-loop.tick:
 		}
-		s.runOnce(ctx, j)
-		s.release(j)
+		s.runOnce(ctx, loop.entry)
+		s.release(loop)
 	}
 }
 

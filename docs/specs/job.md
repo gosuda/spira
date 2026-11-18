@@ -69,6 +69,7 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - When `ctx` ends first, `Stop` MUST return that context error.
 - `Stop` before a successful `Start` MUST return nil.
 - A cancelled runner MUST clear its job's busy mark.
+- A runner MUST clear a busy mark only when its own `Start` set that mark.
 
 ### Queue
 
@@ -148,6 +149,7 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `TestChunkReportsAContextThatEndsWhileReadWaits` proves the error when the context ends between batches.
 - `TestQueueStopRacingStartLeavesNoLiveRun` proves that a `Start`/`Stop` race leaves no live queue.
 - `TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick` proves that a cancelled runner does not skip the next tick after a restart.
+- `TestSchedulerKeepsABusyMarkAgainstARunnerOfAnEarlierStart` proves that a runner of an earlier `Start` does not clear a later busy mark.
 
 ## Not in scope
 
