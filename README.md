@@ -1,14 +1,69 @@
 # spira
 
-A web framework for applications written in LoGOs. spira gives the Spring ecosystem's server-side shape to `.lgo` files: typed routing, HTML views, htmx fragments, browser islands, checked SQL, sessions, metrics and model calls.
+Spring's server-side ideas, rebuilt in LoGOs with no container and no reflection.
 
-An application is ordinary statements in `main`. There is no container, no reflection and no annotation scanning. Compile-time generics do the work that Spring does with proxies and `reflect`.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Checked at compile time.** Types, options and closed unions are checked by the LoGOs compiler. `logos eject` turns the module back into plain Go that builds with upstream Go.
+spira is a web framework for applications written in [LoGOs](https://github.com/gosuda/loGos), a fork of the Go toolchain that compiles `.lgo` files. It covers what a Spring application uses on the server: routing, HTML views, htmx fragments, browser islands, SQL access, sessions, metrics and model calls. An application is ordinary statements in `main`. No container resolves parts and nothing scans annotations. Where Spring asks a type a question at run time through `reflect` or a proxy, spira asks at compile time with a LoGOs comptime generic.
 
-**One language end to end.** The server and the browser share one wire contract: typed views, htmx fragments and custom-element islands for React, Svelte 5 and Solid.
+- **No reflection.** No `.lgo` file in the module imports `reflect`. `app.Run` walks the fields of the application struct at compile time.
+- **One runtime dependency.** `golang.org/x/crypto`, for Argon2id password hashing. The only other module in `go.mod`, `modernc.org/sqlite`, is imported by tests alone.
+- **Plain Go out.** `logos eject` turns the module into Go source that upstream Go 1.27.4 builds. `just eject` checks this.
+- **Page or fragment from one handler.** A `web.Page` reply writes the whole document, or only the body when htmx asks for it.
 
-**SQL checked before run time.** The design analyzes SQL files with `sqlc` against the migration schema and emits typed LoGOs code; the generator is specified in [sqlc-gen-spira](docs/specs/sqlc-gen-spira.md) and is not in the tree yet.
+```lgo
+func index(ctx *web.Context) (web.Reply, error) {
+	return web.Page{Title: "Hello", Body: view.P(view.T("Hello from spira"))}, nil
+}
+
+r := web.NewRouter()
+r.Layout = layout
+r.Handle("GET", "/", index)
+// GET /                        -> <!doctype html><html>...<p>Hello from spira</p></body></html>
+// GET / with HX-Request: true  -> <p>Hello from spira</p>
+```
+
+Contents: [Install](#install) · [Quick start](#quick-start) · [Features](#features) · [Usage](#usage) · [Development](#development) · [License](#license)
+
+## Install
+
+The system `go` cannot build this module. You need a LoGOs toolchain built from source.
+
+1. Clone and build LoGOs. Go 1.27.3 is known to work as the bootstrap compiler.
+
+   ```sh
+   git clone https://github.com/gosuda/loGos.git
+   cd loGos
+   unset GOROOT GOTOOLCHAIN
+   bootstrap_root=$(go env GOROOT)
+   (cd src && GOROOT_BOOTSTRAP="$bootstrap_root" ./make.bash)
+   ```
+
+2. Put the toolchain on your `PATH` for every later command.
+
+   ```sh
+   export GOROOT="$PWD"
+   export PATH="$GOROOT/bin:$PATH"
+   export GOTOOLCHAIN=local
+   ```
+
+3. Check the install. The output starts with `logos version go1.27.4`.
+
+   ```sh
+   logos version
+   ```
+
+4. Create a module and add spira. `logos get` resolves the version and writes it into `go.mod`.
+
+   ```sh
+   mkdir hello && cd hello
+   logos mod init example.com/hello
+   logos get github.com/gosuda/spira@main
+   ```
+
+## Quick start
+
+Write `main.lgo` in the module directory:
 
 ```lgo
 package main
@@ -51,7 +106,29 @@ func main() {
 }
 ```
 
-Output of `curl -i localhost:18080/`:
+`layout` wraps each page in the document shell. `app.Run` starts every field of `App` that implements `app.Part`, in field order, and stops them in reverse order on `SIGINT` or `SIGTERM`.
+
+LoGOs audits what a dependency can reach and denies network access by default. Allow the one spira package that opens sockets. Write `logos.toml` next to `go.mod`:
+
+```toml
+[capabilities]
+transitive_net_allowlist = ["github.com/gosuda/spira/web"]
+```
+
+Build and run:
+
+```sh
+logos build -o hello-bin .
+./hello-bin
+```
+
+The build prints warnings named `capabilities::unauthorized_reflect`. They do not stop the build. Standard library packages that spira imports, such as `fmt`, use `reflect`; spira's own code does not.
+
+In a second terminal:
+
+```sh
+curl -i localhost:18080/
+```
 
 ```text
 HTTP/1.1 200 OK
@@ -61,118 +138,55 @@ Vary: HX-Request, HX-Boosted, HX-History-Restore-Request
 <!doctype html><html><head><title>Hello</title></head><body><h1>Hello</h1><p>Hello from spira</p></body></html>
 ```
 
-Contents: [Install](#install) · [Quick start](#quick-start) · [Features](#features) · [Usage](#usage) · [State](#state) · [Development](#development) · [Contributing](#contributing) · [License](#license)
-
-## Install
-
-spira is written in LoGOs, a Go toolchain fork that compiles `.lgo` files. The system `go` cannot build this module. You need a LoGOs toolchain built from source.
-
-1. Clone and build LoGOs. Go 1.27.3 is known to work as the bootstrap compiler.
-
-   ```sh
-   git clone https://github.com/gosuda/loGos.git
-   cd loGos
-   unset GOROOT GOTOOLCHAIN
-   bootstrap_root=$(go env GOROOT)
-   (cd src && GOROOT_BOOTSTRAP="$bootstrap_root" ./make.bash)
-   ```
-
-2. Put the toolchain on your `PATH` for every later command.
-
-   ```sh
-   export GOROOT="$PWD"
-   export PATH="$GOROOT/bin:$PATH"
-   export GOTOOLCHAIN=local
-   ```
-
-3. Verify the install.
-
-   ```sh
-   logos version
-   ```
-
-   Expected output starts with `logos version go1.27.4`.
-
-4. Create a module and add spira.
-
-   ```sh
-   mkdir hello && cd hello
-   logos mod init example.com/hello
-   logos get github.com/gosuda/spira@main
-   ```
-
-   `logos get` resolves the version and writes it into `go.mod`.
-
-## Quick start
-
-Write `main.lgo` in the module directory with the program from the title block. The layout function wraps each page in the document shell. `Router.Handle` registers a handler for `GET /`. `app.Run` starts every field of the application struct that implements `app.Part`, in field order, and stops them in reverse order on `SIGINT` or `SIGTERM`.
-
-The capability audit denies network access by default. `logos.toml` authorizes the one spira package that opens sockets. Write it at the module root:
-
-```toml
-[capabilities]
-transitive_net_allowlist = ["github.com/gosuda/spira/web"]
-```
-
-Packages that use more of the standard library, such as `db` or `auth`, add their own entries the same way; `logos build` names the package and the capability in its diagnostic.
-
-The build also prints warnings named `capabilities::unauthorized_reflect`. They are warnings by default and do not stop the build: standard library packages that spira imports, such as `fmt`, use `reflect`. spira's own code does not import it.
-
-Build and run:
-
-```sh
-logos build -o hello-bin .
-./hello-bin
-```
-
-In a second terminal:
-
-```sh
-curl -i localhost:18080/
-```
-
-The response is the page shown above. `Vary: HX-Request, HX-Boosted, HX-History-Restore-Request` tells caches that the same URL can return a fragment or a full page depending on the htmx headers.
-
-A `Page` reply writes the body alone for a plain htmx request, and the full layout for any other request, including a boosted one. `web.Fragment` writes an HTML fragment with `HX-Retarget`, `HX-Reswap`, `HX-Push-Url` or `HX-Trigger` headers. `web.Data` writes JSON. `web.Redirect` answers `HX-Redirect` for htmx and `Location` otherwise. `web.Problem` writes RFC 9457 problem details.
-
 ## Features
 
-- **HTTP core** (`web`): `net/http.ServeMux` patterns, ordered `web.Stage` middleware, typed context keys, closed-union `web.Reply`, RFC 9457 problems, `web.Server` as an `app.Part`.
-- **Application lifecycle** (`app`): `app.Run` starts and stops the `app.Part` fields of one struct in declaration order.
-- **Configuration** (`config`): `config.Load[T]` fills a struct from `config.Env()`, `config.Map`, `config.File` and `config.Remote`, with `required` tags and per-key errors.
-- **Validation** (`validate`): `validate.Errors` and the `validate.Checker` interface; rules are code in `Check`.
-- **Views** (`view`): HTML as values from node functions, with escaping, URL scheme filtering, `Island` custom elements and `Later` streamed slots. No template language.
-- **Assets** (`asset`): reads the Vite manifest, emits entry tags in document order, serves build output with immutable caching for `assets/`.
-- **Browser workspace** (`frontend/`): pnpm, Vite, TypeScript strict, Biome, Vitest. Island adapters for React, Svelte 5, Solid and a LoGOs-WASM entry; the slot mover for `Later` fragments; htmx with `allowEval` off.
-- **Push** (`bus`, `live`): `bus.Topic[T]` fans out in-process events without blocking publishers; `live.Events` streams `view.Node` fragments as server-sent events with a heartbeat.
-- **Data** (`db`): `db.Open` over `database/sql` for SQLite, PostgreSQL, MySQL and SQL Server; `db.InTx`; comptime-scanned `db.Query` and `db.One` with `col` tags; a 256-entry prepared-statement cache; `db.In` for slice parameters. Option fields (`string?`) in a row type do not build yet: they wait for a comptime fix in LoGOs.
-- **Migrations** (`migrate`): `migrate.Load` reads `*.up.sql`/`*.down.sql` pairs, `migrate.Apply` runs them in order, `migrate.CheckReversible` proves each `down` restores the schema fingerprint.
-- **Checked SQL** (`cmd/sqlc-gen-spira`): specified; the package is not in the tree yet. It will be a sqlc plugin that emits typed row structs, distinct key types, `orm.Table` values and query functions, and refuses unmapped column types and writes to versioned tables that skip the version column.
-- **Sessions** (`orm`): specified in `docs/specs/orm.md`; the package is not in the tree yet.
-- **Auth** (`auth`): Argon2id password hashing, `auth.Sessions` cookie sessions over a `SessionStore`, `auth.Authenticate` and `auth.Require` stages, `auth.Bearer`, `auth.CrossOrigin`, `auth.SecureHeaders` and `auth.DevHeaders`.
-- **Metrics and ops** (`meter`, `ops`): Prometheus counters, gauges and histograms with a 1000-series cap per metric; `meter.HTTP` records request duration by route; `ops.Mount` serves `/ops/live`, `/ops/ready`, `/ops/health`, `/ops/info`, `/ops/metrics` and `/ops/routes` behind a required guard stage.
-- **Outbound** (`client`, `resilience`, `cache`): typed JSON client over `resilience.Policy` (timeout, retry, circuit breaker); `cache.Memory` LRU with `cache.Load` single-flight.
-- **Background work** (`job`, `gateway`): `job.Scheduler`, `job.Queue` and `job.Chunk` for batch runs; `gateway.Mount` reverse-proxies path prefixes to static upstream lists with per-upstream breakers.
-- **Model calls** (`ai`): messages, tools, `ai.Run` tool loop, `ai.Collect` stream merge, `ai.Wrap` layers and `ai.SearchTools`. Provider packages (`ai/openai`, `ai/anthropic`, `ai/ollama`, `ai/session`, `ai/rag`, `ai/mcp`) are specified and not in the tree yet.
-- **Command** (`cmd/spira`): `spira dev <main-package>` runs the Vite dev server and `logos run` together and restarts the server when an `.lgo` file changes. `spira new` is specified and not in the tree yet.
+Each package has a specification under [docs/specs](docs/specs/README.md). The last column says what this tree holds today.
+
+| Package | What you get | In the tree |
+|---|---|---|
+| `app` | `app.Run` starts and stops the `app.Part` fields of one struct in declaration order | yes |
+| `config` | `config.Load[T]` fills a struct from environment, map, file and remote sources, with `required` tags and an error per key | yes |
+| `web` | `net/http.ServeMux` patterns, ordered `web.Stage` lists, typed context keys, the closed `web.Reply` union, RFC 9457 problems, `web.Server` | yes; typed `Bind` and `Route` wait for `schema` |
+| `validate` | `validate.Errors` and the `validate.Checker` interface; a rule is code in `Check` | yes |
+| `view` | HTML as values from node functions: escaping, a URL scheme filter, `Island` custom elements, `Later` streamed slots; no template language | yes |
+| `asset`, `frontend/` | Vite manifest tags in document order; island adapters for React, Svelte 5 and Solid; the slot mover; htmx with `allowEval` off | yes |
+| `bus`, `live` | `bus.Topic[T]` fans events out in process and never blocks a publisher; `live.Events` streams HTML fragments as server-sent events | yes |
+| `db` | `db.Open` over `database/sql` for SQLite, PostgreSQL, MySQL and SQL Server; `db.InTx`; `db.Query` and `db.One` scan by `col` tag; a 256-entry statement cache | yes; option fields (`string?`) wait for a LoGOs fix |
+| `migrate` | `*.up.sql` and `*.down.sql` pairs; `migrate.CheckReversible` proves that each `down` restores the schema | yes |
+| `auth` | Argon2id passwords, cookie sessions over a `SessionStore`, `auth.Authenticate` and `auth.Require` stages, `auth.Bearer`, cross-origin and security headers | yes |
+| `meter`, `ops` | Prometheus counters, gauges and histograms capped at 1000 series per metric; `/ops` health, info, metrics and routes behind a guard you must pass | yes |
+| `client`, `resilience`, `cache` | A typed JSON client under a timeout, retry and circuit-breaker policy; an LRU cache that runs one load per key | yes |
+| `gateway`, `job` | Reverse proxy to static upstream lists with a breaker per upstream; a scheduler, a queue and chunked batch runs | yes |
+| `ai` | Messages, tools, the `ai.Run` tool loop, `ai.Collect` stream merge, `ai.Wrap` layers, tool search | yes; the provider, session, retrieval and MCP packages are specified |
+| `cmd/spira` | `spira dev` runs Vite and `logos run` together and restarts the server when an `.lgo` file changes | `dev` yes; `new` is specified |
+| `schema`, `openapi`, `admin`, `orm`, `cmd/sqlc-gen-spira` | Type descriptions, an OpenAPI 3.1 document, an admin console, entity sessions, SQL checked by `sqlc` before run time | specified, not yet in the tree |
 
 ## Usage
 
-The example above is the shortest real program: a router, a layout and one page. Features are structs that hold the concrete values they use; `main` is ordinary statements that end in `app.Run`.
+A feature is a struct that holds the concrete values it uses, and its methods are the handlers. `main` builds each feature as a struct literal, registers its methods and ends in `app.Run`.
 
-For the HTTP surface, read the [web specification](docs/specs/web.md). For pages, read [view](docs/specs/view.md) and [frontend](docs/specs/frontend.md). For data, read [db](docs/specs/db.md), [migrate](docs/specs/migrate.md) and [sqlc-gen-spira](docs/specs/sqlc-gen-spira.md). For auth, read [auth](docs/specs/auth.md). The [scope and lexicon](docs/specs/scope-and-lexicon.md) maps each Spring concept to its spira form and lists what spira does not build.
+One handler serves a full page and an htmx fragment. With the quick start program running:
 
-`example/shop/db` holds the shop sample's migration pairs and checked queries. The rest of the sample application is specified in [example-shop](docs/specs/example-shop.md) and lands in later commits.
+```sh
+curl -s localhost:18080/                        # the whole document
+curl -s -H 'HX-Request: true' localhost:18080/  # <p>Hello from spira</p>
+```
 
-## State
+The other replies follow the same rule. `web.Fragment` writes HTML with `HX-Retarget`, `HX-Reswap`, `HX-Push-Url` or `HX-Trigger`. `web.Data` writes JSON. `web.Redirect` answers `HX-Redirect` for htmx and `Location` otherwise. `web.Problem` writes RFC 9457 problem details.
 
-This tree holds these packages: `ai`, `app`, `asset`, `auth`, `bus`, `cache`, `client`, `cmd/spira` (`dev` only), `config`, `db`, `example/shop/db`, `frontend`, `gateway`, `job`, `live`, `meter`, `migrate`, `ops`, `resilience`, `validate`, `view`, `web`, and the `wire` corpus.
+Where to read next:
 
-`docs/specs/` specifies the whole framework, including packages not yet in the tree: `admin`, `openapi`, `schema`, `orm`, `cmd/sqlc-gen-spira`, `spira new`, and the `ai` provider and session packages. Each specification file says whether its package is in the tree.
+- HTTP: [web](docs/specs/web.md)
+- Pages and islands: [view](docs/specs/view.md), [frontend](docs/specs/frontend.md), [wire contract](docs/specs/wire-contract.md)
+- Data: [db](docs/specs/db.md), [migrate](docs/specs/migrate.md)
+- Login and sessions: [auth](docs/specs/auth.md)
+- What maps to which Spring concept, and what spira does not build: [scope and lexicon](docs/specs/scope-and-lexicon.md)
+
+`example/shop/db` holds the migrations and queries of the sample shop. The rest of the sample is specified in [example-shop](docs/specs/example-shop.md).
 
 ## Development
 
-The module builds with `logos`, not `go`. `logos.toml` sits next to `go.mod` and turns off cgo. The `justfile` exports the toolchain environment itself; `LOGOS_ROOT` overrides the toolchain path.
+The module builds with `logos`, not `go`. The `justfile` sets the toolchain environment; `LOGOS_ROOT` overrides the toolchain path.
 
 ```sh
 just build    # logos build ./...
@@ -183,13 +197,11 @@ just gate     # build lint test web
 just eject    # logos eject to /tmp/spira-eject, then upstream go build
 ```
 
-The pre-commit hook runs `just gate`. A commit that fails lint or tests does not land.
+`logos.toml` forbids cgo, so tests run without the race detector.
 
-Database drivers (`modernc.org/sqlite`, `github.com/jackc/pgx/v5`, `github.com/go-sql-driver/mysql`, `github.com/microsoft/go-mssqldb`) are test and example dependencies only; the library imports none of them. `tools/go.mod` pins `sqlc` as a Go tool for the generator.
+### Contributing
 
-## Contributing
-
-Read [AGENTS.md](AGENTS.md) before you change code. It holds the module rules, the design procedure, the wire contract and the finding protocol for LoGOs toolchain defects. Spira never uses dependency injection, reflection or annotation-driven behavior; a package exports an interface only when spira ships two implementations of it.
+Read [CONTRIBUTE.md](CONTRIBUTE.md) for the steps to land a change and [REVIEW.md](REVIEW.md) for what a reviewer checks. [AGENTS.md](AGENTS.md) holds the module rules in full. A defect in the LoGOs toolchain is never worked around in silence: it goes through the finding protocol in that file.
 
 ## License
 
