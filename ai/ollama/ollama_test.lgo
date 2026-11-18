@@ -258,6 +258,33 @@ func TestClientErrorIsFinal(t *testing.T) {
 	}
 }
 
+func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
+	statuses := []int{http.StatusInternalServerError, http.StatusInternalServerError, http.StatusBadRequest}
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(calls.Add(1))
+		if n <= len(statuses) {
+			serveBody(t, statuses[n-1], "application/json", `{"error":"refused"}`)(w, r)
+			return
+		}
+		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)(w, r)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second, Breaker: &resilience.Breaker{Window: 3, FailureRate: 0.5, OpenFor: time.Hour}}
+	for range statuses {
+		if _, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2"}); err == nil {
+			t.Fatal("err=nil, want the failing answer")
+		}
+	}
+	if _, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2"}); err != nil {
+		t.Fatalf("err = %v, want a reply: two 500 answers and a 400 must not fill a window of three", err)
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("server saw %d calls, want 4", calls.Load())
+	}
+}
+
 func TestServerErrorIsRetried(t *testing.T) {
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

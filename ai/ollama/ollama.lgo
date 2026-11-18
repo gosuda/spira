@@ -117,25 +117,16 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 
 func send[T any](ctx context.Context, c *Client, path string, payload []byte) (T, error) {
 	var zero T
-	var final error
-	out, err := resilience.Do[T](ctx, c.Policy, func(actx context.Context) (T, error) {
+	return resilience.Do[T](ctx, c.Policy, func(actx context.Context) (T, error) {
 		value, err := post[T](actx, c, path, payload)
 		if err == nil {
 			return value, nil
 		}
 		if callerFault(err) {
-			final = err
-			return zero, nil
+			return zero, resilience.Ignored(err)
 		}
 		return zero, err
 	})
-	if final != nil {
-		return zero, final
-	}
-	if err != nil {
-		return zero, err
-	}
-	return out, nil
 }
 
 func callerFault(err error) bool {

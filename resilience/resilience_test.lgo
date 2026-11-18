@@ -391,6 +391,62 @@ func TestCancelledProbeReleasesTheSlot(t *testing.T) {
 	}
 }
 
+func TestIgnoredErrorEndsRetriesAndReturnsItsCause(t *testing.T) {
+	var calls atomic.Int64
+	pol := resilience.Policy{Timeout: time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	_, err := resilience.Do(t.Context(), pol, func(context.Context) (int, error) {
+		calls.Add(1)
+		return 0, resilience.Ignored(boom)
+	})
+	if err != boom {
+		t.Fatalf("err = %v, want the wrapped cause itself", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want 1: an ignored error is final", calls.Load())
+	}
+}
+
+func ignoring(context.Context) (int, error) {
+	return 0, resilience.Ignored(boom)
+}
+
+func TestIgnoredErrorIsNoResultInTheWindow(t *testing.T) {
+	brk := &resilience.Breaker{Window: 3, FailureRate: 0.5, OpenFor: time.Hour}
+	pol := resilience.Policy{Timeout: time.Second, Breaker: brk}
+	for _, call := range []func(context.Context) (int, error){failing, failing, ignoring} {
+		if _, err := resilience.Do(t.Context(), pol, call); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want boom", err)
+		}
+	}
+	if _, err := resilience.Do(t.Context(), pol, failing); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want boom: two failures and an ignored error must not fill a window of three", err)
+	}
+	if _, err := resilience.Do(t.Context(), pol, succeeding); !errors.Is(err, resilience.ErrOpen) {
+		t.Fatalf("err = %v, want ErrOpen after the third failure", err)
+	}
+}
+
+func TestIgnoredProbeLeavesTheBreakerHalfOpen(t *testing.T) {
+	clk := &testClock{}
+	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour, Now: clk.Now}
+	pol := resilience.Policy{Timeout: time.Second, Breaker: brk}
+	for range 2 {
+		if _, err := resilience.Do(t.Context(), pol, failing); !errors.Is(err, boom) {
+			t.Fatalf("warm-up err = %v, want boom", err)
+		}
+	}
+	clk.Advance(time.Hour)
+	if _, err := resilience.Do(t.Context(), pol, ignoring); !errors.Is(err, boom) {
+		t.Fatalf("ignored probe err = %v, want boom", err)
+	}
+	if _, err := resilience.Do(t.Context(), pol, failing); !errors.Is(err, boom) {
+		t.Fatalf("next call err = %v, want boom: the ignored probe must release its slot", err)
+	}
+	if _, err := resilience.Do(t.Context(), pol, succeeding); !errors.Is(err, resilience.ErrOpen) {
+		t.Fatalf("err = %v, want ErrOpen: the failed probe opens the breaker, so the ignored probe did not close it", err)
+	}
+}
+
 func TestAttemptTimeoutCountsAsFailure(t *testing.T) {
 	var calls atomic.Int64
 	brk := &resilience.Breaker{Window: 1, FailureRate: 0.5, OpenFor: time.Hour}

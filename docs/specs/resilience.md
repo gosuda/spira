@@ -28,6 +28,7 @@ type Policy struct {
 }
 
 func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T, error)) (T, error)
+func Ignored(err error) error
 ```
 
 ## Requirements
@@ -48,6 +49,9 @@ func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T,
 - `Do` MUST return the zero value of `T` together with an error.
 - `Do` MUST NOT start another attempt after `ErrOpen`.
 - `Do` MUST NOT start another attempt after the caller context ends.
+- `Ignored` MUST mark an error that says nothing about the health of the dependency.
+- `Do` MUST NOT start another attempt after an `Ignored` error.
+- `Do` MUST then return the error that `Ignored` wraps.
 
 ### Timeout and wait
 
@@ -87,6 +91,9 @@ func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T,
 - A failed probe MUST open the breaker again.
 - A cancelled probe MUST release its slot.
 - A released slot MUST allow another probe.
+- An `Ignored` error MUST NOT add a result to the window.
+- A probe that ends with an `Ignored` error MUST release its slot.
+- That probe MUST NOT close the breaker.
 - A result from an older admission MUST NOT change the breaker.
 - A panicking call MUST count as a breaker failure.
 - That panic MUST propagate to the caller of `Do`.
@@ -111,6 +118,9 @@ func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T,
 - `TestBackoffStopsWhenContextEnds` proves that the wait stops with the caller context.
 - `TestCallerCancellationIsNotCountedAsFailure` proves that a caller cancel is not a failure.
 - `TestCancelledProbeReleasesTheSlot` proves that a cancelled probe frees the slot.
+- `TestIgnoredErrorEndsRetriesAndReturnsItsCause` proves that an `Ignored` error is final and that `Do` returns its cause.
+- `TestIgnoredErrorIsNoResultInTheWindow` proves that an `Ignored` error adds no result to the window.
+- `TestIgnoredProbeLeavesTheBreakerHalfOpen` proves that an `Ignored` probe releases its slot and does not close the breaker.
 - `TestAttemptTimeoutCountsAsFailure` proves that an attempt timeout opens the breaker.
 - `TestPolicyAndRetryDefaultsHold` proves the timeout, attempt, base and max defaults.
 - `TestStaleFailureCannotStealTheProbe` and `TestStaleSuccessCannotCloseTheBreaker` prove that an older admission does not change the breaker.

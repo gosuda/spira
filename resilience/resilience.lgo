@@ -19,6 +19,26 @@ type Policy struct {
 	Breaker *Breaker?
 }
 
+type ignored struct {
+	cause error
+}
+
+func (i *ignored) Error() string {
+	return i.cause.Error()
+}
+
+func Ignored(err error) error {
+	return &ignored{cause: err}
+}
+
+func ignoredCause(err error) error? {
+	skipped := &ignored{}
+	if errors.As(err, &skipped) {
+		return skipped.cause
+	}
+	return nil
+}
+
 func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
 	var last error
@@ -29,6 +49,9 @@ func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T,
 		value, err := attempt(ctx, p, call)
 		if err == nil {
 			return value, nil
+		}
+		if cause := ignoredCause(err); cause != nil {
+			return zero, cause
 		}
 		last = err
 		if errors.Is(err, ErrOpen) || ctx.Err() != nil {

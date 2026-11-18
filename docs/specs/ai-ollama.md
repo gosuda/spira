@@ -33,7 +33,8 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `Embed` MUST return the vectors in input order.
 - `Chat` and `Embed` MUST run each attempt under `resilience.Do` with `Policy`.
 - A 4xx answer other than 408 and 429 MUST end the call after one attempt.
-- That answer MUST NOT count as a failure for the breaker.
+- That answer MUST NOT count as a failure or as a success for the breaker.
+- `Chat` and `Embed` MUST report that answer to `resilience.Do` as an `Ignored` error.
 - Any other failing answer MUST be retried under `Policy.Retry`.
 - An option that the request does not set MUST be absent from the JSON.
 - A `Format` of `json` MUST go out as the JSON string `json`.
@@ -58,6 +59,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen` proves that the stream ends at `done` while the server keeps the body open.
 - `TestClientErrorIsFinal` proves that a 400 answer costs one request. The test server counts the requests.
 - `TestServerErrorIsRetried` proves that a 500 answer is retried.
+- `TestClientErrorAddsNoResultToTheBreaker` proves that a 400 answer adds no result to the breaker window.
 - `TestEmbedReturnsEmbeddingsInInputOrder` proves the embed path and the vector order.
 - `TestFormatGoesOutAsJSONModeOrAsASchemaObject` proves the two wire forms of `Format` and the error for any other text.
 - No test needs a key or the network.
