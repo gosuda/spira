@@ -241,3 +241,18 @@ func TestRouteMissesAreCountedUnderOneRouteLabel(t *testing.T) {
 	}
 }
 
+func TestRecoveredPanicIsCountedAsServerError(t *testing.T) {
+	reg := meter.NewRegistry()
+	r := web.NewRouter()
+	r.Use(web.Recover(), meter.HTTP(reg))
+	r.Handle("GET", "/panics", func(ctx *web.Context) (web.Reply, error) {
+		panic("meter test: handler panic")
+	})
+	if rec := meteredGet(r, "/panics"); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("GET /panics status = %d, want 500", rec.Code)
+	}
+	samples := parseMetricLines(t, exposition(t, reg))
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /panics", "status": "5xx"}); !ok || s.value != "1" {
+		t.Fatalf("series after a recovered panic = %+v, want one 5xx", s)
+	}
+}
