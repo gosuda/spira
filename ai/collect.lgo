@@ -1,0 +1,222 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-model/src/main/java/org/springframework/ai/chat/model/MessageAggregator.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai
+
+import (
+	"cmp"
+	"fmt"
+	"iter"
+	"slices"
+	"strings"
+)
+
+type slotKind int
+
+const (
+	slotText slotKind = iota
+	slotReasoning
+	slotWhole
+)
+
+type streamSlot struct {
+	index    int
+	kind     slotKind
+	pieces   []string
+	last     Part
+	complete bool
+}
+
+type streamGroup struct {
+	id       string
+	slots    []streamSlot
+	maxIndex int
+}
+
+type collector struct {
+	groups    []streamGroup
+	text      []string
+	reasoning []string
+	carried   []Part
+	calls     []Part
+	reply     Reply
+	finish    Finish?
+}
+
+func Collect(chunks iter.Seq2[Chunk, error]) (Reply, error) {
+	var c collector
+	for chunk, err := range chunks {
+		if err != nil {
+			return Reply{}, fmt.Errorf("ai: collect: %w", err)
+		}
+		c.note(chunk)
+		c.add(chunk)
+	}
+	return c.result(), nil
+}
+
+func (c *collector) note(chunk Chunk) {
+	if chunk.Usage.Input > 0 {
+		c.reply.Usage.Input = chunk.Usage.Input
+	}
+	if chunk.Usage.Output > 0 {
+		c.reply.Usage.Output = chunk.Usage.Output
+	}
+	if chunk.Usage.Total > 0 {
+		c.reply.Usage.Total = chunk.Usage.Total
+	}
+	if strings.TrimSpace(chunk.ID) != "" {
+		c.reply.ID = chunk.ID
+	}
+	if strings.TrimSpace(chunk.Model) != "" {
+		c.reply.Model = chunk.Model
+	}
+	if finish := chunk.Finish; finish != nil {
+		c.finish = finish
+	}
+}
+
+func (c *collector) add(chunk Chunk) {
+	part := chunk.Part
+	if part == nil {
+		return
+	}
+	if _, isCall := part.(ToolCall); isCall && chunk.Partial {
+		return
+	}
+	index := chunk.Index
+	if index == nil {
+		c.addUnindexed(part, chunk.Partial)
+		return
+	}
+	at := c.groupFor(chunk.ID, index, part)
+	c.groups[at].accept(index, part, chunk.Partial)
+}
+
+func (c *collector) addUnindexed(part Part, partial bool) {
+	switch v := part.(type) {
+	case Text:
+		c.text = append(c.text, v.Text)
+	case Reasoning:
+		if partial {
+			c.reasoning = append(c.reasoning, v.Text)
+			return
+		}
+		c.carried = append(c.carried, v)
+	case ToolCall:
+		c.calls = append(c.calls, v)
+	case ToolResult:
+		c.carried = append(c.carried, v)
+	case nil:
+	}
+}
+
+func (c *collector) groupFor(id string, index int, part Part) int {
+	if strings.TrimSpace(id) != "" {
+		for i := range c.groups {
+			if c.groups[i].id == id {
+				return i
+			}
+		}
+		return c.newGroup(id)
+	}
+	if len(c.groups) == 0 {
+		return c.newGroup("")
+	}
+	last := len(c.groups) - 1
+	if c.groups[last].id != "" || index < c.groups[last].maxIndex {
+		return c.newGroup("")
+	}
+	at := c.groups[last].find(index)
+	if at < 0 {
+		return last
+	}
+	kind, _ := shape(part)
+	slot := c.groups[last].slots[at]
+	if slot.complete || slot.kind != kind {
+		return c.newGroup("")
+	}
+	return last
+}
+
+func (c *collector) newGroup(id string) int {
+	c.groups = append(c.groups, streamGroup{id: id, maxIndex: -1})
+	return len(c.groups) - 1
+}
+
+func (g *streamGroup) find(index int) int {
+	for i := range g.slots {
+		if g.slots[i].index == index {
+			return i
+		}
+	}
+	return -1
+}
+
+func (g *streamGroup) accept(index int, part Part, partial bool) {
+	g.maxIndex = max(g.maxIndex, index)
+	kind, text := shape(part)
+	fresh := streamSlot{index: index, kind: kind, pieces: []string{text}, last: part, complete: !partial}
+	at := g.find(index)
+	if at < 0 {
+		g.slots = append(g.slots, fresh)
+		return
+	}
+	if !partial || g.slots[at].kind != kind {
+		g.slots[at] = fresh
+		return
+	}
+	g.slots[at].pieces = append(g.slots[at].pieces, text)
+	g.slots[at].last = part
+}
+
+func shape(part Part) (slotKind, string) {
+	switch v := part.(type) {
+	case Text:
+		return slotText, v.Text
+	case Reasoning:
+		return slotReasoning, v.Text
+	case ToolCall:
+	case ToolResult:
+	case nil:
+	}
+	return slotWhole, ""
+}
+
+func (s streamSlot) joined() Part {
+	switch s.kind {
+	case slotText:
+		return Text{Text: strings.Join(s.pieces, "")}
+	case slotReasoning:
+		return Reasoning{Text: strings.Join(s.pieces, "")}
+	}
+	return s.last
+}
+
+func (c *collector) result() Reply {
+	var parts []Part
+	for i := range c.groups {
+		slots := c.groups[i].slots
+		slices.SortStableFunc(slots, func(a, b streamSlot) int {
+			return cmp.Compare(a.index, b.index)
+		})
+		for _, slot := range slots {
+			parts = append(parts, slot.joined())
+		}
+	}
+	if len(c.reasoning) > 0 {
+		parts = append(parts, Reasoning{Text: strings.Join(c.reasoning, "")})
+	}
+	parts = append(parts, c.carried...)
+	text := strings.Join(c.text, "")
+	if len(c.groups) == 0 || text != "" {
+		parts = append(parts, Text{Text: text})
+	}
+	parts = append(parts, c.calls...)
+	reply := c.reply
+	reply.Message = Message{Role: RoleAssistant, Parts: parts}
+	reply.Finish = c.finish ?? FinishOther
+	return reply
+}

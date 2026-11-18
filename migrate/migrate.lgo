@@ -1,0 +1,325 @@
+package migrate
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/db"
+)
+
+type Step struct {
+	Name string
+	Up   string
+	Down string
+}
+
+const migrationsTable = "spira_migrations"
+
+const ddlSQLite = "CREATE TABLE IF NOT EXISTS " + migrationsTable + " (name text primary key, applied_at text not null)"
+const ddlPostgres = ddlSQLite
+const ddlMySQL = "CREATE TABLE IF NOT EXISTS " + migrationsTable + " (name varchar(255) primary key, applied_at varchar(64) not null)"
+const ddlMSSQL = "IF OBJECT_ID('" + migrationsTable + "', 'U') IS NULL CREATE TABLE " + migrationsTable + " (name varchar(255) primary key, applied_at varchar(64) not null)"
+
+func Load(fsys fs.FS) ([]Step, error) {
+	entries, err := fs.ReadDir(fsys, ".")
+	if err != nil {
+		return nil, fmt.Errorf("migrate: read migrations: %w", err)
+	}
+	ups := []string{}
+	downFiles := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasSuffix(n, ".up.sql") {
+			ups = append(ups, n)
+		}
+		if strings.HasSuffix(n, ".down.sql") {
+			downFiles[strings.TrimSuffix(n, ".down.sql")] = n
+		}
+	}
+	slices.Sort(ups)
+	return pairSteps(fsys, ups, downFiles)
+}
+
+func pairSteps(fsys fs.FS, ups []string, downFiles map[string]string) ([]Step, error) {
+	steps := make([]Step, 0, len(ups))
+	used := map[string]bool{}
+	for _, up := range ups {
+		stem := strings.TrimSuffix(up, ".up.sql")
+		down, ok := downFiles[stem]
+		if !ok {
+			return nil, fmt.Errorf("migrate: %s has no matching .down.sql file", up)
+		}
+		used[down] = true
+		upSQL, err := fs.ReadFile(fsys, up)
+		if err != nil {
+			return nil, fmt.Errorf("migrate: read %s: %w", up, err)
+		}
+		downSQL, err := fs.ReadFile(fsys, down)
+		if err != nil {
+			return nil, fmt.Errorf("migrate: read %s: %w", down, err)
+		}
+		steps = append(steps, Step{Name: stem, Up: string(upSQL), Down: string(downSQL)})
+	}
+	for _, down := range downFiles {
+		seen, ok := used[down]
+		if !ok || !seen {
+			return nil, fmt.Errorf("migrate: %s has no matching .up.sql file", down)
+		}
+	}
+	return steps, nil
+}
+
+func migrationsDDL(d db.Dialect) string {
+	return switch d.(type) {
+	case db.SQLite => ddlSQLite
+	case db.Postgres => ddlPostgres
+	case db.MySQL => ddlMySQL
+	case db.MSSQL => ddlMSSQL
+	default => boomNil[string]()
+	}
+}
+
+func param(d db.Dialect, n int) string {
+	return switch d.(type) {
+	case db.SQLite => "?"
+	case db.Postgres => "$" + fmt.Sprint(n)
+	case db.MySQL => "?"
+	case db.MSSQL => "@p" + fmt.Sprint(n)
+	default => boomNil[string]()
+	}
+}
+
+func boomNil[T any]() T {
+	panic("migrate: nil dialect")
+}
+
+func insertApplied(d db.Dialect) string {
+	return $"INSERT INTO {migrationsTable} (name, applied_at) VALUES ({param(d, 1)}, {param(d, 2)})"
+}
+
+func deleteApplied(d db.Dialect) string {
+	return $"DELETE FROM {migrationsTable} WHERE name = {param(d, 1)}"
+}
+
+func appliedNamesQuery() string {
+	return $"SELECT name FROM {migrationsTable} ORDER BY name"
+}
+
+func appliedNames(ctx context.Context, q db.Querier) ([]string, error) {
+	rows, err := q.QueryContext(ctx, appliedNamesQuery())
+	if err != nil {
+		return nil, fmt.Errorf("migrate: read applied steps: %w", err)
+	}
+	if rows == nil {
+		return nil, errors.New("migrate: read applied steps: no rows")
+	}
+	defer rows.Close()?
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("migrate: scan applied step: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("migrate: applied steps: %w", err)
+	}
+	return names, nil
+}
+
+func ensureTable(ctx context.Context, p *db.Pool) error {
+	if _, err := db.Exec(ctx, p, migrationsDDL(p.Dialect())); err != nil {
+		return fmt.Errorf("migrate: create bookkeeping table: %w", err)
+	}
+	return nil
+}
+
+func prefixError(applied []string, steps const []Step) error {
+	for i, a := range applied {
+		if i >= len(steps) {
+			return fmt.Errorf("migrate: applied step %q is not in the given steps", a)
+		}
+		if steps[i].Name != a {
+			return fmt.Errorf("migrate: applied step %d is %q, expected %q", i, a, steps[i].Name)
+		}
+	}
+	return nil
+}
+
+func Apply(ctx context.Context, p *db.Pool, steps const []Step) error {
+	if err := ensureTable(ctx, p); err != nil {
+		return err
+	}
+	applied, err := appliedNames(ctx, p)
+	if err != nil {
+		return err
+	}
+	if err := prefixError(applied, steps); err != nil {
+		return err
+	}
+	for _, s := range steps[len(applied):] {
+		if err := applyStep(ctx, p, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyStep(ctx context.Context, p *db.Pool, s Step) error {
+	_, err := db.InTx[int](ctx, p, func(tx *db.Tx) (int, error) {
+		if _, err := db.Exec(ctx, tx, s.Up); err != nil {
+			return 0, upErr(p.Dialect(), s.Name, err)
+		}
+		if err := recordStep(ctx, p, tx, s.Name); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	})
+	return err
+}
+
+func recordStep(ctx context.Context, p *db.Pool, tx *db.Tx, name string) error {
+	if _, err := db.Exec(ctx, tx, insertApplied(p.Dialect()), name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("migrate: record %s: %w", name, err)
+	}
+	return nil
+}
+
+func upErr(d db.Dialect, name string, err error) error {
+	return switch d.(type) {
+	case db.SQLite => fmt.Errorf("migrate: %s up: %w", name, err)
+	case db.Postgres => fmt.Errorf("migrate: %s up: %w", name, err)
+	case db.MySQL => fmt.Errorf("migrate: %s failed; mysql does not roll back DDL, inspect the schema: %w", name, err)
+	case db.MSSQL => fmt.Errorf("migrate: %s up: %w", name, err)
+	default => boomNil[error]()
+	}
+}
+
+func Rollback(ctx context.Context, p *db.Pool, steps const []Step, count int) error {
+	if err := ensureTable(ctx, p); err != nil {
+		return err
+	}
+	applied, err := appliedNames(ctx, p)
+	if err != nil {
+		return err
+	}
+	if count < 0 || count > len(applied) {
+		return fmt.Errorf("migrate: cannot roll back %d of %d applied steps", count, len(applied))
+	}
+	for i := len(applied) - 1; i >= len(applied)-count; i-- {
+		s, ok := findStep(steps, applied[i])
+		if !ok {
+			return fmt.Errorf("migrate: applied step %q is not in the given steps", applied[i])
+		}
+		if err := rollbackStep(ctx, p, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func findStep(steps const []Step, name string) (Step, bool) {
+	for _, s := range steps {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Step{}, false
+}
+
+func rollbackStep(ctx context.Context, p *db.Pool, s Step) error {
+	_, err := db.InTx[int](ctx, p, func(tx *db.Tx) (int, error) {
+		if _, err := db.Exec(ctx, tx, s.Down); err != nil {
+			return 0, fmt.Errorf("migrate: %s down: %w", s.Name, err)
+		}
+		if _, err := db.Exec(ctx, tx, deleteApplied(p.Dialect()), s.Name); err != nil {
+			return 0, fmt.Errorf("migrate: unrecord %s: %w", s.Name, err)
+		}
+		return 0, nil
+	})
+	return err
+}
+
+func CheckReversible(ctx context.Context, p *db.Pool, steps const []Step) error {
+	if err := requireEmpty(ctx, p); err != nil {
+		return err
+	}
+	marks := make([]string, 0, len(steps)+1)
+	first, err := fingerprint(ctx, p)
+	if err != nil {
+		return err
+	}
+	marks = append(marks, first)
+	for _, s := range steps {
+		if err := runStep(ctx, p, s.Up); err != nil {
+			return fmt.Errorf("migrate: %s up: %w", s.Name, err)
+		}
+		mark, err := fingerprint(ctx, p)
+		if err != nil {
+			return err
+		}
+		marks = append(marks, mark)
+	}
+	for i := len(steps) - 1; i >= 0; i-- {
+		s := steps[i]
+		if err := runStep(ctx, p, s.Down); err != nil {
+			return fmt.Errorf("migrate: %s down: %w", s.Name, err)
+		}
+		after, err := fingerprint(ctx, p)
+		if err != nil {
+			return err
+		}
+		if after != marks[i] {
+			return fmt.Errorf("migrate: %s down does not restore the schema", s.Name)
+		}
+	}
+	return nil
+}
+
+func runStep(ctx context.Context, p *db.Pool, statements string) error {
+	_, err := db.InTx[int](ctx, p, func(tx *db.Tx) (int, error) {
+		if _, err := db.Exec(ctx, tx, statements); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	})
+	return err
+}
+
+func requireEmpty(ctx context.Context, p *db.Pool) error {
+	empty, err := userTablesEmpty(ctx, p)
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return errors.New("migrate: scratch database is not empty")
+	}
+	return nil
+}
+
+func userTablesEmpty(ctx context.Context, p *db.Pool) (bool, error) {
+	rows, err := p.QueryContext(ctx, userTablesQuery(p.Dialect()))
+	if err != nil {
+		return false, fmt.Errorf("migrate: inspect schema: %w", err)
+	}
+	if rows == nil {
+		return false, errors.New("migrate: inspect schema: no rows")
+	}
+	defer rows.Close()?
+	if rows.Next() {
+		return false, nil
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("migrate: inspect schema: %w", err)
+	}
+	return true, nil
+}

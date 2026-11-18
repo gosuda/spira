@@ -1,0 +1,280 @@
+package web
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/view"
+)
+
+type Handler func(ctx *Context) (Reply, error)
+
+type Stage func(next Handler) Handler
+
+type RouteInfo struct {
+	Method  string
+	Pattern string
+}
+
+type routeList struct {
+	items sync.Locked[[]RouteInfo]
+}
+
+type Router struct {
+	mux         *http.ServeMux
+	prefix      string
+	root        *Router?
+	stages      []Stage
+	routes      *routeList
+	Layout      func(ctx *Context, p Page) view.Node
+	ProblemView func(p Problem) view.Node?
+	MaxBody     int64 = 1 << 20
+}
+
+func NewRouter() *Router {
+	return &Router{mux: http.NewServeMux(), routes: &routeList{}}
+}
+
+func (r *Router) rootRouter() *Router {
+	if root := r.root; root != nil {
+		return root
+	}
+	return r
+}
+
+func (r *Router) Use(stages ...Stage) {
+	r.stages = append(r.stages, stages...)
+}
+
+func (r *Router) Group(prefix string, build func(g *Router)) {
+	g := &Router{
+		mux:    r.mux,
+		prefix: r.prefix + prefix,
+		stages: append([]Stage(nil), r.stages...),
+		routes: r.routes,
+		root:   r.rootRouter(),
+	}
+	build(g)
+}
+
+func (r *Router) Handle(method string, pattern string, h Handler) {
+	full := r.prefix + pattern
+	r.record(method, full)
+	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
+}
+
+func (r *Router) record(method string, pattern string) {
+	r.routes.items.WithLock(func(list *[]RouteInfo) {
+		*list = append(*list, RouteInfo{Method: method, Pattern: pattern})
+	})
+}
+
+func (r *Router) Routes() const []RouteInfo {
+	var out []RouteInfo
+	r.routes.items.WithLock(func(list *[]RouteInfo) {
+		out = append(out, (*list)...)
+	})
+	var snapshot const []RouteInfo = out
+	return snapshot
+}
+
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	unrouted, pattern := r.mux.Handler(req)
+	if pattern != "" {
+		r.mux.ServeHTTP(w, req)
+		return
+	}
+	root := r.rootRouter()
+	served(root, root.stages, func(_ *Context) (Reply, error) {
+		return Delegate{To: unrouted}, nil
+	}).ServeHTTP(w, req)
+}
+
+func served(root *Router, stages []Stage, h Handler) http.HandlerFunc {
+	run := chain(root, stages, h)
+	return func(w http.ResponseWriter, req *http.Request) {
+		run(newContext(w, req, root))
+	}
+}
+
+func chain(root *Router, stages []Stage, h Handler) func(c *Context) {
+	run := settle(root, h)
+	for i := len(stages) - 1; i >= 0; i-- {
+		inner := run
+		run = settle(root, stages[i](func(c *Context) (Reply, error) {
+			inner(c)
+			return nil, nil
+		}))
+	}
+	return run
+}
+
+func settle(root *Router, h Handler) func(c *Context) {
+	return func(c *Context) {
+		reply, err := h(c)
+		if err != nil {
+			root.answerError(c, err)
+			return
+		}
+		root.answerReply(c, reply)
+	}
+}
+
+func (r *Router) answerReply(c *Context, reply Reply) {
+	if reply == nil {
+		return
+	}
+	if c.writer.wrote {
+		slog.Error("web: reply dropped, the response is already written", "method", c.Request.Method, "path", c.Request.URL.Path)
+		return
+	}
+	if werr := r.writeReply(c, reply); werr != nil {
+		slog.Error("web: reply write failed", "error", werr)
+		r.answerProblem(c, internalProblem())
+	}
+}
+
+func (r *Router) answerError(c *Context, err error) {
+	if c.writer.wrote {
+		slog.Error("web: error after the response was written", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
+		return
+	}
+	pe := &ProblemError{}
+	if errors.As(err, &pe) {
+		r.answerProblem(c, pe.Problem)
+		return
+	}
+	slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
+	r.answerProblem(c, internalProblem())
+}
+
+func (r *Router) answerProblem(c *Context, p Problem) {
+	if c.writer.wrote {
+		return
+	}
+	if perr := r.writeProblem(c, p); perr != nil {
+		slog.Error("web: problem write failed", "error", perr)
+	}
+}
+
+func internalProblem() Problem {
+	return Problem{Title: "Internal Server Error", Status: http.StatusInternalServerError}
+}
+
+type Key[T any] struct {
+	name string
+}
+
+func NewKey[T any](name string) *Key[T] {
+	return &Key[T]{name: name}
+}
+
+func Get[T any](ctx *Context, k *Key[T]) T? {
+	var out T?
+	ctx.vals.WithLock(func(m *map[any]any) {
+		if v, ok := (*m)[any(k)]; ok {
+			if tv, tok := v.(T); tok {
+				out = tv
+			}
+		}
+	})
+	return out
+}
+
+func Set[T any](ctx *Context, k *Key[T], v T) {
+	ctx.vals.WithLock(func(m *map[any]any) {
+		(*m)[any(k)] = v
+	})
+}
+
+type Context struct {
+	Request *http.Request
+	writer  *statusWriter
+	root    *Router
+	vals    sync.Locked[map[any]any]
+}
+
+func newContext(w http.ResponseWriter, req *http.Request, root *Router) *Context {
+	c := &Context{Request: req, writer: newStatusWriter(w), root: root}
+	c.vals.WithLock(func(m *map[any]any) {
+		*m = map[any]any{}
+	})
+	return c
+}
+
+func (c *Context) Ctx() context.Context {
+	if c.Request == nil {
+		return context.Background()
+	}
+	return c.Request.Context()
+}
+
+func (c *Context) ResponseHeader() http.Header {
+	return c.writer.Header()
+}
+
+func (c *Context) Htmx() Htmx {
+	h := c.Request.Header
+	return Htmx{
+		Request:        h.Get("HX-Request") != "",
+		Boosted:        h.Get("HX-Boosted") != "",
+		HistoryRestore: h.Get("HX-History-Restore-Request") != "",
+		Target:         h.Get("HX-Target"),
+		Trigger:        h.Get("HX-Trigger"),
+		CurrentURL:     h.Get("HX-Current-URL"),
+	}
+}
+
+type Htmx struct {
+	Request        bool
+	Boosted        bool
+	HistoryRestore bool
+	Target         string
+	Trigger        string
+	CurrentURL     string
+}
+
+type statusWriter struct {
+	inner  http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func newStatusWriter(inner http.ResponseWriter) *statusWriter {
+	return &statusWriter{inner: inner, status: http.StatusOK}
+}
+
+func (s *statusWriter) Header() http.Header {
+	return s.inner.Header()
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if s.wrote {
+		return
+	}
+	s.inner.WriteHeader(code)
+	s.status = code
+	s.wrote = true
+}
+
+func (s *statusWriter) Unwrap() http.ResponseWriter {
+	return s.inner
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.status = http.StatusOK
+		s.wrote = true
+	}
+	return s.inner.Write(b)
+}
+
+func (s *statusWriter) Flush() {
+	if f, ok := s.inner.(http.Flusher); ok {
+		f.Flush()
+	}
+}

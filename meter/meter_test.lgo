@@ -1,0 +1,410 @@
+package meter_test
+
+import (
+	"fmt"
+	"io"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/meter"
+)
+
+type sample struct {
+	name   string
+	labels map[string]string
+	value  string
+}
+
+func exposition(t *testing.T, r *meter.Registry) string {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(body)
+}
+
+func parseExposition(t *testing.T, text string) []sample {
+	t.Helper()
+	var out []sample
+	for _, line := range strings.Split(text, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, rest, ok := strings.Cut(line, " ")
+		if !ok {
+			t.Fatalf("bad exposition line %q", line)
+		}
+		value := strings.TrimSpace(rest)
+		if i := strings.IndexByte(name, '{'); i >= 0 {
+			labels := parseLabels(t, name[i+1:len(name)-1])
+			name = name[:i]
+			out = append(out, sample{name: name, labels: labels, value: value})
+			continue
+		}
+		out = append(out, sample{name: name, labels: map[string]string{}, value: value})
+	}
+	return out
+}
+
+func parseLabels(t *testing.T, text string) map[string]string {
+	t.Helper()
+	labels := map[string]string{}
+	i := 0
+	for i < len(text) {
+		j := strings.IndexByte(text[i:], ',')
+		var part string
+		if j < 0 {
+			part = text[i:]
+			i = len(text)
+		} else {
+			part = text[i : i+j]
+			i += j + 1
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok || len(v) < 2 || v[0] != '"' {
+			t.Fatalf("bad label pair %q", part)
+		}
+		labels[k] = unescapeLabel(v[1 : len(v)-1])
+	}
+	return labels
+}
+
+func unescapeLabel(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\\' && i+1 < len(v) {
+			i++
+			switch v[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case '\\':
+				b.WriteByte('\\')
+			case '"':
+				b.WriteByte('"')
+			default:
+				b.WriteByte(v[i])
+			}
+			continue
+		}
+		b.WriteByte(v[i])
+	}
+	return b.String()
+}
+
+func findSample(samples []sample, name string, labels map[string]string) (sample, bool) {
+	for _, s := range samples {
+		if s.name != name || len(s.labels) != len(labels) {
+			continue
+		}
+		match := true
+		for k, v := range labels {
+			if (s.labels[k] ?? "") != v {
+				match = false
+			}
+		}
+		if match {
+			return s, true
+		}
+	}
+	return sample{}, false
+}
+
+func TestExpositionRoundTrip(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("http_requests_total", "requests", "method", "code")
+	counter.With("GET", "200").Add(7)
+	counter.With("POST", "500").Add(3)
+	gauge := reg.Gauge("queue_depth", "depth", "queue")
+	gauge.With("main").Set(4.5)
+	gauge.With("main").Add(0.5)
+	hist := reg.Histogram("request_seconds", "latency", []float64{0.1, 0.5, 1}, "route")
+	hist.With("/a").Observe(0.05)
+	hist.With("/a").Observe(0.3)
+	hist.With("/a").Observe(2)
+
+	samples := parseExposition(t, exposition(t, reg))
+	checks := []struct {
+		name   string
+		labels map[string]string
+		value  string
+	}{
+		{"http_requests_total", map[string]string{"method": "GET", "code": "200"}, "7"},
+		{"http_requests_total", map[string]string{"method": "POST", "code": "500"}, "3"},
+		{"queue_depth", map[string]string{"queue": "main"}, "5"},
+		{"request_seconds_bucket", map[string]string{"route": "/a", "le": "0.1"}, "1"},
+		{"request_seconds_bucket", map[string]string{"route": "/a", "le": "0.5"}, "2"},
+		{"request_seconds_bucket", map[string]string{"route": "/a", "le": "1"}, "2"},
+		{"request_seconds_bucket", map[string]string{"route": "/a", "le": "+Inf"}, "3"},
+		{"request_seconds_sum", map[string]string{"route": "/a"}, "2.35"},
+		{"request_seconds_count", map[string]string{"route": "/a"}, "3"},
+	}
+	for _, c := range checks {
+		s, ok := findSample(samples, c.name, c.labels)
+		if !ok {
+			t.Fatalf("missing sample %s %v", c.name, c.labels)
+		}
+		if s.value != c.value {
+			t.Fatalf("sample %s %v = %s, want %s", c.name, c.labels, s.value, c.value)
+		}
+	}
+}
+
+func TestSeriesCapFoldsOverflow(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("requests", "requests", "id")
+	overflowSeen := 0
+	for i := range 1005 {
+		id := strconv.Itoa(i)
+		if i >= 999 {
+			overflowSeen++
+		}
+		counter.With(id).Add(1)
+	}
+	samples := parseExposition(t, exposition(t, reg))
+	series := 0
+	seen := map[string]bool{}
+	var overflow sample
+	for _, s := range samples {
+		if s.name != "requests" {
+			continue
+		}
+		series++
+		key := fmt.Sprint(s.labels)
+		if _, dup := seen[key]; dup {
+			t.Fatalf("two samples share label set %v", s.labels)
+		}
+		seen[key] = true
+		if (s.labels["id"] ?? "") == "overflow" {
+			overflow = s
+		}
+	}
+	if series != 1000 {
+		t.Fatalf("total series = %d, want 1000 including overflow", series)
+	}
+	if overflow.value != strconv.Itoa(overflowSeen) {
+		t.Fatalf("overflow value = %s, want %d folded observations", overflow.value, overflowSeen)
+	}
+}
+
+func TestHistogramNoLabelsManyBuckets(t *testing.T) {
+	reg := meter.NewRegistry()
+	hist := reg.Histogram("latency", "latency", []float64{0.1, 0.5, 1, 5, 10})
+	hist.With().Observe(7)
+	hist.With().Observe(0.2)
+	samples := parseExposition(t, exposition(t, reg))
+	checks := []struct {
+		name   string
+		labels map[string]string
+		value  string
+	}{
+		{"latency_bucket", map[string]string{"le": "0.1"}, "0"},
+		{"latency_bucket", map[string]string{"le": "0.5"}, "1"},
+		{"latency_bucket", map[string]string{"le": "1"}, "1"},
+		{"latency_bucket", map[string]string{"le": "5"}, "1"},
+		{"latency_bucket", map[string]string{"le": "10"}, "2"},
+		{"latency_bucket", map[string]string{"le": "+Inf"}, "2"},
+		{"latency_sum", map[string]string{}, "7.2"},
+		{"latency_count", map[string]string{}, "2"},
+	}
+	for _, c := range checks {
+		s, ok := findSample(samples, c.name, c.labels)
+		if !ok {
+			t.Fatalf("missing sample %s %v", c.name, c.labels)
+		}
+		if s.value != c.value {
+			t.Fatalf("sample %s %v = %s, want %s", c.name, c.labels, s.value, c.value)
+		}
+	}
+}
+
+func TestHistogramThreeLabelsTwelveBuckets(t *testing.T) {
+	edges := []float64{0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
+	reg := meter.NewRegistry()
+	hist := reg.Histogram("span", "span", edges, "a", "b", "c")
+	hist.With("x", "y", "z").Observe(2000)
+	samples := parseExposition(t, exposition(t, reg))
+	s, ok := findSample(samples, "span_bucket", map[string]string{"a": "x", "b": "y", "c": "z", "le": "1024"})
+	if !ok {
+		t.Fatalf("missing last-bucket sample")
+	}
+	if s.value != "0" {
+		t.Fatalf("last finite bucket = %s, want 0 above the top edge", s.value)
+	}
+	inf, ok := findSample(samples, "span_bucket", map[string]string{"a": "x", "b": "y", "c": "z", "le": "+Inf"})
+	if !ok || inf.value != "1" {
+		t.Fatalf("+Inf bucket = %+v, want 1", inf)
+	}
+}
+
+func TestRejectsHistogramLeLabel(t *testing.T) {
+	reg := meter.NewRegistry()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for histogram label named le")
+		}
+	}()
+	reg.Histogram("h", "help", []float64{1}, "le")
+}
+
+func TestRejectsColonInLabelName(t *testing.T) {
+	reg := meter.NewRegistry()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for label name containing colon")
+		}
+	}()
+	reg.Counter("c", "help", "a:b")
+}
+
+func TestEscapesHelpText(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("c", `back\slash`+"\n"+"newline", "a")
+	counter.With("x").Add(1)
+	text := exposition(t, reg)
+	if !strings.Contains(text, "# HELP c back\\\\slash\\nnewline\n") {
+		t.Fatalf("HELP line not escaped as expected, got %q", text)
+	}
+}
+
+func TestDistinctLastLabelSeries(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("http_requests_total", "requests", "method", "code")
+	counter.With("GET", "200").Add(7)
+	counter.With("GET", "500").Add(3)
+	samples := parseExposition(t, exposition(t, reg))
+	s, ok := findSample(samples, "http_requests_total", map[string]string{"method": "GET", "code": "500"})
+	if !ok {
+		t.Fatalf("missing GET/500 sample")
+	}
+	if s.value != "3" {
+		t.Fatalf("GET/500 = %s, want 3", s.value)
+	}
+	first, ok := findSample(samples, "http_requests_total", map[string]string{"method": "GET", "code": "200"})
+	if !ok || first.value != "7" {
+		t.Fatalf("GET/200 = %+v, want 7", first)
+	}
+}
+
+func TestLabelCountMismatchPanics(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("requests", "requests", "a", "b")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic on label count mismatch")
+		}
+	}()
+	counter.With("only-one")
+}
+
+func TestConcurrentAdds(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("hits", "hits")
+	series := counter.With()
+	run := func() error {
+		go group (t.Context(), limit = 8) {
+			for range 8 {
+				go {
+					for range 1000 {
+						series.Add(1)
+					}
+				}
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("group: %v", err)
+	}
+	samples := parseExposition(t, exposition(t, reg))
+	s, ok := findSample(samples, "hits", map[string]string{})
+	if !ok {
+		t.Fatalf("missing hits sample")
+	}
+	if s.value != "8000" {
+		t.Fatalf("hits = %s, want 8000", s.value)
+	}
+}
+
+func TestDistinctLabelSetsDoNotCollide(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("pairs", "pairs", "a", "b")
+	counter.With("ab", "c").Add(2)
+	counter.With("a", "bc").Add(3)
+	samples := parseExposition(t, exposition(t, reg))
+	count := 0
+	for _, s := range samples {
+		if s.name != "pairs" {
+			continue
+		}
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("pairs series = %d, want 2 distinct label sets", count)
+	}
+	s, ok := findSample(samples, "pairs", map[string]string{"a": "ab", "b": "c"})
+	if !ok || s.value != "2" {
+		t.Fatalf("pairs ab/c = %+v, want 2", s)
+	}
+	s, ok = findSample(samples, "pairs", map[string]string{"a": "a", "b": "bc"})
+	if !ok || s.value != "3" {
+		t.Fatalf("pairs a/bc = %+v, want 3", s)
+	}
+}
+
+func TestRejectsDuplicateMetricName(t *testing.T) {
+	reg := meter.NewRegistry()
+	reg.Counter("dup", "help")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for duplicate metric name")
+		}
+	}()
+	reg.Gauge("dup", "help")
+}
+
+func TestRejectsUnsortedBuckets(t *testing.T) {
+	reg := meter.NewRegistry()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for unsorted buckets")
+		}
+	}()
+	reg.Histogram("h", "help", []float64{1, 0.5})
+}
+
+func TestRejectsEmptyBuckets(t *testing.T) {
+	reg := meter.NewRegistry()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for empty buckets")
+		}
+	}()
+	reg.Histogram("h", "help", []float64{})
+}
+
+func TestEscapesLabelValues(t *testing.T) {
+	reg := meter.NewRegistry()
+	counter := reg.Counter("c", "help", "path")
+	counter.With("a\"b\\c\nd").Add(1)
+	text := exposition(t, reg)
+	if !strings.Contains(text, `path="a\"b\\c\nd"`) {
+		t.Fatalf("label value not escaped as expected, got %q", text)
+	}
+}
+
+func TestContentType(t *testing.T) {
+	reg := meter.NewRegistry()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, req)
+	ct := rec.Result().Header.Get("Content-Type")
+	if ct != "text/plain; version=0.0.4; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+}

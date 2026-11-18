@@ -1,0 +1,969 @@
+package web_test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/validate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+	"logos/sync"
+)
+
+type problemMember struct {
+	Field   string `json:"field"`
+	Rule    string `json:"rule"`
+	Message string `json:"message"`
+}
+
+type problemDoc struct {
+	Type     string          `json:"type"`
+	Title    string          `json:"title"`
+	Status   int32           `json:"status"`
+	Detail   string          `json:"detail"`
+	Instance string          `json:"instance"`
+	Errors   []problemMember `json:"errors"`
+}
+
+func shellLayout(ctx *web.Context, p web.Page) view.Node {
+	return view.Html(view.Head(view.Title(view.T(p.Title))), view.Body(view.H1(view.T(p.Title)), p.Body))
+}
+
+func okReply(ctx *web.Context) (web.Reply, error) {
+	return web.Empty{}, nil
+}
+
+func pageReply(ctx *web.Context) (web.Reply, error) {
+	return web.Page{Title: "Shop", Body: view.P(view.T("catalog-body"))}, nil
+}
+
+func notFoundFail(ctx *web.Context) (web.Reply, error) {
+	return nil, web.Fail(web.Problem{
+		Type:     "https://spira.example/thing-missing",
+		Title:    "Thing Missing",
+		Status:   http.StatusNotFound,
+		Detail:   "thing 7 absent",
+		Instance: "/thing/7",
+		Errors:   validate.Errors{{Field: "id", Rule: "present", Message: "id is required"}},
+	})
+}
+
+func goneFail(ctx *web.Context) (web.Reply, error) {
+	return nil, web.Fail(web.Problem{Title: "Gone", Status: http.StatusNotFound})
+}
+
+func call(t *testing.T, r *web.Router, req *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func reqWithHeaders(target string, h http.Header) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	for k, vs := range h {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	return req
+}
+
+func markerHandler(marker string) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		return nil, fmt.Errorf("db exploded with %s", marker)
+	}
+}
+
+func assertProblemJSON(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int) problemDoc {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Fatalf("status %d want %d body %s", rec.Code, wantStatus, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type %q want application/problem+json", ct)
+	}
+	var doc problemDoc
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode problem body %q: %v", rec.Body.String(), err)
+	}
+	return doc
+}
+
+func TestPageReplyRespectsHtmxHeaders(t *testing.T) {
+	r := web.NewRouter()
+	r.Layout = shellLayout
+	r.Handle("GET", "/catalog", pageReply)
+	cases := []struct {
+		name    string
+		headers http.Header
+		full    bool
+	}{
+		{"plain", nil, true},
+		{"fragment", http.Header{"HX-Request": []string{"true"}}, false},
+		{"boosted", http.Header{"HX-Request": []string{"true"}, "HX-Boosted": []string{"true"}}, true},
+		{"history", http.Header{"HX-Request": []string{"true"}, "HX-History-Restore-Request": []string{"true"}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := call(t, r, reqWithHeaders("/catalog", tc.headers))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d want 200", rec.Code)
+			}
+			if got := rec.Header().Get("Vary"); got != "HX-Request, HX-Boosted, HX-History-Restore-Request" {
+				t.Fatalf("Vary %q want the htmx cache keys", got)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+				t.Fatalf("content type %q want text/html; charset=utf-8", ct)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "catalog-body") {
+				t.Fatalf("body %q lacks the page content", body)
+			}
+			if tc.full && !strings.Contains(body, "<html") {
+				t.Fatalf("body %q lacks the document shell", body)
+			}
+			if !tc.full && strings.Contains(body, "<html") {
+				t.Fatalf("fragment body %q carries the document shell", body)
+			}
+		})
+	}
+}
+
+func markerStage(name string, order *[]string) web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			*order = append(*order, name)
+			return next(ctx)
+		}
+	}
+}
+
+func TestStageOrderFollowsRegistration(t *testing.T) {
+	order := []string{}
+	r := web.NewRouter()
+	r.Use(markerStage("a", &order), markerStage("b", &order))
+	r.Group("/api", func(g *web.Router) {
+		g.Use(markerStage("c", &order))
+		g.Handle("GET", "/items", okReply)
+	})
+	r.Handle("GET", "/plain", okReply)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/api/items", nil))
+	if want := []string{"a", "b", "c"}; !slices.Equal(order, want) {
+		t.Fatalf("group stage order %v want %v", order, want)
+	}
+	order = nil
+	call(t, r, httptest.NewRequest(http.MethodGet, "/plain", nil))
+	if want := []string{"a", "b"}; !slices.Equal(order, want) {
+		t.Fatalf("root stage order %v want %v", order, want)
+	}
+}
+
+func TestStageAfterGroupSkipsInnerRoutes(t *testing.T) {
+	order := []string{}
+	r := web.NewRouter()
+	r.Use(markerStage("early", &order))
+	r.Group("/api", func(g *web.Router) {
+		g.Handle("GET", "/x", okReply)
+	})
+	r.Use(markerStage("late", &order))
+	call(t, r, httptest.NewRequest(http.MethodGet, "/api/x", nil))
+	if want := []string{"early"}; !slices.Equal(order, want) {
+		t.Fatalf("group order %v want %v", order, want)
+	}
+	order = nil
+	r.Handle("GET", "/after", okReply)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/after", nil))
+	if want := []string{"early", "late"}; !slices.Equal(order, want) {
+		t.Fatalf("root order %v want %v", order, want)
+	}
+}
+
+func TestRedirectUnderHtmxAndPlain(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/go", func(ctx *web.Context) (web.Reply, error) {
+		return web.Redirect{To: "/next"}, nil
+	})
+	rec := call(t, r, reqWithHeaders("/go", http.Header{"HX-Request": []string{"true"}}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("htmx redirect status %d want 200", rec.Code)
+	}
+	if got := rec.Header().Get("HX-Redirect"); got != "/next" {
+		t.Fatalf("HX-Redirect %q want /next", got)
+	}
+	plain := call(t, r, httptest.NewRequest(http.MethodGet, "/go", nil))
+	if plain.Code != http.StatusSeeOther {
+		t.Fatalf("plain redirect status %d want 303", plain.Code)
+	}
+	if got := plain.Header().Get("Location"); got != "/next" {
+		t.Fatalf("Location %q want /next", got)
+	}
+}
+
+func TestFailWritesProblemMembers(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/thing", notFoundFail)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/thing", nil))
+	doc := assertProblemJSON(t, rec, http.StatusNotFound)
+	if doc.Type != "https://spira.example/thing-missing" || doc.Title != "Thing Missing" {
+		t.Fatalf("type %q title %q wrong", doc.Type, doc.Title)
+	}
+	if doc.Status != http.StatusNotFound || doc.Detail != "thing 7 absent" || doc.Instance != "/thing/7" {
+		t.Fatalf("status %d detail %q instance %q wrong", doc.Status, doc.Detail, doc.Instance)
+	}
+	if len(doc.Errors) != 1 || doc.Errors[0].Field != "id" || doc.Errors[0].Rule != "present" {
+		t.Fatalf("errors %+v wrong", doc.Errors)
+	}
+}
+
+func TestUnknownErrorAndPanicStayHidden(t *testing.T) {
+	const marker = "SECRET-VALUE-40217"
+	r := web.NewRouter()
+	r.Use(web.Defaults()...)
+	r.Handle("GET", "/boom", markerHandler(marker))
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/boom", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Title != "Internal Server Error" || doc.Detail != "" {
+		t.Fatalf("title %q detail %q wrong", doc.Title, doc.Detail)
+	}
+	if strings.Contains(rec.Body.String(), marker) {
+		t.Fatalf("error text leaked into %s", rec.Body.String())
+	}
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Fatal("Defaults did not run RequestID before the failing handler")
+	}
+	panicky := web.NewRouter()
+	panicky.Use(web.Recover())
+	panicky.Handle("GET", "/panic", func(ctx *web.Context) (web.Reply, error) {
+		panic("panic payload " + marker)
+	})
+	rec2 := call(t, panicky, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	assertProblemJSON(t, rec2, http.StatusInternalServerError)
+	if strings.Contains(rec2.Body.String(), marker) {
+		t.Fatalf("panic value leaked into %s", rec2.Body.String())
+	}
+}
+
+func TestPageWithoutLayoutIs500(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/p", pageReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/p", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if !strings.Contains(doc.Detail, "layout") {
+		t.Fatalf("detail %q does not name the missing layout", doc.Detail)
+	}
+}
+
+func TestProblemViewOnlyWhenAcceptPrefersHTML(t *testing.T) {
+	r := web.NewRouter()
+	r.ProblemView = func(p web.Problem) view.Node? {
+		var node view.Node = view.P(view.T("html-problem " + p.Title))
+		return node
+	}
+	r.Handle("GET", "/thing", notFoundFail)
+	html := call(t, r, reqWithHeaders("/thing", http.Header{"Accept": []string{"text/html"}}))
+	if html.Code != http.StatusNotFound {
+		t.Fatalf("html problem status %d want 404", html.Code)
+	}
+	if ct := html.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("html content type %q", ct)
+	}
+	if body := html.Body.String(); !strings.Contains(body, "html-problem Thing Missing") {
+		t.Fatalf("html body %q lacks the problem view", body)
+	}
+	for _, accept := range []string{"application/json", "*/*"} {
+		rec := call(t, r, reqWithHeaders("/thing", http.Header{"Accept": []string{accept}}))
+		if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+			t.Fatalf("accept %q content type %q want problem json", accept, ct)
+		}
+	}
+}
+
+type markResult struct {
+	bodies sync.Locked[map[string]string]
+	errs   sync.Locked[[]error]
+}
+
+func fetchMark(ctx context.Context, base string, who string, res *markResult) error {
+	resp, err := http.Get(base + "/mark?who=" + who)
+	if err != nil {
+		res.errs.WithLock(func(es *[]error) { *es = append(*es, fmt.Errorf("mark test: fetch %s: %w", who, err)) })
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			res.errs.WithLock(func(es *[]error) { *es = append(*es, fmt.Errorf("mark test: close %s: %w", who, cerr)) })
+		}
+	}()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		res.errs.WithLock(func(es *[]error) { *es = append(*es, fmt.Errorf("mark test: read %s: %w", who, err)) })
+		return nil
+	}
+	res.bodies.WithLock(func(m *map[string]string) { (*m)[who] = string(b) })
+	return nil
+}
+
+func runMarkConcurrently(ctx context.Context, base string, res *markResult) error {
+	go group (ctx) {
+		go fetchMark(ctx, base, "alpha", res)
+		go fetchMark(ctx, base, "beta", res)
+	}
+	return nil
+}
+
+func TestSetAndGetIsolatedPerRequest(t *testing.T) {
+	key := web.NewKey[string]("probe")
+	r := web.NewRouter()
+	r.Handle("GET", "/mark", func(ctx *web.Context) (web.Reply, error) {
+		who := ctx.Request.URL.Query().Get("who")
+		web.Set(ctx, key, "value-"+who)
+		time.Sleep(50 * time.Millisecond)
+		v := web.Get(ctx, key)
+		if v == nil {
+			return web.Data{Value: "absent", Status: http.StatusInternalServerError}, nil
+		}
+		return web.Data{Value: v}, nil
+	})
+	srv := httptest.NewServer(r)
+	defer func() {
+		srv.Close()
+	}()
+	res := &markResult{}
+	res.bodies.WithLock(func(m *map[string]string) { *m = map[string]string{} })
+	if err := runMarkConcurrently(context.Background(), srv.URL, res); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	var ferr error
+	res.errs.WithLock(func(es *[]error) { ferr = errors.Join((*es)...) })
+	if ferr != nil {
+		t.Fatalf("fetches: %v", ferr)
+	}
+	res.bodies.WithLock(func(m *map[string]string) {
+		if !strings.Contains((*m)["alpha"]??"", "value-alpha") {
+			t.Fatalf("alpha body %q lost its own value", (*m)["alpha"]??"")
+		}
+		if !strings.Contains((*m)["beta"]??"", "value-beta") {
+			t.Fatalf("beta body %q lost its own value", (*m)["beta"]??"")
+		}
+	})
+}
+
+func TestGetOfUnsetKeyIsAbsent(t *testing.T) {
+	key := web.NewKey[string]("probe")
+	r := web.NewRouter()
+	r.Handle("GET", "/fresh", func(ctx *web.Context) (web.Reply, error) {
+		v := web.Get(ctx, key)
+		if v != nil {
+			return web.Data{Value: "leaked " + v, Status: http.StatusInternalServerError}, nil
+		}
+		return web.Data{Value: "absent"}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/fresh", nil))
+	if body := rec.Body.String(); !strings.Contains(body, "absent") {
+		t.Fatalf("unset key read %q want absent", body)
+	}
+}
+
+func TestRequestIDAcceptsValidAndReplacesInvalid(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(web.RequestID())
+	r.Handle("GET", "/id", idReply)
+	valid := call(t, r, reqWithHeaders("/id", http.Header{"X-Request-Id": []string{"abc_XY.01-99"}}))
+	if got := valid.Header().Get("X-Request-Id"); got != "abc_XY.01-99" {
+		t.Fatalf("valid id %q was replaced", got)
+	}
+	newline := call(t, r, reqWithHeaders("/id", http.Header{"X-Request-Id": []string{"bad\nid"}}))
+	assertReplacedID(t, newline, "bad\nid")
+	long := call(t, r, reqWithHeaders("/id", http.Header{"X-Request-Id": []string{strings.Repeat("a", 65)}}))
+	assertReplacedID(t, long, strings.Repeat("a", 65))
+	smuggled := call(t, r, reqWithHeaders("/id", http.Header{"X-Request-Id": []string{"a b\r\nX: y"}}))
+	assertReplacedID(t, smuggled, "a b\r\nX: y")
+	fresh := call(t, r, httptest.NewRequest(http.MethodGet, "/id", nil))
+	assertReplacedID(t, fresh, "")
+}
+
+func idReply(ctx *web.Context) (web.Reply, error) {
+	v := web.Get(ctx, web.RequestIDKey)
+	if v == nil {
+		return web.Data{Value: "absent", Status: http.StatusInternalServerError}, nil
+	}
+	return web.Data{Value: v}, nil
+}
+
+func assertReplacedID(t *testing.T, rec *httptest.ResponseRecorder, inbound string) {
+	t.Helper()
+	got := rec.Header().Get("X-Request-Id")
+	if got == inbound {
+		t.Fatalf("request id %q was not replaced", got)
+	}
+	if len(got) != 32 {
+		t.Fatalf("generated id %q is not 16 bytes of hex", got)
+	}
+	for _, c := range got {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			t.Fatalf("generated id %q is not hex", got)
+		}
+	}
+}
+
+func TestConflictingPatternPanics(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/dupe", okReply)
+	defer func() {
+		p := recover()
+		if p == nil {
+			t.Fatal("second registration of /dupe did not panic")
+		}
+		if !strings.Contains(fmt.Sprint(p), "/dupe") {
+			t.Fatalf("panic %v does not name the conflicting pattern", p)
+		}
+	}()
+	r.Handle("GET", "/dupe", okReply)
+}
+
+func TestFragmentWritesHtmxHeaders(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/row", func(ctx *web.Context) (web.Reply, error) {
+		return web.Fragment{
+			Body:     view.P(view.T("row-updated")),
+			Retarget: "/rows",
+			Reswap:   "outerHTML",
+			PushURL:  "/rows/7",
+			Trigger:  "rowSaved",
+		}, nil
+	})
+	rec := call(t, r, reqWithHeaders("/row", http.Header{"HX-Request": []string{"true"}}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fragment status %d want 200", rec.Code)
+	}
+	for _, hc := range []struct{ k, v string }{
+		{"HX-Retarget", "/rows"},
+		{"HX-Reswap", "outerHTML"},
+		{"HX-Push-Url", "/rows/7"},
+		{"HX-Trigger", "rowSaved"},
+		{"Vary", "HX-Request"},
+	} {
+		if got := rec.Header().Get(hc.k); got != hc.v {
+			t.Fatalf("header %s = %q want %q", hc.k, got, hc.v)
+		}
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "row-updated") {
+		t.Fatalf("fragment body %q lacks content", body)
+	}
+}
+
+func TestDataReplyEncodesJSON(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/api/item", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: map[string]string{"name": "tea"}}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/api/item", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("data status %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("data content type %q want application/json", ct)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"name":"tea"`) {
+		t.Fatalf("data body %q lacks the value", body)
+	}
+}
+
+func TestCacheControlSetsHeaderOnSuccessOnly(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(web.CacheControl("no-store"))
+	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	r.Handle("GET", "/gone", goneFail)
+	ok := call(t, r, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	if got := ok.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control %q want no-store", got)
+	}
+	gone := call(t, r, httptest.NewRequest(http.MethodGet, "/gone", nil))
+	if got := gone.Header().Get("Cache-Control"); got != "" {
+		t.Fatalf("Cache-Control %q set on a non-2xx reply", got)
+	}
+}
+
+func TestAccessLogRecordsRequestFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{}))
+	r := web.NewRouter()
+	r.Use(web.RequestID(), web.AccessLog(logger))
+	r.Handle("GET", "/logged", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	r.Handle("GET", "/gone", goneFail)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/logged", nil))
+	call(t, r, httptest.NewRequest(http.MethodGet, "/gone", nil))
+	out := buf.String()
+	for _, want := range []string{"method=GET", "status=200", "status=404", "duration=", "request_id=", "GET /logged", "GET /gone"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("access log %q lacks %q", out, want)
+		}
+	}
+}
+
+func TestRoutesListsRegistrationOrder(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/a", okReply)
+	r.Group("/api", func(g *web.Router) {
+		g.Handle("POST", "/b", okReply)
+	})
+	got := r.Routes()
+	want := []web.RouteInfo{{Method: "GET", Pattern: "/a"}, {Method: "POST", Pattern: "/api/b"}}
+	if len(got) != len(want) {
+		t.Fatalf("routes lists %d entries, want %d", len(got), len(want))
+	}
+	for i, info := range got {
+		if info != want[i] {
+			t.Fatalf("route %d is %v, want %v", i, info, want[i])
+		}
+	}
+}
+
+func TestStreamWritesAndFlushes(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/stream", func(ctx *web.Context) (web.Reply, error) {
+		return web.Stream{
+			ContentType: "text/event-stream",
+			Write: func(w io.Writer) error {
+				if _, err := w.Write([]byte("data: one\n\n")); err != nil {
+					return err
+				}
+				_, err := w.Write([]byte("data: two\n\n"))
+				return err
+			},
+		}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/stream", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream status %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content type %q want text/event-stream", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: one") || !strings.Contains(body, "data: two") {
+		t.Fatalf("stream body %q lacks the written events", body)
+	}
+	if !rec.Flushed {
+		t.Fatal("stream writes did not flush the response writer")
+	}
+}
+
+func TestDelegateHandsEveryMethodToTheHandlerBehindTheStages(t *testing.T) {
+	echo := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("X-Upstream", "yes")
+		w.WriteHeader(http.StatusAccepted)
+		if _, err := fmt.Fprintf(w, "%s %s", req.Method, req.URL.Path); err != nil {
+			t.Errorf("upstream write: %v", err)
+		}
+	})
+	seen := map[string]int{}
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Stage", "ran")
+			_, err := next(ctx)
+			seen[ctx.Request.Method] = ctx.Status()
+			return nil, err
+		}
+	})
+	r.Handle("", "/any/", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: echo}, nil
+	})
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		rec := call(t, r, httptest.NewRequest(method, "/any/thing", nil))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("%s status %d want 202", method, rec.Code)
+		}
+		if got, want := rec.Body.String(), method+" /any/thing"; got != want {
+			t.Fatalf("%s body %q want %q", method, got, want)
+		}
+		if rec.Header().Get("X-Upstream") != "yes" || rec.Header().Get("X-Stage") != "ran" {
+			t.Fatalf("%s headers %v lack the handler's or the stage's header", method, rec.Header())
+		}
+		if got := seen[method] ?? 0; got != http.StatusAccepted {
+			t.Fatalf("%s: stage read status %d for the delegated handler, want 202", method, got)
+		}
+	}
+}
+
+func TestStageSetsResponseHeaderOnEveryReply(t *testing.T) {
+	policy := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Content-Type-Options", "nosniff")
+			return next(ctx)
+		}
+	}
+	r := web.NewRouter()
+	r.Use(policy)
+	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	r.Handle("GET", "/gone", goneFail)
+	for _, path := range []string{"/ok", "/gone"} {
+		rec := call(t, r, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Fatalf("%s: X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+	}
+}
+
+func TestStageReadsTheWrittenStatus(t *testing.T) {
+	seen := map[string]int{}
+	record := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			reply, err := next(ctx)
+			seen[ctx.Request.URL.Path] = ctx.Status()
+			return reply, err
+		}
+	}
+	r := web.NewRouter()
+	r.Use(record)
+	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	r.Handle("GET", "/gone", goneFail)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	call(t, r, httptest.NewRequest(http.MethodGet, "/gone", nil))
+	if got := seen["/ok"] ?? 0; got != http.StatusOK {
+		t.Fatalf("status seen for /ok = %d, want 200", got)
+	}
+	if got := seen["/gone"] ?? 0; got != http.StatusNotFound {
+		t.Fatalf("status seen for /gone = %d, want 404", got)
+	}
+}
+
+func TestStageReplyWithoutNextIsWritten(t *testing.T) {
+	ran := false
+	shortcut := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return web.Redirect{To: "/login"}, nil
+		}
+	}
+	r := web.NewRouter()
+	r.Use(shortcut)
+	r.Handle("GET", "/guarded", func(ctx *web.Context) (web.Reply, error) {
+		ran = true
+		return web.Data{Value: "reached"}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/guarded", nil))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("redirect status %d want 303", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "/login" {
+		t.Fatalf("Location %q want /login", got)
+	}
+	if ran {
+		t.Fatal("handler ran behind a stage that answered without calling next")
+	}
+	dataStage := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return web.Data{Value: map[string]string{"early": "yes"}}, nil
+		}
+	}
+	r2 := web.NewRouter()
+	r2.Use(dataStage)
+	r2.Handle("GET", "/early", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "reached"}, nil
+	})
+	rec2 := call(t, r2, httptest.NewRequest(http.MethodGet, "/early", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("data status %d want 200", rec2.Code)
+	}
+	if body := rec2.Body.String(); !strings.Contains(body, `"early":"yes"`) {
+		t.Fatalf("data body %q lacks the stage's value", body)
+	}
+}
+
+func TestStageProblemSetsStatusForOuterStages(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{}))
+	seen := 0
+	denied := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			return nil, web.Fail(web.Problem{Status: http.StatusForbidden, Title: "forbidden"})
+		}
+	}
+	watch := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			_, err := next(ctx)
+			seen = ctx.Status()
+			return nil, err
+		}
+	}
+	r := web.NewRouter()
+	r.Use(watch, web.AccessLog(logger), denied)
+	r.Handle("GET", "/secret", okReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/secret", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d want 403", rec.Code)
+	}
+	if seen != http.StatusForbidden {
+		t.Fatalf("outer stage read status %d want 403", seen)
+	}
+	if !strings.Contains(buf.String(), "status=403") {
+		t.Fatalf("access log %q lacks status=403", buf.String())
+	}
+}
+
+func TestDataEncodeFailureAnswersProblem(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(prev)
+	r := web.NewRouter()
+	r.Handle("GET", "/bad", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: make(chan int)}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/bad", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Status != http.StatusInternalServerError {
+		t.Fatalf("problem status member %d want 500", doc.Status)
+	}
+	if n := strings.Count(buf.String(), "web: reply write failed"); n != 1 {
+		t.Fatalf("encode failure logged %d times, want 1: %q", n, buf.String())
+	}
+}
+
+func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/joined", func(ctx *web.Context) (web.Reply, error) {
+		return nil, errors.Join(web.Fail(web.Problem{Title: "Conflict", Status: http.StatusConflict}), errors.New("x"))
+	})
+	r.Handle("GET", "/wrapped", func(ctx *web.Context) (web.Reply, error) {
+		return nil, fmt.Errorf("wrap: %w", web.Fail(web.Problem{Title: "Conflict", Status: http.StatusConflict}))
+	})
+	for _, path := range []string{"/joined", "/wrapped"} {
+		rec := call(t, r, httptest.NewRequest(http.MethodGet, path, nil))
+		doc := assertProblemJSON(t, rec, http.StatusConflict)
+		if doc.Title != "Conflict" {
+			t.Fatalf("%s title %q want Conflict", path, doc.Title)
+		}
+	}
+}
+
+func TestProblemWithoutStatusAnswers500(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/blank", func(ctx *web.Context) (web.Reply, error) {
+		return nil, web.Fail(web.Problem{Title: "Not Found"})
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/blank", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Status != http.StatusInternalServerError {
+		t.Fatalf("problem status member %d want 500", doc.Status)
+	}
+}
+
+func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
+	seen := 0
+	watch := func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			_, err := next(ctx)
+			seen = ctx.Status()
+			return nil, err
+		}
+	}
+	r := web.NewRouter()
+	r.Use(watch, web.Recover())
+	r.Handle("GET", "/odd", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: 1, Status: 42}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/odd", nil))
+	assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if seen != http.StatusInternalServerError {
+		t.Fatalf("outer stage read status %d want 500", seen)
+	}
+}
+
+func TestLayoutPanicUnderRecoverIsProblem(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(web.Recover())
+	r.Layout = func(ctx *web.Context, p web.Page) view.Node {
+		panic("layout exploded")
+	}
+	r.Handle("GET", "/page", pageReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/page", nil))
+	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
+	if doc.Title != "Internal Server Error" {
+		t.Fatalf("title %q want Internal Server Error", doc.Title)
+	}
+	if strings.Contains(rec.Body.String(), "catalog-body") {
+		t.Fatalf("page bytes %q leaked into the problem answer", rec.Body.String())
+	}
+}
+
+func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
+	withView := web.NewRouter()
+	withView.ProblemView = func(p web.Problem) view.Node? {
+		var node view.Node = view.P(view.T("problem-view"))
+		return node
+	}
+	withView.Handle("GET", "/thing", goneFail)
+	for _, accept := range []string{"application/json", "text/html"} {
+		rec := call(t, withView, reqWithHeaders("/thing", http.Header{"Accept": []string{accept}}))
+		if got := rec.Header().Get("Vary"); got != "Accept" {
+			t.Fatalf("accept %q Vary %q want Accept", accept, got)
+		}
+	}
+	plain := web.NewRouter()
+	plain.Handle("GET", "/thing", goneFail)
+	rec := call(t, plain, httptest.NewRequest(http.MethodGet, "/thing", nil))
+	if got := rec.Header().Get("Vary"); got != "" {
+		t.Fatalf("Vary %q set without a problem view", got)
+	}
+}
+
+func TestProblemNegotiationTable(t *testing.T) {
+	r := web.NewRouter()
+	r.ProblemView = func(p web.Problem) view.Node? {
+		var node view.Node = view.P(view.T("problem-view"))
+		return node
+	}
+	r.Handle("GET", "/thing", goneFail)
+	cases := []struct {
+		accept string
+		html   bool
+	}{
+		{"application/problem+json, text/html;q=0", false},
+		{"text/html;q=0", false},
+		{"text/html", true},
+		{"application/problem+json;q=0.5, text/html;q=0.9", true},
+		{"text/html;q=0.5, application/problem+json;q=0.9", false},
+		{"application/json, text/html", false},
+		{"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", true},
+		{"", false},
+	}
+	for _, tc := range cases {
+		headers := http.Header{}
+		if tc.accept != "" {
+			headers.Set("Accept", tc.accept)
+		}
+		rec := call(t, r, reqWithHeaders("/thing", headers))
+		ct := rec.Header().Get("Content-Type")
+		if tc.html && !strings.HasPrefix(ct, "text/html") {
+			t.Fatalf("accept %q chose %q, want html", tc.accept, ct)
+		}
+		if !tc.html && ct != "application/problem+json" {
+			t.Fatalf("accept %q chose %q, want problem json", tc.accept, ct)
+		}
+	}
+}
+
+func TestDelegateHijackUpgrade(t *testing.T) {
+	upgrader := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		rc := http.NewResponseController(w)
+		conn, buf, err := rc.Hijack()
+		if err != nil {
+			http.Error(w, "hijack unavailable: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if cerr := conn.Close(); cerr != nil {
+				t.Errorf("hijacked close: %v", cerr)
+			}
+		}()
+		if _, err := buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n\r\nhello-ws"); err != nil {
+			return
+		}
+		if err := buf.Flush(); err != nil {
+			return
+		}
+	})
+	r := web.NewRouter()
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: upgrader}, nil
+	})
+	srv := httptest.NewServer(r)
+	defer func() {
+		srv.Close()
+	}()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			t.Errorf("client close: %v", cerr)
+		}
+	}()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: %s\r\n\r\n", strings.TrimPrefix(srv.URL, "http://")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+	}
+	if got := strings.TrimSpace(line); got != "HTTP/1.1 101 Switching Protocols" {
+		t.Fatalf("status line %q want the raw 101 upgrade", got)
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if !strings.Contains(string(rest), "hello-ws") {
+		t.Fatalf("payload %q lacks the upgraded frame", string(rest))
+	}
+}
+
+func TestUnmatchedRequestsRunRootStages(t *testing.T) {
+	groupRan := false
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Root-Stage", "ran")
+			return next(ctx)
+		}
+	})
+	r.Handle("GET", "/users", okReply)
+	r.Group("/api", func(g *web.Router) {
+		g.Use(func(next web.Handler) web.Handler {
+			return func(ctx *web.Context) (web.Reply, error) {
+				groupRan = true
+				return next(ctx)
+			}
+		})
+		g.Handle("GET", "/items", okReply)
+	})
+	miss := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	if miss.Code != http.StatusNotFound {
+		t.Fatalf("unmatched path status %d want 404", miss.Code)
+	}
+	if miss.Header().Get("X-Root-Stage") != "ran" {
+		t.Fatal("root stage did not run for an unmatched path")
+	}
+	wrong := call(t, r, httptest.NewRequest(http.MethodPost, "/users", nil))
+	if wrong.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status %d want 405", wrong.Code)
+	}
+	if !strings.Contains(wrong.Header().Get("Allow"), "GET") {
+		t.Fatalf("Allow %q lacks GET", wrong.Header().Get("Allow"))
+	}
+	if wrong.Header().Get("X-Root-Stage") != "ran" {
+		t.Fatal("root stage did not run for a method mismatch")
+	}
+	if groupRan {
+		t.Fatal("group stage ran for a request outside its prefix")
+	}
+}

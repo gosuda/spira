@@ -1,0 +1,146 @@
+package live_test
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/view"
+)
+
+type corpusRequest struct {
+	Kind  string `json:"kind"`
+	Name  string `json:"name"`
+	Field string `json:"field"`
+}
+
+type corpusResponse struct {
+	Valid   bool `json:"valid"`
+	Emitted bool `json:"emitted"`
+}
+
+type corpusLine struct {
+	Name     string        `json:"name"`
+	Request  corpusRequest `json:"request"`
+	Response corpusResponse `json:"response"`
+	Reject   bool          `json:"reject"`
+}
+
+func corpusPath(t *testing.T) string {
+	for _, p := range []string{"../wire/corpus.jsonl", "wire/corpus.jsonl"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	t.Fatal("live_test: wire/corpus.jsonl not found next to the module")
+	return ""
+}
+
+func readCorpus(t *testing.T) []corpusLine {
+	t.Helper()
+	data, err := os.ReadFile(corpusPath(t))
+	if err != nil {
+		t.Fatalf("read corpus: %v", err)
+	}
+	var lines []corpusLine
+	for i, row := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(row) == "" {
+			continue
+		}
+		var line corpusLine
+		if err := json.Unmarshal([]byte(row), &line); err != nil {
+			t.Fatalf("corpus line %d: %v", i+1, err)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func TestWireCorpus(t *testing.T) {
+	emitted := probeEmittedFields(t)
+	fields := map[string]bool{}
+	for _, line := range readCorpus(t) {
+		checkCorpusLine(t, line, emitted, fields)
+	}
+	for field := range emitted {
+		if !(fields[field] ?? false) {
+			t.Fatalf("the package emits field %q which wire/corpus.jsonl does not hold", field)
+		}
+	}
+}
+
+func checkCorpusLine(t *testing.T, line corpusLine, emitted map[string]bool, fields map[string]bool) {
+	t.Helper()
+	switch line.Request.Kind {
+	case "sse-event-name":
+		checkCorpusName(t, line)
+	case "sse-field":
+		fields[line.Request.Field] = true
+		checkCorpusField(t, line, emitted)
+	case "slot-id", "island-when", "island-props":
+	default:
+		t.Fatalf("%s: unknown corpus kind %q", line.Name, line.Request.Kind)
+	}
+}
+
+func checkCorpusName(t *testing.T, line corpusLine) {
+	t.Helper()
+	_, err := live.NewEvent(line.Request.Name, view.T("x"))
+	if (err != nil) != line.Reject {
+		t.Fatalf("%s: name %q rejected=%v conflicts with reject=%v", line.Name, line.Request.Name, err != nil, line.Reject)
+	}
+	if line.Response.Valid == line.Reject {
+		t.Fatalf("%s: response.valid=%v conflicts with reject=%v", line.Name, line.Response.Valid, line.Reject)
+	}
+}
+
+func checkCorpusField(t *testing.T, line corpusLine, emitted map[string]bool) {
+	t.Helper()
+	if !line.Response.Emitted {
+		t.Fatalf("%s: the corpus marks field %q as not emitted", line.Name, line.Request.Field)
+	}
+	if !(emitted[line.Request.Field] ?? false) {
+		t.Fatalf("%s: the probe stream did not emit field %q", line.Name, line.Request.Field)
+	}
+}
+
+func probeEmittedFields(t *testing.T) map[string]bool {
+	t.Helper()
+	events := make(chan live.Event, 1)
+	ts, serveDone := serveEvents(t, rawHandler(events))
+	resp := openStream(t, ts)
+	defer closeBody(t, resp.Body)
+	tap, g := startTap(t, resp.Body)
+	expectHeartbeat(t, tap)
+	events <- live.Event{Name: "corpus", Body: view.T("first\nsecond")}
+	messages := []string{": live\n\n", nextMessage(t, tap, 3*time.Second)}
+	closeBody(t, resp.Body)
+	awaitServe(t, serveDone)
+	if err := g.Wait(); err != nil {
+		t.Fatalf("client group: %v", err)
+	}
+	tokens := map[string]bool{}
+	for _, m := range messages {
+		collectFieldTokens(tokens, m)
+	}
+	return tokens
+}
+
+func collectFieldTokens(tokens map[string]bool, message string) {
+	for _, line := range strings.Split(strings.TrimSuffix(message, "\n"), "\n") {
+		collectFieldToken(tokens, line)
+	}
+}
+
+func collectFieldToken(tokens map[string]bool, line string) {
+	if strings.HasPrefix(line, ":") {
+		tokens[":"] = true
+		return
+	}
+	if i := strings.Index(line, ":"); i >= 0 {
+		tokens[line[:i]] = true
+	}
+}

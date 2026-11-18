@@ -1,10 +1,10 @@
 # spira
 
-spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). It copies ideas, never code, from the clones under `.references/`.
+spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). It is licensed under Apache-2.0 (`LICENSE`, `NOTICE`). It MAY copy code and tests from the clones under `.references/`; the section "Copying from the reference clones" gives the rules.
 
 ## Module rules
 
-- This module holds only `.lgo` packages. Tests are `_test.lgo` files in an external test package (`package x_test`). [David Parnas]
+- This module holds only `.lgo` packages. Tests are `_test.lgo` files in an external test package (`package x_test`; `package main_test` for a command, which imports its own `main` package). The one in-package file a package may add is `export_test.lgo`: it holds no test and only exposes internal state that an external test must observe. [David Parnas]
 - Build with `logos`. Plain `go` ignores `.lgo` files. [John Carmack]
 - `logos.toml` sits next to `go.mod`. Unknown tables or keys are errors. Add a `[capabilities]` allowlist entry only when `logos build` reports a capability diagnostic, and name the exact module path it reports. [Tony Hoare]
 - Strictly no cgo (human-supplied). `logos.toml` keeps `[build] cgo = "forbid"`; never change it, never set `CGO_ENABLED=1`, and never add a dependency that needs cgo. The race detector needs cgo, so the gate runs tests without `-race`. [Tony Hoare]
@@ -12,10 +12,10 @@ spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). I
 
 ## Toolchain environment
 
-The toolchain is a LoGOs worktree, not the system Go. Every command needs:
+The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113, #114, #116, #117, #118, #119 and #123 applied. The comptime packages need #102, `just eject` needs #103 and #118, `resilience` needs #109, and an interpolated string whose text holds a quote, a backquote or `//` needs #119. #116 rejects an exported comptime generic that names an unexported identifier of its package, so such a generic calls only exported names. #123 lets `just eject` accept an anonymous struct with field tags as the type argument of a comptime generic. Every command needs:
 
 ```sh
-export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-dogfood PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
+export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
 ```
 
 The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carmack]
@@ -35,7 +35,7 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 - Concurrency only through `go group`. Shared mutable state lives in `logos/sync.Locked[T]`. No package-level mutable state. [Edsger W. Dijkstra]
 - Every blocking call takes a `context.Context` and a timeout. [John Carmack]
 - Struct tags name wire fields only (`json`, `path`, `query`, `header`, `form`, `cookie`, `body`, `env`, `col`). A tag never selects behavior. [Claude Shannon]
-- Cross-cutting behavior is an ordered list of `web.Stage` values written in code. [Edsger W. Dijkstra]
+- Cross-cutting behavior is an ordered list of `web.Stage` values written in code. Every stage boundary is settled: the reply or the error that a handler or a stage returns is written at once, `next` returns `nil, nil`, and a stage reads the outcome from `ctx.Status()`. [Edsger W. Dijkstra]
 - Errors are `(T, error)` with `?`, wrapped as `fmt.Errorf("<package>: <what>: %w", err)`. Absence is `T?`. Panic only for programmer errors at registration time. [Tony Hoare]
 - Third-party modules: `golang.org/x/crypto` in `auth`; database drivers only in tests, `example/` and generated applications. Resolve versions with `logos get`; never type one from memory. [Richard Feynman]
 - Tests run the real parts: in-memory SQLite and `net/http/httptest`. [John Carmack]
@@ -44,12 +44,22 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 
 Follow these steps in order before a new exported name lands. [Christopher Alexander]
 
-1. Survey: read how two or more of the clones under `.references/` solve the problem. Record in the commit body what spira keeps and what it drops. [Richard Feynman]
+1. Survey: read how two or more of the clones under `.references/` solve the problem. Record in the commit body what spira keeps, what it copies and what it drops. [Richard Feynman]
 2. Lexicon: name every exported identifier with a word the application author already uses for the thing (`Route`, `Stage`, `Slot`, `Island`). A name that needs a comment to explain it is the wrong name. [Kenya Hara]
 3. Caller first: write the file an application author would write, in `example/` or in a test, before the package. It MUST fail to build for the missing names only. [Tony Hoare]
 4. One layer: the caller file reaches the standard library through one spira call at most. A second spira layer between them needs a reason in the commit body. [Dieter Rams]
 5. Probe: build every LoGOs form the design needs in a scratch module before a brief or a package uses it. A form that fails is a finding. [Richard Feynman]
 6. Signature freeze: a signature that a later plan step names changes only together with that step text. [David Parnas]
+
+## Copying from the reference clones
+
+- spira MAY copy or translate code from a clone under `.references/` when the licence of that clone is Apache-2.0, MIT, BSD or 0BSD. Read the licence file of the clone before you copy. [Richard Feynman]
+- Do not copy from a clone that has another licence or no licence file at its root. Today these are `spring-projects/spring-tools` (EPL-1.0) and `spring-projects/spring-ai-examples`, `spring-projects/spring-batch-extensions`, `spring-projects/spring-integration-samples`, `spring-projects/spring-security-samples` and `spring-projects/spring-ws-samples` (no licence file found). [Tony Hoare]
+- Copy the tests with the code. When a package copies or mirrors a behavior of a reference, port the test cases of the reference for that behavior into the `_test.lgo` files of the package: the inputs and the expected results. An expected result that comes from a reference test is an independent oracle. [Richard Feynman]
+- A copy is LoGOs code that obeys every rule in this file. Translate it; do not transliterate it. Leave out reflection, containers, annotations, class hierarchies and mocks. If the copied unit cannot work without them, copy the algorithm and the test cases only. [Dieter Rams]
+- Keep the notices. A file that is mostly a translation of one source file starts with a comment that names the source project, the source path and the copyright line of the source, and says that spira translated and changed it. This comment is a legal notice, so a rule against comments does not apply to it. [Tony Hoare]
+- Record each source project once in `NOTICE` at the repository root: the project name, its licence, its copyright line, and the text of its own `NOTICE` file when it ships one. [Tony Hoare]
+- Name the source in the commit body: the repository, the path and the revision (`git -C .references/<clone> rev-parse HEAD`) of each copied unit. [Richard Feynman]
 
 ## Wire contract
 
@@ -60,7 +70,7 @@ The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A
 - Island `when`: a closed set of values. An unknown value keeps the fallback and logs one error. [Tony Hoare]
 - Island props: one JSON object. Malformed JSON, or a value that is not a plain object, keeps the fallback: no mount, no child removal, one error log. [Tony Hoare]
 - Events: `live.Events` writes a named `event:` line before each `data:` body and sends a heartbeat comment. The stream ends when the client disconnects. [Claude Shannon]
-- Fragments: a request with `HX-Request` gets the fragment without the document shell, and the response carries `Vary: HX-Request`. [Claude Shannon]
+- Fragments: a request with `HX-Request`, and without `HX-Boosted` and `HX-History-Restore-Request`, gets the fragment without the document shell. A page response carries `Vary: HX-Request, HX-Boosted, HX-History-Restore-Request`. [Claude Shannon]
 - Corpus: `wire/corpus.jsonl` holds one JSON object per line (`name`, `request`, `response`, `reject`). The LoGOs tests and the vitest tests both read this file; neither keeps a copy. [Richard Feynman]
 
 ## Finding protocol

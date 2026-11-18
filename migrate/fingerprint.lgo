@@ -1,0 +1,84 @@
+package migrate
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/db"
+)
+
+func fingerprint(ctx context.Context, p *db.Pool) (string, error) {
+	rows, err := p.QueryContext(ctx, fingerprintQuery(p.Dialect()))
+	if err != nil {
+		return "", fmt.Errorf("migrate: fingerprint: %w", err)
+	}
+	if rows == nil {
+		return "", errors.New("migrate: fingerprint: no rows")
+	}
+	defer rows.Close()?
+	var parts []string
+	for rows.Next() {
+		line, err := scanFingerprintRow(rows)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, line)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("migrate: fingerprint: %w", err)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\n"), nil
+}
+
+func scanFingerprintRow(rows *sql.Rows) (string, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return "", fmt.Errorf("migrate: fingerprint columns: %w", err)
+	}
+	vals := make([]sql.NullString, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return "", fmt.Errorf("migrate: fingerprint scan: %w", err)
+	}
+	var b strings.Builder
+	for i, v := range vals {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		if v.Valid {
+			b.WriteString(strconv.Quote(v.String))
+		} else {
+			b.WriteString("<null>")
+		}
+	}
+	return b.String(), nil
+}
+
+func fingerprintQuery(d db.Dialect) string {
+	return switch d.(type) {
+	case db.SQLite => "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+	case db.Postgres => "SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = current_schema()"
+	case db.MySQL => "SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = database()"
+	case db.MSSQL => "SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = SCHEMA_NAME()"
+	default => boomNil[string]()
+	}
+}
+
+func userTablesQuery(d db.Dialect) string {
+	return switch d.(type) {
+	case db.SQLite => "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+	case db.Postgres => "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'"
+	case db.MySQL => "SELECT table_name FROM information_schema.tables WHERE table_schema = database() AND table_type = 'BASE TABLE'"
+	case db.MSSQL => "SELECT table_name FROM information_schema.tables WHERE table_schema = SCHEMA_NAME() AND table_type = 'BASE TABLE'"
+	default => boomNil[string]()
+	}
+}

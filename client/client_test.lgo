@@ -1,0 +1,548 @@
+package client_test
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/client"
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
+)
+
+type probe struct {
+	Ok  bool   `json:"ok"`
+	Pad string `json:"pad"`
+}
+
+type nothing struct{}
+
+func serve(t *testing.T, status int, contentType string, body string) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}
+}
+
+func serveJSON(t *testing.T, status int, body string) http.HandlerFunc {
+	return serve(t, status, "application/json", body)
+}
+
+type countingTransport struct {
+	inner  http.RoundTripper
+	trips  atomic.Int64
+	closes atomic.Int64
+}
+
+func (t *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.inner.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	t.trips.Add(1)
+	resp.Body = &countedBody{inner: resp.Body, closes: &t.closes}
+	return resp, nil
+}
+
+type countedBody struct {
+	inner  io.ReadCloser
+	closes *atomic.Int64
+}
+
+func (b *countedBody) Read(p []byte) (int, error) {
+	return b.inner.Read(p)
+}
+
+func (b *countedBody) Close() error {
+	b.closes.Add(1)
+	return b.inner.Close()
+}
+
+type retryCase struct {
+	method    string
+	failAll   bool
+	wantCalls int64
+}
+
+func TestRetriesApplyOnlyToIdempotentMethods(t *testing.T) {
+	for _, tc := range []retryCase{
+		{method: http.MethodGet, failAll: false, wantCalls: 3},
+		{method: http.MethodPut, failAll: false, wantCalls: 3},
+		{method: http.MethodDelete, failAll: false, wantCalls: 3},
+		{method: http.MethodHead, failAll: true, wantCalls: 3},
+		{method: http.MethodPost, failAll: true, wantCalls: 1},
+		{method: http.MethodPatch, failAll: true, wantCalls: 1},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			var calls atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if tc.failAll || calls.Load() <= 2 {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				serveJSON(t, http.StatusOK, `{"ok":true}`)(w, r)
+			}))
+			defer srv.Close()
+			c := client.New(srv.URL, resilience.Policy{
+				Timeout: 2 * time.Second,
+				Retry:   resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond},
+			})
+			_, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{Method: tc.method, Path: "/thing"})
+			if tc.failAll && err == nil {
+				t.Fatal("err=nil, want the failing answer as an error")
+			}
+			if !tc.failAll && err != nil {
+				t.Fatalf("err=%v, want success after retries", err)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Fatalf("server saw %d calls, want %d (err=%v)", got, tc.wantCalls, err)
+			}
+		})
+	}
+}
+
+func TestSendEncodesJSONBodyAndCallerHeaders(t *testing.T) {
+	var seen sync.Locked[string]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read body: %v", err)
+		}
+		seen.WithLock(func(s *string) {
+			*s = r.Header.Get("Content-Type") + "|" + r.Header.Get("X-Trace") + "|" + string(b)
+		})
+		serveJSON(t, http.StatusOK, `{"ok":false,"pad":""}`)(w, r)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	got, err := client.Send[probe, probe](t.Context(), c, client.Request[probe]{
+		Method: http.MethodPut,
+		Path:   "/things/9",
+		Body:   probe{Ok: true, Pad: "pad"},
+		Header: http.Header{"X-Trace": []string{"t-41"}},
+	})
+	if err == nil {
+		if got.Ok {
+			t.Fatalf("decoded %+v, want the server answer", got)
+		}
+	} else {
+		t.Fatalf("err=%v", err)
+	}
+	var note string
+	seen.WithLock(func(s *string) { note = *s })
+	want := `application/json|t-41|{"ok":true,"pad":"pad"}`
+	if note != want {
+		t.Fatalf("server saw %q, want %q", note, want)
+	}
+}
+
+func TestProblemAnswerBecomesStatusErrorWithProblem(t *testing.T) {
+	body := `{"type":"https://example.com/probs/stock","title":"Stock mismatch","status":503,"detail":"two left"}`
+	srv := httptest.NewServer(serve(t, http.StatusServiceUnavailable, "application/problem+json", body))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/orders/7")
+	if err == nil {
+		t.Fatal("err=nil, want the problem answer as an error")
+	}
+	se := &client.StatusError{}
+	if !errors.As(err, &se) {
+		t.Fatalf("err=%v (%T), want *client.StatusError", err, err)
+	}
+	if se.Status != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", se.Status)
+	}
+	if p := se.Problem; p != nil {
+		if p.Title != "Stock mismatch" || p.Detail != "two left" || p.Status != 503 {
+			t.Fatalf("problem=%+v, want the server problem", p)
+		}
+		if p.Type != "https://example.com/probs/stock" {
+			t.Fatalf("problem type=%q", p.Type)
+		}
+	} else {
+		t.Fatal("StatusError carries no problem")
+	}
+}
+
+func TestPlainErrorStatusNamesStatusAndBoundsBody(t *testing.T) {
+	tail := strings.Repeat("z", 64*1024)
+	srv := httptest.NewServer(serve(t, http.StatusBadGateway, "text/plain", "upstream fell over "+tail))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/relay")
+	if err == nil {
+		t.Fatal("err=nil, want the failing answer as an error")
+	}
+	se := &client.StatusError{}
+	if !errors.As(err, &se) {
+		t.Fatalf("err=%v (%T), want *client.StatusError", err, err)
+	}
+	if se.Status != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", se.Status)
+	}
+	if se.Problem != nil {
+		t.Fatal("a text/plain answer must not carry a problem")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "502") {
+		t.Fatalf("error %q lacks the status", msg)
+	}
+	if !strings.Contains(msg, "upstream fell over") {
+		t.Fatalf("error %q lacks the body prefix", msg)
+	}
+	if strings.Contains(msg, tail) {
+		t.Fatal("error leaks the whole body")
+	}
+	if len(msg) > 1024 {
+		t.Fatalf("error is %d bytes, want a bounded prefix", len(msg))
+	}
+}
+
+func TestBodyReadUnderSizeLimit(t *testing.T) {
+	big := `{"ok":true,"pad":"` + strings.Repeat("b", 4096) + `"}`
+	srv := httptest.NewServer(serveJSON(t, http.StatusOK, big))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	c.MaxBody = 64
+	_, err := client.Get[probe](t.Context(), c, "/big")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err=%v, want the oversize body as an error", err)
+	}
+	c.MaxBody = 1 << 20
+	v, err := client.Get[probe](t.Context(), c, "/big")
+	if err == nil {
+		if !v.Ok || v.Pad != strings.Repeat("b", 4096) {
+			t.Fatalf("decoded %+v, want the whole body", v)
+		}
+	} else {
+		t.Fatalf("within the limit err=%v", err)
+	}
+}
+
+func TestOpenBreakerStopsRequestsBeforeTheWire(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Breaker: brk})
+	for range 2 {
+		if _, err := client.Get[probe](t.Context(), c, "/x"); err == nil {
+			t.Fatal("warm-up call succeeded against a failing server")
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("warm-up made %d calls, want 2", calls.Load())
+	}
+	_, err := client.Get[probe](t.Context(), c, "/x")
+	if !errors.Is(err, resilience.ErrOpen) {
+		t.Fatalf("err=%v, want resilience.ErrOpen", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("the open breaker let %d calls through in total", calls.Load())
+	}
+}
+
+func TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
+	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry, Breaker: brk})
+	for i := range 3 {
+		_, err := client.Get[probe](t.Context(), c, "/missing")
+		se := &client.StatusError{}
+		if !errors.As(err, &se) {
+			t.Fatalf("call %d err = %v, want a StatusError", i, err)
+			return
+		}
+		if se.Status != http.StatusNotFound {
+			t.Fatalf("call %d status = %d, want 404: the breaker must not refuse a caller's mistake", i, se.Status)
+		}
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("server saw %d calls for three 404 answers, want 3: a client error is not retried", calls.Load())
+	}
+}
+
+func TestTooManyRequestsIsRetried(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry})
+	if _, err := client.Get[probe](t.Context(), c, "/busy"); err == nil {
+		t.Fatal("Get succeeded against a server that answers 429")
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("server saw %d calls, want 3: 429 is retried", calls.Load())
+	}
+}
+
+func TestCallerContextCancelsRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var reached atomic.Int64
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Add(1)
+		cancel()
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	defer close(release)
+	c := client.New(srv.URL, resilience.Policy{Timeout: 5 * time.Second})
+	_, err := client.Get[probe](ctx, c, "/hang")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled", err)
+	}
+	if reached.Load() != 1 {
+		t.Fatalf("server reached %d times, want 1", reached.Load())
+	}
+}
+
+func TestAttemptTimeoutEndsSlowAttempt(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(120 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{
+		Timeout: 25 * time.Millisecond,
+		Retry:   resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 2 * time.Millisecond},
+	})
+	start := time.Now()
+	_, err := client.Get[probe](t.Context(), c, "/slow")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want context.DeadlineExceeded", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d, want 2 attempts each ended by the per-attempt timeout", calls.Load())
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("elapsed=%v, the per-attempt timeout was not enforced", elapsed)
+	}
+}
+
+func TestResponseBodyClosedOnEveryPath(t *testing.T) {
+	tr := &countingTransport{inner: http.DefaultTransport}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			serveJSON(t, http.StatusOK, `{"ok":true}`)(w, r)
+		case "/problem":
+			serve(t, http.StatusServiceUnavailable, "application/problem+json", `{"title":"Down","status":503,"detail":"briefly"}`)(w, r)
+		case "/garbage":
+			serveJSON(t, http.StatusOK, `{"ok":`)(w, r)
+		case "/big":
+			serveJSON(t, http.StatusOK, `{"ok":true,"pad":"`+strings.Repeat("a", 512)+`"}`)(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	c.HTTP = &http.Client{Transport: tr}
+	c.MaxBody = 128
+	for _, path := range []string{"/ok", "/problem", "/garbage", "/big"} {
+		_, err := client.Get[probe](t.Context(), c, path)
+		if err == nil && path != "/ok" {
+			t.Fatalf("%s: err=nil, want a failure", path)
+		}
+	}
+	if tr.trips.Load() != 4 {
+		t.Fatalf("trips=%d, want 4", tr.trips.Load())
+	}
+	if tr.closes.Load() != 4 {
+		t.Fatalf("closes=%d, want one close per response body", tr.closes.Load())
+	}
+}
+
+func TestInvalidJSONForResultTypeNamesPath(t *testing.T) {
+	srv := httptest.NewServer(serveJSON(t, http.StatusOK, `}not json{`))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/api/thing")
+	if err == nil {
+		t.Fatal("err=nil, want a decode error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/api/thing") {
+		t.Fatalf("error %q lacks the URL path", msg)
+	}
+	if !strings.Contains(msg, "decode") {
+		t.Fatalf("error %q lacks the decode cause", msg)
+	}
+}
+
+func TestErrorTextStaysUsable(t *testing.T) {
+	se := &client.StatusError{Status: 503}
+	if msg := se.Error(); !strings.Contains(msg, "503") {
+		t.Fatalf("Error()=%q, lacks the status", msg)
+	}
+	withProblem := &client.StatusError{Status: 503, Problem: web.Problem{Title: "Stock mismatch", Status: 503, Detail: "two left"}}
+	msg := withProblem.Error()
+	if !strings.Contains(msg, "Stock mismatch") || !strings.Contains(msg, "two left") {
+		t.Fatalf("Error()=%q, lacks the problem title and detail", msg)
+	}
+}
+
+func TestOversizedCallerFaultStaysCallerFault(t *testing.T) {
+	var calls atomic.Int64
+	tail := strings.Repeat("x", 300)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusNotFound)
+		if _, err := io.WriteString(w, tail); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	defer srv.Close()
+	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
+	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry, Breaker: brk})
+	c.MaxBody = 64
+	for i := range 4 {
+		_, err := client.Get[probe](t.Context(), c, "/missing")
+		se := &client.StatusError{}
+		if !errors.As(err, &se) {
+			t.Fatalf("call %d err = %v, want a StatusError: a 404 body over MaxBody is still the caller's mistake", i, err)
+			return
+		}
+		if se.Status != http.StatusNotFound {
+			t.Fatalf("call %d status = %d, want 404", i, se.Status)
+			return
+		}
+		if len(se.Prefix) != 64 {
+			t.Fatalf("call %d prefix is %d bytes, want the %d bytes MaxBody allows", i, len(se.Prefix), 64)
+			return
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("server saw %d calls for four oversized 404 answers, want 4: not retried, breaker closed", calls.Load())
+	}
+}
+
+func TestHeadSuccessSkipsDecode(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	out, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{Method: http.MethodHead, Path: "/x"})
+	if err != nil {
+		t.Fatalf("HEAD 200 err = %v, want nil: a bodyless HEAD answer is not a decode error", err)
+		return
+	}
+	if out.Ok || out.Pad != "" {
+		t.Fatalf("HEAD out = %+v, want the zero value", out)
+		return
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("server saw %d calls, want 1", calls.Load())
+	}
+}
+
+func TestNoContentAndResetContentSkipDecode(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch r.URL.Path {
+		case "/gone":
+			w.WriteHeader(http.StatusNoContent)
+		case "/reset":
+			w.WriteHeader(http.StatusResetContent)
+		}
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	for _, path := range []string{"/gone", "/reset"} {
+		out, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{Method: http.MethodDelete, Path: path})
+		if err != nil {
+			t.Fatalf("%s err = %v, want nil: a %s answer carries no body to decode", path, err, path)
+			return
+		}
+		if out.Ok || out.Pad != "" {
+			t.Fatalf("%s out = %+v, want the zero value", path, out)
+			return
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("server saw %d calls, want 2", calls.Load())
+	}
+}
+
+func TestGetEmptyBodyStillADecodeError(t *testing.T) {
+	srv := httptest.NewServer(serveJSON(t, http.StatusOK, ""))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/empty")
+	if err == nil {
+		t.Fatal("GET 200 with an empty body err = nil, want a decode error")
+		return
+	}
+	if !strings.Contains(err.Error(), "client: GET /empty") {
+		t.Fatalf("err = %v, want it to name method and path", err)
+	}
+}
+
+func TestMaxBodyLimitIsExact(t *testing.T) {
+	fit := `{"ok":true,"pad":"` + strings.Repeat("a", 44) + `"}`
+	over := `{"ok":true,"pad":"` + strings.Repeat("a", 45) + `"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fit":
+			serveJSON(t, http.StatusOK, fit)(w, r)
+		case "/over":
+			serveJSON(t, http.StatusOK, over)(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	c.MaxBody = 64
+	v, err := client.Get[probe](t.Context(), c, "/fit")
+	if err != nil {
+		t.Fatalf("a 64-byte body against MaxBody 64 err = %v, want it to decode", err)
+		return
+	}
+	if !v.Ok || v.Pad != strings.Repeat("a", 44) {
+		t.Fatalf("decoded %+v, want the whole 64-byte body", v)
+		return
+	}
+	_, err = client.Get[probe](t.Context(), c, "/over")
+	if err == nil {
+		t.Fatal("a 65-byte body against MaxBody 64 err = nil, want the exceeds error")
+		return
+	}
+	if !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "client: GET /over") {
+		t.Fatalf("err = %v, want the exceeds error naming method and path", err)
+	}
+}

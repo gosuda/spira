@@ -1,0 +1,123 @@
+package ai
+
+import (
+	"context"
+	"iter"
+)
+
+type Role string
+
+const (
+	RoleSystem    Role = "system"
+	RoleUser      Role = "user"
+	RoleAssistant Role = "assistant"
+	RoleTool      Role = "tool"
+)
+
+type Part interface { Text | Reasoning | ToolCall | ToolResult }
+
+type Text struct {
+	Text string
+}
+
+type Reasoning struct {
+	Text string
+}
+
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+type ToolResult struct {
+	ID      string
+	Name    string
+	Content string
+}
+
+type Message struct {
+	Role  Role
+	Parts []Part
+}
+
+type Tool struct {
+	Name        string
+	Description string
+	Schema      string
+	Call        func(ctx context.Context, arguments string) (string, error)
+	Direct      bool
+	Confirm     bool
+}
+
+type Request struct {
+	Messages    []Message
+	Tools       []Tool
+	Model       string?
+	Temperature float64?
+	TopP        float64?
+	TopK        int?
+	MaxTokens   int?
+	Stop        []string
+	Format      string?
+	Decisions   []Decision
+}
+
+type Finish string
+
+const (
+	FinishCompleted Finish = "completed"
+	FinishTruncated Finish = "truncated"
+	FinishToolCall  Finish = "tool_call"
+	FinishFiltered  Finish = "filtered"
+	FinishOther     Finish = "other"
+)
+
+func FinishOf(raw string) Finish {
+	switch raw {
+	case "stop", "end_turn", "STOP", "stop_sequence":
+		return FinishCompleted
+	case "length", "max_tokens", "MAX_TOKENS", "context_window_exceeded":
+		return FinishTruncated
+	case "tool_calls", "tool_call", "tool_use", "TOOL_CALLS":
+		return FinishToolCall
+	case "content_filter", "SAFETY", "RECITATION", "refusal", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST":
+		return FinishFiltered
+	}
+	return FinishOther
+}
+
+type Usage struct {
+	Input  int
+	Output int
+	Total  int
+}
+
+type Reply struct {
+	Message Message
+	Finish  Finish
+	Usage   Usage
+	ID      string
+	Model   string
+}
+
+type Chunk struct {
+	Part    Part?
+	Index   int?
+	Partial bool
+	Finish  Finish?
+	Usage   Usage
+	ID      string
+	Model   string
+}
+
+type Model interface {
+	Chat(ctx context.Context, req Request) (Reply, error)
+	Stream(ctx context.Context, req Request) iter.Seq2[Chunk, error]
+}
+
+type Layer func(next Model) Model
+
+type Embedder interface {
+	Embed(ctx context.Context, texts const []string) ([][]float32, error)
+}

@@ -1,0 +1,193 @@
+package auth_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/web"
+)
+
+func callAuth(t *testing.T, r *web.Router, req *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func okHandler(ctx *web.Context) (web.Reply, error) {
+	return web.Empty{}, nil
+}
+
+func principalHandler(ctx *web.Context) (web.Reply, error) {
+	p := web.Get(ctx, auth.PrincipalKey)
+	if p == nil {
+		return web.Data{Value: "anonymous"}, nil
+	}
+	return web.Data{Value: p}, nil
+}
+
+func noPrincipal(ctx *web.Context) (auth.Principal?, error) {
+	return nil, nil
+}
+
+func principalB(ctx *web.Context) (auth.Principal?, error) {
+	return auth.Principal{ID: "u-b", Roles: []string{"user"}}, nil
+}
+
+func principalC(ctx *web.Context) (auth.Principal?, error) {
+	return auth.Principal{ID: "u-c"}, nil
+}
+
+func brokenAuthenticator(ctx *web.Context) (auth.Principal?, error) {
+	return nil, fmt.Errorf("idp unreachable")
+}
+
+func TestRequireWithoutAuthenticateAnswers500(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{})))
+	defer slog.SetDefault(previous)
+
+	r := web.NewRouter()
+	r.Use(auth.Require(auth.Authenticated()))
+	r.Handle("GET", "/x", okHandler)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d want 500 body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logs.String(), "auth.Require used without auth.Authenticate") {
+		t.Fatalf("log %q lacks the required message", logs.String())
+	}
+}
+
+func TestRequireAnswers401WithoutPrincipal403WithOne(t *testing.T) {
+	cases := []struct {
+		name    string
+		methods []auth.Authenticator
+		want    int
+	}{
+		{"anonymous", []auth.Authenticator{noPrincipal}, http.StatusUnauthorized},
+		{"known", []auth.Authenticator{principalB}, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := web.NewRouter()
+			r.Use(auth.Authenticate(tc.methods...))
+			r.Use(auth.Require(func(p auth.Principal?) bool { return false }))
+			r.Handle("GET", "/x", okHandler)
+			rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+			if rec.Code != tc.want {
+				t.Fatalf("status %d want %d body %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestRequirePassesAuthenticatedPrincipal(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(principalB))
+	r.Use(auth.Require(auth.Authenticated()))
+	r.Handle("GET", "/x", okHandler)
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHasRole(t *testing.T) {
+	cases := []struct {
+		name  string
+		roles []string
+		role  string
+		want  int
+	}{
+		{"member", []string{"user", "admin"}, "admin", http.StatusNoContent},
+		{"missing", []string{"user"}, "admin", http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := web.NewRouter()
+			r.Use(auth.Authenticate(func(ctx *web.Context) (auth.Principal?, error) {
+				return auth.Principal{ID: "u-b", Roles: tc.roles}, nil
+			}))
+			r.Use(auth.Require(auth.HasRole(tc.role)))
+			r.Handle("GET", "/x", okHandler)
+			rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+			if rec.Code != tc.want {
+				t.Fatalf("status %d want %d body %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAuthenticateTriesMethodsInOrderAndStoresFirst(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(noPrincipal, principalB, principalC))
+	r.Handle("GET", "/who", principalHandler)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/who", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "u-b") {
+		t.Fatalf("body %q wants principal u-b", body)
+	}
+	if strings.Contains(body, "u-c") {
+		t.Fatalf("body %q must not hold u-c", body)
+	}
+}
+
+func TestAuthenticateErrorIs401Problem(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(brokenAuthenticator, principalB))
+	r.Use(auth.Require(auth.Authenticated()))
+	r.Handle("GET", "/x", okHandler)
+
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type %q want application/problem+json", ct)
+	}
+}
+
+func TestBearerVerifiesTokenAndFallsThrough(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(auth.Bearer(verifyBearer), principalC))
+	r.Handle("GET", "/who", principalHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/who", nil)
+	req.Header.Set("Authorization", "Bearer tok-123")
+	rec := callAuth(t, r, req)
+	if body := rec.Body.String(); !strings.Contains(body, "u-bearer") {
+		t.Fatalf("body %q wants principal u-bearer", body)
+	}
+
+	basic := httptest.NewRequest(http.MethodGet, "/who", nil)
+	basic.Header.Set("Authorization", "Basic tok-123")
+	rec = callAuth(t, r, basic)
+	if body := rec.Body.String(); !strings.Contains(body, "u-c") {
+		t.Fatalf("body %q wants fallback principal u-c", body)
+	}
+
+	lower := httptest.NewRequest(http.MethodGet, "/who", nil)
+	lower.Header.Set("Authorization", "bearer tok-123")
+	rec = callAuth(t, r, lower)
+	if body := rec.Body.String(); !strings.Contains(body, "u-bearer") {
+		t.Fatalf("body %q wants principal u-bearer: the scheme name has no letter case", body)
+	}
+}
+
+func verifyBearer(ctx context.Context, token string) (auth.Principal?, error) {
+	if token != "tok-123" {
+		return nil, nil
+	}
+	return auth.Principal{ID: "u-bearer"}, nil
+}

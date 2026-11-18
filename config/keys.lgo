@@ -1,0 +1,43 @@
+package config
+
+func joinKey(prefix string, name string, tag string) string {
+	if tag != "" {
+		return tag
+	}
+	key := snake(name)
+	if prefix != "" {
+		key = prefix + "_" + key
+	}
+	return key
+}
+
+func snake(name string) string {
+	var b []byte
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' && i > 0 && splitBefore(name, i) {
+			b = append(b, '_')
+		}
+		b = append(b, c)
+	}
+	return upperASCII(b)
+}
+
+func splitBefore(name string, i int) bool {
+	prev := name[i-1]
+	if prev >= 'a' && prev <= 'z' || prev >= '0' && prev <= '9' {
+		return true
+	}
+	return prev >= 'A' && prev <= 'Z' && i+1 < len(name) && name[i+1] >= 'a' && name[i+1] <= 'z'
+}
+
+func upperASCII(b []byte) string {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 'a' && c <= 'z' {
+			c = c - 'a' + 'A'
+		}
+		out[i] = c
+	}
+	return string(out)
+}

@@ -1,0 +1,162 @@
+package auth
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/web"
+)
+
+type SessionStore interface {
+	Load(ctx context.Context, id string) (Principal?, error)
+	Save(ctx context.Context, id string, p Principal, ttl time.Duration) error
+	Delete(ctx context.Context, id string) error
+}
+
+type Sessions struct {
+	Store  SessionStore
+	Cookie string        = "__Host-spira"
+	TTL    time.Duration = 12 * time.Hour
+}
+
+func (s *Sessions) Authenticator() Authenticator {
+	return func(ctx *web.Context) (Principal?, error) {
+		cookie, err := ctx.Request.Cookie(s.Cookie)
+		if err != nil {
+			return nil, nil
+		}
+		p, lerr := s.Store.Load(ctx.Ctx(), hashSessionID(cookie.Value))
+		if lerr != nil {
+			return nil, fmt.Errorf("auth: session load: %w", lerr)
+		}
+		return p, nil
+	}
+}
+
+func (s *Sessions) Login(ctx *web.Context, p Principal) (*http.Cookie?, error) {
+	id := newSessionID()?
+	if derr := s.dropCookieSession(ctx); derr != nil {
+		return nil, fmt.Errorf("auth: session delete: %w", derr)
+	}
+	if serr := s.Store.Save(ctx.Ctx(), hashSessionID(id), p, s.TTL); serr != nil {
+		return nil, fmt.Errorf("auth: session save: %w", serr)
+	}
+	return &http.Cookie{
+		Name:     s.Cookie,
+		Value:    id,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
+}
+
+func (s *Sessions) Logout(ctx *web.Context) (*http.Cookie?, error) {
+	if derr := s.dropCookieSession(ctx); derr != nil {
+		return nil, fmt.Errorf("auth: session delete: %w", derr)
+	}
+	return &http.Cookie{
+		Name:     s.Cookie,
+		Value:    "",
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0).UTC(),
+	}, nil
+}
+
+func (s *Sessions) dropCookieSession(ctx *web.Context) error {
+	cookie, err := ctx.Request.Cookie(s.Cookie)
+	if err != nil {
+		return nil
+	}
+	return s.Store.Delete(ctx.Ctx(), hashSessionID(cookie.Value))
+}
+
+func newSessionID() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("auth: session id entropy: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func hashSessionID(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])
+}
+
+type memoryEntry struct {
+	principal Principal
+	expires   time.Time
+}
+
+const sweepInterval = time.Minute
+
+type memoryState struct {
+	sessions  map[string]memoryEntry
+	nextSweep time.Time
+}
+
+type memoryStore struct {
+	sessions sync.Locked[memoryState]
+}
+
+func NewMemoryStore() SessionStore {
+	store := &memoryStore{}
+	store.sessions.WithLock(func(st *memoryState) {
+		st.sessions = map[string]memoryEntry{}
+		st.nextSweep = time.Now().Add(sweepInterval)
+	})
+	return store
+}
+
+func (s *memoryStore) Load(ctx context.Context, id string) (Principal?, error) {
+	var out Principal?
+	s.sessions.WithLock(func(st *memoryState) {
+		e, ok := st.sessions[id]
+		if ok && time.Now().Before(e.expires) {
+			out = e.principal
+		} else {
+			delete(st.sessions, id)
+		}
+	})
+	return out, nil
+}
+
+func (s *memoryStore) Save(ctx context.Context, id string, p Principal, ttl time.Duration) error {
+	s.sessions.WithLock(func(st *memoryState) {
+		now := time.Now()
+		if !now.Before(st.nextSweep) {
+			sweepExpired(st.sessions, now)
+			st.nextSweep = now.Add(sweepInterval)
+		}
+		st.sessions[id] = memoryEntry{principal: p, expires: now.Add(ttl)}
+	})
+	return nil
+}
+
+func sweepExpired(sessions map[string]memoryEntry, now time.Time) {
+	for key, entry := range sessions {
+		if !now.Before(entry.expires) {
+			delete(sessions, key)
+		}
+	}
+}
+
+func (s *memoryStore) Delete(ctx context.Context, id string) error {
+	s.sessions.WithLock(func(st *memoryState) {
+		delete(st.sessions, id)
+	})
+	return nil
+}

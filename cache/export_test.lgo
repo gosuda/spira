@@ -1,0 +1,37 @@
+package cache
+
+func FlightWaiters(c *Memory[string, int], k string) int {
+	n := 0
+	c.store.WithLock(func(s *store[string, int]) {
+		if fl, ok := s.flights[k]; ok {
+			n = len(fl.waiters)
+		}
+	})
+	return n
+}
+
+func IndexMatchesOrder(c *Memory[string, int]) bool {
+	same := false
+	c.store.WithLock(func(s *store[string, int]) {
+		if s.order.Len() == len(s.entries) {
+			same = true
+		}
+	})
+	return same
+}
+
+func FlightsLenFloat(c *Memory[float64, int]) int {
+	n := 0
+	c.store.WithLock(func(s *store[float64, int]) {
+		n = len(s.flights)
+	})
+	return n
+}
+
+func EntriesLenFloat(c *Memory[float64, int]) int {
+	n := 0
+	c.store.WithLock(func(s *store[float64, int]) {
+		n = len(s.entries)
+	})
+	return n
+}

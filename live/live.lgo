@@ -1,0 +1,129 @@
+package live
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+const heartbeatEvery = 15 * time.Second
+
+type Event struct {
+	Name string
+	Body view.Node
+}
+
+func NewEvent(name string, body view.Node) (Event, error) {
+	if badName(name) {
+		return Event{}, fmt.Errorf("live: event name %q contains a line break", name)
+	}
+	return Event{Name: name, Body: body}, nil
+}
+
+func Events(ctx *web.Context, events <-chan Event) web.Reply {
+	reqCtx := ctx.Ctx()
+	return web.Stream{
+		ContentType: "text/event-stream",
+		Write:       func(w io.Writer) error { return writeEvents(reqCtx, w, events) },
+	}
+}
+
+func writeEvents(ctx context.Context, w io.Writer, events <-chan Event) error {
+	if err := beat(ctx, w); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(heartbeatEvery)
+	defer ticker.Stop()
+	for {
+		keep, err := oneRound(ctx, w, events, ticker.C)
+		if err != nil {
+			return err
+		}
+		if !keep {
+			return nil
+		}
+	}
+}
+
+func oneRound(ctx context.Context, w io.Writer, events <-chan Event, beats <-chan time.Time) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, nil
+	case <-beats:
+		if err := beat(ctx, w); err != nil {
+			return false, err
+		}
+		return true, nil
+	case ev, ok := <-events:
+		if stop, serr := relay(ctx, w, ok, ev); serr != nil {
+			return false, serr
+		} else if stop {
+			return false, nil
+		}
+		return true, nil
+	}
+}
+
+func relay(ctx context.Context, w io.Writer, open bool, ev Event) (bool, error) {
+	if !open {
+		return true, nil
+	}
+	if err := writeMessage(ctx, w, ev); err != nil {
+		return true, endIfDone(ctx, err)
+	}
+	return false, nil
+}
+
+func beat(ctx context.Context, w io.Writer) error {
+	if err := writeHeartbeat(w); err != nil {
+		return endIfDone(ctx, fmt.Errorf("live: heartbeat: %w", err))
+	}
+	return nil
+}
+
+func writeHeartbeat(w io.Writer) error {
+	if _, err := io.WriteString(w, ": live\n\n"); err != nil {
+		return fmt.Errorf("live: write heartbeat: %w", err)
+	}
+	return nil
+}
+
+func writeMessage(ctx context.Context, w io.Writer, ev Event) error {
+	if badName(ev.Name) {
+		return fmt.Errorf("live: event name %q contains a line break", ev.Name)
+	}
+	var body strings.Builder
+	if err := view.Render(ctx, &body, ev.Body); err != nil {
+		return fmt.Errorf("live: render event %q: %w", ev.Name, err)
+	}
+	var msg strings.Builder
+	msg.WriteString($"event: {ev.Name}\n")
+	for _, line := range strings.Split(newlines(body.String()), "\n") {
+		msg.WriteString($"data: {line}\n")
+	}
+	msg.WriteString("\n")
+	if _, err := io.WriteString(w, msg.String()); err != nil {
+		return fmt.Errorf("live: write event %q: %w", ev.Name, err)
+	}
+	return nil
+}
+
+func newlines(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
+func badName(name string) bool {
+	return strings.ContainsAny(name, "\n\r")
+}
+
+func endIfDone(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}

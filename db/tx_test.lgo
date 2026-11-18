@@ -1,0 +1,516 @@
+package db_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+
+	_ "modernc.org/sqlite"
+)
+
+const txCallTimeout = 5 * time.Second
+
+const txCacheLimit = 256
+
+func txPoolKey(t *testing.T) string {
+	t.Helper()
+	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(t.Name(), "/", "_"), "(", "_"), ")", "_")
+}
+
+func openTxPoolDSN(t *testing.T, dsn string) *db.Pool {
+	t.Helper()
+	pool, err := db.Open("sqlite", dsn)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: open %s: %v", dsn, err))
+	}
+	if pool == nil {
+		panic("db_test: Open returned no pool")
+	}
+	if serr := pool.Start(t.Context()); serr != nil {
+		panic(fmt.Sprintf("db_test: start %s: %v", dsn, serr))
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func openTxPool(t *testing.T) *db.Pool {
+	t.Helper()
+	return openTxPoolDSN(t, "file:spira_"+txPoolKey(t)+"?mode=memory&cache=shared")
+}
+
+func txTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), txCallTimeout)
+}
+
+type txRow struct {
+	N int64 `col:"n"`
+}
+
+func TestTxRunsUnseenStatementsOnItsOwnConnection(t *testing.T) {
+	pool := openTxPool(t)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, "CREATE TABLE tx_a (n integer not null)"); err != nil {
+			return struct{}{}, fmt.Errorf("create: %w", err)
+		}
+		if _, err := db.Exec(ctx, tx, "INSERT INTO tx_a (n) VALUES (41)"); err != nil {
+			return struct{}{}, fmt.Errorf("insert: %w", err)
+		}
+		rows, err := db.Query[txRow](ctx, tx, "SELECT n FROM tx_a")
+		if err != nil {
+			return struct{}{}, fmt.Errorf("select: %w", err)
+		}
+		if len(rows) != 1 || rows[0].N != 41 {
+			return struct{}{}, fmt.Errorf("tx select = %+v, want one row with n=41", rows)
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		t.Fatalf("InTx: %v", err)
+	}
+	rows, err := db.Query[int64](ctx, pool, "SELECT COUNT(*) FROM tx_a")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: count committed: %v", err))
+	}
+	if len(rows) != 1 {
+		t.Fatalf("committed rows = %+v, want [1]", rows)
+	}
+	if rows[0] != 1 {
+		t.Fatalf("committed count = %d, want 1", rows[0])
+	}
+}
+
+func TestTxSeesUncommittedRowThroughCachedStatement(t *testing.T) {
+	pool := openTxPool(t)
+	if _, err := db.Exec(t.Context(), pool, "CREATE TABLE tx_b (n integer not null)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(t.Context(), pool, "INSERT INTO tx_b (n) VALUES (1)"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	ctx, cancel := txTimeout()
+	defer cancel()
+	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, "INSERT INTO tx_b (n) VALUES (2)"); err != nil {
+			return struct{}{}, fmt.Errorf("tx insert: %w", err)
+		}
+		rows, err := db.Query[int64](ctx, tx, "SELECT COUNT(*) FROM tx_b")
+		if err != nil {
+			return struct{}{}, fmt.Errorf("tx count: %w", err)
+		}
+		if len(rows) != 1 || rows[0] != 2 {
+			return struct{}{}, fmt.Errorf("tx count = %+v, want [2] (uncommitted row visible)", rows)
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		t.Fatalf("InTx: %v", err)
+	}
+}
+
+func txQueryText(i int) string {
+	return fmt.Sprintf("SELECT %d AS v", i)
+}
+
+func txRunOne(t *testing.T, pool *db.Pool, i int, calls int) error {
+	ctx, cancel := context.WithTimeout(t.Context(), txCallTimeout)
+	defer cancel()
+	for j := 0; j < calls; j++ {
+		q := txQueryText((i + j) % 300)
+		if _, err := db.Exec(ctx, pool, q); err != nil {
+			return fmt.Errorf("call %d query %q: %w", j, q, err)
+		}
+	}
+	return nil
+}
+
+func TestPreparedStatementSurvivesEvictionUnderConcurrentLoad(t *testing.T) {
+	pool := openTxPool(t)
+	const workers = 16
+	const callsEach = 125
+	spawn := func() error {
+		go group (t.Context(), limit = workers) {
+			for i := range workers {
+				go { txRunOne(t, pool, i, callsEach)? }
+			}
+		}
+		return nil
+	}
+	if err := spawn(); err != nil {
+		t.Fatalf("concurrent prepared statements: %v", err)
+	}
+	if got := pool.Prepared(); got > txCacheLimit {
+		t.Fatalf("Prepared() = %d, want at most %d", got, txCacheLimit)
+	}
+}
+
+func TestEvictedHeldStatementStaysUsableUntilRelease(t *testing.T) {
+	pool := openTxPool(t)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	heldQuery := "SELECT 42 AS held"
+	held, err := pool.HoldStatement(ctx, heldQuery)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: hold statement: %v", err))
+	}
+	if held == nil {
+		panic("db_test: HoldStatement returned no statement")
+	}
+	for i := range txCacheLimit {
+		if _, err := pool.ExecContext(ctx, fmt.Sprintf("SELECT %d AS churn", i)); err != nil {
+			t.Fatalf("churn %d: %v", i, err)
+		}
+	}
+	var got int64
+	if serr := held.QueryRow().Scan(&got); serr != nil {
+		t.Fatalf("held statement after eviction: %v", serr)
+	}
+	if got != 42 {
+		t.Fatalf("held query returned %d, want 42", got)
+	}
+	if size := pool.Prepared(); size > txCacheLimit {
+		t.Fatalf("Prepared() = %d, want at most %d", size, txCacheLimit)
+	}
+	pool.ReleaseStatement(heldQuery)
+	if serr := held.QueryRow().Scan(&got); serr == nil {
+		t.Fatal("held statement still usable after release, want it closed")
+	}
+	if !pool.RetiredStatementsEmpty() {
+		t.Fatal("retired statements remain after release")
+	}
+}
+
+func seedOpenRows(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE tx_open_rows (n integer not null)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for i := range 3 {
+		if _, err := db.Exec(ctx, pool, "INSERT INTO tx_open_rows (n) VALUES (?)", i); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+}
+
+func scanFirstRow(t *testing.T, rows *sql.Rows) int64 {
+	t.Helper()
+	if !rows.Next() {
+		t.Fatal("want a first row")
+	}
+	var first int64
+	if err := rows.Scan(&first); err != nil {
+		t.Fatalf("scan first: %v", err)
+	}
+	return first
+}
+
+func churnStatements(t *testing.T, pool *db.Pool, count int) {
+	t.Helper()
+	ctx, cancel := txTimeout()
+	defer cancel()
+	for i := range count {
+		if _, err := db.Exec(ctx, pool, txQueryText(i)); err != nil {
+			t.Fatalf("churn %d: %v", i, err)
+		}
+	}
+}
+
+func drainRemainingRows(t *testing.T, rows *sql.Rows) []int64 {
+	t.Helper()
+	got := []int64{}
+	for rows.Next() {
+		var n int64
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, n)
+	}
+	return got
+}
+
+func TestOpenRowsSurviveStatementEviction(t *testing.T) {
+	pool := openTxPool(t)
+	seedOpenRows(t, pool)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	rows, err := pool.QueryContext(ctx, "SELECT n FROM tx_open_rows ORDER BY n")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: open rows: %v", err))
+	}
+	if rows == nil {
+		panic("db_test: QueryContext returned no rows")
+	}
+	defer func() {
+		if cerr := rows.Close(); cerr != nil {
+			t.Errorf("rows close: %v", cerr)
+		}
+	}()
+	if first := scanFirstRow(t, rows); first != 0 {
+		t.Fatalf("first row = %d, want 0", first)
+	}
+	churnStatements(t, pool, 300)
+	got := drainRemainingRows(t, rows)
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("remaining rows = %v, want [1 2]", got)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows err: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("rows close: %v", err)
+	}
+}
+
+func txProbeFreed(t *testing.T, pool *db.Pool, table string, absent int64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "INSERT INTO "+table+" (n) VALUES (50)"); err != nil {
+		t.Fatalf("write through pool after aborted tx: %v", err)
+	}
+	rows, err := db.Query[int64](ctx, pool, "SELECT n FROM "+table)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: select %s: %v", table, err))
+	}
+	for _, n := range rows {
+		if n == absent {
+			t.Fatalf("row %d from the aborted transaction is present", absent)
+		}
+	}
+}
+
+func txWorkPanics(ctx context.Context, pool *db.Pool) (panicked bool, err error) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+		}
+	}()
+	_, err = db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, "INSERT INTO tx_panic (n) VALUES (1)"); err != nil {
+			return struct{}{}, fmt.Errorf("insert: %w", err)
+		}
+		panic("tx work panicked")
+	})
+	return panicked, err
+}
+
+func TestInTxRollsBackWhenWorkPanics(t *testing.T) {
+	pool := openTxPool(t)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE tx_panic (n integer not null)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	panicked, ierr := txWorkPanics(ctx, pool)
+	if ierr != nil {
+		panic(fmt.Sprintf("db_test: txWorkPanics err=%v", ierr))
+	}
+	if !panicked {
+		t.Fatal("InTx must propagate the work panic")
+	}
+	txProbeFreed(t, pool, "tx_panic", 1)
+}
+
+func TestInTxRollsBackWhenWorkFails(t *testing.T) {
+	pool := openTxPool(t)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE tx_fail (n integer not null)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	boom := errors.New("tx work failed")
+	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, "INSERT INTO tx_fail (n) VALUES (1)"); err != nil {
+			return struct{}{}, fmt.Errorf("insert: %w", err)
+		}
+		return struct{}{}, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("InTx error = %v, want the work error %v", err, boom)
+	}
+	txProbeFreed(t, pool, "tx_fail", 1)
+}
+
+func TestInTxCommitFailureReturnsCommitErrorAlone(t *testing.T) {
+	pool := openTxPoolDSN(t, "file:spira_"+txPoolKey(t)+"?mode=memory&cache=shared&_pragma=foreign_keys(1)")
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE cf_parent (id integer primary key)"); err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE cf_child (n integer not null, pid integer not null references cf_parent(id) deferrable initially deferred)"); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, "INSERT INTO cf_child (n, pid) VALUES (1, 99)"); err != nil {
+			return struct{}{}, fmt.Errorf("insert: %w", err)
+		}
+		return struct{}{}, nil
+	})
+	if err == nil {
+		t.Fatal("want the commit error")
+	}
+	if !strings.HasPrefix(err.Error(), "db: commit:") {
+		t.Fatalf("InTx error = %q, want the commit error", err)
+	}
+	if errors.Unwrap(err) == nil {
+		t.Fatalf("InTx error = %q is joined with a second error, want the commit error alone", err)
+	}
+}
+
+type wrapCase struct {
+	name string
+	want string
+	run  func(ctx context.Context) error
+}
+
+func poolWrapCases(pool *db.Pool) []wrapCase {
+	return []wrapCase{
+		{"pool query through cache", "db: query:", func(c context.Context) error {
+			rows, err := pool.QueryContext(c, "SELECT n FROM wrap_t")
+			if err != nil {
+				return err
+			}
+			if rows == nil {
+				return errors.New("db_test: no rows handle")
+			}
+			return rows.Close()
+		}},
+		{"pool query direct", "db: query:", func(c context.Context) error {
+			rows, err := pool.QueryContext(c, db.In("SELECT /*SLICE:n*/? FROM no_wrap_t", "n", 1))
+			if err != nil {
+				return err
+			}
+			if rows == nil {
+				return errors.New("db_test: no rows handle")
+			}
+			return rows.Close()
+		}},
+		{"pool exec through cache", "db: exec:", func(c context.Context) error {
+			_, err := pool.ExecContext(c, "INSERT INTO wrap_u (n) VALUES (1)")
+			return err
+		}},
+		{"pool exec direct", "db: exec:", func(c context.Context) error {
+			_, err := pool.ExecContext(c, db.In("INSERT INTO no_wrap_t (n) VALUES /*SLICE:n*/?", "n", 1))
+			return err
+		}},
+	}
+}
+
+func txWrapCases(pool *db.Pool) []wrapCase {
+	return []wrapCase{
+		{"tx query through cache", "db: query:", func(c context.Context) error {
+			_, err := db.InTx(c, pool, func(tx *db.Tx) (struct{}, error) {
+				rows, qerr := tx.QueryContext(c, "SELECT n FROM wrap_t")
+				if qerr != nil {
+					return struct{}{}, qerr
+				}
+				if rows == nil {
+					return struct{}{}, errors.New("db_test: no rows handle")
+				}
+				return struct{}{}, rows.Close()
+			})
+			return err
+		}},
+		{"tx query direct", "db: query:", func(c context.Context) error {
+			_, err := db.InTx(c, pool, func(tx *db.Tx) (struct{}, error) {
+				rows, qerr := tx.QueryContext(c, db.In("SELECT /*SLICE:n*/? FROM no_wrap_t", "n", 1))
+				if qerr != nil {
+					return struct{}{}, qerr
+				}
+				if rows == nil {
+					return struct{}{}, errors.New("db_test: no rows handle")
+				}
+				return struct{}{}, rows.Close()
+			})
+			return err
+		}},
+		{"tx exec through cache", "db: exec:", func(c context.Context) error {
+			_, err := db.InTx(c, pool, func(tx *db.Tx) (struct{}, error) {
+				_, xerr := tx.ExecContext(c, "INSERT INTO wrap_u (n) VALUES (1)")
+				return struct{}{}, xerr
+			})
+			return err
+		}},
+		{"tx exec direct", "db: exec:", func(c context.Context) error {
+			_, err := db.InTx(c, pool, func(tx *db.Tx) (struct{}, error) {
+				_, xerr := tx.ExecContext(c, db.In("INSERT INTO no_wrap_t (n) VALUES /*SLICE:n*/?", "n", 1))
+				return struct{}{}, xerr
+			})
+			return err
+		}},
+	}
+}
+
+func TestQueryAndExecErrorsWrapOnce(t *testing.T) {
+	pool := openTxPool(t)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE wrap_u (n integer not null unique)"); err != nil {
+		t.Fatalf("create wrap_u: %v", err)
+	}
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE wrap_t (n integer not null)"); err != nil {
+		t.Fatalf("create wrap_t: %v", err)
+	}
+	if _, err := db.Query[int64](ctx, pool, "SELECT n FROM wrap_t"); err != nil {
+		t.Fatalf("seed query: %v", err)
+	}
+	if _, err := db.Exec(ctx, pool, "INSERT INTO wrap_u (n) VALUES (1)"); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	if _, err := db.Exec(ctx, pool, "DROP TABLE wrap_t"); err != nil {
+		t.Fatalf("drop wrap_t: %v", err)
+	}
+	for _, tc := range append(poolWrapCases(pool), txWrapCases(pool)...) {
+		err := tc.run(ctx)
+		if err == nil {
+			t.Fatalf("%s: want an error", tc.name)
+		}
+		if got := strings.Count(err.Error(), tc.want); got != 1 {
+			t.Fatalf("%s: error %q carries %q %d times, want 1", tc.name, err.Error(), tc.want, got)
+		}
+	}
+}
+
+func TestTxRunsUncachedStatementsOnItsOwnConnection(t *testing.T) {
+	pool := openTxPool(t)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE tx_in (n integer not null)"); err != nil {
+		t.Fatalf("create: %v", err)
+		return
+	}
+	stop := errors.New("tx stop")
+	insert := db.In("INSERT INTO tx_in (n) SELECT 9 WHERE 9 IN (/*SLICE:ids*/?)", "ids", 1)
+	read := db.In("SELECT n FROM tx_in WHERE n IN (/*SLICE:ids*/?)", "ids", 2)
+	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, insert, 9); err != nil {
+			return struct{}{}, fmt.Errorf("insert: %w", err)
+		}
+		rows, err := db.Query[int64](ctx, tx, read, 9, 10)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("select: %w", err)
+		}
+		if len(rows) != 1 {
+			return struct{}{}, fmt.Errorf("tx sees %d rows through an uncached statement, want its own uncommitted row", len(rows))
+		}
+		return struct{}{}, stop
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("InTx error = %v, want the work error", err)
+	}
+	txProbeFreed(t, pool, "tx_in", 9)
+}

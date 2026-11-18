@@ -1,0 +1,198 @@
+package job
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync/atomic"
+
+	"logos/rt"
+	"logos/sync"
+)
+
+var errQueueClosed = errors.New("job: queue closed")
+
+type queueRun[T any] struct {
+	items      chan T
+	stop       chan struct{}
+	join       *joinState
+	cancel     context.CancelFunc
+	joinCancel context.CancelFunc
+}
+
+type Queue[T any] struct {
+	workers  int
+	capacity int
+	handle   func(ctx context.Context, item T) error
+	wake     sync.Locked[chan struct{}]
+	sending  atomic.Int64
+	started  atomic.Bool
+	open     atomic.Bool
+	run      atomic.Pointer[queueRun[T]]
+}
+
+func NewQueue[T any](workers int, capacity int, handle func(ctx context.Context, item T) error) *Queue[T] {
+	if workers < 1 {
+		panic("job: NewQueue: workers must be at least 1")
+	}
+	if capacity < 0 {
+		panic("job: NewQueue: capacity must not be negative")
+	}
+	q := &Queue[T]{workers: workers, capacity: capacity, handle: handle}
+	q.wake.WithLock(func(w *chan struct{}) {
+		*w = make(chan struct{})
+	})
+	return q
+}
+
+func (q *Queue[T]) Start(ctx context.Context) error {
+	if !q.started.CompareAndSwap(false, true) {
+		return fmt.Errorf("job: queue already started")
+	}
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	items := make(chan T, q.capacity)
+	stop := make(chan struct{})
+	g, _ := rt.NewGroup(runCtx, 0)
+	for range q.workers {
+		g.Go(func(gctx context.Context) error {
+			return q.worker(gctx, items, stop)
+		})
+	}
+	js := &joinState{done: make(chan struct{})}
+	joinCtx, joinCancel := context.WithCancel(context.Background())
+	context.AfterFunc(joinCtx, func() {
+		js.err.WithLock(func(e *error) {
+			*e = g.Wait()
+		})
+		close(js.done)
+	})
+	q.wake.WithLock(func(w *chan struct{}) {
+		*w = make(chan struct{})
+	})
+	q.run.Store(&queueRun[T]{
+		items:      items,
+		stop:       stop,
+		join:       js,
+		cancel:     cancel,
+		joinCancel: joinCancel,
+	})
+	q.open.Store(true)
+	return nil
+}
+
+func (q *Queue[T]) Stop(ctx context.Context) error {
+	if !q.started.Swap(false) {
+		return nil
+	}
+	q.open.Store(false)
+	r := q.run.Load()
+	if r == nil {
+		return nil
+	}
+	close(r.stop)
+	r.joinCancel()
+	defer r.cancel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.join.done:
+	}
+	var err error
+	r.join.err.WithLock(func(e *error) {
+		err = *e
+	})
+	return err
+}
+
+func (q *Queue[T]) Enqueue(ctx context.Context, item T) error {
+	q.sending.Add(1)
+	defer func() {
+		if q.sending.Add(-1) == 0 {
+			q.broadcast()
+		}
+	}()
+	r := q.run.Load()
+	if r == nil || !q.open.Load() {
+		return errQueueClosed
+	}
+	select {
+	case r.items <- item:
+		return nil
+	case <-r.stop:
+		return errQueueClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (q *Queue[T]) broadcast() {
+	q.wake.WithLock(func(w *chan struct{}) {
+		close(*w)
+		*w = make(chan struct{})
+	})
+}
+
+func (q *Queue[T]) waitCh() chan struct{} {
+	var w chan struct{}
+	q.wake.WithLock(func(x *chan struct{}) {
+		w = *x
+	})
+	return w
+}
+
+func (q *Queue[T]) worker(ctx context.Context, items chan T, stop <-chan struct{}) error {
+	for {
+		select {
+		case <-stop:
+			return q.drain(ctx, items)
+		case item := <-items:
+			q.handleItem(ctx, item)
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (q *Queue[T]) handleItem(ctx context.Context, item T) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("job: handle panicked", "panic", fmt.Sprint(r))
+		}
+	}()
+	if err := q.handle(ctx, item); err != nil {
+		slog.Warn("job: handle failed", "error", err)
+	}
+}
+
+func (q *Queue[T]) drain(ctx context.Context, items chan T) error {
+	for {
+		if q.takeItem(ctx, items) {
+			return nil
+		}
+	}
+}
+
+func (q *Queue[T]) takeItem(ctx context.Context, items chan T) bool {
+	select {
+	case item := <-items:
+		q.handleItem(ctx, item)
+		return false
+	case <-ctx.Done():
+		return true
+	default:
+	}
+	w := q.waitCh()
+	if q.sending.Load() == 0 {
+		return true
+	}
+	select {
+	case item := <-items:
+		q.handleItem(ctx, item)
+		return false
+	case <-w:
+		return false
+	case <-ctx.Done():
+		return true
+	}
+}

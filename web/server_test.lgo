@@ -1,0 +1,430 @@
+package web_test
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/web"
+	"logos/sync"
+)
+
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatalf("probe close: %v", err)
+	}
+	return addr
+}
+
+type slowProbe struct {
+	entered  chan struct{}
+	release  chan struct{}
+	status   sync.Locked[int]
+	fetchErr sync.Locked[error]
+	stopErr  sync.Locked[error]
+	stopDur  sync.Locked[time.Duration]
+}
+
+func fetchSlow(ctx context.Context, url string, p *slowProbe) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("server test: build: %w", err) })
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("server test: do: %w", err) })
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("server test: close body: %w", cerr) })
+		}
+	}()
+	p.status.WithLock(func(s *int) { *s = resp.StatusCode })
+	return nil
+}
+
+func waitEntered(ctx context.Context, entered chan struct{}) error {
+	select {
+	case <-entered:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func stopSlow(ctx context.Context, s *web.Server, p *slowProbe) error {
+	if err := waitEntered(ctx, p.entered); err != nil {
+		return err
+	}
+	start := time.Now()
+	err := s.Stop(ctx)
+	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
+	p.stopErr.WithLock(func(e *error) { *e = err })
+	return nil
+}
+
+func releaseSlow(ctx context.Context, p *slowProbe) error {
+	if err := waitEntered(ctx, p.entered); err != nil {
+		return err
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(p.release)
+	return nil
+}
+
+func driveSlow(ctx context.Context, s *web.Server, url string, p *slowProbe) error {
+	go group (ctx) {
+		go fetchSlow(ctx, url, p)
+		go stopSlow(ctx, s, p)
+		go releaseSlow(ctx, p)
+	}
+	return nil
+}
+
+func TestServerStopWaitsForInFlightRequest(t *testing.T) {
+	r := web.NewRouter()
+	p := &slowProbe{entered: make(chan struct{}), release: make(chan struct{})}
+	r.Handle("GET", "/slow", slowHandler(p))
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 5 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := driveSlow(context.Background(), s, "http://"+addr+"/slow", p); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	var ferr error
+	p.fetchErr.WithLock(func(e *error) { ferr = *e })
+	if ferr != nil {
+		t.Fatalf("in-flight request failed while stopping: %v", ferr)
+	}
+	var status int
+	p.status.WithLock(func(s *int) { status = *s })
+	if status != http.StatusNoContent {
+		t.Fatalf("in-flight request status %d want 204", status)
+	}
+	var serr error
+	p.stopErr.WithLock(func(e *error) { serr = *e })
+	if serr != nil {
+		t.Fatalf("Stop: %v", serr)
+	}
+	var dur time.Duration
+	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
+	if dur < 40*time.Millisecond {
+		t.Fatalf("Stop returned after %v, before the in-flight request ended", dur)
+	}
+}
+
+func TestSecondStartOnTakenPortFails(t *testing.T) {
+	addr := freeAddr(t)
+	s1 := &web.Server{Addr: addr, Router: web.NewRouter(), ShutdownGrace: 2 * time.Second}
+	if err := s1.Start(context.Background()); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	s2 := &web.Server{Addr: addr, Router: web.NewRouter()}
+	err := s2.Start(context.Background())
+	if err == nil {
+		if serr := s1.Stop(context.Background()); serr != nil {
+			t.Fatalf("stop first server: %v", serr)
+		}
+		t.Fatal("second start on a taken port succeeded")
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("start error %q does not name the listen failure", err.Error())
+	}
+	if serr := s1.Stop(context.Background()); serr != nil {
+		t.Fatalf("stop first server: %v", serr)
+	}
+}
+
+type ctxProbe struct {
+	slowProbe
+	cancelled chan struct{}
+	url       string
+	reqErr    sync.Locked[error]
+}
+
+func cancelThenRelease(ctx context.Context, cancel context.CancelFunc, p *ctxProbe) error {
+	if err := waitEntered(ctx, p.entered); err != nil {
+		return err
+	}
+	cancel()
+	close(p.cancelled)
+	time.Sleep(20 * time.Millisecond)
+	close(p.release)
+	return nil
+}
+
+func stopAfterCancel(ctx context.Context, s *web.Server, p *ctxProbe) error {
+	select {
+	case <-p.cancelled:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	p.stopErr.WithLock(func(e *error) { *e = s.Stop(ctx) })
+	return nil
+}
+
+func driveContextCancel(ctx context.Context, s *web.Server, cancel context.CancelFunc, p *ctxProbe) error {
+	go group (ctx) {
+		go fetchSlow(ctx, p.url, &p.slowProbe)
+		go cancelThenRelease(ctx, cancel, p)
+		go stopAfterCancel(ctx, s, p)
+	}
+	return nil
+}
+
+func TestServerServesAfterStartContextCancel(t *testing.T) {
+	r := web.NewRouter()
+	p := &ctxProbe{
+		slowProbe: slowProbe{entered: make(chan struct{}), release: make(chan struct{})},
+		cancelled: make(chan struct{}),
+	}
+	r.Handle("GET", "/slow", watchedHandler(p))
+	addr := freeAddr(t)
+	p.url = "http://" + addr + "/slow"
+	startCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 5 * time.Second}
+	if err := s.Start(startCtx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := driveContextCancel(context.Background(), s, cancel, p); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	var status int
+	p.status.WithLock(func(v *int) { status = *v })
+	if status != http.StatusOK {
+		t.Fatalf("in-flight request status %d want 200 after start-context cancel", status)
+	}
+	var ferr error
+	p.fetchErr.WithLock(func(e *error) { ferr = *e })
+	if ferr != nil {
+		t.Fatalf("in-flight request failed: %v", ferr)
+	}
+	var rerr error
+	p.reqErr.WithLock(func(e *error) { rerr = *e })
+	if rerr != nil {
+		t.Fatalf("request context did not outlive the start context: %v", rerr)
+	}
+	var serr error
+	p.stopErr.WithLock(func(e *error) { serr = *e })
+	if serr != nil {
+		t.Fatalf("Stop after start-context cancel: %v", serr)
+	}
+}
+
+func slowHandler(p *slowProbe) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Ctx().Done():
+			return nil, fmt.Errorf("server test: request context ended: %w", ctx.Ctx().Err())
+		}
+		return web.Empty{}, nil
+	}
+}
+
+func watchedHandler(p *ctxProbe) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Ctx().Done():
+			return nil, fmt.Errorf("server test: request context ended: %w", ctx.Ctx().Err())
+		}
+		if err := ctx.Request.Context().Err(); err != nil {
+			p.reqErr.WithLock(func(e *error) { *e = fmt.Errorf("server test: request context ended with %w", err) })
+		}
+		return web.Data{Value: "done"}, nil
+	}
+}
+
+type stuckProbe struct {
+	entered    chan struct{}
+	release    chan struct{}
+	stopWithin time.Duration = time.Minute
+	stopErr    sync.Locked[error]
+	stopDur    sync.Locked[time.Duration]
+}
+
+func fetchStuck(url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	return nil
+}
+
+func stopStuck(ctx context.Context, s *web.Server, p *stuckProbe) error {
+	if err := waitEntered(ctx, p.entered); err != nil {
+		return err
+	}
+	time.Sleep(50 * time.Millisecond)
+	stopCtx, cancel := context.WithTimeout(ctx, p.stopWithin)
+	defer cancel()
+	start := time.Now()
+	p.stopErr.WithLock(func(e *error) { *e = s.Stop(stopCtx) })
+	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
+	close(p.release)
+	return nil
+}
+
+func driveStuck(ctx context.Context, s *web.Server, url string, p *stuckProbe) error {
+	go group (ctx) {
+		go fetchStuck(url)
+		go stopStuck(ctx, s, p)
+	}
+	return nil
+}
+
+func stuckHandler(p *stuckProbe) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Ctx().Done():
+			return nil, fmt.Errorf("server test: request context ended: %w", ctx.Ctx().Err())
+		}
+		return web.Empty{}, nil
+	}
+}
+
+func TestServerStopReturnsWithinGraceWhenHandlerNeverReturns(t *testing.T) {
+	r := web.NewRouter()
+	p := &stuckProbe{entered: make(chan struct{}), release: make(chan struct{})}
+	r.Handle("GET", "/stuck", stuckHandler(p))
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 500 * time.Millisecond}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := driveStuck(context.Background(), s, "http://"+addr+"/stuck", p); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	var err error
+	p.stopErr.WithLock(func(e *error) { err = *e })
+	if err == nil {
+		t.Fatal("Stop of a never-returning handler reported success")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("Stop error %q does not name the grace deadline", err)
+	}
+	var dur time.Duration
+	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
+	if dur < 400*time.Millisecond {
+		t.Fatalf("Stop returned after %v without waiting out the grace period", dur)
+	}
+	if dur > 5*time.Second {
+		t.Fatalf("Stop returned after %v, beyond the grace period", dur)
+	}
+}
+
+func TestServerStopReturnsByTheCallerDeadline(t *testing.T) {
+	r := web.NewRouter()
+	p := &stuckProbe{entered: make(chan struct{}), release: make(chan struct{}), stopWithin: 300 * time.Millisecond}
+	r.Handle("GET", "/stuck", stuckHandler(p))
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 5 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := driveStuck(context.Background(), s, "http://"+addr+"/stuck", p); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	var err error
+	p.stopErr.WithLock(func(e *error) { err = *e })
+	if err == nil {
+		t.Fatal("Stop of a never-returning handler reported success")
+	}
+	var dur time.Duration
+	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
+	if dur < 250*time.Millisecond {
+		t.Fatalf("Stop returned after %v, before the caller deadline of 300ms", dur)
+	}
+	if dur > 2*time.Second {
+		t.Fatalf("Stop returned after %v; the caller deadline was 300ms and the grace period 5s", dur)
+	}
+}
+
+type closeProbe struct {
+	entered chan struct{}
+	ended   chan struct{}
+	stopErr sync.Locked[error]
+	closed  sync.Locked[bool]
+}
+
+func closeWatchingHandler(p *closeProbe) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(p.entered)
+		select {
+		case <-ctx.Ctx().Done():
+			close(p.ended)
+		case <-time.After(10 * time.Second):
+		}
+		return web.Empty{}, nil
+	}
+}
+
+func stopAndWatch(ctx context.Context, s *web.Server, p *closeProbe) error {
+	if err := waitEntered(ctx, p.entered); err != nil {
+		return err
+	}
+	p.stopErr.WithLock(func(e *error) { *e = s.Stop(ctx) })
+	select {
+	case <-p.ended:
+		p.closed.WithLock(func(b *bool) { *b = true })
+	case <-time.After(3 * time.Second):
+	}
+	return nil
+}
+
+func driveClose(ctx context.Context, s *web.Server, url string, p *closeProbe) error {
+	go group (ctx) {
+		go fetchStuck(url)
+		go stopAndWatch(ctx, s, p)
+	}
+	return nil
+}
+
+func TestServerStopClosesOpenConnectionsWhenShutdownTimesOut(t *testing.T) {
+	r := web.NewRouter()
+	p := &closeProbe{entered: make(chan struct{}), ended: make(chan struct{})}
+	r.Handle("GET", "/stream", closeWatchingHandler(p))
+	addr := freeAddr(t)
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 200 * time.Millisecond}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := driveClose(context.Background(), s, "http://"+addr+"/stream", p); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	var err error
+	p.stopErr.WithLock(func(e *error) { err = *e })
+	if err == nil {
+		t.Fatal("Stop of an open stream reported success")
+	}
+	var closed bool
+	p.closed.WithLock(func(b *bool) { closed = *b })
+	if !closed {
+		t.Fatal("the request context of an open stream did not end within 3s after Stop timed out")
+	}
+}

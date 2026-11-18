@@ -1,0 +1,182 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-tool-search-tool/src/test/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndexTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+func described(name string, description string) ai.Tool {
+	return ai.Tool{Name: name, Description: description, Schema: `{"type":"object"}`, Call: func(ctx context.Context, arguments string) (string, error) {
+		return name + " ran", nil
+	}}
+}
+
+func searchNames(t *testing.T, all []ai.Tool, arguments string) []string {
+	t.Helper()
+	search, _ := ai.SearchTools(all)
+	out, err := search.Call(t.Context(), arguments)
+	if err != nil {
+		t.Fatalf("search %s: %v", arguments, err)
+		return nil
+	}
+	var names []string
+	if derr := json.Unmarshal([]byte(out), &names); derr != nil {
+		t.Fatalf("search result %q is not a JSON list of names: %v", out, derr)
+		return nil
+	}
+	return names
+}
+
+func TestSearchToolsMatchesByToolName(t *testing.T) {
+	all := []ai.Tool{described("weatherTool", "Returns current weather conditions"), described("calculatorTool", "Performs arithmetic calculations")}
+	requireStrings(t, "names", searchNames(t, all, `{"query":"weather"}`), "weatherTool")
+}
+
+func TestSearchToolsMatchesByDescription(t *testing.T) {
+	all := []ai.Tool{described("toolA", "Fetches stock price data"), described("toolB", "Converts temperature units")}
+	requireStrings(t, "names", searchNames(t, all, `{"query":"stock price"}`), "toolA")
+}
+
+func TestSearchToolsRanksANameMatchAboveADescriptionMatch(t *testing.T) {
+	all := []ai.Tool{described("genericTool", "Provides weather forecasts"), described("weatherTool", "General purpose tool")}
+	requireStrings(t, "names", searchNames(t, all, `{"query":"weather"}`), "weatherTool", "genericTool")
+	weighted := []ai.Tool{described("multi", "weather weather"), described("weatherTool", "General purpose tool")}
+	requireStrings(t, "one name match outranks two description matches", searchNames(t, weighted, `{"query":"weather"}`), "weatherTool", "multi")
+}
+
+func manyDataTools() []ai.Tool {
+	var all []ai.Tool
+	for i := range 20 {
+		all = append(all, described(fmt.Sprintf("dataTool%d", i), fmt.Sprintf("Retrieves data from source %d", i)))
+	}
+	return all
+}
+
+func TestSearchToolsLimitsItsResults(t *testing.T) {
+	all := manyDataTools()
+	if got := searchNames(t, all, `{"query":"data","maxResults":3}`); len(got) != 3 {
+		t.Fatalf("maxResults 3 returned %d names", len(got))
+	}
+	if got := searchNames(t, all, `{"query":"data"}`); len(got) != 5 {
+		t.Fatalf("no maxResults returned %d names, want the default 5", len(got))
+	}
+	if got := searchNames(t, all, `{"query":"data","maxResults":50}`); len(got) != 10 {
+		t.Fatalf("maxResults 50 returned %d names, want the cap 10", len(got))
+	}
+}
+
+func TestSearchToolsReadsAQueryWithoutCaseStopWordsOrPunctuation(t *testing.T) {
+	all := []ai.Tool{
+		described("inventoryTool", "Counts items"),
+		described("otherTool", "the best tool, to be used"),
+		described("compilerTool", "Builds c++ code (fast)"),
+		described("rTool", "PRINTS REPORTS"),
+	}
+	requireStrings(t, "upper case", searchNames(t, all, `{"query":"GET INVENTORY"}`), "inventoryTool")
+	requireStrings(t, "stop words dropped", searchNames(t, all, `{"query":"the inventory, to be counted!"}`), "inventoryTool")
+	requireStrings(t, "only stop words fall back to the words themselves", searchNames(t, all, `{"query":"the"}`), "otherTool")
+	requireStrings(t, "regular expression signs are plain text", searchNames(t, all, `{"query":"c++ (fast)"}`), "compilerTool")
+	requireStrings(t, "lower case query, upper case text", searchNames(t, all, `{"query":"reports"}`), "rTool")
+	requireStrings(t, "upper case stop word dropped", searchNames(t, all, `{"query":"THE Inventory"}`), "inventoryTool")
+}
+
+func TestSearchToolsDropsTheLastWordsOfAQueryThatIsTooLong(t *testing.T) {
+	all := []ai.Tool{described("alphaword00", "first word of the query"), described("zebra", "last word of the query")}
+	var words []string
+	for i := range 30 {
+		words = append(words, fmt.Sprintf("alphaword%02d", i))
+	}
+	query := strings.Join(append(words, "zebra"), " ")
+	requireStrings(t, "names", searchNames(t, all, fmt.Sprintf(`{"query":%q}`, query)), "alphaword00")
+}
+
+func TestSearchToolsReturnsEveryToolUpToTheLimitForABlankQuery(t *testing.T) {
+	all := []ai.Tool{described("one", "first"), described("two", "second")}
+	requireStrings(t, "names", searchNames(t, all, `{"query":"  "}`), "one", "two")
+}
+
+func TestSearchToolsReturnsAnEmptyListWhenNothingMatches(t *testing.T) {
+	all := []ai.Tool{described("one", "first")}
+	search, _ := ai.SearchTools(all)
+	out, err := search.Call(t.Context(), `{"query":"zebra"}`)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+		return
+	}
+	if out != "[]" {
+		t.Fatalf("result = %q, want an empty JSON list", out)
+	}
+}
+
+func TestSearchToolsRefusesArgumentsThatAreNotJSON(t *testing.T) {
+	search, _ := ai.SearchTools([]ai.Tool{described("one", "first")})
+	_, err := search.Call(t.Context(), `{"query":`)
+	if err == nil || !strings.HasPrefix(err.Error(), "ai: search tools: arguments: ") {
+		t.Fatalf("error = %v, want one behind the ai: search tools: arguments: prefix", err)
+	}
+}
+
+func toolNames(req ai.Request) []string {
+	var names []string
+	for _, tool := range req.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+func TestSearchToolsShowsTheModelOnlyTheSearchToolAndWhatEarlierSearchesFound(t *testing.T) {
+	managed := []ai.Tool{described("weather", "Returns current weather conditions"), described("stocks", "Fetches stock price data")}
+	search, narrow := ai.SearchTools(managed)
+	always := described("clock", "Tells the time")
+	model := &scripted{replies: []ai.Reply{
+		asking(ai.ToolCall{ID: "s1", Name: ai.SearchToolName, Arguments: `{"query":"weather"}`}),
+		asking(ai.ToolCall{ID: "w1", Name: "weather", Arguments: "{}"}),
+		saying("It is sunny."),
+	}}
+	request := ai.Request{Messages: question(), Tools: append(append([]ai.Tool{always}, managed...), search)}
+	reply, err := ai.Run(t.Context(), ai.Wrap(model, narrow), request, ai.Limits{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	if got := textOf(reply.Message); got != "It is sunny." {
+		t.Fatalf("final text = %q", got)
+	}
+	if len(model.seen) != 3 {
+		t.Fatalf("model saw %d requests, want 3", len(model.seen))
+		return
+	}
+	requireStrings(t, "tools in round one", toolNames(model.seen[0]), "clock", ai.SearchToolName)
+	requireStrings(t, "tools in round two", toolNames(model.seen[1]), "clock", "weather", ai.SearchToolName)
+	requireStrings(t, "tools in round three", toolNames(model.seen[2]), "clock", "weather", ai.SearchToolName)
+	requireStrings(t, "weather result", resultsOf(model.seen[2].Messages[4]), "w1=weather ran")
+}
+
+func TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage(t *testing.T) {
+	managed := []ai.Tool{described("weather", "Returns current weather conditions"), described("stocks", "Fetches stock price data")}
+	search, narrow := ai.SearchTools(managed)
+	history := append(question(),
+		ai.Message{Role: ai.RoleTool, Parts: []ai.Part{
+			ai.ToolResult{ID: "s0", Name: ai.SearchToolName, Content: "not json"},
+			ai.ToolResult{ID: "s1", Name: "SEARCH_TOOLS", Content: `["weather","ghost"]`},
+			ai.ToolResult{ID: "x1", Name: "other", Content: `["stocks"]`},
+		}},
+		ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "and now?"}}},
+	)
+	model := &scripted{replies: []ai.Reply{saying("ok")}}
+	if _, err := ai.Run(t.Context(), ai.Wrap(model, narrow), ai.Request{Messages: history, Tools: append(managed, search)}, ai.Limits{}); err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	requireStrings(t, "tools", toolNames(model.seen[0]), "weather", ai.SearchToolName)
+}

@@ -1,0 +1,284 @@
+package db
+
+import (
+	"comptime"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"logos/rt"
+	"strings"
+	"time"
+)
+
+type ScanPlan struct {
+	Type  string
+	Names []string
+	Paths []string
+	Count int
+}
+
+func Query[T any](ctx context.Context, q Querier, query string, args ...any) ([]T, error) {
+	rows := q.QueryContext(ctx, query, args...)?
+	if rows == nil {
+		return nil, errors.New("db: query returned no rows handle")
+	}
+	defer rows.Close()?
+	cols := rows.Columns()?
+	plan := ScanPlan{Type: TypeName[T]()}
+	const if comptime.IsStruct[T]() {
+		PlanFields[T](plan.Type, &plan)?
+		plan.Count = len(plan.Names)
+	} else {
+		var probe T
+		var dests []any
+		ScanField[T](&probe, plan.Type, &dests)?
+		plan.Count = 1
+	}
+	var out []T
+	checked := false
+	for rows.Next() {
+		var row T
+		if !checked {
+			checked = true
+			CheckScan(cols, plan)?
+		}
+		ScanRow[T](&row, rows, plan)?
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: scan %s: %w", plan.Type, err)
+	}
+	return out, nil
+}
+
+func One[T any](ctx context.Context, q Querier, query string, args ...any) (found T?, err error) {
+	rows := q.QueryContext(ctx, query, args...)?
+	if rows == nil {
+		return nil, errors.New("db: query returned no rows handle")
+	}
+	defer rows.Close()?
+	cols := rows.Columns()?
+	plan := ScanPlan{Type: TypeName[T]()}
+	const if comptime.IsStruct[T]() {
+		PlanFields[T](plan.Type, &plan)?
+		plan.Count = len(plan.Names)
+	} else {
+		var probe T
+		var dests []any
+		ScanField[T](&probe, plan.Type, &dests)?
+		plan.Count = 1
+	}
+	var out T?
+	seen := false
+	for rows.Next() {
+		if seen {
+			return nil, fmt.Errorf("db: %s: query returned more than one row", plan.Type)
+		}
+		CheckScan(cols, plan)?
+		var row T
+		ScanRow[T](&row, rows, plan)?
+		out = row
+		seen = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: scan %s: %w", plan.Type, err)
+	}
+	return out, nil
+}
+
+func PlanFields[T any](prefix string, plan *ScanPlan) error {
+	const for _, f := range comptime.Fields[T]() {
+		if err := PlanField[f.Type](prefix+"."+f.Name, f.Name, f.Tag.Get("col"), plan); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func PlanField[F any](path string, name string, tag string, plan *ScanPlan) error {
+	const if comptime.IsStruct[F]() {
+		return PlanFields[F](path, plan)
+	} else {
+		var probe F
+		var dests []any
+		if err := ScanField[F](&probe, path, &dests); err != nil {
+			return err
+		}
+		column := tag
+		if column == "" {
+			column = SnakeName(name)
+		}
+		plan.Names = append(plan.Names, column)
+		plan.Paths = append(plan.Paths, path)
+		return nil
+	}
+}
+
+func ScanRow[T any](row *T, rows *sql.Rows, plan ScanPlan) error {
+	var dests []any
+	const if comptime.IsStruct[T]() {
+		ScanFields[T](row, plan.Type, &dests)?
+	} else {
+		ScanField[T](row, plan.Type, &dests)?
+	}
+	if err := rows.Scan(dests...); err != nil {
+		if cause := errors.Unwrap(err); cause != nil {
+			return cause
+		}
+		return err
+	}
+	return nil
+}
+
+func ScanFields[T any](row *T, prefix string, dests *[]any) error {
+	const for _, f := range comptime.Fields[T]() {
+		if err := ScanField[f.Type](&row.[f], prefix+"."+f.Name, dests); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ScanField[F any](dst *F, path string, dests *[]any) error {
+	const if comptime.IsStruct[F]() {
+		return ScanFields[F](dst, path, dests)
+	} else {
+		before := len(*dests)
+		AppendPlain[F](dst, path, dests)
+		AppendOption[F](dst, path, dests)
+		if len(*dests) != before+1 {
+			return fmt.Errorf("db: %s: unsupported type", path)
+		}
+		return nil
+	}
+}
+
+func AppendPlain[F any](dst *F, path string, dests *[]any) {
+	const switch F {
+	case time.Time:
+		*dests = append(*dests, &NotNullDest[time.Time]{dst: dst, path: path})
+	case []byte:
+		*dests = append(*dests, &NotNullDest[[]byte]{dst: dst, path: path})
+	case string:
+		*dests = append(*dests, &NotNullDest[string]{dst: dst, path: path})
+	case bool:
+		*dests = append(*dests, &NotNullDest[bool]{dst: dst, path: path})
+	case int:
+		*dests = append(*dests, &NotNullDest[int]{dst: dst, path: path})
+	case int8:
+		*dests = append(*dests, &NotNullDest[int8]{dst: dst, path: path})
+	case int16:
+		*dests = append(*dests, &NotNullDest[int16]{dst: dst, path: path})
+	case int32:
+		*dests = append(*dests, &NotNullDest[int32]{dst: dst, path: path})
+	case int64:
+		*dests = append(*dests, &NotNullDest[int64]{dst: dst, path: path})
+	case float32:
+		*dests = append(*dests, &NotNullDest[float32]{dst: dst, path: path})
+	case float64:
+		*dests = append(*dests, &NotNullDest[float64]{dst: dst, path: path})
+	case ~string:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	}
+}
+
+func AppendOption[F any](dst *F, path string, dests *[]any) {
+	const switch F {
+	case rt.Option[time.Time]:
+		*dests = append(*dests, &OptionDest[time.Time]{dst: dst, path: path})
+	case rt.Option[string]:
+		*dests = append(*dests, &OptionDest[string]{dst: dst, path: path})
+	case rt.Option[bool]:
+		*dests = append(*dests, &OptionDest[bool]{dst: dst, path: path})
+	case rt.Option[int16]:
+		*dests = append(*dests, &OptionDest[int16]{dst: dst, path: path})
+	case rt.Option[int32]:
+		*dests = append(*dests, &OptionDest[int32]{dst: dst, path: path})
+	case rt.Option[int64]:
+		*dests = append(*dests, &OptionDest[int64]{dst: dst, path: path})
+	case rt.Option[float32]:
+		*dests = append(*dests, &OptionDest[float32]{dst: dst, path: path})
+	case rt.Option[float64]:
+		*dests = append(*dests, &OptionDest[float64]{dst: dst, path: path})
+	}
+}
+
+func CheckScan(cols []string, plan ScanPlan) error {
+	if len(cols) != plan.Count {
+		return fmt.Errorf("db: %s has %d fields, query returned %d columns", plan.Type, plan.Count, len(cols))
+	}
+	for i, name := range plan.Names {
+		if cols[i] != name {
+			return fmt.Errorf("db: column %d is %q, field %s expects %q", i, cols[i], plan.Paths[i], name)
+		}
+	}
+	return nil
+}
+
+func TypeName[T any]() string {
+	var probe T
+	return fmt.Sprintf("%T", probe)
+}
+
+func SnakeName(name string) string {
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			if splitBefore(name, i) {
+				b.WriteByte('_')
+			}
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func splitBefore(name string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	prev := name[i-1]
+	if prev < 'A' || prev > 'Z' {
+		return true
+	}
+	return i+1 < len(name) && name[i+1] >= 'a' && name[i+1] <= 'z'
+}
+
+type NotNullDest[V any] struct {
+	dst  *V
+	path string
+}
+
+func (d *NotNullDest[V]) Scan(src any) error {
+	if src == nil {
+		return fmt.Errorf("db: NULL in non-optional %s", d.path)
+	}
+	var n sql.Null[V]
+	if err := n.Scan(src); err != nil {
+		return fmt.Errorf("db: scan %s: %w", d.path, err)
+	}
+	*d.dst = n.V
+	return nil
+}
+
+type OptionDest[V any] struct {
+	dst  *rt.Option[V]
+	path string
+}
+
+func (d *OptionDest[V]) Scan(src any) error {
+	if src == nil {
+		var none rt.Option[V]
+		*d.dst = none
+		return nil
+	}
+	var n sql.Null[V]
+	if err := n.Scan(src); err != nil {
+		return fmt.Errorf("db: scan %s: %w", d.path, err)
+	}
+	*d.dst = rt.Option[V]{Value: n.V, Present: true}
+	return nil
+}

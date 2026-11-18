@@ -1,0 +1,198 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"logos/sync"
+)
+
+const cacheCapacity = 256
+
+type stmtEntry struct {
+	query   string
+	stmt    *sql.Stmt
+	holders int
+}
+
+type stmtLRU struct {
+	entries      [cacheCapacity]stmtEntry
+	count        int
+	retired      [cacheCapacity]stmtEntry
+	retiredCount int
+}
+
+type stmtCache struct {
+	state    sync.Locked[stmtLRU]
+	closeErr sync.Locked[error]
+}
+
+func (c *stmtCache) size() int {
+	n := 0
+	c.state.WithLock(s => {
+		n = s.count
+	})
+	return n
+}
+
+func (c *stmtCache) acquire(query string) (*sql.Stmt?, bool) {
+	var hit *sql.Stmt?
+	var found bool
+	c.state.WithLock(s => {
+		for i := range s.count {
+			if s.entries[i].query == query {
+				s.entries[i].holders++
+				hit = s.entries[i].stmt
+				found = true
+				moveToMRU(s, i)
+				return
+			}
+		}
+		for i := range s.retiredCount {
+			if s.retired[i].query == query {
+				s.retired[i].holders++
+				hit = s.retired[i].stmt
+				found = true
+				return
+			}
+		}
+	})
+	return hit, found
+}
+
+func (c *stmtCache) release(query string) {
+	var unheld *sql.Stmt?
+	c.state.WithLock(s => {
+		for i := range s.count {
+			if s.entries[i].query == query {
+				s.entries[i].holders--
+				return
+			}
+		}
+		for i := range s.retiredCount {
+			if s.retired[i].query == query {
+				unheld = s.unhold(i)
+				return
+			}
+		}
+	})
+	if stmt := unheld; stmt != nil {
+		c.noteCloseError(stmt.Close())
+	}
+}
+
+func (s *stmtLRU) unhold(i int) *sql.Stmt? {
+	s.retired[i].holders--
+	if s.retired[i].holders != 0 {
+		return nil
+	}
+	stmt := s.retired[i].stmt
+	copy(s.retired[i:s.retiredCount-1], s.retired[i+1:s.retiredCount])
+	s.retiredCount--
+	return stmt
+}
+
+func (c *stmtCache) prepare(ctx context.Context, handle *sql.DB, query string) (*sql.Stmt?, error) {
+	if stmt, cached := c.acquire(query); cached {
+		return stmt, nil
+	}
+	fresh, err := handle.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("db: prepare: %w", err)
+	}
+	var stmt *sql.Stmt?
+	var evicted *sql.Stmt?
+	var raced bool
+	c.state.WithLock(s => {
+		for i := range s.count {
+			if s.entries[i].query == query {
+				s.entries[i].holders++
+				stmt = s.entries[i].stmt
+				raced = true
+				return
+			}
+		}
+		for i := range s.retiredCount {
+			if s.retired[i].query == query {
+				s.retired[i].holders++
+				stmt = s.retired[i].stmt
+				raced = true
+				return
+			}
+		}
+		room := false
+		evicted, room = s.makeRoom()
+		if !room {
+			return
+		}
+		s.entries[s.count] = stmtEntry{query: query, stmt: fresh, holders: 1}
+		s.count++
+		stmt = fresh
+	})
+	if old := evicted; old != nil {
+		c.noteCloseError(old.Close())
+	}
+	if !raced && stmt != nil {
+		return stmt, nil
+	}
+	cerr := fresh.Close()
+	if raced {
+		c.noteCloseError(cerr)
+		return stmt, nil
+	}
+	return nil, errors.Join(errors.New("db: prepared statement cache full"), cerr)
+}
+
+func (s *stmtLRU) makeRoom() (*sql.Stmt?, bool) {
+	if s.count < cacheCapacity {
+		return nil, true
+	}
+	victim := s.entries[0]
+	if victim.holders != 0 && s.retiredCount == cacheCapacity {
+		return nil, false
+	}
+	copy(s.entries[0:s.count-1], s.entries[1:s.count])
+	s.count--
+	if victim.holders == 0 {
+		return victim.stmt, true
+	}
+	s.retired[s.retiredCount] = victim
+	s.retiredCount++
+	return nil, true
+}
+
+func (c *stmtCache) noteCloseError(err error) {
+	c.closeErr.WithLock(func(e *error) {
+		*e = errors.Join(*e, err)
+	})
+}
+
+func (c *stmtCache) closeStmts() error {
+	var stmts []*sql.Stmt
+	c.state.WithLock(s => {
+		for i := range s.count {
+			stmts = append(stmts, s.entries[i].stmt)
+		}
+		for i := range s.retiredCount {
+			stmts = append(stmts, s.retired[i].stmt)
+		}
+		s.count = 0
+		s.retiredCount = 0
+	})
+	for _, stmt := range stmts {
+		c.noteCloseError(stmt.Close())
+	}
+	var all error
+	c.closeErr.WithLock(func(e *error) {
+		all = *e
+		*e = nil
+	})
+	return all
+}
+
+func moveToMRU(s *stmtLRU, i int) {
+	entry := s.entries[i]
+	copy(s.entries[i:s.count-1], s.entries[i+1:s.count])
+	s.entries[s.count-1] = entry
+}

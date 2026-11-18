@@ -1,0 +1,10 @@
+package ai
+
+import "slices"
+
+func Wrap(m Model, layers ...Layer) Model {
+	for _, layer := range slices.Backward(layers) {
+		m = layer(m)
+	}
+	return m
+}

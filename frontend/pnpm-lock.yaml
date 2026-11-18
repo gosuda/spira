@@ -175,6 +175,9 @@ importers:
 
   .:
     dependencies:
+      htmx-ext-sse:
+        specifier: ^2.2.4
+        version: 2.2.4
       htmx.org:
         specifier: ^2.0.11
         version: 2.0.11
@@ -858,6 +861,9 @@ packages:
 
   html-entities@2.3.3:
     resolution: {integrity: sha512-DV5Ln36z34NNTDgnz0EWGBLZENelNAtkiFA4kyNOG2tDI6Mz1uSWiq1wAKdyjnJwyDiDO7Fa2SO1CTxPXL8VxA==}
+
+  htmx-ext-sse@2.2.4:
+    resolution: {integrity: sha512-LJmxVhykyflBWgh5PvbRidcyuqMHlgfajmmzumvKctv9puvsufeH6OaejSMZTNTnEI8O2wXXn4ZZtBdpEMqmEQ==}
 
   htmx.org@2.0.11:
     resolution: {integrity: sha512-Thx/WtpeOQqSrqBCw/A1cwGJGg4UrVa3+sW0GmrM3p4gJgO89ecH4qtbnyzDDWFvBTqjnIMCgELTNt636dtamA==}
@@ -1713,6 +1719,10 @@ snapshots:
       - utf-8-validate
 
   html-entities@2.3.3: {}
+
+  htmx-ext-sse@2.2.4:
+    dependencies:
+      htmx.org: 2.0.11
 
   htmx.org@2.0.11: {}
 

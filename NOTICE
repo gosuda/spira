@@ -1,0 +1,28 @@
+spira
+Copyright 2026 metaphorics (metaphoric-dev)
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes code and test cases translated from Spring AI
+(https://github.com/spring-projects/spring-ai), revision
+4cce4caa9653092624b20ae1113633b3ad97d256.
+Copyright 2023-present the original author or authors.
+Licensed under the Apache License, Version 2.0.
+Spring AI ships no NOTICE file at that revision.
+Translated units:
+- ai/collect.lgo, from
+  spring-ai-model/src/main/java/org/springframework/ai/chat/model/MessageAggregator.java
+- ai/collect_test.lgo, from
+  spring-ai-model/src/test/java/org/springframework/ai/chat/model/MessageAggregatorTests.java
+- ai/run.lgo, from
+  spring-ai-model/src/main/java/org/springframework/ai/model/tool/DefaultToolCallingManager.java,
+  ToolCallLimits.java and ToolCallDecisions.java in that directory, and
+  spring-ai-client-chat/src/main/java/org/springframework/ai/chat/client/advisor/ToolCallingAdvisor.java
+- ai/run_test.lgo, from
+  spring-ai-model/src/test/java/org/springframework/ai/model/tool/DefaultToolCallingManagerDecisionsTests.java
+  and DefaultToolCallingManagerTest.java in that directory
+- ai/search.lgo, from
+  spring-ai-tool-search-tool/src/main/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndex.java
+  and advisors/spring-ai-tool-search-advisor/src/main/java/org/springframework/ai/chat/client/advisor/toolsearch/ToolSearchToolCallingAdvisor.java
+- ai/search_test.lgo, from
+  spring-ai-tool-search-tool/src/test/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndexTests.java

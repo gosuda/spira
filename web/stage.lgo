@@ -1,0 +1,125 @@
+package web
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+var RequestIDKey = NewKey[string]("web.request-id")
+
+func Defaults() []Stage {
+	return []Stage{Recover(), RequestID()}
+}
+
+func Recover() Stage {
+	return func(next Handler) Handler {
+		return func(ctx *Context) (Reply, error) {
+			return guarded(ctx, next)
+		}
+	}
+}
+
+func guarded(ctx *Context, next Handler) (Reply, error) {
+	defer func() {
+		if p := recover(); p != nil {
+			slog.Error("web: panic recovered", "value", fmt.Sprint(p))
+			ctx.root.answerProblem(ctx, internalProblem())
+		}
+	}()
+	_, err := next(ctx)
+	return nil, err
+}
+
+func RequestID() Stage {
+	return func(next Handler) Handler {
+		return func(ctx *Context) (Reply, error) {
+			id, err := newRequestID(ctx.Request.Header.Get("X-Request-Id"))
+			if err != nil {
+				return nil, err
+			}
+			ctx.writer.Header().Set("X-Request-Id", id)
+			Set(ctx, RequestIDKey, id)
+			return next(ctx)
+		}
+	}
+}
+
+func newRequestID(in string) (string, error) {
+	if validRequestID(in) {
+		return in, nil
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("web: request id entropy: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func validRequestID(v string) bool {
+	if len(v) < 1 || len(v) > 64 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if !requestIDByte(v[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func requestIDByte(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '.' || c == '_' || c == '-':
+		return true
+	}
+	return false
+}
+
+func AccessLog(log *slog.Logger) Stage {
+	return func(next Handler) Handler {
+		return func(ctx *Context) (Reply, error) {
+			start := time.Now()
+			_, err := next(ctx)
+			log.Info("web: request",
+				"method", ctx.Request.Method,
+				"route", routeName(ctx.Request),
+				"status", ctx.Status(),
+				"duration", time.Since(start).String(),
+				"request_id", ctx.writer.Header().Get("X-Request-Id"),
+			)
+			return nil, err
+		}
+	}
+}
+
+func routeName(req *http.Request) string {
+	if req.Pattern != "" {
+		return req.Pattern
+	}
+	return req.URL.Path
+}
+
+func (c *Context) Status() int {
+	return c.writer.status
+}
+
+var cacheControlKey = NewKey[string]("web.cache-control")
+
+func CacheControl(directive string) Stage {
+	return func(next Handler) Handler {
+		return func(ctx *Context) (Reply, error) {
+			Set(ctx, cacheControlKey, directive)
+			return next(ctx)
+		}
+	}
+}

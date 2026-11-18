@@ -1,0 +1,314 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-model/src/main/java/org/springframework/ai/model/tool/DefaultToolCallingManager.java,
+// ToolCallLimits.java and ToolCallDecisions.java in the same directory, and
+// spring-ai-client-chat/src/main/java/org/springframework/ai/chat/client/advisor/ToolCallingAdvisor.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+const DenyMessage = "The user did not allow this tool call."
+
+type Decision struct {
+	Call string
+	Deny string?
+}
+
+type Limits struct {
+	PerTool int = 40
+	PerTurn int = 150
+}
+
+type ConfirmError struct {
+	Waiting  []string
+	Messages []Message
+}
+
+func (e *ConfirmError) Error() string {
+	return "ai: run: tool calls wait for a decision: " + strings.Join(e.Waiting, ", ")
+}
+
+type LimitError struct {
+	Tool     string?
+	Limit    int
+	Messages []Message
+}
+
+func (e *LimitError) Error() string {
+	return "ai: run: " + e.text()
+}
+
+func (e *LimitError) text() string {
+	if tool := e.Tool; tool != nil {
+		return fmt.Sprintf("Tool call limit (%d) exceeded for tool '%s'. No further calls to this tool are allowed in this turn.", e.Limit, tool)
+	}
+	return fmt.Sprintf("Total tool call limit (%d) exceeded for this turn. No further tool calls are allowed.", e.Limit)
+}
+
+func Run(ctx context.Context, m Model, req Request, limits Limits) (Reply, error) {
+	messages := slices.Clone(req.Messages)
+	decisions := req.Decisions
+	var usage Usage
+	var last Reply
+	for {
+		calls := pendingCalls(messages)
+		if len(calls) == 0 {
+			round := req
+			round.Messages = messages
+			round.Decisions = nil
+			reply, err := m.Chat(ctx, round)
+			if err != nil {
+				return Reply{}, fmt.Errorf("ai: run: %w", err)
+			}
+			usage = usage.plus(reply.Usage)
+			last = reply
+			calls = toolCalls(reply.Message)
+			if len(calls) == 0 {
+				reply.Usage = usage
+				return reply, nil
+			}
+			messages = append(messages, reply.Message)
+		}
+		b := batch{tools: req.Tools, limits: limits, decisions: decisions, calls: calls, history: messages}
+		results, err := b.run(ctx)
+		if err != nil {
+			return Reply{}, err
+		}
+		decisions = nil
+		messages = append(messages, results)
+		if b.direct && b.ran > 0 && !b.denied {
+			return Reply{Message: results, Finish: FinishCompleted, Usage: usage, ID: last.ID, Model: last.Model}, nil
+		}
+	}
+}
+
+func (u Usage) plus(v Usage) Usage {
+	return Usage{Input: u.Input + v.Input, Output: u.Output + v.Output, Total: u.Total + v.Total}
+}
+
+func toolCalls(m Message) []ToolCall {
+	var calls []ToolCall
+	for _, part := range m.Parts {
+		if call, isCall := part.(ToolCall); isCall {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+func pendingCalls(messages []Message) []ToolCall {
+	if len(messages) == 0 {
+		return nil
+	}
+	last := messages[len(messages)-1]
+	if last.Role != RoleAssistant {
+		return nil
+	}
+	return toolCalls(last)
+}
+
+type batch struct {
+	tools     []Tool
+	limits    Limits
+	decisions []Decision
+	calls     []ToolCall
+	history   []Message
+	counts    map[string]int
+	total     int
+	results   []Part
+	direct    bool
+	ran       int
+	denied    bool
+}
+
+func (b *batch) run(ctx context.Context) (Message, error) {
+	keys := callKeys(b.calls)
+	if len(b.decisions) == 0 {
+		if waiting := b.waiting(keys); len(waiting) > 0 {
+			return Message{}, &ConfirmError{Waiting: waiting, Messages: b.history}
+		}
+	} else if err := b.checkDecisions(keys); err != nil {
+		return Message{}, err
+	}
+	b.counts, b.total = priorCalls(b.history)
+	b.direct = true
+	for i, call := range b.calls {
+		if err := b.one(ctx, call, keys[i]); err != nil {
+			return Message{}, err
+		}
+	}
+	return Message{Role: RoleTool, Parts: b.results}, nil
+}
+
+func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
+	if deny := b.denial(key); deny != nil {
+		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: deny})
+		b.denied = true
+		return nil
+	}
+	b.total++
+	count := (b.counts[call.Name] ?? 0) + 1
+	b.counts[call.Name] = count
+	if breach := b.limits.breach(call.Name, count, b.total); breach != nil {
+		b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: breach.text()})
+		breach.Messages = append(slices.Clone(b.history), Message{Role: RoleTool, Parts: b.results})
+		return breach
+	}
+	tool := toolNamed(b.tools, call.Name)
+	if tool == nil {
+		return fmt.Errorf("ai: run: no tool named %q", call.Name)
+	}
+	b.direct = b.direct && tool.Direct
+	b.ran++
+	content, err := callTool(ctx, tool, call)
+	if err != nil {
+		return err
+	}
+	b.results = append(b.results, ToolResult{ID: call.ID, Name: call.Name, Content: content})
+	return nil
+}
+
+func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
+	arguments := call.Arguments
+	if strings.TrimSpace(arguments) == "" {
+		arguments = "{}"
+	}
+	content, err := tool.Call(ctx, arguments)
+	if cerr := ctx.Err(); cerr != nil {
+		return "", fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr)
+	}
+	if err == nil {
+		return content, nil
+	}
+	if text := err.Error(); strings.TrimSpace(text) != "" {
+		return text, nil
+	}
+	return "tool " + call.Name + " failed", nil
+}
+
+func (l Limits) breach(tool string, count int, total int) *LimitError? {
+	if count > l.PerTool {
+		return &LimitError{Tool: tool, Limit: l.PerTool}
+	}
+	if total > l.PerTurn {
+		return &LimitError{Limit: l.PerTurn}
+	}
+	return nil
+}
+
+func priorCalls(history []Message) (map[string]int, int) {
+	start := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == RoleUser {
+			start = i
+			break
+		}
+	}
+	counts := map[string]int{}
+	total := 0
+	for _, message := range history[start:] {
+		for _, part := range message.Parts {
+			if result, isResult := part.(ToolResult); isResult {
+				counts[result.Name] = (counts[result.Name] ?? 0) + 1
+				total++
+			}
+		}
+	}
+	return counts, total
+}
+
+func toolNamed(tools []Tool, name string) Tool? {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return tool
+		}
+	}
+	return nil
+}
+
+func callKeys(calls []ToolCall) []string {
+	keys := make([]string, len(calls))
+	for i, call := range calls {
+		keys[i] = "#" + strconv.Itoa(i)
+		if ownID(call.ID, calls) {
+			keys[i] = call.ID
+		}
+	}
+	return keys
+}
+
+func ownID(id string, calls []ToolCall) bool {
+	if strings.TrimSpace(id) == "" || strings.HasPrefix(id, "#") {
+		return false
+	}
+	holders := 0
+	for _, call := range calls {
+		if call.ID == id {
+			holders++
+		}
+	}
+	return holders == 1
+}
+
+func (b *batch) waiting(keys []string) []string {
+	var waiting []string
+	for i, call := range b.calls {
+		if tool := toolNamed(b.tools, call.Name); tool != nil && tool.Confirm {
+			waiting = append(waiting, keys[i])
+		}
+	}
+	return waiting
+}
+
+func (b *batch) denial(key string) string? {
+	for _, decision := range b.decisions {
+		if decision.Call != key {
+			continue
+		}
+		deny := decision.Deny
+		if deny == nil {
+			return nil
+		}
+		if strings.TrimSpace(deny) == "" {
+			return DenyMessage
+		}
+		return deny
+	}
+	return nil
+}
+
+func (b *batch) checkDecisions(keys []string) error {
+	decided := map[string]bool{}
+	for _, decision := range b.decisions {
+		if !slices.Contains(keys, decision.Call) {
+			return fmt.Errorf("ai: run: no tool call has the key '%s'; the reply's tool call keys: %v", decision.Call, keys)
+		}
+		if decided[decision.Call] ?? false {
+			return fmt.Errorf("ai: run: two decisions name the tool call '%s'", decision.Call)
+		}
+		decided[decision.Call] = true
+	}
+	var missing []string
+	for i, key := range keys {
+		if !(decided[key] ?? false) {
+			missing = append(missing, key)
+			continue
+		}
+		name := b.calls[i].Name
+		if b.denial(key) == nil && toolNamed(b.tools, name) == nil {
+			return fmt.Errorf("ai: run: the request does not carry the tool '%s' of the allowed call '%s'", name, key)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("ai: run: every tool call of the reply needs a decision; missing: %v", missing)
+	}
+	return nil
+}

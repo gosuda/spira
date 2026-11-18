@@ -1,0 +1,642 @@
+package db_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/db"
+
+	_ "modernc.org/sqlite"
+)
+
+const insertThing = "INSERT INTO things (n) VALUES (?)"
+
+const cacheLimit = 256
+
+func openPool(t *testing.T) *db.Pool {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", "_", ")", "_").Replace(t.Name())
+	pool, err := db.Open("sqlite", fmt.Sprintf("file:spira_%s?mode=memory&cache=shared", key))
+	if err != nil {
+		panic(fmt.Sprintf("db_test: open %s: %v", key, err))
+	}
+	if pool == nil {
+		panic("db_test: Open returned no pool")
+	}
+	if serr := pool.Start(t.Context()); serr != nil {
+		panic(fmt.Sprintf("db_test: start %s: %v", key, serr))
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func createThings(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	if _, err := db.Exec(t.Context(), pool, "CREATE TABLE things (n integer not null)"); err != nil {
+		panic(fmt.Sprintf("db_test: create: %v", err))
+	}
+}
+
+func insertThingRow(t *testing.T, q db.Querier) {
+	t.Helper()
+	if _, err := db.Exec(t.Context(), q, insertThing, 7); err != nil {
+		panic(fmt.Sprintf("db_test: insert: %v", err))
+	}
+}
+
+func countThings(t *testing.T, pool *db.Pool) int {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), "SELECT COUNT(*) FROM things")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: count: %v", err))
+	}
+	if rows == nil {
+		panic("db_test: count returned no rows handle")
+	}
+	defer closeRows(t, rows)
+	if !rows.Next() {
+		t.Fatal("count: query returned no row")
+	}
+	var n int
+	if serr := rows.Scan(&n); serr != nil {
+		t.Fatalf("scan: %v", serr)
+	}
+	return n
+}
+
+func closeRows(t *testing.T, rows *sql.Rows?) {
+	if rows == nil {
+		return
+	}
+	if err := rows.Close(); err != nil {
+		t.Errorf("close: %v", err)
+	}
+}
+
+func TestInTxCommitsOnSuccess(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	saved, err := db.InTx[int](t.Context(), pool, func(tx *db.Tx) (int, error) {
+		insertThingRow(t, tx)
+		return 7, nil
+	})
+	if err != nil {
+		panic(fmt.Sprintf("db_test: InTx: %v", err))
+	}
+	if saved != 7 {
+		t.Fatalf("InTx result = %d, want 7", saved)
+	}
+	if n := countThings(t, pool); n != 1 {
+		t.Fatalf("rows after commit = %d, want 1", n)
+	}
+}
+
+func TestInTxRollsBackOnError(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	boom := errors.New("boom")
+	_, err := db.InTx[int](t.Context(), pool, func(tx *db.Tx) (int, error) {
+		insertThingRow(t, tx)
+		return 0, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("InTx error = %v, want boom", err)
+	}
+	if n := countThings(t, pool); n != 0 {
+		t.Fatalf("rows after error = %d, want 0", n)
+	}
+}
+
+func TestInTxRollsBackOnPanic(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	recovered := runPanickingTx(t, pool)
+	if recovered == nil {
+		t.Fatal("InTx swallowed the work panic")
+	}
+	if n := countThings(t, pool); n != 0 {
+		t.Fatalf("rows after panic = %d, want 0", n)
+	}
+}
+
+func runPanickingTx(t *testing.T, pool *db.Pool) (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	_, err := db.InTx[int](t.Context(), pool, func(tx *db.Tx) (int, error) {
+		insertThingRow(t, tx)
+		panic("boom")
+	})
+	if err != nil {
+		t.Errorf("InTx returned an error alongside the panic: %v", err)
+	}
+	return recovered
+}
+
+func TestStatementCacheNeverExceedsCapacity(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	for i := range 1000 {
+		runCount(t, pool, fmt.Sprintf("SELECT COUNT(*) FROM things WHERE n <> %d", i))
+	}
+	if got := pool.Prepared(); got != cacheLimit {
+		t.Fatalf("cache holds %d statements, want %d", got, cacheLimit)
+	}
+	runCount(t, pool, "SELECT COUNT(*) FROM things WHERE n <> 0")
+	if got := pool.Prepared(); got != cacheLimit {
+		t.Fatalf("cache holds %d statements after reuse, want %d", got, cacheLimit)
+	}
+}
+
+func runCount(t *testing.T, pool *db.Pool, query string) {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), query)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query %q: %v", query, err))
+	}
+	if rows == nil {
+		panic(fmt.Sprintf("db_test: query %q returned no rows handle", query))
+	}
+	defer closeRows(t, rows)
+	if !rows.Next() {
+		t.Fatalf("query %q returned no row", query)
+	}
+}
+
+func TestInExpandsTheMarker(t *testing.T) {
+	cases := []struct {
+		query string
+		name  string
+		count int
+		want  string
+	}{
+		{"SELECT * FROM t WHERE id IN (/*SLICE:ids*/?)", "ids", 3, "/*db:nocache*/SELECT * FROM t WHERE id IN (?,?,?)"},
+		{"SELECT * FROM t WHERE id IN (/*SLICE:ids*/?)", "ids", 1, "/*db:nocache*/SELECT * FROM t WHERE id IN (?)"},
+		{"SELECT * FROM t WHERE id IN (/*SLICE:ids*/?)", "ids", 0, "/*db:nocache*/SELECT * FROM t WHERE id IN (NULL)"},
+		{"UPDATE t SET a = ? WHERE b IN (/*SLICE:keys*/?)", "keys", 2, "/*db:nocache*/UPDATE t SET a = ? WHERE b IN (?,?)"},
+		{"SELECT * FROM t WHERE a IN (/*SLICE:x*/?) AND b IN (/*SLICE:y*/?)", "y", 2, "/*db:nocache*/SELECT * FROM t WHERE a IN (/*SLICE:x*/?) AND b IN (?,?)"},
+		{"SELECT * FROM t", "ids", 2, "/*db:nocache*/SELECT * FROM t"},
+	}
+	for _, c := range cases {
+		got := db.In(c.query, c.name, c.count)
+		if got != c.want {
+			t.Errorf("In(%q, %q, %d) = %q, want %q", c.query, c.name, c.count, got, c.want)
+		}
+	}
+}
+
+func TestInRunsThroughThePoolUncached(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	ctx := t.Context()
+	for _, n := range []int{5, 7, 9} {
+		if _, err := db.Exec(ctx, pool, insertThing, n); err != nil {
+			panic(fmt.Sprintf("db_test: insert %d: %v", n, err))
+		}
+	}
+	before := pool.Prepared()
+	matched := db.In("SELECT n FROM things WHERE n IN (/*SLICE:ns*/?) ORDER BY n", "ns", 2)
+	assertQueryResult(t, pool, matched, []any{5, 7})
+	empty := db.In("SELECT n FROM things WHERE n IN (/*SLICE:ns*/?)", "ns", 0)
+	assertQueryResult(t, pool, empty, nil)
+	if got := pool.Prepared(); got != before {
+		t.Fatalf("cache holds %d statements after In queries, want %d", got, before)
+	}
+}
+
+func assertQueryResult(t *testing.T, pool *db.Pool, query string, args []any) {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), query, args...)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query: %v", err))
+	}
+	if rows == nil {
+		panic("db_test: query returned no rows handle")
+	}
+	defer closeRows(t, rows)
+	seen := 0
+	for rows.Next() {
+		var n int
+		if serr := rows.Scan(&n); serr != nil {
+			t.Fatalf("scan: %v", serr)
+		}
+		if seen < len(args) {
+			if want, ok := args[seen].(int); ok && n != want {
+				t.Fatalf("row %d = %d, want %d", seen, n, want)
+			}
+		}
+		seen++
+	}
+	if seen != len(args) {
+		t.Fatalf("query returned %d rows, want %d", seen, len(args))
+	}
+}
+
+func TestOpenRejectsUnknownDriver(t *testing.T) {
+	_, err := db.Open("oracle", "x")
+	if err == nil {
+		t.Fatal("Open accepted the unknown driver oracle")
+	}
+	if err.Error() != `db: unknown driver "oracle"` {
+		t.Fatalf("error = %q, want db: unknown driver \"oracle\"", err.Error())
+	}
+}
+
+func TestOpenRejectsMysqlWithoutParseTime(t *testing.T) {
+	_, err := db.Open("mysql", "user:pass@/dbname")
+	if err == nil {
+		t.Fatal("Open accepted a mysql DSN without parseTime=true")
+	}
+	if err.Error() != "db: mysql DSN needs parseTime=true" {
+		t.Fatalf("error = %q, want db: mysql DSN needs parseTime=true", err.Error())
+	}
+}
+
+func TestDialectOfMatchesEachDriverName(t *testing.T) {
+	cases := []struct {
+		driver string
+		dsn    string
+		want   string
+	}{
+		{"sqlite", "file:x?mode=memory", "sqlite"},
+		{"pgx", "postgres://localhost/db", "postgres"},
+		{"postgres", "postgres://localhost/db", "postgres"},
+		{"mysql", "user@/db?parseTime=true", "mysql"},
+		{"sqlserver", "sqlserver://localhost?database=db", "mssql"},
+	}
+	for _, c := range cases {
+		d, err := db.DialectOf(c.driver, c.dsn)
+		if err != nil {
+			panic(fmt.Sprintf("db_test: DialectOf(%s): %v", c.driver, err))
+		}
+		if got := dialectName(d); got != c.want {
+			t.Fatalf("DialectOf(%s) = %s, want %s", c.driver, got, c.want)
+		}
+	}
+	if _, err := db.DialectOf("mysql", "user@/db"); err == nil || err.Error() != "db: mysql DSN needs parseTime=true" {
+		t.Fatalf("DialectOf(mysql, missing parseTime) error = %v", err)
+	}
+	if _, err := db.DialectOf("oracle", "x"); err == nil || err.Error() != `db: unknown driver "oracle"` {
+		t.Fatalf("DialectOf(oracle) error = %v", err)
+	}
+}
+
+func dialectName(d db.Dialect) string {
+	switch d.(type) {
+	case db.SQLite:
+		return "sqlite"
+	case db.Postgres:
+		return "postgres"
+	case db.MySQL:
+		return "mysql"
+	case db.MSSQL:
+		return "mssql"
+	case nil:
+		return "nil"
+	}
+	return "unknown"
+}
+
+type productCode string
+
+type plainRow struct {
+	ID   int64       `col:"id"`
+	N    int         `col:"n"`
+	I8   int8        `col:"i8"`
+	I16  int16       `col:"i16"`
+	I32  int32       `col:"i32"`
+	F32  float32     `col:"f32"`
+	F64  float64     `col:"f64"`
+	S    string      `col:"s"`
+	Code productCode `col:"code"`
+	B    []byte      `col:"b"`
+	Yes  bool        `col:"yes"`
+}
+
+const createPlain = `CREATE TABLE plain (
+	id INTEGER PRIMARY KEY,
+	n INTEGER,
+	i8 INTEGER,
+	i16 INTEGER,
+	i32 INTEGER,
+	f32 REAL,
+	f64 REAL,
+	s TEXT,
+	code TEXT,
+	b BLOB,
+	yes INTEGER
+)`
+
+const insertPlain = `INSERT INTO plain (id, n, i8, i16, i32, f32, f64, s, code, b, yes)
+	VALUES (1, 41, -3, 300, 70000, 2.5, 3.125, 'left', 'SKU-1', x'6279746573', 1)`
+
+const selectPlain = `SELECT id, n, i8, i16, i32, f32, f64, s, code, b, yes FROM plain`
+
+func mustExec(t *testing.T, q db.Querier, statement string) {
+	t.Helper()
+	if _, err := db.Exec(t.Context(), q, statement); err != nil {
+		panic(fmt.Sprintf("db_test: exec %q: %v", statement, err))
+	}
+}
+
+func readPlainRaw(t *testing.T, pool *db.Pool) plainRow {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), selectPlain)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: raw query: %v", err))
+	}
+	if rows == nil {
+		panic("db_test: raw query returned no rows handle")
+	}
+	defer closeRows(t, rows)
+	if !rows.Next() {
+		t.Fatal("raw query returned no row")
+	}
+	var raw plainRow
+	if serr := rows.Scan(&raw.ID, &raw.N, &raw.I8, &raw.I16, &raw.I32, &raw.F32, &raw.F64, &raw.S, &raw.Code, &raw.B, &raw.Yes); serr != nil {
+		t.Fatalf("raw scan: %v", serr)
+	}
+	return raw
+}
+
+func plainDiff(got plainRow, want plainRow) error {
+	if got.ID != want.ID || got.N != want.N || got.I8 != want.I8 || got.I16 != want.I16 || got.I32 != want.I32 {
+		return fmt.Errorf("int columns = %+v, want %+v", got, want)
+	}
+	if got.F32 != want.F32 || got.F64 != want.F64 || got.S != want.S || string(got.Code) != string(want.Code) || got.Yes != want.Yes {
+		return fmt.Errorf("value columns = %+v, want %+v", got, want)
+	}
+	if string(got.B) != string(want.B) {
+		return fmt.Errorf("blob = %q, want %q", got.B, want.B)
+	}
+	return nil
+}
+
+func TestQueryScansEveryPlainKind(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, createPlain)
+	mustExec(t, pool, insertPlain)
+	rows, err := db.Query[plainRow](t.Context(), pool, selectPlain)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query plain: %v", err))
+	}
+	if len(rows) != 1 {
+		t.Fatalf("Query returned %d rows, want 1", len(rows))
+	}
+	if diff := plainDiff(rows[0], readPlainRaw(t, pool)); diff != nil {
+		t.Fatal(diff)
+	}
+}
+
+type pairRow struct {
+	A string `col:"a"`
+	B string `col:"b"`
+}
+
+func pairPool(t *testing.T) *db.Pool {
+	t.Helper()
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE pairs (a TEXT, b TEXT)")
+	mustExec(t, pool, "INSERT INTO pairs (a, b) VALUES ('x', 'y')")
+	return pool
+}
+
+func TestQueryRejectsWrongColumnOrder(t *testing.T) {
+	pool := pairPool(t)
+	_, err := db.Query[pairRow](t.Context(), pool, "SELECT b, a FROM pairs")
+	want := `db: column 0 is "b", field db_test.pairRow.A expects "a"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestQueryRejectsExtraColumn(t *testing.T) {
+	pool := pairPool(t)
+	_, err := db.Query[pairRow](t.Context(), pool, "SELECT a, b, a AS c FROM pairs")
+	want := "db: db_test.pairRow has 2 fields, query returned 3 columns"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestQueryRejectsMissingColumn(t *testing.T) {
+	pool := pairPool(t)
+	_, err := db.Query[pairRow](t.Context(), pool, "SELECT a FROM pairs")
+	want := "db: db_test.pairRow has 2 fields, query returned 1 columns"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+type strictRow struct {
+	ID int64  `col:"id"`
+	S  string `col:"s"`
+}
+
+func TestQueryRejectsNullInNonOptional(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE strict (id INTEGER PRIMARY KEY, s TEXT)")
+	mustExec(t, pool, "INSERT INTO strict (id, s) VALUES (1, NULL)")
+	_, err := db.Query[strictRow](t.Context(), pool, "SELECT id, s FROM strict")
+	want := "db: NULL in non-optional db_test.strictRow.S"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+type innerRow struct {
+	B int    `col:"b"`
+	C string `col:"c"`
+}
+
+type outerRow struct {
+	A     string  `col:"a"`
+	Inner innerRow
+	D     bool    `col:"d"`
+}
+
+func nestedPool(t *testing.T) *db.Pool {
+	t.Helper()
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE nested (a TEXT, b INTEGER, c TEXT, d INTEGER)")
+	mustExec(t, pool, "INSERT INTO nested (a, b, c, d) VALUES ('x', 7, 'y', 1)")
+	return pool
+}
+
+func TestQueryFlattensNestedStructs(t *testing.T) {
+	pool := nestedPool(t)
+	got, err := db.Query[outerRow](t.Context(), pool, "SELECT a, b, c, d FROM nested")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query nested: %v", err))
+	}
+	if len(got) != 1 {
+		t.Fatalf("Query returned %d rows, want 1", len(got))
+	}
+	rows, rerr := pool.QueryContext(t.Context(), "SELECT a, b, c, d FROM nested")
+	if rerr != nil {
+		panic(fmt.Sprintf("db_test: raw query: %v", rerr))
+	}
+	if rows == nil {
+		panic("db_test: raw query returned no rows handle")
+	}
+	defer closeRows(t, rows)
+	if !rows.Next() {
+		t.Fatal("raw query returned no row")
+	}
+	var a string
+	var b int
+	var c string
+	var d bool
+	if serr := rows.Scan(&a, &b, &c, &d); serr != nil {
+		t.Fatalf("raw scan: %v", serr)
+	}
+	if got[0].A != a || got[0].Inner.B != b || got[0].Inner.C != c || got[0].D != d {
+		t.Fatalf("nested scan = %+v, want a=%q b=%d c=%q d=%v", got[0], a, b, c, d)
+	}
+}
+
+func TestQueryRejectsWrongNestedOrder(t *testing.T) {
+	pool := nestedPool(t)
+	_, err := db.Query[outerRow](t.Context(), pool, "SELECT a, c, b, d FROM nested")
+	want := `db: column 1 is "c", field db_test.outerRow.Inner.B expects "b"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestQueryScansScalarColumns(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	insertThingRow(t, pool)
+	nums, err := db.Query[int64](t.Context(), pool, "SELECT n FROM things")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query int64: %v", err))
+	}
+	if len(nums) != 1 || nums[0] != 7 {
+		t.Fatalf("Query int64 = %v, want [7]", nums)
+	}
+	if n := countThings(t, pool); n != 1 {
+		t.Fatalf("count = %d, want 1", n)
+	}
+	words, werr := db.Query[string](t.Context(), pool, "SELECT CAST(n AS TEXT) FROM things")
+	if werr != nil {
+		panic(fmt.Sprintf("db_test: query string: %v", werr))
+	}
+	if len(words) != 1 || words[0] != "7" {
+		t.Fatalf("Query string = %v, want [7]", words)
+	}
+}
+
+func TestOneReturnsAbsentWithoutARow(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	got, err := db.One[int64](t.Context(), pool, "SELECT n FROM things")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: one absent: %v", err))
+	}
+	if got != nil {
+		t.Fatalf("One = %v, want absent", got)
+	}
+}
+
+func TestOneReturnsTheOnlyRow(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	insertThingRow(t, pool)
+	got, err := db.One[int64](t.Context(), pool, "SELECT n FROM things")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: one row: %v", err))
+	}
+	if got == nil {
+		t.Fatal("One returned no row")
+	}
+	if value := got ?? 0; value != 7 {
+		t.Fatalf("One = %d, want 7", value)
+	}
+}
+
+func TestOneRejectsTwoRows(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	insertThingRow(t, pool)
+	insertThingRow(t, pool)
+	_, err := db.One[int64](t.Context(), pool, "SELECT n FROM things")
+	want := "db: int64: query returned more than one row"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+type mapRow struct {
+	ID int64             `col:"id"`
+	M  map[string]string `col:"m"`
+}
+
+func TestQueryRejectsUnsupportedFieldBeforeRows(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE maps (id INTEGER, m TEXT)")
+	_, err := db.Query[mapRow](t.Context(), pool, "SELECT id, m FROM maps")
+	want := "db: db_test.mapRow.M: unsupported type"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestQueryServesSixteenConcurrentReaders(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, createPlain)
+	mustExec(t, pool, insertPlain)
+	want := readPlainRaw(t, pool)
+	read := func() error {
+		rows, err := db.Query[plainRow](t.Context(), pool, selectPlain)
+		if err != nil {
+			return fmt.Errorf("query: %w", err)
+		}
+		if len(rows) != 1 {
+			return fmt.Errorf("query returned %d rows, want 1", len(rows))
+		}
+		return plainDiff(rows[0], want)
+	}
+	spawn := func() error {
+		go group (t.Context(), limit = 16) {
+			for range 16 {
+				go { read()? }
+			}
+		}
+		return nil
+	}
+	if err := spawn(); err != nil {
+		t.Fatalf("concurrent readers: %v", err)
+	}
+}
+
+type snakeRow struct {
+	ProductID  int64
+	OrderTotal float64
+}
+
+func TestQueryExpectsSnakeCaseWithoutTag(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE snake (product_id INTEGER, order_total REAL)")
+	mustExec(t, pool, "INSERT INTO snake (product_id, order_total) VALUES (9, 4.5)")
+	got, err := db.Query[snakeRow](t.Context(), pool, "SELECT product_id, order_total FROM snake")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query snake: %v", err))
+	}
+	if len(got) != 1 || got[0].ProductID != 9 || got[0].OrderTotal != 4.5 {
+		t.Fatalf("Query = %+v, want one row 9/4.5", got)
+	}
+	_, aerr := db.Query[snakeRow](t.Context(), pool, "SELECT order_total, product_id FROM snake")
+	want := `db: column 0 is "order_total", field db_test.snakeRow.ProductID expects "product_id"`
+	if aerr == nil || aerr.Error() != want {
+		t.Fatalf("error = %v, want %q", aerr, want)
+	}
+}

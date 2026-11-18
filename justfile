@@ -1,4 +1,4 @@
-logos_root := env_var_or_default("LOGOS_ROOT", "/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-dogfood")
+logos_root := env_var_or_default("LOGOS_ROOT", "/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip")
 upstream_go := env_var_or_default("UPSTREAM_GO", "/home/linuxbrew/.linuxbrew/bin/go")
 
 export GOROOT := logos_root

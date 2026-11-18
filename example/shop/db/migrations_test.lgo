@@ -1,0 +1,339 @@
+package shopdb_test
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/db"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/migrate"
+
+	_ "modernc.org/sqlite"
+)
+
+func dsnFor(t *testing.T) string {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", "_", ")", "_", "$", "_").Replace(t.Name())
+	return fmt.Sprintf("file:spira_shopdb_%s?mode=memory&cache=shared&_pragma=foreign_keys(1)", key)
+}
+
+func openPool(t *testing.T) *db.Pool {
+	t.Helper()
+	pool, err := db.Open("sqlite", dsnFor(t))
+	if err != nil {
+		panic(fmt.Sprintf("shopdb_test: open %s: %v", t.Name(), err))
+	}
+	if pool == nil {
+		panic("shopdb_test: Open returned no pool")
+	}
+	if serr := pool.Start(t.Context()); serr != nil {
+		panic(fmt.Sprintf("shopdb_test: start %s: %v", t.Name(), serr))
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func loadSteps(t *testing.T) []migrate.Step {
+	t.Helper()
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return nil
+	}
+	return steps
+}
+
+func tableNames(t *testing.T, pool *db.Pool) []string {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+	if err != nil {
+		t.Fatalf("tableNames: %v", err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatal("tableNames: no rows")
+		return nil
+	}
+	defer closeRows(t, rows)
+	var names []string
+	for rows.Next() {
+		var name string
+		if serr := rows.Scan(&name); serr != nil {
+			t.Fatalf("scan: %v", serr)
+			return nil
+		}
+		names = append(names, name)
+	}
+	if serr := rows.Err(); serr != nil {
+		t.Fatalf("rows: %v", serr)
+		return nil
+	}
+	return names
+}
+
+func storedNames(t *testing.T, pool *db.Pool) []string {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), "SELECT name FROM spira_migrations ORDER BY name")
+	if err != nil {
+		t.Fatalf("storedNames: %v", err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatal("storedNames: no rows")
+		return nil
+	}
+	defer closeRows(t, rows)
+	var names []string
+	for rows.Next() {
+		var name string
+		if serr := rows.Scan(&name); serr != nil {
+			t.Fatalf("scan: %v", serr)
+			return nil
+		}
+		names = append(names, name)
+	}
+	if serr := rows.Err(); serr != nil {
+		t.Fatalf("rows: %v", serr)
+		return nil
+	}
+	return names
+}
+
+func closeRows(t *testing.T, rows *sql.Rows) {
+	t.Helper()
+	if err := rows.Close(); err != nil {
+		t.Errorf("close rows: %v", err)
+	}
+}
+
+func seed(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	if _, err := pool.ExecContext(t.Context(), "INSERT INTO users (id, name, password_hash) VALUES (1, 'ada', 'phc-hash')"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := pool.ExecContext(t.Context(), "INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'mug', 900, 5, '2026-01-01 10:00:00')"); err != nil {
+		t.Fatalf("seed product: %v", err)
+	}
+}
+
+func TestLoadReturnsStepsInOrder(t *testing.T) {
+	steps := loadSteps(t)
+	want := []string{
+		"0001_create_products",
+		"0002_create_users",
+		"0003_create_sessions",
+		"0004_create_cart_items",
+		"0005_create_orders",
+		"0006_create_order_lines",
+	}
+	if len(steps) != len(want) {
+		t.Fatalf("Load returned %d steps, want %d", len(steps), len(want))
+		return
+	}
+	for i, name := range want {
+		if steps[i].Name != name {
+			t.Fatalf("step %d = %q, want %q", i, steps[i].Name, name)
+		}
+		if steps[i].Up == "" || steps[i].Down == "" {
+			t.Fatalf("step %q has an empty side", steps[i].Name)
+		}
+	}
+}
+
+func TestApplyAppliesAndReapplies(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t)
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	before := tableNames(t, pool)
+	if len(before) != 7 {
+		t.Fatalf("tables after Apply = %v, want 6 user tables plus spira_migrations", before)
+		return
+	}
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("second Apply: %v", err)
+		return
+	}
+	after := tableNames(t, pool)
+	if strings.Join(before, ",") != strings.Join(after, ",") {
+		t.Fatalf("second Apply changed tables: %v -> %v", before, after)
+		return
+	}
+	stored := storedNames(t, pool)
+	if len(stored) != 6 {
+		t.Fatalf("stored steps after two Applies = %d, want 6", len(stored))
+		return
+	}
+}
+
+func TestCheckReversiblePasses(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t)
+	if err := migrate.CheckReversible(t.Context(), pool, steps); err != nil {
+		t.Fatalf("CheckReversible: %v", err)
+		return
+	}
+}
+
+var sliceMacro = regexp.MustCompile(`sqlc\.slice\('[^']+'\)`)
+
+var embedMacro = regexp.MustCompile(`sqlc\.embed\(([a-zA-Z_][a-zA-Z0-9_]*)\)`)
+
+func expandMacros(sqlText string) (string, error) {
+	out := sliceMacro.ReplaceAllString(sqlText, "?, ?")
+	out = embedMacro.ReplaceAllString(out, "$1.*")
+	if strings.Contains(out, "sqlc.") {
+		return "", fmt.Errorf("unexpanded sqlc macro remains in %q", out)
+	}
+	return out, nil
+}
+
+func queryStatements(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("queries")
+	if err != nil {
+		t.Fatalf("read queries dir: %v", err)
+		return nil
+	}
+	statements := []string{}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".sql") {
+			continue
+		}
+		data, err := os.ReadFile("queries/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+			return nil
+		}
+		parts := strings.Split(string(data), "-- name:")
+		for _, part := range parts[1:] {
+			lines := strings.SplitN(part, "\n", 2)
+			if len(lines) != 2 {
+				t.Fatalf("%s: annotation without a statement: %q", name, part)
+				return nil
+			}
+			stmt := strings.TrimSpace(lines[1])
+			if stmt == "" {
+				t.Fatalf("%s: empty statement after annotation %q", name, strings.TrimSpace(lines[0]))
+				return nil
+			}
+			statements = append(statements, name+": "+strings.TrimSpace(lines[0])+"\n"+stmt)
+		}
+	}
+	if len(statements) == 0 {
+		t.Fatal("no query statements found")
+		return nil
+	}
+	return statements
+}
+
+func TestQueryStatementsPrepare(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t)
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	handle, err := sql.Open("sqlite", dsnFor(t))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := handle.Close(); cerr != nil {
+			t.Errorf("raw close: %v", cerr)
+		}
+	}()
+	for _, labeled := range queryStatements(t) {
+		label := strings.SplitN(labeled, "\n", 2)[0]
+		body := strings.SplitN(labeled, "\n", 2)[1]
+		expanded, err := expandMacros(body)
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+			return
+		}
+		stmt, err := handle.PrepareContext(t.Context(), expanded)
+		if err != nil {
+			t.Fatalf("%s: prepare: %v", label, err)
+			return
+		}
+		if err := stmt.Close(); err != nil {
+			t.Fatalf("%s: close stmt: %v", label, err)
+			return
+		}
+	}
+}
+
+func TestForeignKeysEnforced(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t)
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	seed(t, pool)
+	if _, err := pool.ExecContext(t.Context(), "INSERT INTO orders (id, user_id, status, total, created_at) VALUES (1, 1, 'open', 0, '2026-01-01 10:00:00')"); err != nil {
+		t.Fatalf("seed order: %v", err)
+		return
+	}
+	for _, tc := range []struct {
+		name   string
+		insert string
+	}{
+		{name: "session for a missing user", insert: "INSERT INTO sessions (id_hash, user_id, expires_at) VALUES ('h1', 999, '2026-01-02 10:00:00')"},
+		{name: "cart item for a missing product", insert: "INSERT INTO cart_items (owner_kind, owner_key, product_id, quantity) VALUES ('session', 's1', 999, 1)"},
+		{name: "order for a missing user", insert: "INSERT INTO orders (user_id, status, total, created_at) VALUES (999, 'open', 0, '2026-01-01 10:00:00')"},
+		{name: "order line for a missing order", insert: "INSERT INTO order_lines (order_id, product_id, quantity, unit_price) VALUES (999, 1, 1, 900)"},
+		{name: "order line for a missing product", insert: "INSERT INTO order_lines (order_id, product_id, quantity, unit_price) VALUES (1, 999, 1, 900)"},
+	} {
+		_, err := pool.ExecContext(t.Context(), tc.insert)
+		if err == nil {
+			t.Fatalf("%s was accepted", tc.name)
+			return
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+			t.Fatalf("%s: error = %q, want a foreign key violation", tc.name, err.Error())
+			return
+		}
+	}
+}
+
+func TestCheckConstraintsReject(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t)
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	seed(t, pool)
+	_, quantityErr := pool.ExecContext(t.Context(), "INSERT INTO cart_items (owner_kind, owner_key, product_id, quantity) VALUES ('session', 's1', 1, 0)")
+	if quantityErr == nil {
+		t.Fatal("cart quantity 0 was accepted")
+		return
+	}
+	if !strings.Contains(strings.ToLower(quantityErr.Error()), "check") {
+		t.Fatalf("quantity error = %q, want a check violation", quantityErr.Error())
+		return
+	}
+	_, statusErr := pool.ExecContext(t.Context(), "INSERT INTO orders (user_id, status, total, created_at) VALUES (1, 'lost', 0, '2026-01-01 10:00:00')")
+	if statusErr == nil {
+		t.Fatal("order status 'lost' was accepted")
+		return
+	}
+	if !strings.Contains(strings.ToLower(statusErr.Error()), "check") {
+		t.Fatalf("status error = %q, want a check violation", statusErr.Error())
+		return
+	}
+}

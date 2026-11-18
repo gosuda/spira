@@ -1,0 +1,280 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+type Querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+type SQLite struct{}
+
+type Postgres struct{}
+
+type MySQL struct{}
+
+type MSSQL struct{}
+
+type Dialect interface {
+	SQLite | Postgres | MySQL | MSSQL
+}
+
+const skipCache = "/*db:nocache*/"
+
+func DialectOf(driver string, dsn string) (Dialect, error) {
+	switch driver {
+	case "sqlite":
+		return SQLite{}, nil
+	case "pgx", "postgres":
+		return Postgres{}, nil
+	case "mysql":
+		if !strings.Contains(dsn, "parseTime=true") {
+			return nil, errors.New("db: mysql DSN needs parseTime=true")
+		}
+		return MySQL{}, nil
+	case "sqlserver":
+		return MSSQL{}, nil
+	default:
+		return nil, fmt.Errorf("db: unknown driver %q", driver)
+	}
+}
+
+func Open(driver string, dsn string) (*Pool?, error) {
+	dialect, err := DialectOf(driver, dsn)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := sql.Open(driver, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("db: open %s: %w", driver, err)
+	}
+	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}}, nil
+}
+
+type Pool struct {
+	handle  *sql.DB
+	dialect Dialect
+	stmts   *stmtCache
+}
+
+func (p *Pool) Dialect() Dialect {
+	return p.dialect
+}
+
+func (p *Pool) Prepared() int {
+	return p.stmts.size()
+}
+
+func (p *Pool) Prepare(ctx context.Context, query string) error {
+	q, skip := unmarked(query)
+	if skip {
+		return prepareDirect(ctx, p.handle, q)
+	}
+	stmt, err := p.stmts.prepare(ctx, p.handle, q)
+	if err != nil {
+		return err
+	}
+	if stmt == nil {
+		return errors.New("db: prepared statement missing")
+	}
+	p.stmts.release(q)
+	return nil
+}
+
+func prepareDirect(ctx context.Context, handle *sql.DB, q string) error {
+	stmt, err := handle.PrepareContext(ctx, q)
+	if err != nil {
+		return fmt.Errorf("db: prepare: %w", err)
+	}
+	if cerr := stmt.Close(); cerr != nil {
+		return fmt.Errorf("db: prepare close: %w", cerr)
+	}
+	return nil
+}
+
+func (p *Pool) Start(ctx context.Context) error {
+	if err := p.handle.PingContext(ctx); err != nil {
+		return fmt.Errorf("db: ping: %w", err)
+	}
+	return nil
+}
+
+func (p *Pool) Stop(ctx context.Context) error {
+	closeErr := p.stmts.closeStmts()
+	handleErr := p.handle.Close()
+	if handleErr != nil {
+		return fmt.Errorf("db: close: %w", errors.Join(closeErr, handleErr))
+	}
+	return closeErr
+}
+
+func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error) {
+	q, skip := unmarked(query)
+	if skip {
+		rows, err := p.handle.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("db: query: %w", err)
+		}
+		return rows, nil
+	}
+	prepared, err := p.stmts.prepare(ctx, p.handle, q)
+	if err != nil {
+		return nil, err
+	}
+	if prepared == nil {
+		return nil, errors.New("db: prepared statement missing")
+	}
+	rows, err := prepared.QueryContext(ctx, args...)
+	p.stmts.release(q)
+	if err != nil {
+		return nil, fmt.Errorf("db: query: %w", err)
+	}
+	if rows == nil {
+		return nil, errors.New("db: query returned no rows")
+	}
+	return rows, nil
+}
+
+func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	q, skip := unmarked(query)
+	if skip {
+		res, err := p.handle.ExecContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("db: exec: %w", err)
+		}
+		return res, nil
+	}
+	prepared, err := p.stmts.prepare(ctx, p.handle, q)
+	if err != nil {
+		return nil, err
+	}
+	if prepared == nil {
+		return nil, errors.New("db: prepared statement missing")
+	}
+	res, err := prepared.ExecContext(ctx, args...)
+	p.stmts.release(q)
+	if err != nil {
+		return nil, fmt.Errorf("db: exec: %w", err)
+	}
+	return res, nil
+}
+
+type Tx struct {
+	tx   *sql.Tx
+	pool *Pool
+}
+
+func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error) {
+	q, skip := unmarked(query)
+	if skip {
+		rows, err := t.tx.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("db: query: %w", err)
+		}
+		return rows, nil
+	}
+	if stmt, cached := t.pool.stmts.acquire(q); cached {
+		rows, err := t.tx.StmtContext(ctx, stmt).QueryContext(ctx, args...)
+		t.pool.stmts.release(q)
+		if err != nil {
+			return nil, fmt.Errorf("db: query: %w", err)
+		}
+		if rows == nil {
+			return nil, errors.New("db: query returned no rows")
+		}
+		return rows, nil
+	}
+	rows, err := t.tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: query: %w", err)
+	}
+	if rows == nil {
+		return nil, errors.New("db: query returned no rows")
+	}
+	return rows, nil
+}
+
+func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	q, skip := unmarked(query)
+	if skip {
+		res, err := t.tx.ExecContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("db: exec: %w", err)
+		}
+		return res, nil
+	}
+	if stmt, cached := t.pool.stmts.acquire(q); cached {
+		res, err := t.tx.StmtContext(ctx, stmt).ExecContext(ctx, args...)
+		t.pool.stmts.release(q)
+		if err != nil {
+			return nil, fmt.Errorf("db: exec: %w", err)
+		}
+		return res, nil
+	}
+	res, err := t.tx.ExecContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: exec: %w", err)
+	}
+	return res, nil
+}
+
+func InTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (T, error) {
+	var zero T
+	tx, err := p.handle.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return zero, fmt.Errorf("db: begin: %w", err)
+	}
+	v, workErr := runTxWork(&Tx{tx: tx, pool: p}, work)
+	if workErr != nil {
+		return zero, workErr
+	}
+	if err := tx.Commit(); err != nil {
+		return zero, fmt.Errorf("db: commit: %w", err)
+	}
+	return v, nil
+}
+
+func runTxWork[T any](run *Tx, work func(tx *Tx) (T, error)) (T, error) {
+	errdefer run.tx.Rollback()?
+	return work(run)
+}
+
+func Exec(ctx context.Context, q Querier, query string, args ...any) (sql.Result, error) {
+	return q.ExecContext(ctx, query, args...)
+}
+
+func In(query string, name string, count int) string {
+	expanded := strings.Replace(query, marker(name), replacement(count), 1)
+	return skipCache + expanded
+}
+
+func marker(name string) string {
+	return "/*SLICE:" + name + "*/?"
+}
+
+func replacement(count int) string {
+	if count <= 0 {
+		return "NULL"
+	}
+	var b strings.Builder
+	for i := range count {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("?")
+	}
+	return b.String()
+}
+
+func unmarked(query string) (string, bool) {
+	if strings.HasPrefix(query, skipCache) {
+		return strings.TrimPrefix(query, skipCache), true
+	}
+	return query, false
+}

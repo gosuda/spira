@@ -1,0 +1,282 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-model/src/test/java/org/springframework/ai/chat/model/MessageAggregatorTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai_test
+
+import (
+	"errors"
+	"fmt"
+	"iter"
+	"math/rand/v2"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+func streamOf(chunks ...ai.Chunk) iter.Seq2[ai.Chunk, error] {
+	for _, chunk := range chunks {
+		yield chunk, nil
+	}
+}
+
+func delta(id string, index int, part ai.Part) ai.Chunk {
+	return ai.Chunk{ID: id, Index: index, Part: part, Partial: true}
+}
+
+func whole(id string, index int, part ai.Part) ai.Chunk {
+	return ai.Chunk{ID: id, Index: index, Part: part}
+}
+
+func loose(part ai.Part) ai.Chunk {
+	return ai.Chunk{Part: part, Partial: true}
+}
+
+func collectParts(t *testing.T, chunks ...ai.Chunk) []ai.Part {
+	t.Helper()
+	reply, err := ai.Collect(streamOf(chunks...))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+		return nil
+	}
+	if reply.Message.Role != ai.RoleAssistant {
+		t.Fatalf("role = %q, want assistant", reply.Message.Role)
+	}
+	return reply.Message.Parts
+}
+
+func requireParts(t *testing.T, got []ai.Part, want ...ai.Part) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("parts = %+v, want %+v", got, want)
+		return
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("part %d = %+v, want %+v (all: %+v)", i, got[i], want[i], got)
+			return
+		}
+	}
+}
+
+func TestCollectJoinsUnindexedTextAndPutsCompleteCallsAfterIt(t *testing.T) {
+	call := ai.ToolCall{ID: "toolu_1", Name: "getWeather", Arguments: "{}"}
+	got := collectParts(t,
+		loose(ai.Text{Text: "Hello"}),
+		loose(ai.Text{Text: " world"}),
+		loose(ai.Text{Text: ""}),
+		ai.Chunk{Part: ai.Part(call)},
+	)
+	requireParts(t, got, ai.Text{Text: "Hello world"}, call)
+}
+
+func TestCollectCarriesAnUnindexedCompleteReasoningBeforeTheText(t *testing.T) {
+	call := ai.ToolCall{ID: "toolu_1", Name: "getWeather", Arguments: "{}"}
+	got := collectParts(t,
+		loose(ai.Text{Text: "Hello"}),
+		loose(ai.Text{Text: " world"}),
+		ai.Chunk{Part: ai.Part(ai.Reasoning{Text: "think"})},
+		ai.Chunk{Part: ai.Part(call)},
+	)
+	requireParts(t, got, ai.Reasoning{Text: "think"}, ai.Text{Text: "Hello world"}, call)
+}
+
+func TestCollectJoinsUnindexedReasoningDeltasIntoOnePart(t *testing.T) {
+	got := collectParts(t,
+		loose(ai.Reasoning{Text: "first "}),
+		loose(ai.Reasoning{Text: "second"}),
+		loose(ai.Text{Text: "answer"}),
+	)
+	requireParts(t, got, ai.Reasoning{Text: "first second"}, ai.Text{Text: "answer"})
+}
+
+func TestCollectMergesIndexedDeltasInIndexOrder(t *testing.T) {
+	call := ai.ToolCall{ID: "toolu_1", Name: "getWeather", Arguments: `{"city":"Paris"}`}
+	got := collectParts(t,
+		delta("msg_1", 0, ai.Reasoning{Text: "think"}),
+		delta("msg_1", 0, ai.Reasoning{Text: "ing"}),
+		delta("msg_1", 0, ai.Reasoning{Text: ""}),
+		delta("msg_1", 1, ai.Text{Text: "Let me "}),
+		delta("msg_1", 1, ai.Text{Text: "check."}),
+		delta("msg_1", 3, ai.Text{Text: " Done."}),
+		whole("msg_1", 2, call),
+	)
+	requireParts(t, got, ai.Reasoning{Text: "thinking"}, ai.Text{Text: "Let me check."}, call, ai.Text{Text: " Done."})
+}
+
+func TestCollectSkipsToolCallDeltasAndKeepsTheCompleteCall(t *testing.T) {
+	complete := ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: `{"city":"Paris"}`}
+	got := collectParts(t,
+		delta("msg_1", 0, ai.Text{Text: "Checking."}),
+		delta("msg_1", 1, ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: ""}),
+		delta("msg_1", 1, ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: `{"city":"Pa`}),
+		delta("msg_1", 1, ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: `ris"}`}),
+		whole("msg_1", 1, complete),
+	)
+	requireParts(t, got, ai.Text{Text: "Checking."}, complete)
+}
+
+func TestCollectNeverBuildsAToolCallFromDeltasAlone(t *testing.T) {
+	got := collectParts(t,
+		delta("msg_1", 0, ai.Text{Text: "Checking."}),
+		delta("msg_1", 1, ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: `{"city":`}),
+		delta("msg_1", 1, ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: `"Paris"}`}),
+		delta("msg_2", 0, ai.Text{Text: "Sunny."}),
+	)
+	requireParts(t, got, ai.Text{Text: "Checking."}, ai.Text{Text: "Sunny."})
+}
+
+func TestCollectSkipsAnUnindexedToolCallDeltaAndKeepsTheEmptyText(t *testing.T) {
+	got := collectParts(t, loose(ai.ToolCall{ID: "call_1", Name: "getWeather", Arguments: "{}"}))
+	requireParts(t, got, ai.Text{Text: ""})
+}
+
+func TestCollectLetsACompletePartReplaceItsDeltas(t *testing.T) {
+	got := collectParts(t,
+		delta("msg_1", 0, ai.Reasoning{Text: "par"}),
+		delta("msg_1", 0, ai.Reasoning{Text: "tial"}),
+		whole("msg_1", 0, ai.Reasoning{Text: "final"}),
+	)
+	requireParts(t, got, ai.Reasoning{Text: "final"})
+}
+
+func TestCollectKeepsResponsesWithDifferentIDsApartInFirstSeenOrder(t *testing.T) {
+	got := collectParts(t,
+		delta("msg_1", 0, ai.Reasoning{Text: "round one"}),
+		delta("msg_1", 1, ai.Text{Text: "Checking. "}),
+		delta("msg_2", 0, ai.Reasoning{Text: "round two"}),
+		delta("msg_2", 1, ai.Text{Text: "Sunny."}),
+		delta("msg_1", 1, ai.Text{Text: "Still. "}),
+	)
+	requireParts(t, got,
+		ai.Reasoning{Text: "round one"}, ai.Text{Text: "Checking. Still. "},
+		ai.Reasoning{Text: "round two"}, ai.Text{Text: "Sunny."},
+	)
+}
+
+func TestCollectStartsANewResponseWhenAnIndexRestartsWithoutAnID(t *testing.T) {
+	call := ai.ToolCall{Name: "getWeather", Arguments: "{}"}
+	got := collectParts(t,
+		delta("", 0, ai.Reasoning{Text: "round one"}),
+		delta("", 1, ai.Text{Text: "Checking. "}),
+		whole("", 2, call),
+		delta("", 0, ai.Reasoning{Text: "round two"}),
+		delta("", 0, ai.Reasoning{Text: ""}),
+		delta("", 1, ai.Text{Text: "Sunny."}),
+	)
+	requireParts(t, got,
+		ai.Reasoning{Text: "round one"}, ai.Text{Text: "Checking. "}, call,
+		ai.Reasoning{Text: "round two"}, ai.Text{Text: "Sunny."},
+	)
+}
+
+func TestCollectStartsANewResponseWhenACompleteSlotIsHitAgainWithoutAnID(t *testing.T) {
+	got := collectParts(t,
+		whole("", 0, ai.Reasoning{Text: "one"}),
+		whole("", 0, ai.Reasoning{Text: "two"}),
+	)
+	requireParts(t, got, ai.Reasoning{Text: "one"}, ai.Reasoning{Text: "two"})
+}
+
+func TestCollectFinishesAnOpenSlotInPlaceWithoutAnID(t *testing.T) {
+	got := collectParts(t,
+		delta("", 0, ai.Reasoning{Text: "par"}),
+		whole("", 0, ai.Reasoning{Text: "final"}),
+	)
+	requireParts(t, got, ai.Reasoning{Text: "final"})
+}
+
+func TestCollectJoinsManyDeltasToTheFullText(t *testing.T) {
+	var chunks []ai.Chunk
+	var want strings.Builder
+	for i := range 2000 {
+		piece := fmt.Sprintf("w%d ", i)
+		chunks = append(chunks, delta("msg_1", 0, ai.Text{Text: piece}))
+		want.WriteString(piece)
+	}
+	requireParts(t, collectParts(t, chunks...), ai.Text{Text: want.String()})
+}
+
+func TestCollectKeepsTheLastPositiveUsageAndTheLastNamedIDAndModel(t *testing.T) {
+	reply, err := ai.Collect(streamOf(
+		ai.Chunk{ID: "msg_1", Model: "model-a", Usage: ai.Usage{Input: 12}},
+		ai.Chunk{Part: ai.Part(ai.Text{Text: "hi"}), Partial: true, Usage: ai.Usage{Output: 3, Total: 15}},
+		ai.Chunk{ID: " ", Model: "", Usage: ai.Usage{Input: 0, Output: 5, Total: 0}, Finish: ai.FinishCompleted},
+		ai.Chunk{Usage: ai.Usage{Total: 17}},
+	))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+		return
+	}
+	if want := (ai.Usage{Input: 12, Output: 5, Total: 17}); reply.Usage != want {
+		t.Fatalf("usage = %+v, want %+v", reply.Usage, want)
+	}
+	if reply.ID != "msg_1" || reply.Model != "model-a" {
+		t.Fatalf("id %q model %q, want msg_1 and model-a", reply.ID, reply.Model)
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish = %q, want completed", reply.Finish)
+	}
+}
+
+func TestCollectReportsOtherWhenNoChunkCarriesAFinish(t *testing.T) {
+	reply, err := ai.Collect(streamOf(loose(ai.Text{Text: "cut"})))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishOther {
+		t.Fatalf("finish = %q, want other", reply.Finish)
+	}
+}
+
+var errCutStream = errors.New("collect test: stream cut")
+
+func TestCollectEndsWithTheStreamError(t *testing.T) {
+	cut := func(yield func(ai.Chunk, error) bool) {
+		if !yield(loose(ai.Text{Text: "partial answer"}), nil) {
+			return
+		}
+		yield(ai.Chunk{}, errCutStream)
+	}
+	_, err := ai.Collect(cut)
+	if !errors.Is(err, errCutStream) {
+		t.Fatalf("error = %v, want the stream error", err)
+		return
+	}
+	if !strings.HasPrefix(err.Error(), "ai: collect: ") {
+		t.Fatalf("error %q lacks the ai: collect: prefix", err.Error())
+	}
+}
+
+func splitAtRandom(r *rand.Rand, text string) []string {
+	var pieces []string
+	for len(text) > 0 {
+		n := 1 + r.IntN(len(text))
+		pieces = append(pieces, text[:n])
+		text = text[n:]
+	}
+	return pieces
+}
+
+func TestCollectReturnsTheSameTextForEverySplit(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 11))
+	const alphabet = "ab \n{}\"\u00e9\U0001F600"
+	letters := []rune(alphabet)
+	for range 500 {
+		var text strings.Builder
+		for range 1 + r.IntN(60) {
+			text.WriteRune(letters[r.IntN(len(letters))])
+		}
+		want := text.String()
+		var unindexed, indexed []ai.Chunk
+		for _, piece := range splitAtRandom(r, want) {
+			unindexed = append(unindexed, loose(ai.Text{Text: piece}))
+			indexed = append(indexed, delta("msg_1", 4, ai.Text{Text: piece}))
+		}
+		requireParts(t, collectParts(t, unindexed...), ai.Text{Text: want})
+		requireParts(t, collectParts(t, indexed...), ai.Text{Text: want})
+	}
+}

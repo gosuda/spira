@@ -1,0 +1,431 @@
+package asset_test
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/view"
+)
+
+const manifestJSON = `{
+	"src/entry.ts": {
+		"file": "assets/entry-BFks04Pk.js",
+		"src": "src/entry.ts",
+		"isEntry": true,
+		"css": ["assets/entry-A0.css"],
+		"imports": ["_shared-A1.js", "_cycA.js"]
+	},
+	"_shared-A1.js": {
+		"file": "assets/shared-A1.js",
+		"name": "shared",
+		"css": ["assets/shared-A1.css"],
+		"imports": ["_leaf.js"]
+	},
+	"_leaf.js": {
+		"file": "assets/leaf-A2.js",
+		"name": "leaf"
+	},
+	"_cycA.js": {
+		"file": "assets/cycA-A3.js",
+		"name": "cycA",
+		"css": ["assets/cycA-A3.css"],
+		"imports": ["_cycB.js"]
+	},
+	"_cycB.js": {
+		"file": "assets/cycB-A4.js",
+		"name": "cycB",
+		"imports": ["_cycA.js"]
+	}
+}`
+
+func loadManifest(t *testing.T) *asset.Manifest {
+	t.Helper()
+	m, err := asset.Load(fstest.MapFS{
+		".vite/manifest.json": &fstest.MapFile{Data: []byte(manifestJSON)},
+	}, ".vite/manifest.json")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		panic("loadManifest: unreachable")
+	}
+	if m == nil {
+		t.Fatal("Load returned no manifest and no error")
+		panic("loadManifest: unreachable")
+	}
+	return m
+}
+
+func renderTags(t *testing.T, n view.Node) string {
+	t.Helper()
+	var b strings.Builder
+	if err := view.Render(context.Background(), &b, n); err != nil {
+		t.Fatalf("Render: %v", err)
+		return ""
+	}
+	return b.String()
+}
+
+func TestTagsEmitDocumentOrder(t *testing.T) {
+	m := loadManifest(t)
+	n, err := m.Tags("src/entry.ts")
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	want := `<link rel="stylesheet" href="/assets/entry-A0.css">` +
+		`<link rel="stylesheet" href="/assets/shared-A1.css">` +
+		`<link rel="stylesheet" href="/assets/cycA-A3.css">` +
+		`<script type="module" src="/assets/entry-BFks04Pk.js"></script>` +
+		`<link rel="modulepreload" href="/assets/leaf-A2.js">` +
+		`<link rel="modulepreload" href="/assets/shared-A1.js">` +
+		`<link rel="modulepreload" href="/assets/cycB-A4.js">` +
+		`<link rel="modulepreload" href="/assets/cycA-A3.js">`
+	if got != want {
+		t.Fatalf("Tags output:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestTagsUnknownEntry(t *testing.T) {
+	m := loadManifest(t)
+	_, err := m.Tags("src/missing.ts")
+	if err == nil {
+		t.Fatal("Tags on an unknown entry returned no error")
+		return
+	}
+	if got := err.Error(); got != `asset: entry "src/missing.ts" not in manifest` {
+		t.Fatalf("error = %q", got)
+	}
+}
+
+func TestTagsCyclicImportsTerminate(t *testing.T) {
+	m := loadManifest(t)
+	n, err := m.Tags("src/entry.ts")
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	if strings.Count(got, `rel="modulepreload"`) != 4 {
+		t.Fatalf("modulepreload count = %d, want 4: %s", strings.Count(got, `rel="modulepreload"`), got)
+	}
+}
+
+func TestPreloadEmitsModulepreloadForKnownKey(t *testing.T) {
+	m := loadManifest(t)
+	n, err := m.Preload("_shared-A1.js")
+	if err != nil {
+		t.Fatalf("Preload: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	want := `<link rel="modulepreload" href="/assets/shared-A1.js">`
+	if got != want {
+		t.Fatalf("Preload output = %s, want %s", got, want)
+	}
+}
+
+func TestPreloadUnknownKeyErrors(t *testing.T) {
+	m := loadManifest(t)
+	_, err := m.Preload("assets/lazy-9.js")
+	if err == nil {
+		t.Fatal("Preload on an unknown key returned no error")
+		return
+	}
+	if got := err.Error(); got != `asset: source "assets/lazy-9.js" not in manifest` {
+		t.Fatalf("error = %q", got)
+	}
+}
+
+func TestProductionURLsAreRootRelative(t *testing.T) {
+	m := loadManifest(t)
+	n, err := m.Tags("src/entry.ts")
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	for _, key := range []string{"src/entry.ts", "_shared-A1.js", "_leaf.js", "_cycA.js", "_cycB.js"} {
+		pn, err := m.Preload(key)
+		if err != nil {
+			t.Fatalf("Preload(%s): %v", key, err)
+			return
+		}
+		got += renderTags(t, pn)
+	}
+	attr := regexp.MustCompile(`(?:src|href)="([^"]*)"`)
+	matches := attr.FindAllStringSubmatch(got, -1)
+	if len(matches) == 0 {
+		t.Fatalf("no src or href attributes in:\n%s", got)
+	}
+	for _, match := range matches {
+		if !strings.HasPrefix(match[1], "/") {
+			t.Fatalf("attribute value %q is not root-relative:\n%s", match[1], got)
+		}
+	}
+}
+
+func TestPreloadDevUsesOriginAndSrc(t *testing.T) {
+	m := asset.Dev("http://localhost:5173")
+	n, err := m.Preload("src/lazy.ts")
+	if err != nil {
+		t.Fatalf("Preload: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	want := `<link rel="modulepreload" href="http://localhost:5173/src/lazy.ts">`
+	if got != want {
+		t.Fatalf("Preload output = %s, want %s", got, want)
+	}
+}
+
+func TestDevTagsEmitClientPreambleAndEntry(t *testing.T) {
+	m := asset.Dev("http://localhost:5173")
+	n, err := m.Tags("src/entry.ts")
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	for _, want := range []string{
+		`<script type="module" src="http://localhost:5173/@vite/client"></script>`,
+		`import RefreshRuntime from 'http://localhost:5173/@react-refresh'`,
+		`window.__vite_plugin_react_preamble_installed__ = true`,
+		`<script type="module" src="http://localhost:5173/src/entry.ts"></script>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Dev Tags output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestDevRejectsBadOrigins(t *testing.T) {
+	for _, origin := range []string{
+		`http://localhost:5173/extra`,
+		`http://user@localhost:5173`,
+		`http://localhost:5173?q=1`,
+		`http://localhost:5173#frag`,
+		`javascript:alert(1)`,
+		`localhost:5173`,
+		`http://`,
+		`ftp://localhost:5173`,
+		`http://localhost:5173'`,
+		`http://a"b`,
+		`http://a<b`,
+		`http://localhost:5173/x`,
+		`javascript://x`,
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("Dev(%q) did not panic", origin)
+				}
+			}()
+			asset.Dev(origin)
+		}()
+	}
+}
+
+func TestDevAcceptsValidOrigins(t *testing.T) {
+	for _, origin := range []string{
+		"http://localhost:5173",
+		"https://vite.internal",
+		"http://127.0.0.1:5173",
+		"http://[::1]:5173",
+		"https://[2001:db8::1]",
+	} {
+		n, err := asset.Dev(origin).Tags("src/entry.ts")
+		if err != nil {
+			t.Fatalf("Tags for Dev(%q): %v", origin, err)
+			return
+		}
+		if got := renderTags(t, n); !strings.Contains(got, origin+"/@vite/client") {
+			t.Fatalf("Dev(%q) Tags missing dev client:\n%s", origin, got)
+		}
+	}
+}
+
+func TestDevTagsEscapeEntryName(t *testing.T) {
+	m := asset.Dev("http://localhost:5173")
+	n, err := m.Tags(`src/"><script>alert(1)</script>.ts`)
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	if strings.Contains(got, `<script>alert(1)</script>`) {
+		t.Fatalf("Dev Tags emitted an unescaped entry name:\n%s", got)
+	}
+	if !strings.Contains(got, `src/&#34;&gt;&lt;script&gt;`) {
+		t.Fatalf("Dev Tags output missing escaped entry name:\n%s", got)
+	}
+}
+
+func TestLoadMalformedJSONNamesPath(t *testing.T) {
+	m, err := asset.Load(fstest.MapFS{
+		"bad/manifest.json": &fstest.MapFile{Data: []byte(`{not json`)},
+	}, "bad/manifest.json")
+	if err != nil {
+		if !strings.Contains(err.Error(), "bad/manifest.json") {
+			t.Fatalf("error %q does not name the path", err)
+			return
+		}
+		return
+	}
+	if m != nil {
+		t.Fatal("Load returned a manifest without an error")
+	}
+	t.Fatal("Load accepted malformed JSON")
+}
+
+func TestLoadMissingFile(t *testing.T) {
+	m, err := asset.Load(fstest.MapFS{}, ".vite/manifest.json")
+	if err != nil {
+		if !strings.Contains(err.Error(), ".vite/manifest.json") {
+			t.Fatalf("error %q does not name the path", err)
+			return
+		}
+		return
+	}
+	if m != nil {
+		t.Fatal("Load returned a manifest without an error")
+	}
+	t.Fatal("Load accepted a missing manifest")
+}
+
+func TestFilesServesBuildOutputWithCacheHeaders(t *testing.T) {
+	fsys := fstest.MapFS{
+		"index.html":         &fstest.MapFile{Data: []byte("<html></html>")},
+		"assets/app-abc.js":  &fstest.MapFile{Data: []byte("console.log(1)")},
+		"foo/assets/evil.js": &fstest.MapFile{Data: []byte("evil")},
+		"assets/dir/keep.txt": &fstest.MapFile{Data: []byte("x")},
+	}
+	h := loadManifest(t).Files(fsys)
+	for _, tc := range []struct {
+		path        string
+		wantStatus  int
+		wantCache   string
+		wantBodyHas string
+	}{
+		{"/assets/app-abc.js", 200, "public, max-age=31536000, immutable", "console.log(1)"},
+		{"/", 200, "", "<html></html>"},
+		{"/foo/assets/evil.js", 200, "", "evil"},
+		{"/assets/dir/", 200, "", "keep.txt"},
+		{"/assets/nope.js", 404, "", ""},
+		{"/missing.txt", 404, "", ""},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.wantStatus {
+			t.Fatalf("GET %s status = %d, want %d", tc.path, rec.Code, tc.wantStatus)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != tc.wantCache {
+			t.Fatalf("GET %s Cache-Control = %q, want %q", tc.path, got, tc.wantCache)
+		}
+		body, err := io.ReadAll(rec.Result().Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+			return
+		}
+		if tc.wantBodyHas != "" && !strings.Contains(string(body), tc.wantBodyHas) {
+			t.Fatalf("GET %s body = %q, want it to contain %q", tc.path, body, tc.wantBodyHas)
+		}
+	}
+}
+
+func TestFilesTraversalNeverServesOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "assets"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "assets", "a.js"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write a.js: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "..", "secret.txt"), []byte("TOPSECRET"), 0o644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	h := loadManifest(t).Files(os.DirFS(root))
+	for _, rawPath := range []string{"/../secret.txt", "/assets/../../secret.txt"} {
+		req := &http.Request{
+			Method: http.MethodGet,
+			URL:    &url.URL{Path: rawPath},
+			Header: http.Header{},
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		body, err := io.ReadAll(rec.Result().Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+			return
+		}
+		if rec.Code == 200 || strings.Contains(string(body), "TOPSECRET") {
+			t.Fatalf("GET %s status = %d body = %q, want 404/400 without secret", rawPath, rec.Code, body)
+		}
+	}
+}
+
+const sharedCSSManifestJSON = `{
+	"src/entry.ts": {
+		"file": "assets/entry-E1.js",
+		"isEntry": true,
+		"css": ["assets/shared-B0.css", "assets/entry-E0.css"],
+		"imports": ["_a.js", "_b.js"]
+	},
+	"_a.js": {
+		"file": "assets/a-A1.js",
+		"css": ["assets/shared-B0.css", "assets/a-A2.css"]
+	},
+	"_b.js": {
+		"file": "assets/b-A3.js",
+		"css": ["assets/b-A4.css", "assets/shared-B0.css"]
+	}
+}`
+
+func loadSharedCSSManifest(t *testing.T) *asset.Manifest {
+	t.Helper()
+	m, err := asset.Load(fstest.MapFS{
+		".vite/manifest.json": &fstest.MapFile{Data: []byte(sharedCSSManifestJSON)},
+	}, ".vite/manifest.json")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		panic("loadSharedCSSManifest: unreachable")
+	}
+	if m == nil {
+		t.Fatal("Load returned no manifest and no error")
+		panic("loadSharedCSSManifest: unreachable")
+	}
+	return m
+}
+
+func TestTagsLinksEachStylesheetOnce(t *testing.T) {
+	m := loadSharedCSSManifest(t)
+	n, err := m.Tags("src/entry.ts")
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+		return
+	}
+	got := renderTags(t, n)
+	want := `<link rel="stylesheet" href="/assets/shared-B0.css">` +
+		`<link rel="stylesheet" href="/assets/entry-E0.css">` +
+		`<link rel="stylesheet" href="/assets/a-A2.css">` +
+		`<link rel="stylesheet" href="/assets/b-A4.css">` +
+		`<script type="module" src="/assets/entry-E1.js"></script>` +
+		`<link rel="modulepreload" href="/assets/a-A1.js">` +
+		`<link rel="modulepreload" href="/assets/b-A3.js">`
+	if got != want {
+		t.Fatalf("Tags output:\n got %s\nwant %s", got, want)
+	}
+	if c := strings.Count(got, "shared-B0.css"); c != 1 {
+		t.Fatalf("shared stylesheet appears %d times, want 1", c)
+	}
+}

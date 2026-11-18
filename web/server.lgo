@@ -1,0 +1,121 @@
+package web
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+
+	"logos/rt"
+	"logos/sync"
+)
+
+type Server struct {
+	Addr              string = ":8080"
+	Router            *Router
+	ReadHeaderTimeout time.Duration = 5 * time.Second
+	ShutdownGrace     time.Duration = 20 * time.Second
+
+	state sync.Locked[serverState]
+}
+
+type serverState struct {
+	run *serverRun?
+}
+
+type serverRun struct {
+	srv        *http.Server
+	join       *joinState
+	joinCancel context.CancelFunc
+}
+
+type joinState struct {
+	done chan struct{}
+	err  sync.Locked[error]
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	busy := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run != nil {
+			busy = true
+		}
+	})
+	if busy {
+		return errors.New("web: server already started")
+	}
+	if s.Router == nil {
+		return errors.New("web: server needs a router")
+	}
+	l, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return fmt.Errorf("web: listen %s: %w", s.Addr, err)
+	}
+	run := s.serve(ctx, l)
+	stored := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run == nil {
+			st.run = run
+			stored = true
+		}
+	})
+	if !stored {
+		return errors.Join(errors.New("web: server already started"), run.stop(ctx, s.ShutdownGrace))
+	}
+	return nil
+}
+
+func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
+	srv := &http.Server{Handler: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout}
+	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
+	g.Go(func(_ context.Context) error {
+		if serr := srv.Serve(l); !errors.Is(serr, http.ErrServerClosed) {
+			return fmt.Errorf("web: serve: %w", serr)
+		}
+		return nil
+	})
+	js := &joinState{done: make(chan struct{})}
+	joinCtx, joinCancel := context.WithCancel(context.Background())
+	context.AfterFunc(joinCtx, func() {
+		js.err.WithLock(func(e *error) {
+			*e = g.Wait()
+		})
+		close(js.done)
+	})
+	return &serverRun{srv: srv, join: js, joinCancel: joinCancel}
+}
+
+func (s *Server) Stop(ctx context.Context) error {
+	var held *serverRun?
+	s.state.WithLock(func(st *serverState) {
+		held = st.run
+		st.run = nil
+	})
+	current := held
+	if current != nil {
+		return current.stop(ctx, s.ShutdownGrace)
+	}
+	return nil
+}
+
+func (r *serverRun) stop(ctx context.Context, grace time.Duration) error {
+	sctx, cancel := context.WithTimeout(ctx, grace)
+	defer cancel()
+	shutdownErr := r.srv.Shutdown(sctx)
+	if shutdownErr != nil {
+		shutdownErr = errors.Join(fmt.Errorf("web: shutdown: %w", shutdownErr), r.srv.Close())
+	}
+	r.joinCancel()
+	select {
+	case <-r.join.done:
+	case <-ctx.Done():
+		return errors.Join(shutdownErr, ctx.Err())
+	}
+	var joinErr error
+	r.join.err.WithLock(func(e *error) {
+		joinErr = *e
+	})
+	return errors.Join(joinErr, shutdownErr)
+}

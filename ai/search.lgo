@@ -1,0 +1,200 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-tool-search-tool/src/main/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndex.java
+// and advisors/spring-ai-tool-search-advisor/src/main/java/org/springframework/ai/chat/client/advisor/toolsearch/ToolSearchToolCallingAdvisor.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai
+
+import (
+	"cmp"
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"iter"
+	"regexp"
+	"slices"
+	"strings"
+)
+
+const SearchToolName = "search_tools"
+
+const (
+	searchDefaultResults = 5
+	searchMaxResults     = 10
+	searchMaxPattern     = 200
+	searchDescription    = "Search the tools of this application to find one that can do the current task. " +
+		"Use it when no tool you see fits. The search reads tool names and descriptions. " +
+		"It returns the names of the matching tools; those tools are available from your next step on."
+	searchSchema = `{"type":"object","properties":{` +
+		`"query":{"type":"string","description":"Words that describe the capability you need. Be specific."},` +
+		`"maxResults":{"type":"integer","description":"The most tool names to return, from 1 to 10. The default is 5."}},` +
+		`"required":["query"]}`
+)
+
+const searchStopWords = " a an the is are was were be been being have has had do does did will would could should may might must shall " +
+	"can need dare ought used to of in for on with at by from as into through during before after above below between and or but if " +
+	"because until while although this that these those what which who whom whose i me my we our you your he him his she her it " +
+	"its they them their all any both each every some no not only just also very too so "
+
+type searchInput struct {
+	Query      string `json:"query"`
+	MaxResults int32  `json:"maxResults"`
+}
+
+func SearchTools(all const []Tool) (Tool, Layer) {
+	managed := map[string]bool{}
+	for _, tool := range all {
+		managed[tool.Name] = true
+	}
+	search := Tool{
+		Name:        SearchToolName,
+		Description: searchDescription,
+		Schema:      searchSchema,
+		Call: func(ctx context.Context, arguments string) (string, error) {
+			return searchCall(all, arguments)
+		},
+	}
+	layer := func(next Model) Model {
+		return narrowing{next: next, managed: managed}
+	}
+	return search, layer
+}
+
+func searchCall(all const []Tool, arguments string) (string, error) {
+	var in searchInput
+	if err := json.Unmarshal([]byte(arguments), &in); err != nil {
+		return "", fmt.Errorf("ai: search tools: arguments: %w", err)
+	}
+	limit := searchDefaultResults
+	if in.MaxResults >= 1 {
+		limit = int(min(in.MaxResults, searchMaxResults))
+	}
+	names, err := findTools(all, in.Query, limit)
+	if err != nil {
+		return "", err
+	}
+	out, err := json.Marshal(names)
+	if err != nil {
+		return "", fmt.Errorf("ai: search tools: result: %w", err)
+	}
+	return string(out), nil
+}
+
+type scoredTool struct {
+	name  string
+	score float64
+}
+
+func findTools(all const []Tool, query string, limit int) ([]string, error) {
+	pattern, err := regexp.Compile(searchPattern(query))
+	if err != nil {
+		return nil, fmt.Errorf("ai: search tools: pattern: %w", err)
+	}
+	var found []scoredTool
+	for _, tool := range all {
+		nameCount, namePosition := matchWeight(pattern, tool.Name)
+		textCount, textPosition := matchWeight(pattern, tool.Description)
+		score := 2*nameCount + namePosition + textCount + 0.5*textPosition
+		if score > 0 {
+			found = append(found, scoredTool{name: tool.Name, score: score})
+		}
+	}
+	slices.SortStableFunc(found, func(a, b scoredTool) int {
+		return cmp.Compare(b.score, a.score)
+	})
+	var names []string
+	for _, tool := range found[:min(limit, len(found))] {
+		names = append(names, tool.name)
+	}
+	return names, nil
+}
+
+func matchWeight(pattern *regexp.Regexp, text string) (float64, float64) {
+	matches := pattern.FindAllStringIndex(text, -1)
+	if len(matches) == 0 {
+		return 0, 0
+	}
+	return float64(len(matches)), 1 / (1 + 0.1*float64(matches[0][0]))
+}
+
+func searchPattern(query string) string {
+	raw := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return strings.ContainsRune(" \t\r\n\f\v,;:.!?()[]{}\"'", r)
+	})
+	var tokens []string
+	for _, token := range raw {
+		if len([]rune(token)) >= 2 && !strings.Contains(searchStopWords, " "+token+" ") {
+			tokens = appendToken(tokens, token)
+		}
+	}
+	if len(tokens) == 0 {
+		for _, token := range raw {
+			tokens = appendToken(tokens, token)
+		}
+	}
+	if len(tokens) == 0 {
+		return ".*"
+	}
+	pattern := "(?i)(" + strings.Join(tokens, "|") + ")"
+	for len(pattern) > searchMaxPattern && len(tokens) > 1 {
+		tokens = tokens[:len(tokens)-1]
+		pattern = "(?i)(" + strings.Join(tokens, "|") + ")"
+	}
+	return pattern
+}
+
+func appendToken(tokens []string, token string) []string {
+	quoted := regexp.QuoteMeta(token)
+	if slices.Contains(tokens, quoted) {
+		return tokens
+	}
+	return append(tokens, quoted)
+}
+
+type narrowing struct {
+	next    Model
+	managed map[string]bool
+}
+
+func (n narrowing) Chat(ctx context.Context, req Request) (Reply, error) {
+	return n.next.Chat(ctx, n.narrow(req))
+}
+
+func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, error] {
+	for chunk, err := range n.next.Stream(ctx, n.narrow(req)) {
+		yield chunk, err
+	}
+}
+
+func (n narrowing) narrow(req Request) Request {
+	found := foundTools(req.Messages)
+	var visible []Tool
+	for _, tool := range req.Tools {
+		if !(n.managed[tool.Name] ?? false) || (found[tool.Name] ?? false) {
+			visible = append(visible, tool)
+		}
+	}
+	req.Tools = visible
+	return req
+}
+
+func foundTools(messages []Message) map[string]bool {
+	found := map[string]bool{}
+	for _, message := range messages {
+		for _, part := range message.Parts {
+			result, isResult := part.(ToolResult)
+			if !isResult || !strings.EqualFold(result.Name, SearchToolName) {
+				continue
+			}
+			var names []string
+			if err := json.Unmarshal([]byte(result.Content), &names); err != nil {
+				continue
+			}
+			for _, name := range names {
+				found[name] = true
+			}
+		}
+	}
+	return found
+}

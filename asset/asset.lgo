@@ -1,0 +1,150 @@
+package asset
+
+import (
+	"encoding/json/v2"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"path"
+	"regexp"
+	"strings"
+
+	"github.com/gosuda/spira/view"
+)
+
+type manifestChunk struct {
+	File    string   `json:"file"`
+	Css     []string `json:"css"`
+	Imports []string `json:"imports"`
+}
+
+type Manifest struct {
+	chunks    map[string]manifestChunk
+	devOrigin string
+}
+
+const devPreamble = `<script type="module">
+import RefreshRuntime from '%s/@react-refresh'
+RefreshRuntime.injectIntoGlobalHook(window)
+window.$RefreshReg$ = () => {}
+window.$RefreshSig$ = () => (type) => type
+window.__vite_plugin_react_preamble_installed__ = true
+</script>`
+
+func Load(fsys fs.FS, manifestPath string) (*Manifest?, error) {
+	data, err := fs.ReadFile(fsys, manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("asset: read manifest %s: %w", manifestPath, err)
+	}
+	var chunks map[string]manifestChunk
+	if err := json.Unmarshal(data, &chunks); err != nil {
+		return nil, fmt.Errorf("asset: parse manifest %s: %w", manifestPath, err)
+	}
+	return &Manifest{chunks: chunks}, nil
+}
+
+var devOrigin = regexp.MustCompile(`^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?$`)
+
+func Dev(origin string) *Manifest {
+	if !devOrigin.MatchString(origin) {
+		panic(fmt.Sprintf("asset: dev origin %q is not an http(s) origin", origin))
+	}
+	return &Manifest{devOrigin: origin}
+}
+
+func (m *Manifest) Tags(entry string) (view.Node, error) {
+	if m.devOrigin != "" {
+		return view.Group{Nodes: []view.Node{
+			devScript(m.devOrigin + "/@vite/client"),
+			view.Trust(fmt.Sprintf(devPreamble, m.devOrigin)),
+			devScript(m.devOrigin + "/" + entry),
+		}}, nil
+	}
+	entryChunk, ok := m.chunks[entry]
+	if !ok {
+		return nil, fmt.Errorf("asset: entry %q not in manifest", entry)
+	}
+	seen := map[string]bool{entry: true}
+	seenCSS := map[string]bool{}
+	var nodes []view.Node
+	nodes = append(nodes, cssLinks(entryChunk.Css, seenCSS)...)
+	var imports []manifestChunk
+	for _, imp := range entryChunk.Imports {
+		imports = append(imports, postOrder(m.chunks, imp, seen)...)
+	}
+	for _, chunk := range imports {
+		nodes = append(nodes, cssLinks(chunk.Css, seenCSS)...)
+	}
+	nodes = append(nodes, view.Script(view.Attr("type", "module"), view.Attr("src", rooted(entryChunk.File))))
+	for _, chunk := range imports {
+		nodes = append(nodes, view.Link(view.Attr("rel", "modulepreload"), view.Attr("href", rooted(chunk.File))))
+	}
+	return view.Group{Nodes: nodes}, nil
+}
+
+func devScript(src string) view.Element {
+	return view.Script(view.Attr("type", "module"), view.Attr("src", src))
+}
+
+func rooted(p string) string {
+	if strings.HasPrefix(p, "/") {
+		return p
+	}
+	return "/" + p
+}
+
+func postOrder(chunks map[string]manifestChunk, key string, seen map[string]bool) []manifestChunk {
+	if seen[key] ?? false {
+		return nil
+	}
+	chunk, ok := chunks[key]
+	if !ok {
+		return nil
+	}
+	seen[key] = true
+	var out []manifestChunk
+	for _, imp := range chunk.Imports {
+		out = append(out, postOrder(chunks, imp, seen)...)
+	}
+	return append(out, chunk)
+}
+
+func cssLink(href string) view.Element {
+	return view.Link(view.Attr("rel", "stylesheet"), view.Attr("href", rooted(href)))
+}
+
+func cssLinks(css const []string, seen map[string]bool) []view.Node {
+	var nodes []view.Node
+	for _, href := range css {
+		if seen[href] ?? false {
+			continue
+		}
+		seen[href] = true
+		nodes = append(nodes, cssLink(href))
+	}
+	return nodes
+}
+
+func (m *Manifest) Preload(src string) (view.Node, error) {
+	if m.devOrigin != "" {
+		return view.Link(view.Attr("rel", "modulepreload"), view.Attr("href", m.devOrigin+"/"+src)), nil
+	}
+	file, ok := m.chunks[src]
+	if !ok {
+		return nil, fmt.Errorf("asset: source %q not in manifest", src)
+	}
+	return view.Link(view.Attr("rel", "modulepreload"), view.Attr("href", rooted(file.File))), nil
+}
+
+func (m *Manifest) Files(fsys fs.FS) http.Handler {
+	inner := http.FileServerFS(fsys)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+			if info, err := fs.Stat(fsys, name); err == nil && info.Mode().IsRegular() {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
+		}
+		inner.ServeHTTP(w, r)
+	})
+}
