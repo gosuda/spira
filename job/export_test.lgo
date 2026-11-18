@@ -1,0 +1,23 @@
+package job
+
+import (
+	"time"
+)
+
+func SetTicker(s *Scheduler, tick func(time.Duration) <-chan time.Time) {
+	s.tick = tick
+}
+
+func MarkEntryBusy(s *Scheduler, name string) bool {
+	found := false
+	s.life.WithLock(func(l *schedLife) {
+		for i := range s.jobs {
+			if s.jobs[i].name == name {
+				s.jobs[i].busy = true
+				found = true
+				return
+			}
+		}
+	})
+	return found
+}

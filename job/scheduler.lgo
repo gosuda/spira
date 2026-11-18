@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
 	"time"
 
 	"logos/rt"
@@ -15,7 +14,7 @@ type jobEntry struct {
 	name     string
 	interval time.Duration
 	run      func(ctx context.Context) error
-	busy     atomic.Bool
+	busy     bool
 }
 
 type joinState struct {
@@ -29,65 +28,95 @@ type schedRun struct {
 	joinCancel context.CancelFunc
 }
 
+type schedLife struct {
+	started bool
+	run     *schedRun?
+	skipped uint64
+}
+
 type Scheduler struct {
-	jobs    []jobEntry
-	started atomic.Bool
-	skipped atomic.Uint64
-	run     atomic.Pointer[schedRun]
+	jobs []jobEntry
+	life sync.Locked[schedLife]
+	tick func(time.Duration) <-chan time.Time
 }
 
 func (s *Scheduler) Every(name string, interval time.Duration, run func(ctx context.Context) error) {
-	if s.started.Load() {
-		panic(fmt.Sprintf("job: Every %q: scheduler already started", name))
-	}
-	if interval <= 0 {
-		panic(fmt.Sprintf("job: Every %q: interval must be positive", name))
-	}
-	s.jobs = append(s.jobs, jobEntry{name: name, interval: interval, run: run})
+	s.life.WithLock(func(l *schedLife) {
+		if l.started {
+			panic(fmt.Sprintf("job: Every %q: scheduler already started", name))
+		}
+		if interval <= 0 {
+			panic(fmt.Sprintf("job: Every %q: interval must be positive", name))
+		}
+		s.jobs = append(s.jobs, jobEntry{name: name, interval: interval, run: run})
+	})
 }
 
 func (s *Scheduler) Skipped() uint64 {
-	return s.skipped.Load()
+	var n uint64
+	s.life.WithLock(func(l *schedLife) {
+		n = l.skipped
+	})
+	return n
 }
 
 func (s *Scheduler) Start(ctx context.Context) error {
-	if !s.started.CompareAndSwap(false, true) {
-		return fmt.Errorf("job: scheduler already started")
-	}
 	runCtx, cancel := context.WithCancel(ctx)
-	g, _ := rt.NewGroup(runCtx, 0)
-	for i := range s.jobs {
-		s.spawn(g, &s.jobs[i])
-	}
-	js := &joinState{done: make(chan struct{})}
-	joinCtx, joinCancel := context.WithCancel(context.Background())
-	context.AfterFunc(joinCtx, func() {
-		js.err.WithLock(func(e *error) {
-			*e = g.Wait()
+	var startErr error
+	s.life.WithLock(func(l *schedLife) {
+		if l.started {
+			startErr = fmt.Errorf("job: scheduler already started")
+			return
+		}
+		l.started = true
+		g, _ := rt.NewGroup(runCtx, 0)
+		for i := range s.jobs {
+			s.spawn(g, &s.jobs[i])
+		}
+		js := &joinState{done: make(chan struct{})}
+		joinCtx, joinCancel := context.WithCancel(context.Background())
+		context.AfterFunc(joinCtx, func() {
+			js.err.WithLock(func(e *error) {
+				*e = g.Wait()
+			})
+			close(js.done)
 		})
-		close(js.done)
+		l.run = &schedRun{join: js, cancel: cancel, joinCancel: joinCancel}
 	})
-	s.run.Store(&schedRun{join: js, cancel: cancel, joinCancel: joinCancel})
+	if startErr != nil {
+		cancel()
+		return startErr
+	}
 	return nil
 }
 
+func (s *Scheduler) takeRun() *schedRun? {
+	var r *schedRun?
+	s.life.WithLock(func(l *schedLife) {
+		if !l.started {
+			return
+		}
+		l.started = false
+		r = l.run
+		l.run = nil
+	})
+	return r
+}
+
 func (s *Scheduler) Stop(ctx context.Context) error {
-	if !s.started.Swap(false) {
+	run := s.takeRun()
+	if run == nil {
 		return nil
 	}
-	r := s.run.Load()
-	if r == nil {
-		return nil
-	}
-	r.cancel()
-	r.joinCancel()
+	run.cancel()
+	run.joinCancel()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-r.join.done:
+	case <-run.join.done:
 	}
 	var err error
-	r.join.err.WithLock(func(e *error) {
+	run.join.err.WithLock(func(e *error) {
 		err = *e
 	})
 	return err
@@ -104,13 +133,18 @@ func (s *Scheduler) spawn(g *rt.Group, j *jobEntry) {
 }
 
 func (s *Scheduler) pump(ctx context.Context, j *jobEntry, tick chan struct{}) error {
-	ticker := time.NewTicker(j.interval)
-	defer ticker.Stop()
+	ticks := s.tick
+	if ticks == nil {
+		ticker := time.NewTicker(j.interval)
+		defer ticker.Stop()
+		ticks = func(time.Duration) <-chan time.Time { return ticker.C }
+	}
+	source := ticks(j.interval)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-source:
 			if !s.deliver(ctx, j, tick) {
 				return nil
 			}
@@ -119,20 +153,40 @@ func (s *Scheduler) pump(ctx context.Context, j *jobEntry, tick chan struct{}) e
 }
 
 func (s *Scheduler) deliver(ctx context.Context, j *jobEntry, tick chan struct{}) bool {
-	if !j.busy.CompareAndSwap(false, true) {
-		s.skipped.Add(1)
+	if !s.claim(j) {
+		s.life.WithLock(func(l *schedLife) {
+			l.skipped++
+		})
 		return true
 	}
 	select {
 	case tick <- struct{}{}:
 		return true
 	case <-ctx.Done():
-		j.busy.Store(false)
+		s.release(j)
 		return false
 	}
 }
 
+func (s *Scheduler) claim(j *jobEntry) bool {
+	ok := false
+	s.life.WithLock(func(l *schedLife) {
+		if !j.busy {
+			j.busy = true
+			ok = true
+		}
+	})
+	return ok
+}
+
+func (s *Scheduler) release(j *jobEntry) {
+	s.life.WithLock(func(l *schedLife) {
+		j.busy = false
+	})
+}
+
 func (s *Scheduler) runner(ctx context.Context, j *jobEntry, tick chan struct{}) error {
+	defer s.release(j)
 	for {
 		select {
 		case <-ctx.Done():
@@ -140,7 +194,7 @@ func (s *Scheduler) runner(ctx context.Context, j *jobEntry, tick chan struct{})
 		case <-tick:
 		}
 		s.runOnce(ctx, j)
-		j.busy.Store(false)
+		s.release(j)
 	}
 }
 

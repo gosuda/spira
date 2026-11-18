@@ -68,6 +68,7 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `Stop` MUST wait until the runs end or until `ctx` ends.
 - When `ctx` ends first, `Stop` MUST return that context error.
 - `Stop` before a successful `Start` MUST return nil.
+- A cancelled runner MUST clear its job's busy mark.
 
 ### Queue
 
@@ -86,6 +87,8 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - A handler panic MUST NOT stop the queue.
 - A handler panic MUST be logged with message `job: handle panicked`.
 - `Stop` before `Start` MUST return nil.
+- `Start` after `Stop` MUST return `job: queue stopped`.
+- `Stop` before `Start` MUST prevent a later `Start`.
 
 ### Chunk
 
@@ -114,6 +117,7 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - Panic `job: NewQueue: capacity must not be negative` when `capacity` is below 0.
 - `job: queue already started` when `Queue.Start` is called again.
 - `job: queue closed` when `Enqueue` finds no open queue.
+- `job: queue stopped` when `Start` follows `Stop`.
 - `job: chunk failed after %d items in %d chunks: %v` from `ChunkError.Error`.
 
 ## Proof
@@ -135,6 +139,8 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `TestChunkWriteFailureStopsRun` proves the stop, the `*ChunkError` stats and the error text. The cause is the error `Write` returned.
 - `TestChunkSuccessStats` proves the item count, the chunk count and the final short batch.
 - `TestChunkReadError` proves that a read error is a `*ChunkError` with zero stats before any write.
+- `TestQueueStopRacingStartLeavesNoLiveRun` proves that a `Start`/`Stop` race leaves no live queue.
+- `TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick` proves that a cancelled runner does not skip the next tick after a restart.
 
 ## Not in scope
 

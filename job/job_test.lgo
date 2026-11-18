@@ -523,3 +523,108 @@ func TestChunkReadError(t *testing.T) {
 		t.Fatalf("ChunkError stats = %+v, want zero items before the read error", ce.Stats)
 	}
 }
+
+func TestQueueStopRacingStartLeavesNoLiveRun(t *testing.T) {
+	race := func(i int) error {
+		q := job.NewQueue[int](8, 4, func(ctx context.Context, v int) error { return nil })
+		started := make(chan error, 1)
+		stopped := make(chan error, 1)
+		if err := func() error {
+			go group (t.Context()) {
+				go {
+					started <- q.Start(t.Context())
+				}
+				go {
+					stopped <- q.Stop(t.Context())
+				}
+			}
+			return nil
+		}(); err != nil {
+			return err
+		}
+		var startErr, stopErr error
+		select {
+		case startErr = <-started:
+		case <-t.Context().Done():
+			t.Fatal("test context ended waiting for Start")
+		}
+		select {
+		case stopErr = <-stopped:
+		case <-t.Context().Done():
+			t.Fatal("test context ended waiting for Stop")
+		}
+		if stopErr != nil {
+			return fmt.Errorf("Stop: %w", stopErr)
+		}
+		if startErr != nil && startErr.Error() != "job: queue stopped" {
+			return fmt.Errorf("Start: %w", startErr)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := q.Enqueue(ctx, 1); err == nil {
+			return fmt.Errorf("queue accepted an item after the race")
+		}
+		return nil
+	}
+	for i := range 1000 {
+		if err := race(i); err != nil {
+			t.Fatalf("race %d: %v", i, err)
+		}
+	}
+}
+
+func sendTick(t *testing.T, ticks chan time.Time) {
+	t.Helper()
+	select {
+	case ticks <- time.Time{}:
+	case <-t.Context().Done():
+		t.Fatal("test context ended sending a tick")
+	}
+}
+
+func waitRun(t *testing.T, runs chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-runs:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("job did not run: %s", what)
+	case <-t.Context().Done():
+		t.Fatalf("test context ended waiting for %s", what)
+	}
+}
+
+func TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	runs := make(chan struct{}, 4)
+	s.Every("held", time.Second, func(ctx context.Context) error {
+		select {
+		case runs <- struct{}{}:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	ctl, cancel := context.WithCancel(context.Background())
+	if err := s.Start(ctl); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !job.MarkEntryBusy(&s, "held") {
+		t.Fatal("MarkEntryBusy did not find the job")
+	}
+	cancel()
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("restart Start: %v", err)
+	}
+	sendTick(t, ticks)
+	waitRun(t, runs, "the run after the restart")
+	if got := s.Skipped(); got != 0 {
+		t.Fatalf("Skipped = %d, want 0 after the restart", got)
+	}
+	if err := s.Stop(t.Context()); err != nil {
+		t.Fatalf("final Stop: %v", err)
+	}
+}
