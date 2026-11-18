@@ -133,6 +133,8 @@ area base br col embed hr img input link meta param source track wbr
 - A `Later` found inside a resolved node MUST join that same queue.
 - That `Later` MUST join only after the template of the resolved node is written.
 - When a resolved node fails to render, a `Later` inside that node MUST NOT run.
+- When the write of a resolved slot template fails, `Render` MUST NOT publish the nested slots of that node.
+- When the write of a resolved slot template succeeds, `Render` MUST publish the nested slots of that node.
 - The set of written template ids MUST equal the set of slot ids.
 - A resolver error MUST still write `<template data-spira-slot="ID"><spira-error></spira-error></template>`.
 - `Render` MUST return the joined slot errors after every queued slot is written.
@@ -174,6 +176,8 @@ area base br col embed hr img input link meta param source track wbr
 - `TestLaterInsideTableStructureIsRejected` and `TestLaterInGroupInsideTableStructureIsRejected` prove the banned parents, in lower and upper case.
 - `TestLaterInsideAllowedParentsRenders` proves `td`, `th`, `div` and a root `Later`.
 - `TestSlotInsideAFailedResultNeverRuns` proves that a failed result runs none of its nested resolvers.
+- `TestSlotNestedPublishOnSuccess` proves that a resolved node publishes its nested slots and the written template ids equal the queued slot ids.
+- `TestSlotTemplateWriteFailureSuppressesNested` proves that a failed template write publishes no nested slot.
 - `TestCheckSlotsFindsABannedParentWithoutResolving` proves `CheckSlots` through an element, a group, a fallback and an island.
 
 ## Not in scope

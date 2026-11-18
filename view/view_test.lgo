@@ -791,6 +791,67 @@ func TestSlotInsideAFailedResultNeverRuns(t *testing.T) {
 	}
 }
 
+func TestSlotNestedPublishOnSuccess(t *testing.T) {
+	log := &eventLog{}
+	inner := &view.Later{Fallback: view.T("if"), Resolve: func(ctx context.Context) (view.Node, error) {
+		log.add("inner-ran")
+		return view.T("inner"), nil
+	}}
+	outer := &view.Later{Fallback: view.T("of"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.Group{Nodes: []view.Node{inner, view.T("rest")}}, nil
+	}}
+	var b bytes.Buffer
+	if err := view.Render(context.Background(), &b, view.Div(outer)); err != nil {
+		t.Fatalf("Render: %v", err)
+		return
+	}
+	out := b.String()
+	open := idSet(slotOpenRe, out)
+	written := idSet(slotWrittenRe, out)
+	if !maps.Equal(open, written) {
+		t.Fatalf("written slot ids %v do not equal queued ids %v", keysOf(written), keysOf(open))
+		return
+	}
+	if len(open) != 2 {
+		t.Fatalf("slot ids %v, want the outer slot and its nested slot", keysOf(open))
+		return
+	}
+	if !strings.Contains(out, ">inner<") {
+		t.Fatalf("output %q lacks the nested slot content", out)
+		return
+	}
+	for _, e := range log.snapshot() {
+		if e == "inner-ran" {
+			return
+		}
+	}
+	t.Fatal("the nested resolver never ran although the outer template was written")
+}
+
+func TestSlotTemplateWriteFailureSuppressesNested(t *testing.T) {
+	log := &eventLog{}
+	innerRan := &eventLog{}
+	inner := &view.Later{Fallback: view.T("if"), Resolve: func(ctx context.Context) (view.Node, error) {
+		innerRan.add("ran")
+		return view.T("inner"), nil
+	}}
+	outer := &view.Later{Fallback: view.T("of"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.Group{Nodes: []view.Node{inner}}, nil
+	}}
+	w := &failingWriter{log: log, failOn: func(b []byte) bool {
+		return strings.Contains(string(b), `data-spira-slot="`)
+	}}
+	err := view.Render(context.Background(), w, view.Div(outer))
+	if !errors.Is(err, errBrokenWriter) {
+		t.Fatalf("Render error = %v, want the slot template write failure", err)
+		return
+	}
+	if len(innerRan.snapshot()) != 0 {
+		t.Fatal("the nested resolver ran although the outer template write failed")
+		return
+	}
+}
+
 func TestCheckSlotsFindsABannedParentWithoutResolving(t *testing.T) {
 	ran := false
 	later := &view.Later{Fallback: view.T("f"), Resolve: func(ctx context.Context) (view.Node, error) {
