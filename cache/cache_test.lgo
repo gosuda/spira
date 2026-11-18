@@ -266,13 +266,8 @@ func TestLoadFailureSharedAndNotCached(t *testing.T) {
 	gate := make(chan struct{})
 	release := make(chan struct{})
 	boom := errors.New("cache test: boom")
-	failing := true
-	result := func() (int, error) {
-		if failing {
-			return 0, boom
-		}
-		return 7, nil
-	}
+	failure := boom
+	result := func() (int, error) { return 7, failure }
 	load := blockingLoad(release, result, &calls)
 	errs := make([]error, 3)
 	run := func() error {
@@ -305,8 +300,10 @@ func TestLoadFailureSharedAndNotCached(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("load ran %d times for one failing flight, want 1", calls.Load())
 	}
-	failing = false
-	v, err := cache.Load(ctx, c, "k", load)
+	failure = nil
+	retryCtx, retryCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer retryCancel()
+	v, err := cache.Load(retryCtx, c, "k", load)
 	if err != nil {
 		t.Fatalf("retry Load: %v", err)
 		return
