@@ -176,6 +176,28 @@ func TestStreamCutBeforeDoneYieldsErrorAndNoReply(t *testing.T) {
 	}
 }
 
+func TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonToolStream)(w, r)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply := collectReply(t, c.Stream(ctx, ai.Request{Model: "llama3.2"}))
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish = %q, want tool_call", reply.Finish)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	}
+}
+
 func TestClientErrorIsFinal(t *testing.T) {
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

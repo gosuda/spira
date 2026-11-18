@@ -26,6 +26,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `Chat` MUST send `POST <BaseURL>/api/chat` with `stream` false.
 - `Stream` MUST send the same request with `stream` true.
 - `Stream` MUST read NDJSON that ends at the object with `done` true.
+- `Stream` MUST end at that object and MUST NOT wait for the body to close.
 - A tool call MUST carry its arguments as one complete JSON object text.
 - Usage MUST come from `prompt_eval_count` and `eval_count`.
 - `Embed` MUST send `POST <BaseURL>/api/embed`.
@@ -50,6 +51,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestChatRequestBodyMatchesReferenceShape` compares the request body with the reference JSON for a prompt with one tool.
 - `TestStreamCollectsCompleteToolCall` replays an NDJSON stream through `ai.Collect` and requires one complete tool call.
 - `TestStreamCutBeforeDoneYieldsErrorAndNoReply` proves the error chunk for a cut stream.
+- `TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen` proves that the stream ends at `done` while the server keeps the body open.
 - `TestClientErrorIsFinal` proves that a 400 answer costs one request. The test server counts the requests.
 - `TestServerErrorIsRetried` proves that a 500 answer is retried.
 - `TestEmbedReturnsEmbeddingsInInputOrder` proves the embed path and the vector order.

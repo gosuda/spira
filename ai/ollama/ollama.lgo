@@ -204,10 +204,11 @@ func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error]
 				yield chunk, cerr
 			}
 		}
+		if done {
+			return
+		}
 		if err != nil {
-			if !done {
-				yield ai.Chunk{}, fmt.Errorf("ai/ollama: stream ended before done")
-			}
+			yield ai.Chunk{}, fmt.Errorf("ai/ollama: stream ended before done")
 			return
 		}
 		if ctx.Err() != nil {
