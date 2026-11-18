@@ -715,13 +715,14 @@ func TestNaNKeyLoadNeverJoinsAFlight(t *testing.T) {
 		})
 	}
 	settled := waitUntil(func() bool { return calls.Load() == 2 && cache.FlightsLenFloat(c) == 0 }, 5*time.Second)
-	if !settled {
-		t.Fatalf("in-flight loads = %d, registered flights = %d: a NaN key must not register a flight", calls.Load(), cache.FlightsLenFloat(c))
-		return
-	}
+	inflight, flights := calls.Load(), cache.FlightsLenFloat(c)
 	close(release)
 	if err := g.Wait(); err != nil {
 		t.Fatalf("go group: %v", err)
+		return
+	}
+	if !settled {
+		t.Fatalf("in-flight loads = %d, registered flights = %d: a NaN key must not register a flight", inflight, flights)
 		return
 	}
 	for i := range 2 {
