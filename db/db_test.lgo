@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gosuda/spira/db"
 
@@ -403,6 +404,43 @@ func TestQueryScansEveryPlainKind(t *testing.T) {
 	}
 	if diff := plainDiff(rows[0], readPlainRaw(t, pool)); diff != nil {
 		t.Fatal(diff)
+	}
+}
+
+type stampedRow struct {
+	ID int64     `col:"id"`
+	At time.Time `col:"ts"`
+}
+
+func TestQueryScansTimestampColumn(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE stamped (id INTEGER PRIMARY KEY, ts TIMESTAMP NOT NULL)")
+	mustExec(t, pool, "INSERT INTO stamped (id, ts) VALUES (1, '2026-11-18 10:20:30')")
+	got, err := db.Query[stampedRow](t.Context(), pool, "SELECT id, ts FROM stamped")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query stamped: %v", err))
+	}
+	if len(got) != 1 {
+		t.Fatalf("Query returned %d rows, want 1", len(got))
+	}
+	rows, rerr := pool.QueryContext(t.Context(), "SELECT id, ts FROM stamped")
+	if rerr != nil {
+		panic(fmt.Sprintf("db_test: raw query: %v", rerr))
+	}
+	if rows == nil {
+		panic("db_test: raw query returned no rows handle")
+	}
+	defer closeRows(t, rows)
+	if !rows.Next() {
+		t.Fatal("raw query returned no row")
+	}
+	var id int64
+	var want time.Time
+	if serr := rows.Scan(&id, &want); serr != nil {
+		panic(fmt.Sprintf("db_test: raw scan: %v", serr))
+	}
+	if got[0].ID != id || !got[0].At.Equal(want) {
+		t.Fatalf("scan = %d %v, want %d %v", got[0].ID, got[0].At, id, want)
 	}
 }
 

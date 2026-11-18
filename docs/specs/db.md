@@ -56,6 +56,7 @@ func Query[T any](ctx context.Context, q Querier, query string, args ...any) ([]
 func One[T any](ctx context.Context, q Querier, query string, args ...any) (found T?, err error)
 func PlanFields[T any](prefix string, plan *ScanPlan) error
 func PlanField[F any](path string, name string, tag string, plan *ScanPlan) error
+func PlanLeaf(path string, name string, tag string, plan *ScanPlan)
 func ScanRow[T any](row *T, rows *sql.Rows, plan ScanPlan) error
 func ScanFields[T any](row *T, prefix string, dests *[]any) error
 func ScanField[F any](dst *F, path string, dests *[]any) error
@@ -133,6 +134,7 @@ func (d *OptionDest[V]) Scan(src any) error
 
 - `Query` and `One` MUST read struct fields in declaration order.
 - A nested struct MUST expand to its fields, in declaration order, at that position.
+- A `time.Time` field MUST take one column. It MUST NOT expand to its fields.
 - A `T` that is not a struct MUST take one column.
 - The expected column name MUST be the `col` tag when that tag is not empty.
 - If the `col` tag is empty, the expected name MUST be `SnakeName` of the field name.
@@ -204,6 +206,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestQueryExpectsSnakeCaseWithoutTag` proves the snake-case name when the `col` tag is empty.
 - `TestQueryFlattensNestedStructs` proves nested field order against a direct `rows.Scan`.
 - `TestQueryScansScalarColumns` and `TestQueryScansEveryPlainKind` prove a one-column scan and each plain field type. The oracle is a direct `rows.Scan`.
+- `TestQueryScansTimestampColumn` proves that a `time.Time` field scans a timestamp column. The oracle is a direct `rows.Scan`.
 - `TestOneReturnsAbsentWithoutARow` and `TestOneReturnsTheOnlyRow` prove the absent result and the single row.
 - `TestOneRejectsTwoRows` proves the second-row error.
 - `TestQueryRejectsNullInNonOptional` proves the NULL error for a field that is not an option.
