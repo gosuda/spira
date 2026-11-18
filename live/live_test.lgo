@@ -496,6 +496,7 @@ func TestWriteFailureIsLoggedOnlyWhileTheClientIsPresent(t *testing.T) {
 type beatCounter struct {
 	header http.Header
 	beats  atomic.Int64
+	seen   sync.Locked[[]string]
 }
 
 func (b *beatCounter) Header() http.Header {
@@ -507,8 +508,20 @@ func (b *beatCounter) WriteHeader(status int) {}
 func (b *beatCounter) Write(p []byte) (int, error) {
 	if string(p) == ": live\n\n" {
 		b.beats.Add(1)
+		return len(p), nil
 	}
+	b.seen.WithLock(func(s *[]string) {
+		*s = append(*s, string(p))
+	})
 	return len(p), nil
+}
+
+func (b *beatCounter) delivered() []string {
+	var out []string
+	b.seen.WithLock(func(s *[]string) {
+		out = append(out, *s...)
+	})
+	return out
 }
 
 func TestHeartbeatRepeatsEveryFifteenSeconds(t *testing.T) {
@@ -576,17 +589,30 @@ func TestHeartbeatContinuesWhileAnEventRenders(t *testing.T) {
 		out := &beatCounter{header: http.Header{}}
 		err := serveUntilWatched(ctx, r, out, func() error {
 			defer cancel()
-			defer close(release)
 			synctest.Wait()
 			time.Sleep(31 * time.Second)
 			synctest.Wait()
 			if got := out.beats.Load(); got != 3 {
 				return fmt.Errorf("live_test: %d heartbeats 31 seconds into a blocked render, want 3", got)
 			}
-			return nil
+			close(release)
+			return deliveredEvent(out)
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 	})
+}
+
+func deliveredEvent(out *beatCounter) error {
+	for range 100 {
+		synctest.Wait()
+		for _, m := range out.delivered() {
+			if strings.Contains(m, "event: tick") && strings.Contains(m, "done") {
+				return nil
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("live_test: event tick not delivered after release: %q", out.delivered())
 }

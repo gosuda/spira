@@ -24,6 +24,7 @@ func Events(ctx *web.Context, events <-chan Event) web.Reply
 - A heartbeat MUST NOT wait for an event body that is still rendering.
 - The stream MUST NOT write a heartbeat and an event at the same time.
 - `Events` MUST render `Body` with [view](view.md) before it writes the event.
+- The stream MUST deliver an event once its body has rendered.
 - Each output line of the body MUST be one `data:` field.
 - `Events` MUST treat a carriage return in the body as a line break.
 - The stream MUST end when the request context ends.
@@ -48,7 +49,7 @@ func Events(ctx *web.Context, events <-chan Event) web.Reply
 - `TestEventMessageWireForm` proves the `event:` line, one `data:` field per body line, and the carriage-return split.
 - `TestEventTextEscapedAndNameRejected` proves the name error and that view escaping reaches the `data:` field.
 - `TestHeartbeatRepeatsEveryFifteenSeconds` proves the first heartbeat and the 15 second gap, with a test clock.
-- `TestHeartbeatContinuesWhileAnEventRenders` proves two more heartbeats while a `Later` resolver blocks an event.
+- `TestHeartbeatContinuesWhileAnEventRenders` proves two more heartbeats while a `Later` resolver blocks an event and that the event is delivered after release.
 - `TestClientDisconnectEndsStreamAndSubscription` proves that the stream ends and the subscription channel closes after the client disconnects. The oracle is the group join.
 - `TestSlowStreamSubscriberLosesEventsFastKeepsAll` proves that a slow subscriber drops events and a fast subscriber keeps them.
 - `TestRenderErrorEndsStreamLoggedOnce` proves that a render failure ends the stream and is logged once.
