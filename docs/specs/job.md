@@ -153,6 +153,8 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick` proves that a cancelled runner does not skip the next tick after a restart.
 - `TestSchedulerSkipsWhileAnEarlierStartStillRuns` proves that a restart skips ticks while a timed-out stop leaves a run active.
 - `TestSchedulerDoesNotLeakABusyMarkFromACancelledPump` proves that a pump cancelled during shutdown leaves no busy mark for a later start.
+- `TestSchedulerReclaimsTickSentBeforeCancel` proves that a pump cancelled after its send takes its tick back and leaves no busy mark.
+- `TestSchedulerReleasesClaimWhenCancelWinsBeforeSend` proves that a pump cancelled before its send clears the claim it just made.
 
 ## Not in scope
 

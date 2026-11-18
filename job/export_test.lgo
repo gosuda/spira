@@ -44,3 +44,19 @@ func DeliverTick(s *Scheduler, name string, ctx context.Context, start uint64) b
 	}
 	return false
 }
+
+func DeliverTickBlocked(s *Scheduler, name string, ctx context.Context, start uint64) bool {
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			tick := make(chan struct{}, 1)
+			select {
+			case tick <- struct{}{}:
+			case <-ctx.Done():
+				return false
+			}
+			s.deliver(ctx, jobLoop{entry: &s.jobs[i], tick: tick, start: start})
+			return true
+		}
+	}
+	return false
+}

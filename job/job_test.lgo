@@ -891,3 +891,68 @@ func TestSchedulerDoesNotLeakABusyMarkFromACancelledPump(t *testing.T) {
 	}
 	restartRunsJob(t, &s, ticks, runs)
 }
+
+type flipClaimContext struct {
+	calls atomic.Int64
+	dones atomic.Int64
+	done chan struct{}
+}
+
+func (c *flipClaimContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *flipClaimContext) Done() <-chan struct{} {
+	if c.dones.Add(1) == 1 {
+		return make(chan struct{})
+	}
+	return c.done
+}
+func (c *flipClaimContext) Err() error {
+	if c.calls.Add(1) == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+func (c *flipClaimContext) Value(key any) any { return nil }
+
+func TestSchedulerReclaimsTickSentBeforeCancel(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	runs := make(chan struct{}, 8)
+	s.Every("held", time.Second, func(ctx context.Context) error {
+		select {
+		case runs <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	mustStart(t, &s)
+	mustStop(t, &s)
+	ctx := &flipClaimContext{done: make(chan struct{})}
+	if !job.DeliverTick(&s, "held", ctx, 1) {
+		t.Fatal("DeliverTick did not find the job")
+	}
+	restartRunsJob(t, &s, ticks, runs)
+}
+
+func TestSchedulerReleasesClaimWhenCancelWinsBeforeSend(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	runs := make(chan struct{}, 8)
+	s.Every("held", time.Second, func(ctx context.Context) error {
+		select {
+		case runs <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	mustStart(t, &s)
+	mustStop(t, &s)
+	done := make(chan struct{})
+	close(done)
+	ctx := &flipClaimContext{done: done}
+	if !job.DeliverTickBlocked(&s, "held", ctx, 1) {
+		t.Fatal("DeliverTickBlocked did not find the job")
+	}
+	restartRunsJob(t, &s, ticks, runs)
+}
