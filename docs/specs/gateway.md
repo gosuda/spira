@@ -1,0 +1,111 @@
+# gateway
+
+Package `gateway` forwards each request to a fixed list of upstreams. The application author names the path, the upstream URLs and the stages. Each route is one path predicate plus stages, in one proxy, as in Spring Cloud Gateway.
+
+## Interface
+
+```lgo
+type Route struct {
+	Host        string?
+	PathPrefix  string
+	StripPrefix bool
+	To          []string
+	Stages      []web.Stage
+}
+
+func Mount(r *web.Router, routes []Route, policy resilience.Policy)
+```
+
+## Requirements
+
+### Registration
+
+- `Mount` MUST register each route with an empty method, so one registration accepts every method.
+- A prefix other than `/` MUST be registered as that path and as that path with a trailing slash.
+- A prefix of `/` MUST be registered as `/` only.
+- When `Host` is set, the pattern MUST include that host.
+- A request for another host MUST NOT select that route.
+- A route with no `Host` MUST be registered with no host constraint.
+- A path that continues the prefix without a slash, such as `/shopping` for `/shop`, MUST NOT select the route.
+
+### Forward
+
+- The proxy MUST keep the request method.
+- The proxy MUST keep the query string.
+- The proxy MUST keep the request body.
+- The proxy MUST set `X-Forwarded-For` from the client address.
+- The proxy MUST set `X-Forwarded-Host` from the inbound host.
+- The proxy MUST set `X-Forwarded-Proto` from the inbound scheme.
+- The proxy MUST NOT keep a client value for those three headers.
+- The proxy MUST keep a caller header that is not one of those three.
+- When `StripPrefix` is false, the tail MUST be the request path.
+- When `StripPrefix` is true, the tail MUST be the request path without `PathPrefix`.
+- When that remainder is empty, the tail MUST be `/`.
+- When the upstream base path is empty or `/`, the upstream path MUST be the tail.
+- Otherwise the join MUST place one `/` between the base path and the tail.
+- The proxy MUST send the request to the upstream scheme and host.
+- Each request MUST start at the next upstream in list order.
+- After the last upstream, the next request MUST start at the first.
+- Router stages MUST run before the route stages.
+- Route stages MUST run in list order.
+- The proxy MUST run after the route stages.
+- A stage that returns a reply MUST NOT send the request to an upstream.
+
+### Failure
+
+- `Mount` MUST give each upstream its own breaker when `Policy.Breaker` is set.
+- That copy MUST use the same `Window`, `FailureRate`, `OpenFor` and `Now`.
+- A nil `Policy.Breaker` MUST leave the upstream with no breaker.
+- `Mount` MUST NOT apply `Policy.Retry`.
+- `Policy.Timeout` MUST bound the wait for response headers.
+- `Policy.Timeout` MUST NOT end the body read after the headers arrive.
+- The proxy MUST write the first body chunk before the upstream finishes the body.
+- The proxy MUST cancel the upstream request when the client context ends.
+- A transport error MUST count as a failure of that upstream.
+- An upstream status of 502, 503 or 504 MUST count as a failure of that upstream.
+- Any other upstream status MUST pass through to the client.
+- A passed-through status MUST NOT open the breaker.
+- An open breaker MUST skip that upstream.
+- A request with no body MUST try the later upstreams after a failure.
+- A request whose body is nil or `http.NoBody` MUST count as a request with no body.
+- A request with a body MUST stop after its first upstream.
+- When every tried upstream fails, the proxy MUST answer 502.
+- That answer MUST use the content type `application/problem+json`.
+- The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.
+- The body MUST NOT contain an upstream address.
+- Breaker admission and open duration MUST follow [resilience](resilience.md).
+
+## Errors
+
+- `gateway: route <prefix>: path prefix must start with /` when `PathPrefix` does not start with `/`.
+- `gateway: route <prefix>: no upstream` when `To` is empty.
+- `gateway: route <prefix>: upstream <raw> is not an absolute http or https URL` when an upstream is not an absolute `http` or `https` URL with a host.
+- `gateway: encode bad gateway problem: <cause>` when the 502 problem body cannot be encoded.
+- `gateway: upstream answered <status>` is the failure cause for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
+- `gateway: upstream headers exceeded <timeout>` when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
+
+## Proof
+
+- `TestMethodBodyQueryAndHeaderArriveUnchanged` proves that method, body, query and a caller header arrive unchanged.
+- `TestPrefixStrippedOrKeptByFlagAndShoppingNotRouted` proves strip, a kept prefix, and that `/shopping` does not select `/shop`.
+- `TestUpstreamBasePathIsJoinedBeforeTheStrippedTail` proves the base-path join.
+- `TestForwardedHeadersHoldInboundValuesAndDropForgedOnes` proves the three forwarded headers and that a forged value is dropped.
+- `TestUpstreamsTakeTurns` proves the rotation across the upstream list.
+- `TestHostRouteMatchesOnlyItsHost` proves that a host route rejects another host.
+- `TestRouteStagesRunAfterRouterStagesBeforeTheProxy` proves the stage order.
+- `TestStageAnswerKeepsTheRequestFromTheUpstream` proves that a stage reply does not reach an upstream.
+- `TestMountPanicsOnBadRoutes` proves the three registration panics.
+- `TestDeadUpstreamFailsOverForGetAndNeverReplaysPost` proves failover for a bodyless request and no second try for a body.
+- `TestOpenBreakerSkipsItsUpstreamAndKeepsTheLiveOne` proves that an open breaker skips only its upstream.
+- `TestBreakerRecoversThroughProbeWithSharedClock` proves probe recovery from the copied `Now`.
+- `TestAllUpstreamsDeadAnswersProblemWithoutLeaking` proves the 502 problem and that the body names no upstream.
+- `TestClientErrorsAndInternalErrorsPassThroughWithoutOpeningBreaker` proves that 404 and 500 pass through and do not open the breaker.
+- `TestServiceUnavailableCountsAsFailedAndAnswersProblem` proves that status 503 counts as a failure.
+- `TestTimeoutBeforeHeadersCountsAsFailed` proves that the header wait is bounded.
+- `TestFirstChunkStreamsBeforeUpstreamFinishes` proves that the first chunk arrives before the upstream finishes.
+- `TestClientCancelReachesUpstream` proves that a client cancel ends the upstream request.
+
+## Not in scope
+
+- A protocol switch is not supported. The proxy body is wrapped, so a WebSocket upgrade cannot pass through.
+- The upstream list is fixed at `Mount`. The package has no discovery backend.
