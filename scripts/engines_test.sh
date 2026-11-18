@@ -44,11 +44,14 @@ pg_port="${pg_port%%/*}"
 my_port="${SPIRA_TEST_MYSQL_DSN##*@tcp(127.0.0.1:}"
 my_port="${my_port%%)*}"
 ms_port="${SPIRA_TEST_MSSQL_DSN##*@127.0.0.1:}"
-ms_port="${ms_port%%/*}"
+ms_port="${ms_port%%[/?]*}"
 
-: "</dev/tcp/127.0.0.1/${pg_port}"
-: "</dev/tcp/127.0.0.1/${my_port}"
-: "</dev/tcp/127.0.0.1/${ms_port}"
+port_open() {
+	(exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+port_open "$pg_port" || { printf 'postgres published port %s refused the connection\n' "$pg_port" >&2; exit 1; }
+port_open "$my_port" || { printf 'mysql published port %s refused the connection\n' "$my_port" >&2; exit 1; }
+port_open "$ms_port" || { printf 'sqlserver published port %s refused the connection\n' "$ms_port" >&2; exit 1; }
 
 docker exec "$SPIRA_PG_CONTAINER" psql -U postgres -d postgres -tAc \
 	"SELECT 1 FROM pg_database WHERE datname='spira_test'" | grep -qx 1
