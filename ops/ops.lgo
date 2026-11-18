@@ -64,7 +64,11 @@ func checksResponse(ctx *web.Context, o Options) web.Reply {
 func runCheck(parent context.Context, name string, check func(ctx context.Context) error, timeout time.Duration) checkStatus {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	if err := guardedCheck(ctx, check); err != nil {
+	err := guardedCheck(ctx, check)
+	if err == nil && ctx.Err() != nil {
+		err = fmt.Errorf("ops: check outlived its context: %w", ctx.Err())
+	}
+	if err != nil {
 		return checkStatus{Name: name, Status: "fail", Error: err.Error()}
 	}
 	return checkStatus{Name: name, Status: "ok"}

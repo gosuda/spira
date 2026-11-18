@@ -40,6 +40,7 @@ func Mount(r *web.Router, guard web.Stage, o Options)
 - A check that returns an error MUST have status `fail`.
 - The fail member `error` MUST be that error text.
 - A check that panics MUST have status `fail`.
+- A check that returns nil after its context ended MUST have status `fail`.
 - The report MUST list checks in name order.
 - The report JSON MUST use the member names `status` and `checks`.
 - Each check JSON MUST use the member names `name`, `status` and `error`.
@@ -76,6 +77,7 @@ func Mount(r *web.Router, guard web.Stage, o Options)
 - `ops: Options.Registry is required` when `Registry` is nil.
 - `ops: Options.CheckTimeout must be positive` when `CheckTimeout` is not positive.
 - `ops: check panicked: <value>` is the check error text when a check panics. `<value>` is the panic value.
+- `ops: check outlived its context: <cause>` is the check error text when a check returns nil after its context ended.
 
 ## Proof
 
@@ -88,6 +90,7 @@ func Mount(r *web.Router, guard web.Stage, o Options)
 - `TestInfoEndpointReportsBuildInfo` proves the Go version and the `info` map.
 - `TestPanickingCheckFails` proves that a panic becomes a failed check and that the body holds the panic value.
 - `TestTimedOutCheckFails` proves that the check context ends at `CheckTimeout`.
+- `TestExpiredCheckReturningNilFails` proves that a nil result after the timeout answers 503 and names the check.
 - `TestMountRefusesNonPositiveCheckTimeout` proves the panic for a zero `CheckTimeout`.
 
 ## Not in scope

@@ -250,3 +250,21 @@ func TestMountRefusesNonPositiveCheckTimeout(t *testing.T) {
 	}()
 	ops.Mount(web.NewRouter(), tokenGuard(), ops.Options{Registry: meter.NewRegistry(), CheckTimeout: 0})
 }
+
+func TestExpiredCheckReturningNilFails(t *testing.T) {
+	checks := map[string]checkFunc{
+		"late": func(ctx context.Context) error {
+			<-ctx.Done()
+			return nil
+		},
+	}
+	r, _ := newOpsRouter(checks)
+	rec := opsGet(r, "/ops/ready", true)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /ops/ready status = %d, want 503 when the check returns nil after its timeout", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "late") || !strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("body must name the expired check and the deadline: %s", body)
+	}
+}
