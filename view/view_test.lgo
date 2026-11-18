@@ -733,7 +733,7 @@ func tableRowLater() *view.Later {
 }
 
 func TestLaterInsideTableStructureIsRejected(t *testing.T) {
-	for _, parent := range []string{"table", "thead", "tbody", "tfoot", "tr", "colgroup", "select"} {
+	for _, parent := range []string{"table", "thead", "tbody", "tfoot", "tr", "colgroup", "select", "TABLE", "TBody", "Select"} {
 		var b bytes.Buffer
 		err := view.Render(context.Background(), &b, view.El(parent, tableRowLater()))
 		if err == nil {

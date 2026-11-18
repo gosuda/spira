@@ -384,7 +384,7 @@ func writeIslandOpen(w io.Writer, i *Island, props []byte) error {
 }
 
 func parentForbidsSlot(parent string) bool {
-	switch parent {
+	switch strings.ToLower(parent) {
 	case "table", "thead", "tbody", "tfoot", "tr", "colgroup", "select":
 		return true
 	}

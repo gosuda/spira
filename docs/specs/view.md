@@ -134,6 +134,7 @@ area base br col embed hr img input link meta param source track wbr
 - A resolver error MUST still write `<template data-spira-slot="ID"><spira-error></spira-error></template>`.
 - `Render` MUST return the joined slot errors after every queued slot is written.
 - A `Later` inside `table`, `thead`, `tbody`, `tfoot`, `tr`, `colgroup` or `select` MUST be an error.
+- That parent name MUST match in any letter case.
 - A `Later` inside a `Group` under one of those parents MUST use that parent in the error.
 - A `Later` inside `td`, `th`, `div` or at the root MUST render.
 
@@ -163,7 +164,7 @@ area base br col embed hr img input link meta param source track wbr
 - `TestSlotFlushOrder` proves that each slot result is flushed.
 - `TestRootWriteFailure`, `TestSlotWriteFailure` and `TestRenderWriteErrorCarriesViewContext` prove the write errors.
 - `TestEachConstView` proves row order for a named callback and a lambda.
-- `TestLaterInsideTableStructureIsRejected` and `TestLaterInGroupInsideTableStructureIsRejected` prove the banned parents.
+- `TestLaterInsideTableStructureIsRejected` and `TestLaterInGroupInsideTableStructureIsRejected` prove the banned parents, in lower and upper case.
 - `TestLaterInsideAllowedParentsRenders` proves `td`, `th`, `div` and a root `Later`.
 
 ## Not in scope
