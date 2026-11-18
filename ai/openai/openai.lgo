@@ -10,6 +10,7 @@ package openai
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"iter"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/resilience"
@@ -58,30 +60,36 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		yield ai.Chunk{}, err
 		return
 	}
-	status, body, err := c.do(ctx, "/chat/completions", payload)
+	limit := c.Policy.Timeout
+	bounded, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	idle := time.AfterFunc(limit, func() {
+		cancel(fmt.Errorf("ai/openai: no stream event for %s", limit))
+	})
+	defer idle.Stop()
+	status, body, err := c.do(bounded, "/chat/completions", payload)
 	if err != nil {
-		yield ai.Chunk{}, err
+		yield ai.Chunk{}, cmp.Or(context.Cause(bounded), err)
 		return
 	}
+	defer closeBody(body)
 	if status < 200 || status > 299 {
-		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
-		if rerr != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/openai: read response: %w", rerr)
-			closeBody(body)
-			return
-		}
-		yield ai.Chunk{}, statusError(status, data)
-		closeBody(body)
+		yield ai.Chunk{}, failure(status, body)
 		return
 	}
-	defer func() {
-		if cerr := body.Close(); cerr != nil {
-			return
-		}
-	}()
-	for chunk, err := range streamEvents(ctx, body) {
+	for chunk, err := range streamEvents(bounded, body) {
+		idle.Stop()
 		yield chunk, err
+		idle.Reset(limit)
 	}
+}
+
+func failure(status int, body io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(body, replyLimit))
+	if err != nil {
+		return fmt.Errorf("ai/openai: read response: %w", err)
+	}
+	return statusError(status, data)
 }
 
 func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
@@ -465,14 +473,14 @@ func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error
 		if state.done {
 			return
 		}
+		if cause := context.Cause(ctx); cause != nil {
+			yield ai.Chunk{}, cause
+			return
+		}
 		if err != nil {
 			for chunk, cerr := range endOfStream(state) {
 				yield chunk, cerr
 			}
-			return
-		}
-		if ctx.Err() != nil {
-			yield ai.Chunk{}, ctx.Err()
 			return
 		}
 	}
@@ -518,8 +526,11 @@ func eventLine(text string, state *streamState) iter.Seq2[ai.Chunk, error] {
 func deltaParts(chunk *wireChunk) iter.Seq2[ai.Chunk, error] {
 	for _, choice := range chunk.Choices {
 		d := choice.Delta
-		if d.Content != "" {
-			yield ai.Chunk{Part: ai.Part(ai.Text{Text: d.Content}), Partial: true}, nil
+		if d.Content.text != "" {
+			yield ai.Chunk{Part: ai.Part(ai.Text{Text: d.Content.text}), Partial: true}, nil
+		}
+		for _, part := range chunkParts(d.Content.chunks) {
+			yield ai.Chunk{Part: part, Partial: true}, nil
 		}
 		if d.ReasoningContent != "" {
 			yield ai.Chunk{Part: ai.Part(ai.Reasoning{Text: d.ReasoningContent}), Partial: true}, nil

@@ -31,6 +31,10 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `Chat` MUST send the bearer token in the `Authorization` header when `Key` is set.
 - `Chat` MUST read server-sent events that end with `data: [DONE]`.
 - `Stream` MUST end at the `data: [DONE]` record and MUST NOT wait for the body to close.
+- `Stream` MUST end with an error when no event arrives for `Policy.Timeout`.
+- The time that the caller spends on a chunk MUST NOT count toward that timeout.
+- `Stream` MUST close the response body on every path, also when the caller stops at an error.
+- `Stream` MUST read delta content that is a string or a Mistral chunk array.
 - `Chat` MUST assemble tool arguments from fragments into one complete call.
 - `Chat` MUST read usage from `prompt_tokens`, `completion_tokens` and `total_tokens`.
 - `Embed` MUST send `POST <BaseURL>/embeddings`.
@@ -49,8 +53,11 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `Chat` and `Embed` MUST report that answer to `resilience.Do` as an `Ignored` error.
 - Any other failing answer MUST be retried under `Policy.Retry`.
 - An option that the request does not set MUST be absent from the JSON.
+- `TopK` MUST go out as `top_k` when the caller sets it, for the compatible servers that take it.
 - A `Format` of `json` MUST go out as `{"type":"json_object"}`.
 - A `Format` that is a JSON object MUST go out as a `json_schema` response format.
+- That response format MUST set `strict`, as the reference does, so the answer conforms to the schema.
+- The caller MUST give a schema of the strict subset of the provider.
 - Any other `Format` MUST be an error before the request is sent.
 - A stream that ends before `data: [DONE]` MUST yield an error and no reply.
 - An error MUST name the package, the status and the body as `ai/openai: <status>: <body>`.
@@ -60,6 +67,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 
 - `ai/openai: <status>: <body>` when the provider returns a failing status.
 - `ai/openai: stream ended before [DONE]` when the stream is cut.
+- `ai/openai: no stream event for <timeout>` when the provider sends no event for `Policy.Timeout`.
 - `ai/openai: format is not json and not a JSON schema` when `Format` is any other text.
 - `ai/openai: tool <name> schema: <cause>` when a tool schema is not a JSON object.
 - `ai/openai: embedding index <i> is outside the <n> vectors of the answer` when the provider names an index it did not send.
@@ -74,6 +82,11 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestStreamToolCallAssemblesFragments` proves fragments assemble into one complete tool call.
 - `TestStreamEndsAtDoneWhileTheBodyStaysOpen` proves the stream ends at `data: [DONE]` while the server keeps the body open.
 - `TestCutStreamYieldsErrorChunkAndNoReply` proves the error for a stream cut before `data: [DONE]`.
+- `TestStreamOfAStalledProviderEndsAtThePolicyTimeout` proves the error for a provider that stops sending.
+- `TestStreamKeepsAProviderWhoseEventsStayInsideTheTimeout` proves the timeout bounds the gap between events, not the stream.
+- `TestStreamClosesTheBodyOfAFailingAnswer` proves the body of a failing answer closes when the caller stops.
+- `TestStreamReadsMistralChunkArrayContent` proves array and string delta content in one stream.
+- `TestTopKGoesOutWhenTheCallerSetsIt` proves `top_k` on the wire only for a caller value.
 - `TestEmbeddingsReturnVectorsInInputOrder` proves the embed path and the vector order.
 - `TestEmbedBodyOverItsLimitIsFinal` proves the size limit and that the call is not repeated.
 - `TestEmbeddingIndexOutsideTheAnswerIsAnError` proves the error for an index outside the answer.

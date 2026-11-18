@@ -119,7 +119,7 @@ type wireDelta struct {
 }
 
 type wireDeltaMsg struct {
-	Content          string          `json:"content"`
+	Content          wireContent     `json:"content"`
 	ReasoningContent string          `json:"reasoning_content"`
 	Reasoning        string          `json:"reasoning"`
 	ToolCalls        []wireDeltaCall `json:"tool_calls"`

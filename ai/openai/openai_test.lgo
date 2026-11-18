@@ -15,9 +15,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"logos/sync"
 
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/ai/openai"
@@ -151,31 +152,52 @@ func testClient(srv *httptest.Server) *openai.Client {
 	}
 }
 
+type request struct {
+	body string
+	auth string
+	path string
+}
+
+type requests struct {
+	seen []request
+}
+
+func (s *requests) at(i int) request {
+	return s.seen[i]
+}
+
 type recorder struct {
-	mu     sync.Mutex
-	bodies []string
-	auths  []string
-	paths  []string
+	state sync.Locked[requests]
 }
 
 func (r *recorder) add(req *http.Request, body string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.bodies = append(r.bodies, body)
-	r.auths = append(r.auths, req.Header.Get("Authorization"))
-	r.paths = append(r.paths, req.URL.Path)
+	r.state.WithLock(func(s *requests) {
+		s.seen = append(s.seen, request{body: body, auth: req.Header.Get("Authorization"), path: req.URL.Path})
+	})
 }
 
 func (r *recorder) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.bodies)
+	n := 0
+	r.state.WithLock(func(s *requests) { n = len(s.seen) })
+	return n
+}
+
+func (r *recorder) at(i int) request {
+	var got request
+	r.state.WithLock(func(s *requests) { got = s.at(i) })
+	return got
 }
 
 func (r *recorder) body(i int) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.bodies[i]
+	return r.at(i).body
+}
+
+func (r *recorder) auth(i int) string {
+	return r.at(i).auth
+}
+
+func (r *recorder) path(i int) string {
+	return r.at(i).path
 }
 
 func (rec *recorder) serve(t *testing.T, status int, contentType string, body string) *httptest.Server {
@@ -250,11 +272,11 @@ func TestChatReplies(t *testing.T) {
 	if text, ok := reply.Message.Parts[0].(ai.Text); !ok || text.Text != "Hello!" {
 		t.Fatalf("text part: %+v", reply.Message.Parts[0])
 	}
-	if rec.paths[0] != "/chat/completions" {
-		t.Fatalf("path: %s", rec.paths[0])
+	if rec.path(0) != "/chat/completions" {
+		t.Fatalf("path: %s", rec.path(0))
 	}
-	if rec.auths[0] != "" {
-		t.Fatalf("unexpected auth header: %s", rec.auths[0])
+	if rec.auth(0) != "" {
+		t.Fatalf("unexpected auth header: %s", rec.auth(0))
 	}
 }
 
@@ -315,8 +337,8 @@ func TestStreamCollectsTheReferenceReply(t *testing.T) {
 	if reply.ID != "chatcmpl-123" || reply.Model != "gpt-6-astra" {
 		t.Fatalf("reply identity: %+v", reply)
 	}
-	if rec.paths[0] != "/chat/completions" {
-		t.Fatalf("path: %s", rec.paths[0])
+	if rec.path(0) != "/chat/completions" {
+		t.Fatalf("path: %s", rec.path(0))
 	}
 }
 
@@ -429,8 +451,8 @@ func TestEmbeddingsReturnVectorsInInputOrder(t *testing.T) {
 	if got := canonical(t, rec.body(0)); got != want {
 		t.Fatalf("request body:\n got %s\nwant %s", got, want)
 	}
-	if rec.paths[0] != "/embeddings" {
-		t.Fatalf("path: %s", rec.paths[0])
+	if rec.path(0) != "/embeddings" {
+		t.Fatalf("path: %s", rec.path(0))
 	}
 }
 
@@ -803,7 +825,171 @@ func TestKeyNeverAppearsInError(t *testing.T) {
 	if strings.Contains(err.Error(), "sk-super-secret-value") {
 		t.Fatalf("error leaks the key: %v", err)
 	}
-	if rec.auths[0] != "Bearer sk-super-secret-value" {
-		t.Fatalf("bearer header: %s", rec.auths[0])
+	if rec.auth(0) != "Bearer sk-super-secret-value" {
+		t.Fatalf("bearer header: %s", rec.auth(0))
+	}
+}
+
+const sseFirstEvent = `data: {"id":"chatcmpl-123","model":"gpt-6-astra","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}
+
+`
+
+func askHello() ai.Request {
+	return ai.Request{Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Say hello"}}}}}
+}
+
+func TestStreamOfAStalledProviderEndsAtThePolicyTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, sseFirstEvent); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+
+	_, err := ai.Collect(c.Stream(ctx, askHello()))
+
+	if err == nil || !strings.Contains(err.Error(), "ai/openai: no stream event for 200ms") {
+		t.Fatalf("collect error after %v = %v, want the stall error", time.Since(start), err)
+	}
+	if waited := time.Since(start); waited > 3*time.Second {
+		t.Errorf("Collect returned after %v, want an end near the timeout of 200ms", waited)
+	}
+}
+
+func TestStreamKeepsAProviderWhoseEventsStayInsideTheTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for range 8 {
+			if _, err := io.WriteString(w, sseFirstEvent); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: time.Second}
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("a stream of 2s with an event each 250ms failed under a timeout of 1s: %v", err)
+		return
+	}
+	if got := textOf(reply); got != strings.Repeat("Hel", 8) {
+		t.Errorf("stream text = %q, want eight events", got)
+	}
+}
+
+func textOf(reply ai.Reply) string {
+	var text strings.Builder
+	for _, p := range reply.Message.Parts {
+		if part, ok := p.(ai.Text); ok {
+			text.WriteString(part.Text)
+		}
+	}
+	return text.String()
+}
+
+func TestStreamClosesTheBodyOfAFailingAnswer(t *testing.T) {
+	released := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(released)
+		w.WriteHeader(http.StatusBadGateway)
+		block := strings.Repeat("x", 64<<10)
+		for range 256 {
+			if _, err := io.WriteString(w, block); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(srv.CloseClientConnections)
+	c := testClient(srv)
+
+	_, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err == nil || !strings.Contains(err.Error(), "ai/openai: 502") {
+		t.Fatalf("collect error = %v, want the 502 answer", err)
+	}
+	select {
+	case <-released:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the body of the failing answer stayed open: the server still writes its 16 MiB")
+	}
+}
+
+const sseMistralChunks = `data: {"id":"cmpl-1","model":"mistral-large-latest","choices":[{"index":0,"delta":{"role":"assistant","content":[{"type":"thinking","thinking":[{"type":"text","text":"ponder"}]}]},"finish_reason":null}]}
+
+data: {"id":"cmpl-1","model":"mistral-large-latest","choices":[{"index":0,"delta":{"content":[{"type":"text","text":"Hel"}]},"finish_reason":null}]}
+
+data: {"id":"cmpl-1","model":"mistral-large-latest","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+
+func TestStreamReadsMistralChunkArrayContent(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", sseMistralChunks)
+	c := testClient(srv)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if got := textOf(reply); got != "Hello" {
+		t.Errorf("stream text = %q, want Hello from one array delta and one string delta", got)
+	}
+	var reasoning strings.Builder
+	for _, p := range reply.Message.Parts {
+		if part, ok := p.(ai.Reasoning); ok {
+			reasoning.WriteString(part.Text)
+		}
+	}
+	if reasoning.String() != "ponder" {
+		t.Errorf("stream reasoning = %q, want ponder from the thinking chunk", reasoning.String())
+	}
+}
+
+func TestTopKGoesOutWhenTheCallerSetsIt(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", completionBody)
+	c := testClient(srv)
+	req := askHello()
+	req.TopK = 40
+
+	if _, err := c.Chat(context.Background(), req); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+
+	if !strings.Contains(rec.body(0), `"top_k":40`) {
+		t.Errorf("request body %s, want top_k 40", rec.body(0))
+	}
+	plain := &recorder{}
+	c = testClient(plain.serve(t, http.StatusOK, "application/json", completionBody))
+	if _, err := c.Chat(context.Background(), askHello()); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if strings.Contains(plain.body(0), "top_k") {
+		t.Errorf("request body %s, want no top_k without a caller value", plain.body(0))
 	}
 }
