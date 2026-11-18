@@ -191,7 +191,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestDialectOfMatchesEachDriverName` proves the four driver names.
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
 - `TestDialectOfRejectsParseTimeInThePassword` proves that `parseTime=true` outside the query part does not count.
-- `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the bounded `Stop`. A registered SQL function holds the statement open until the test releases it.
+- `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the bounded `Stop` and the close that finishes after it. A registered SQL function holds the statement open until the test releases it.
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
 - `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
 - `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.

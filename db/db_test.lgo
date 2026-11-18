@@ -349,6 +349,17 @@ func TestStopReturnsByItsDeadlineWhileAStatementRuns(t *testing.T) {
 	if !errors.Is(serr, context.DeadlineExceeded) || !strings.HasPrefix(serr.Error(), "db: stop:") {
 		t.Fatalf("Stop error = %v, want db: stop: context deadline exceeded", serr)
 	}
+	closed := false
+	for !closed && ctx.Err() == nil {
+		_, qerr := pool.ExecContext(ctx, "SELECT 1")
+		closed = qerr != nil && strings.Contains(qerr.Error(), "database is closed")
+		if !closed {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !closed {
+		t.Fatal("the pool stayed open after the timed-out Stop and the end of the statement")
+	}
 }
 
 func TestDialectOfMatchesEachDriverName(t *testing.T) {
