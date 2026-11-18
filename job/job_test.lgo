@@ -414,7 +414,7 @@ func TestChunkWriteFailureStopsRun(t *testing.T) {
 	var written []int
 	calls := 0
 	c := job.Chunk[int, int]{
-		Read: func(yield func(int, error) bool) {
+		Read: func(ctx context.Context, yield func(int, error) bool) {
 			for i := range 5 {
 				if !yield(i, nil) {
 					return
@@ -462,7 +462,7 @@ func TestChunkWriteFailureStopsRun(t *testing.T) {
 func TestChunkSuccessStats(t *testing.T) {
 	var written []int
 	c := job.Chunk[int, int]{
-		Read: func(yield func(int, error) bool) {
+		Read: func(ctx context.Context, yield func(int, error) bool) {
 			for i := range 5 {
 				if !yield(i, nil) {
 					return
@@ -493,7 +493,7 @@ func TestChunkSuccessStats(t *testing.T) {
 
 func TestChunkReadError(t *testing.T) {
 	boom := errors.New("read boom")
-	read := func(yield func(int, error) bool) {
+	read := func(ctx context.Context, yield func(int, error) bool) {
 		yield(1, nil)
 		yield(0, boom)
 	}
@@ -521,6 +521,75 @@ func TestChunkReadError(t *testing.T) {
 	}
 	if ce.Stats.Items != 0 || ce.Stats.Chunks != 0 {
 		t.Fatalf("ChunkError stats = %+v, want zero items before the read error", ce.Stats)
+	}
+}
+
+func TestChunkPassesItsContextToRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	readSawContextEnd := false
+	writes := 0
+	c := job.Chunk[int, int]{
+		Read: func(ctx context.Context, yield func(int, error) bool) {
+			if !yield(1, nil) {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				readSawContextEnd = true
+			case <-time.After(2 * time.Second):
+			}
+		},
+		Process: func(in int) (int, error) {
+			cancel()
+			return in, nil
+		},
+		Write: func(ctx context.Context, items const []int) error {
+			writes++
+			return nil
+		},
+		Size: 10,
+	}
+	_, err := c.Run(ctx)
+	if !readSawContextEnd {
+		t.Fatal("Read did not see the end of the context that Run got")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context canceled", err)
+	}
+	if writes != 0 {
+		t.Fatalf("Write ran %d times after the context ended, want 0", writes)
+	}
+}
+
+func TestChunkStopsBeforeNextItemAfterContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	processed := 0
+	c := job.Chunk[int, int]{
+		Read: func(ctx context.Context, yield func(int, error) bool) {
+			for i := range 3 {
+				if !yield(i, nil) {
+					return
+				}
+			}
+		},
+		Process: func(in int) (int, error) {
+			processed++
+			cancel()
+			return in, nil
+		},
+		Write: func(ctx context.Context, items const []int) error {
+			return nil
+		},
+		Size: 10,
+	}
+	_, err := c.Run(ctx)
+	if processed != 1 {
+		t.Fatalf("Process ran %d times, want 1: Run must stop before the next item after the context ends", processed)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context canceled", err)
 	}
 }
 

@@ -3,7 +3,6 @@ package job
 import (
 	"context"
 	"fmt"
-	"iter"
 )
 
 type Stats struct {
@@ -25,7 +24,7 @@ func (e *ChunkError) Unwrap() error {
 }
 
 type Chunk[In any, Out any] struct {
-	Read    iter.Seq2[In, error]
+	Read    func(ctx context.Context, yield func(In, error) bool)
 	Process func(in In) (Out, error)
 	Write   func(ctx context.Context, items const []Out) error
 	Size    int = 100
@@ -38,9 +37,15 @@ func (c Chunk[In, Out]) Run(ctx context.Context) (Stats, error) {
 	}
 	var stats Stats
 	batch := make([]Out, 0, size)
-	for in, readErr := range c.Read {
+	read := func(yield func(In, error) bool) {
+		c.Read(ctx, yield)
+	}
+	for in, readErr := range read {
 		if readErr != nil {
 			return Stats{}, &ChunkError{Stats: stats, Err: readErr}
+		}
+		if err := ctx.Err(); err != nil {
+			return Stats{}, &ChunkError{Stats: stats, Err: err}
 		}
 		out, err := c.Process(in)
 		if err != nil {

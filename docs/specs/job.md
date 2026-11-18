@@ -19,7 +19,7 @@ func (e *ChunkError) Error() string
 func (e *ChunkError) Unwrap() error
 
 type Chunk[In any, Out any] struct {
-	Read    iter.Seq2[In, error]
+	Read    func(ctx context.Context, yield func(In, error) bool)
 	Process func(in In) (Out, error)
 	Write   func(ctx context.Context, items const []Out) error
 	Size    int = 100
@@ -98,6 +98,9 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `Stats.Items` MUST count the items in `Write` calls that returned nil.
 - `Stats.Chunks` MUST count those `Write` calls.
 - A read error MUST stop the run before `Write` of the open batch.
+- `Run` MUST pass its context to `Read`.
+- `Run` MUST stop before the next item when its context has ended.
+- A `Read` that ignores its context MAY delay `Run` until it yields or returns.
 - A process error MUST stop the run before `Write` of the open batch.
 - A write error MUST stop the run.
 - A write error MUST NOT cause another `Write` call.
@@ -139,6 +142,8 @@ func (s *Scheduler) Stop(ctx context.Context) error
 - `TestChunkWriteFailureStopsRun` proves the stop, the `*ChunkError` stats and the error text. The cause is the error `Write` returned.
 - `TestChunkSuccessStats` proves the item count, the chunk count and the final short batch.
 - `TestChunkReadError` proves that a read error is a `*ChunkError` with zero stats before any write.
+- `TestChunkPassesItsContextToRead` proves that `Read` sees the end of the context of `Run`.
+- `TestChunkStopsBeforeNextItemAfterContextEnds` proves the stop before the next item.
 - `TestQueueStopRacingStartLeavesNoLiveRun` proves that a `Start`/`Stop` race leaves no live queue.
 - `TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick` proves that a cancelled runner does not skip the next tick after a restart.
 
