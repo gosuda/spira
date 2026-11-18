@@ -591,3 +591,28 @@ func TestSlashEndingPrefixServesSubpathsWithoutARedirect(t *testing.T) {
 		t.Fatalf("GET reached the upstream as %q want /x", m.Path)
 	}
 }
+
+func TestMountRefusesWildcardPrefixButStripsLiteralNeighbor(t *testing.T) {
+	for _, prefix := range []string{"/api/{rest...}", "/api/*", "/api/{id}"} {
+		func() {
+			defer func() {
+				p := recover()
+				if p == nil {
+					t.Fatalf("Mount with prefix %q did not panic", prefix)
+				}
+			}()
+			gateway.Mount(web.NewRouter(), []gateway.Route{{PathPrefix: prefix, StripPrefix: true, To: []string{"http://example.com"}}}, plainPolicy())
+		}()
+	}
+	notes := make(chan upstreamNote, 2)
+	up := echoUpstream(t, notes)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/api/files", StripPrefix: true, To: []string{up.URL}}}, plainPolicy())
+	resp, err := http.Get(gw.URL + "/api/files/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody(t, resp)
+	if n := awaitNote(t, notes); n.Path != "/x" {
+		t.Fatalf("/api/files/x reached the upstream as %q want /x", n.Path)
+	}
+}

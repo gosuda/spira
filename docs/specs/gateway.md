@@ -28,6 +28,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - A request for another host MUST NOT select that route.
 - A route with no `Host` MUST be registered with no host constraint.
 - A path that continues the prefix without a slash, such as `/shopping` for `/shop`, MUST NOT select the route.
+- A `PathPrefix` with `{`, `}` or `*` MUST be refused at registration.
 
 ### Forward
 
@@ -90,6 +91,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 ## Errors
 
 - `gateway: route <prefix>: path prefix must start with /` when `PathPrefix` does not start with `/`.
+- `gateway: route <prefix>: path prefix must not contain wildcards` when `PathPrefix` holds `{`, `}` or `*`.
 - `gateway: route <prefix>: no upstream` when `To` is empty.
 - `gateway: route <prefix>: upstream <raw> is not an absolute http or https URL` when an upstream is not an absolute `http` or `https` URL with a host.
 - `gateway: encode bad gateway problem: <cause>` when the 502 problem body cannot be encoded.
@@ -111,6 +113,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestStageAnswerKeepsTheRequestFromTheUpstream` proves that a stage reply does not reach an upstream.
 - `TestSettledStagesLetTheProxyAnswer` proves that `web.Recover` and `web.AccessLog` as route stages let the upstream answer.
 - `TestMountPanicsOnBadRoutes` proves the three registration panics.
+- `TestMountRefusesWildcardPrefixButStripsLiteralNeighbor` proves that a wildcard prefix is refused and a literal neighbor still strips.
 - `TestDeadUpstreamFailsOverForGetAndNeverReplaysPost` proves failover for a bodyless request and no second try for a body.
 - `TestOpenBreakerSkipsItsUpstreamAndKeepsTheLiveOne` proves that an open breaker skips only its upstream.
 - `TestBreakerRecoversThroughProbeWithSharedClock` proves probe recovery from the copied `Now`.
