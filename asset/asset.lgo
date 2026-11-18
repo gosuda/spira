@@ -65,18 +65,15 @@ func (m *Manifest) Tags(entry string) (view.Node, error) {
 		return nil, fmt.Errorf("asset: entry %q not in manifest", entry)
 	}
 	seen := map[string]bool{entry: true}
+	seenCSS := map[string]bool{}
 	var nodes []view.Node
-	for _, css := range entryChunk.Css {
-		nodes = append(nodes, cssLink(css))
-	}
+	nodes = append(nodes, cssLinks(entryChunk.Css, seenCSS)...)
 	var imports []manifestChunk
 	for _, imp := range entryChunk.Imports {
 		imports = append(imports, postOrder(m.chunks, imp, seen)...)
 	}
 	for _, chunk := range imports {
-		for _, css := range chunk.Css {
-			nodes = append(nodes, cssLink(css))
-		}
+		nodes = append(nodes, cssLinks(chunk.Css, seenCSS)...)
 	}
 	nodes = append(nodes, view.Script(view.Attr("type", "module"), view.Attr("src", rooted(entryChunk.File))))
 	for _, chunk := range imports {
@@ -114,6 +111,18 @@ func postOrder(chunks map[string]manifestChunk, key string, seen map[string]bool
 
 func cssLink(href string) view.Element {
 	return view.Link(view.Attr("rel", "stylesheet"), view.Attr("href", rooted(href)))
+}
+
+func cssLinks(css const []string, seen map[string]bool) []view.Node {
+	var nodes []view.Node
+	for _, href := range css {
+		if seen[href] ?? false {
+			continue
+		}
+		seen[href] = true
+		nodes = append(nodes, cssLink(href))
+	}
+	return nodes
 }
 
 func (m *Manifest) Preload(src string) (view.Node, error) {
