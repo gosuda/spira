@@ -102,6 +102,10 @@ func (p *Pool) Prepare(ctx context.Context, query string) error {
 	if skip {
 		return prepareDirect(ctx, p.handle, q)
 	}
+	if _, cached := p.stmts.acquire(q); cached {
+		p.stmts.release(q)
+		return prepareDirect(ctx, p.handle, q)
+	}
 	stmt, err := p.stmts.prepare(ctx, p.handle, q)
 	if err != nil {
 		return err

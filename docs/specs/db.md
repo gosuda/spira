@@ -117,6 +117,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `Tx` MUST run a cached statement with `StmtContext` on the transaction.
 - `Tx` MUST run an uncached statement on the transaction itself.
 - `Prepare` MUST prepare the given text.
+- `Prepare` MUST check the text against the engine also when the cache holds that text.
 - `Prepare` MUST release that statement before it returns.
 - `Prepare` MUST NOT keep text that starts with `/*db:nocache*/`.
 - `Prepared` MUST return the number of statements in the cache.
@@ -200,6 +201,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestInExpandsTheMarker` proves marker replacement, `NULL`, and a second marker left unchanged.
 - `TestInRunsThroughThePoolUncached` and `TestPrepareOfMarkedTextStaysUncached` prove that `In` text does not enter the cache.
 - `TestPrepareRejectsAMissingTable` proves the `db: prepare` wrap.
+- `TestPrepareChecksCachedTextAgainstTheSchema` proves that `Prepare` asks the engine again for cached text.
 - `TestPrepareFeedsLaterQueriesThroughTheCache` and `TestPrepareLeavesNoStatementHeld` prove prepare, reuse and release.
 - `TestTxSeesUncommittedRowThroughCachedStatement` proves `StmtContext` on a cached statement.
 - `TestTxRunsUnseenStatementsOnItsOwnConnection` and `TestTxRunsUncachedStatementsOnItsOwnConnection` prove an uncached statement on the transaction.

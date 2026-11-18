@@ -83,3 +83,27 @@ func TestPrepareLeavesNoStatementHeld(t *testing.T) {
 		t.Fatal("a statement that Prepare loaded stayed held after its eviction")
 	}
 }
+
+func TestPrepareChecksCachedTextAgainstTheSchema(t *testing.T) {
+	pool := openPool(t)
+	ctx, cancel := prepareCtx(t)
+	defer cancel()
+	createThings(t, pool)
+	const query = "SELECT n FROM things"
+	if err := pool.Prepare(ctx, query); err != nil {
+		t.Fatalf("Prepare before the schema change: %v", err)
+		return
+	}
+	if _, err := pool.ExecContext(ctx, "/*db:nocache*/DROP TABLE things"); err != nil {
+		t.Fatalf("drop: %v", err)
+		return
+	}
+	err := pool.Prepare(ctx, query)
+	if err == nil {
+		t.Fatal("Prepare accepted cached text although its table is gone")
+		return
+	}
+	if !strings.HasPrefix(err.Error(), "db: prepare:") {
+		t.Fatalf("Prepare error = %q, want the db: prepare: prefix", err.Error())
+	}
+}
