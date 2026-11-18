@@ -411,3 +411,73 @@ func TestErrorTextStaysUsable(t *testing.T) {
 		t.Fatalf("Error()=%q, lacks the problem title and detail", msg)
 	}
 }
+
+func TestOversizedCallerFaultStaysCallerFault(t *testing.T) {
+	var calls atomic.Int64
+	tail := strings.Repeat("x", 300)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusNotFound)
+		if _, err := io.WriteString(w, tail); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	defer srv.Close()
+	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
+	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry, Breaker: brk})
+	c.MaxBody = 64
+	for i := range 4 {
+		_, err := client.Get[probe](t.Context(), c, "/missing")
+		se := &client.StatusError{}
+		if !errors.As(err, &se) {
+			t.Fatalf("call %d err = %v, want a StatusError: a 404 body over MaxBody is still the caller's mistake", i, err)
+			return
+		}
+		if se.Status != http.StatusNotFound {
+			t.Fatalf("call %d status = %d, want 404", i, se.Status)
+			return
+		}
+		if len(se.Prefix) != 64 {
+			t.Fatalf("call %d prefix is %d bytes, want the %d bytes MaxBody allows", i, len(se.Prefix), 64)
+			return
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("server saw %d calls for four oversized 404 answers, want 4: not retried, breaker closed", calls.Load())
+	}
+}
+
+func TestMaxBodyLimitIsExact(t *testing.T) {
+	fit := `{"ok":true,"pad":"` + strings.Repeat("a", 44) + `"}`
+	over := `{"ok":true,"pad":"` + strings.Repeat("a", 45) + `"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fit":
+			serveJSON(t, http.StatusOK, fit)(w, r)
+		case "/over":
+			serveJSON(t, http.StatusOK, over)(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	c.MaxBody = 64
+	v, err := client.Get[probe](t.Context(), c, "/fit")
+	if err != nil {
+		t.Fatalf("a 64-byte body against MaxBody 64 err = %v, want it to decode", err)
+		return
+	}
+	if !v.Ok || v.Pad != strings.Repeat("a", 44) {
+		t.Fatalf("decoded %+v, want the whole 64-byte body", v)
+		return
+	}
+	_, err = client.Get[probe](t.Context(), c, "/over")
+	if err == nil {
+		t.Fatal("a 65-byte body against MaxBody 64 err = nil, want the exceeds error")
+		return
+	}
+	if !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "client: GET /over") {
+		t.Fatalf("err = %v, want the exceeds error naming method and path", err)
+	}
+}
