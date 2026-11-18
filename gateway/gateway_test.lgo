@@ -18,14 +18,15 @@ import (
 )
 
 type upstreamNote struct {
-	Method string
-	Path   string
-	Query  string
-	Body   string
-	XFF    string
-	XFH    string
-	XFP    string
-	Custom string
+	Method    string
+	Path      string
+	Query     string
+	Body      string
+	XFF       string
+	XFH       string
+	XFP       string
+	Forwarded string
+	Custom    string
 }
 func echoUpstream(t *testing.T, notes chan<- upstreamNote) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,10 +39,11 @@ func echoUpstream(t *testing.T, notes chan<- upstreamNote) *httptest.Server {
 			Path:   r.URL.Path,
 			Query:  r.URL.RawQuery,
 			Body:   string(b),
-			XFF:    r.Header.Get("X-Forwarded-For"),
-			XFH:    r.Header.Get("X-Forwarded-Host"),
-			XFP:    r.Header.Get("X-Forwarded-Proto"),
-			Custom: r.Header.Get("X-Custom"),
+			XFF:       r.Header.Get("X-Forwarded-For"),
+			XFH:       r.Header.Get("X-Forwarded-Host"),
+			XFP:       r.Header.Get("X-Forwarded-Proto"),
+			Forwarded: r.Header.Get("Forwarded"),
+			Custom:    r.Header.Get("X-Custom"),
 		}
 		select {
 		case notes <- note:
@@ -411,6 +413,25 @@ func TestStrippedTailStaysAnAbsolutePath(t *testing.T) {
 		if n := awaitNote(t, notes); n.Path != tc.want {
 			t.Fatalf("%s reached the upstream as %q want %q", tc.path, n.Path, tc.want)
 		}
+	}
+}
+
+func TestClientForwardedHeaderNeverReachesTheUpstream(t *testing.T) {
+	notes := make(chan upstreamNote, 2)
+	up := echoUpstream(t, notes)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/", To: []string{up.URL}}}, plainPolicy())
+	req, err := http.NewRequest(http.MethodGet, gw.URL+"/thing", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Forwarded", "for=9.9.9.9;host=evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody(t, resp)
+	if n := awaitNote(t, notes); n.Forwarded != "" {
+		t.Fatalf("Forwarded=%q reached the upstream; a client forwarding header must be dropped", n.Forwarded)
 	}
 }
 

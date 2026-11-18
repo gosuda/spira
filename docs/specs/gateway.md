@@ -52,6 +52,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - Route stages MUST run in list order.
 - The proxy MUST run after the route stages.
 - A stage that returns a reply MUST NOT send the request to an upstream.
+- The proxy MUST NOT forward a client `Forwarded` header.
 
 ### Failure
 
@@ -75,6 +76,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - That answer MUST use the content type `application/problem+json`.
 - The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.
 - The body MUST NOT contain an upstream address.
+- A refusal MUST carry a fresh body for each client.
 - Breaker admission and open duration MUST follow [resilience](resilience.md).
 
 ## Errors
@@ -110,6 +112,11 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestStrippedTailStaysAnAbsolutePath` proves that a stripped tail stays an absolute path for the root prefix and for a prefix that ends in a slash.
 - `TestTimeoutCauseNamesTheHeaderWait` proves that a missed header wait is reported as `gateway: upstream headers exceeded`.
 - `TestBodyOutlivesTheHeaderTimeout` proves that the header timeout does not end the body read.
+- `TestSharedRefusalBodyServesEveryConcurrentClient` proves that concurrent refusals each carry the full problem body.
+- `TestMountLeavesARetryPolicyUntouched` proves that a retrying policy does not retry a POST.
+- `TestClientForwardedHeaderNeverReachesTheUpstream` proves that a client `Forwarded` header does not ride along.
+- `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
+- `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
 
 ## Not in scope
 

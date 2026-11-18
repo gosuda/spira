@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -446,5 +447,93 @@ func TestBodyOutlivesTheHeaderTimeout(t *testing.T) {
 	data := readBody(t, resp)
 	if data != "headtail" {
 		t.Fatalf("body=%q want headtail: the header timeout must not end the body read", data)
+	}
+}
+
+func TestSharedRefusalBodyServesEveryConcurrentClient(t *testing.T) {
+	dead := deadUpstream(t)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{dead, dead + "/alt"}}}, plainPolicy())
+	g, _ := rt.NewGroup(t.Context(), 8)
+	for range 8 {
+		g.Go(func(_ context.Context) error {
+			resp, err := http.Get(gw.URL + "/shop/x")
+			if err != nil {
+				return err
+			}
+			data, rerr := io.ReadAll(resp.Body)
+			cerr := resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway {
+				return fmt.Errorf("status=%d want 502", resp.StatusCode)
+			}
+			if rerr != nil {
+				return fmt.Errorf("read body: %w", rerr)
+			}
+			if cerr != nil {
+				return fmt.Errorf("close body: %w", cerr)
+			}
+			if !strings.Contains(string(data), "Bad Gateway") {
+				return fmt.Errorf("body %q lacks the problem title", data)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("a concurrent client got a broken refusal: %v", err)
+	}
+}
+
+func TestBodylessPostFailsOverLikeAGet(t *testing.T) {
+	dead := deadUpstream(t)
+	var hits atomic.Int64
+	live := countingUpstream(t, &hits)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{dead, live.URL}}}, plainPolicy())
+	resp, err := http.Post(gw.URL+"/shop/order", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200 through the live upstream", resp.StatusCode)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("the live upstream saw %d requests, want 1: a bodyless POST may be replayed", hits.Load())
+	}
+}
+
+func TestMountLeavesARetryPolicyUntouched(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(up.Close)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}})
+	presp, err := http.Post(gw.URL+"/shop/order", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantProblem(t, presp, "a POST against a 503 upstream")
+	if hits.Load() != 1 {
+		t.Fatalf("the upstream saw %d requests, want 1: Mount must not apply Policy.Retry to a POST", hits.Load())
+	}
+}
+
+func TestNilBreakerPolicyAddsNoBreaker(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(up.Close)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: time.Second})
+	for i := range 30 {
+		resp, err := http.Get(gw.URL + "/shop/x")
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		wantProblem(t, resp, "a 503 upstream with no breaker")
+	}
+	if hits.Load() != 30 {
+		t.Fatalf("the upstream saw %d requests, want 30: a nil breaker must leave every request admitted", hits.Load())
 	}
 }
