@@ -59,6 +59,7 @@ type Service struct {
 type memory struct {
 	logs    map[string]*sessionLog
 	sweepAt time.Time
+	next    int64
 }
 
 type sessionLog struct {
@@ -100,7 +101,8 @@ func (m *memory) open(id string, now time.Time, ttl time.Duration) Session {
 		m.sweepAt = now.Add(ttl)
 	}
 	head := Session{ID: id, CreatedAt: now, ExpiresAt: now.Add(ttl)}
-	m.logs[id] = &sessionLog{head: head}
+	m.logs[id] = &sessionLog{head: head, version: m.next}
+	m.next++
 	return head
 }
 
@@ -138,7 +140,10 @@ func (s *Service) Events(ctx context.Context, id string) ([]Event, error) {
 	var out []Event
 	s.store.WithLock(func(m *memory) {
 		if log := m.live(id, s.now()); log != nil {
-			out = slices.Clone(log.events)
+			out = make([]Event, len(log.events))
+			for i, e := range log.events {
+				out[i] = copyEvent(e)
+			}
 		}
 	})
 	return out, nil
@@ -180,6 +185,10 @@ func (s *Service) Append(ctx context.Context, id string, version int64, events .
 	}
 	now := s.now()
 	ok := false
+	stored := make([]Event, len(events))
+	for i, e := range events {
+		stored[i] = copyEvent(e)
+	}
 	s.store.WithLock(func(m *memory) {
 		log := m.live(id, now)
 		if log == nil {
@@ -188,8 +197,9 @@ func (s *Service) Append(ctx context.Context, id string, version int64, events .
 		if log.version != version {
 			return
 		}
-		log.events = append(log.events, events...)
-		log.version++
+		log.events = append(log.events, stored...)
+		log.version = m.next
+		m.next++
 		ok = true
 	})
 	return ok, nil
@@ -231,6 +241,16 @@ func newID() string {
 		panic(fmt.Sprintf("ai/session: event id entropy: %v", err))
 	}
 	return hex.EncodeToString(b[:])
+}
+
+func copyEvent(e Event) Event {
+	if m := e.Message; m != nil {
+		parts := slices.Clone(m.Parts)
+		msg := m
+		msg.Parts = parts
+		e.Message = msg
+	}
+	return e
 }
 
 func activeMessages(log []Event) []ai.Message {
@@ -396,8 +416,39 @@ func dropOrphans(history []ai.Message, following []ai.Message) []ai.Message {
 	markOrphans(history, all, keep)
 	var out []ai.Message
 	for i, m := range history {
-		if keep[i] {
-			out = append(out, m)
+		if !keep[i] {
+			continue
+		}
+		if m.Role == ai.RoleTool {
+			if kept := filterOrphanResults(history, keep, i, m); len(kept.Parts) > 0 {
+				out = append(out, kept)
+			}
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func filterOrphanResults(history []ai.Message, keep []bool, i int, m ai.Message) ai.Message {
+	ids := keptCallIDs(history, keep, i)
+	out := m
+	out.Parts = slices.Clone(m.Parts)
+	out.Parts = slices.DeleteFunc(out.Parts, func(p ai.Part) bool {
+		r, ok := p.(ai.ToolResult)
+		return ok && !(ids[r.ID] ?? false)
+	})
+	return out
+}
+
+func keptCallIDs(history []ai.Message, keep []bool, i int) map[string]bool {
+	out := map[string]bool{}
+	for j := 0; j < i; j++ {
+		if !keep[j] || !hasCalls(history[j]) {
+			continue
+		}
+		for id := range callIDs(history[j]) {
+			out[id] = true
 		}
 	}
 	return out
@@ -426,7 +477,7 @@ func answersAllCalls(all []ai.Message, i int, m ai.Message) bool {
 	unanswered := callIDs(m)
 	for j := i + 1; j < len(all) && len(unanswered) > 0; j++ {
 		if all[j].Role != ai.RoleTool {
-			break
+			continue
 		}
 		for _, id := range resultIDs(all[j]) {
 			delete(unanswered, id)
@@ -436,11 +487,15 @@ func answersAllCalls(all []ai.Message, i int, m ai.Message) bool {
 }
 
 func answersKnownCall(history []ai.Message, keep []bool, i int, m ai.Message) bool {
-	call := i - 1
-	for call >= 0 && history[call].Role == ai.RoleTool {
-		call--
+	ids := keptCallIDs(history, keep, i)
+	for _, p := range m.Parts {
+		if r, ok := p.(ai.ToolResult); ok {
+			if ids[r.ID] ?? false {
+				return true
+			}
+		}
 	}
-	return call >= 0 && keep[call] && hasCalls(history[call]) && answers(history[call], m)
+	return false
 }
 
 func hasCalls(m ai.Message) bool {
@@ -470,20 +525,6 @@ func resultIDs(m ai.Message) []string {
 		}
 	}
 	return out
-}
-
-func answers(call ai.Message, result ai.Message) bool {
-	ids := callIDs(call)
-	for _, p := range result.Parts {
-		r, ok := p.(ai.ToolResult)
-		if !ok {
-			continue
-		}
-		if ids[r.ID] ?? false {
-			return true
-		}
-	}
-	return false
 }
 
 func LastUserOrTool(messages []ai.Message) ai.Message? {

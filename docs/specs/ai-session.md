@@ -54,6 +54,14 @@ func (s *Service) Compact(ctx context.Context, id string, version int64, boundar
 func History(stored []ai.Message, request []ai.Message) []ai.Message
 func LastUserOrTool(messages []ai.Message) ai.Message?
 func Remember(s *Service, id string) ai.Layer
+
+type Turn struct {
+	Model   ai.Model
+	Request ai.Request
+	Limits  ai.Limits
+}
+
+func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 ```
 
 ## Requirements
@@ -74,18 +82,28 @@ func Remember(s *Service, id string) ai.Layer
 - `History` MUST put system texts first.
 - `History` MUST deduplicate system texts.
 - `History` MUST drop blank system texts.
-- `History` MUST drop an assistant tool call that no following tool result answers.
-- `History` MUST drop a tool result that answers no earlier kept call.
 - `History` MUST NOT double the turn that a tool loop resends.
 - `History` MUST keep a one-message request as new history.
 - `LastUserOrTool` MUST return none for a request of system messages only.
-- `Remember` MUST load the history before the call.
+- `History` MUST drop an assistant tool call that no following tool result answers.
+- `Remember` MUST store the call message again when the request resumes it but the log lacks it.
+- `History` MUST keep a stored call answerable to its result in true log order, not adjacent.
+- `Service.Run` MUST take the unwrapped model in `Turn.Model`.
+- `Service.Run` MUST refuse a `Turn.Model` that `Remember` or `Run` already wrapped.
+- `Service.Run` MUST record every `ai.Run` turn that carries a direct tool, including a confirm resume.
+- `Remember` MUST append the turn after an append that another call made during the call.
+- `Remember` MUST append the turn to a new session when the session expires during the call.
+- `Remember` MUST NOT store a call message that the log already holds.
+- `Service.Run` MUST run the tool loop through `Remember`.
+- `Service.Run` MUST store a direct tool answer without another model call.
+- `Service` MUST give each session generation its own version sequence.
+- A stale version from an expired session MUST NOT append to the new session.
+- `Service` MUST copy message parts on store and on read.
+- `History` MUST keep only the result parts that answer the kept call.
 - `Remember` MUST append the trailing user or tool message and the assistant reply after the call.
 - `Remember` MUST append nothing when the call fails.
 - `Remember` MUST append once on a stream, after the stream ends.
 - `Remember` MUST append nothing when the caller stops the stream.
-- `Remember` MUST append the turn after an append that another call made during the call.
-- `Remember` MUST append the turn to a new session when the session expires during the call.
 - A SQL store over `db` MUST serve SQLite, PostgreSQL, MySQL and SQL Server.
 - The in-memory store MUST be a concrete type.
 
@@ -121,7 +139,7 @@ func Remember(s *Service, id string) ai.Layer
 - `TestHistoryDropsBlankSystem` proves a blank system text is not sent.
 - `TestHistoryDropsOrphanToolCall` proves an unanswered call is dropped.
 - `TestHistoryDropsOrphanToolResult` proves a result with no call is dropped.
-- `TestHistoryKeepsAnsweredToolCall` proves an answered call and its result stay.
+- `TestHistoryKeepsOnlyTheResultThatAnswersAStoredCall` proves a mixed tool message keeps one part.
 - `TestHistoryDoesNotDoubleOverlap` proves a reloded call still overlaps.
 - `TestHistoryLaterRoundPrependsOnlyWhatLoopDoesNotCarry` proves the loop round prepends nothing twice.
 - `TestHistoryWithLoopsOwnHistoryOff` proves the loop tail alone still gets the history.
@@ -135,7 +153,15 @@ func Remember(s *Service, id string) ai.Layer
 - `TestRememberStreamFailedCallAppendsNothing` proves a cut stream records nothing.
 - `TestRememberStreamStoppedEarlyAppendsNothing` proves a stopped stream records nothing.
 - `TestRememberRecordsATurnBesideAConcurrentTurn` proves the turn follows a concurrent append.
-- `TestRememberRecordsATurnWhenTheSessionExpiresDuringTheCall` proves an expiry during the call does not lose the turn.
+- `TestRememberRecordsADirectToolAnswer` proves a direct answer reaches the next prompt.
+- `TestRememberKeepsAResumedToolExchangeTogether` proves a resumed call keeps its result answerable in order.
+- `TestRunStoresTheCallWithTheDirectResultAcrossAnExpiry` proves call and result store together across expiry.
+- `TestRunRefusesAModelTheSessionAlreadyWrapped` proves the double-wrap refusal.
+- `TestRunRecordsADirectAnswerAfterAConfirmResume` proves a confirm resume records the direct answer.
+- `TestCompactFromAnExpiredSessionCannotHideTheNewTurn` proves a stale compaction loses to the new turn.
+- `TestRememberRestoresAResumedCallAfterExpiry` proves an expired session still replays the call.
+- `TestAppendKeepsThePartsOfTheStoredMessage` proves an input edit leaves the stored parts alone.
+- `TestActiveKeepsThePartsOfTheReturnedMessage` proves a read edit leaves the stored parts alone.
 
 ## Not in scope
 

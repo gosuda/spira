@@ -1,0 +1,7 @@
+package session
+
+func StoredSessions(s *Service) int {
+	count := 0
+	s.store.WithLock(func(m *memory) { count = len(m.logs) })
+	return count
+}

@@ -7,6 +7,8 @@ package session
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"iter"
 
 	"github.com/gosuda/spira/ai"
@@ -18,10 +20,104 @@ type remember struct {
 	next ai.Model
 }
 
+type Turn struct {
+	Model   ai.Model
+	Request ai.Request
+	Limits  ai.Limits
+}
+
 func Remember(s *Service, id string) ai.Layer {
 	return func(next ai.Model) ai.Model {
 		return remember{svc: s, id: id, next: next}
 	}
+}
+
+func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error) {
+	switch t.Model.(type) {
+	case remember, recorderModel:
+		return ai.Reply{}, errors.New("ai/session: run: model is already wrapped by session; pass the unwrapped model")
+	}
+	rec := &recorder{}
+	reply, err := ai.Run(ctx, rec.wrap(Remember(s, id)(t.Model)), t.Request, t.Limits)
+	if err != nil {
+		return ai.Reply{}, fmt.Errorf("ai/session: run: %w", err)
+	}
+	if reply.Message.Role != ai.RoleTool {
+		return reply, nil
+	}
+	if err := s.storeDirect(ctx, id, reply, rec.call); err != nil {
+		return ai.Reply{}, err
+	}
+	return reply, nil
+}
+
+type recorder struct {
+	call ai.Message?
+}
+
+func (r *recorder) wrap(next ai.Model) ai.Model {
+	return recorderModel{rec: r, next: next}
+}
+
+type recorderModel struct {
+	rec  *recorder
+	next ai.Model
+}
+
+func (m recorderModel) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	reply, err := m.next.Chat(ctx, req)
+	if err != nil {
+		return reply, err
+	}
+	if hasCalls(reply.Message) {
+		m.rec.call = reply.Message
+	}
+	return reply, nil
+}
+
+func (m recorderModel) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	return m.next.Stream(ctx, req)
+}
+
+func (s *Service) storeDirect(ctx context.Context, id string, reply ai.Reply, call ai.Message?) error {
+	if _, err := s.Ensure(id); err != nil {
+		return err
+	}
+	for {
+		ok, err := s.appendDirect(ctx, id, reply, call)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if _, err := s.Ensure(id); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Service) appendDirect(ctx context.Context, id string, reply ai.Reply, call ai.Message?) (bool, error) {
+	version, err := s.Version(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	stored, err := s.Active(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return s.Append(ctx, id, version, s.directEvents(id, stored, reply, call)...)
+}
+
+func (s *Service) directEvents(id string, stored []ai.Message, reply ai.Reply, call ai.Message?) []Event {
+	r := remember{svc: s, id: id}
+	var events []Event
+	if c := call; c != nil {
+		if isMissing(stored, c ?? ai.Message{}) {
+			events = append(events, r.event(c ?? ai.Message{}))
+		}
+	}
+	return append(events, r.event(reply.Message))
 }
 
 func (r remember) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
@@ -86,24 +182,12 @@ func (r remember) prepare(ctx context.Context, req ai.Request) (int64, []ai.Mess
 }
 
 func (r remember) record(ctx context.Context, version int64, req ai.Request, reply ai.Reply) error {
-	var events []Event
-	if tail := LastUserOrTool(req.Messages); tail != nil {
-		events = append(events, Event{
-			ID:      newID(),
-			Session: r.id,
-			At:      r.svc.now(),
-			Type:    EventMessage,
-			Message: tail,
-		})
-	}
-	events = append(events, Event{
-		ID:      newID(),
-		Session: r.id,
-		At:      r.svc.now(),
-		Type:    EventMessage,
-		Message: reply.Message,
-	})
 	for {
+		stored, err := r.svc.Active(ctx, r.id)
+		if err != nil {
+			return err
+		}
+		events := r.turnEvents(stored, req, reply)
 		ok, err := r.svc.Append(ctx, r.id, version, events...)
 		if err != nil {
 			return err
@@ -119,6 +203,49 @@ func (r remember) record(ctx context.Context, version int64, req ai.Request, rep
 			return err
 		}
 	}
+}
+
+func (r remember) turnEvents(stored []ai.Message, req ai.Request, reply ai.Reply) []Event {
+	var events []Event
+	if call := callMessageBefore(req.Messages); call != nil {
+		c := call ?? ai.Message{}
+		if isMissing(stored, c) {
+			events = append(events, r.event(c))
+		}
+	}
+	if tail := LastUserOrTool(req.Messages); tail != nil {
+		t := tail ?? ai.Message{}
+		events = append(events, r.event(t))
+	}
+	return append(events, r.event(reply.Message))
+}
+
+func (r remember) event(m ai.Message) Event {
+	return Event{ID: newID(), Session: r.id, At: r.svc.now(), Type: EventMessage, Message: m}
+}
+
+func callMessageBefore(messages []ai.Message) ai.Message? {
+	end := len(messages)
+	i := end - 1
+	for i >= 0 && messages[i].Role == ai.RoleTool {
+		i--
+	}
+	if i == end-1 || i < 0 {
+		return nil
+	}
+	if messages[i].Role != ai.RoleAssistant || !hasCalls(messages[i]) {
+		return nil
+	}
+	return messages[i]
+}
+
+func isMissing(stored []ai.Message, m ai.Message) bool {
+	for _, s := range stored {
+		if sameContent(s, m) {
+			return false
+		}
+	}
+	return true
 }
 
 func sliceSeq(chunks []ai.Chunk) iter.Seq2[ai.Chunk, error] {

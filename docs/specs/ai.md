@@ -225,6 +225,7 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `Run` MUST return tool results directly only when every call ran and every tool has `Direct`.
 - A direct reply MUST have role tool and finish completed.
 - A direct reply MUST copy the id and model from the last model reply of the call.
+- `Run` MUST return a direct reply without another model call.
 - `Run` MUST sum the usage of every model round.
 
 ### Layers
@@ -306,8 +307,8 @@ func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, err
 - `TestRunRefusesADecisionAboutACallTheReplyDoesNotHold` proves unknown keys.
 - `TestRunRefusesTwoDecisionsAboutOneCall` proves duplicate keys.
 - `TestRunUsesTheDecisionsForTheResumedBatchOnly` proves decisions are single-use.
-- `TestRunRefusesAnAllowedCallWhoseToolTheRequestDoesNotCarry` proves missing tools.
 - `TestRunReturnsToolResultsDirectlyOnlyWhenEveryCallRanAndAskedForIt` proves direct return.
+- `TestRunRefusesAnAllowedCallWhoseToolTheRequestDoesNotCarry` proves missing tools.
 - `TestRunNamesACallByItsPositionWhenItsIDIsMissingSharedOrLooksLikeAPosition` proves call keys.
 - `TestRunStopsAtTheLimitForOneToolAndKeepsTheResultsItGathered` proves the per-tool limit.
 - `TestRunStopsAtTheLimitForTheTurnWithTheResultsOfTheSameBatch` proves the per-turn limit.
