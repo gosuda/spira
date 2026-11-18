@@ -157,7 +157,7 @@ Each package has a specification under [docs/specs](docs/specs/README.md). The l
 | `meter`, `ops` | Prometheus counters, gauges and histograms capped at 1000 series per metric; `/ops` health, info, metrics and routes behind a guard you must pass | yes |
 | `client`, `resilience`, `cache` | A typed JSON client under a timeout, retry and circuit-breaker policy; an LRU cache that runs one load per key | yes |
 | `gateway`, `job` | Reverse proxy to static upstream lists with a breaker per upstream; a scheduler, a queue and chunked batch runs | yes |
-| `ai` | Messages, tools, the `ai.Run` tool loop, `ai.Collect` stream merge, `ai.Wrap` layers, tool search | yes; the provider, session, retrieval and MCP packages are specified |
+| `ai`, `ai/ollama` | Messages, tools, the `ai.Run` tool loop, `ai.Collect` stream merge, `ai.Wrap` layers, tool search; the Ollama provider with chat, streaming and embeddings | yes; the other providers and the session, retrieval and MCP packages are specified |
 | `cmd/spira` | `spira dev` runs Vite and `logos run` together and restarts the server when an `.lgo` file changes | `dev` yes; `new` is specified |
 | `schema`, `openapi`, `admin`, `orm`, `cmd/sqlc-gen-spira` | Type descriptions, an OpenAPI 3.1 document, an admin console, entity sessions, SQL checked by `sqlc` before run time | specified, not yet in the tree |
 
