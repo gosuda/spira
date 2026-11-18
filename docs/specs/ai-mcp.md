@@ -71,7 +71,7 @@ func (c *Client) Close() error
 func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 ```
 
-`Envelope` is the JSON-RPC message: `jsonrpc`, `id`, `method`, `params`, `result`, `error`. `id`, `params` and `result` are `jsontext.Value`; `error` is `*RPCError?` with `Code int32`, `Message`, `Data`. A transport is used by one goroutine at a time. Every blocking call takes a context; a transport checks the context between messages, and a blocked read ends when the peer closes its end.
+`Envelope` is the JSON-RPC message: `jsonrpc`, `id`, `method`, `params`, `result`, `error`. `id`, `params` and `result` are `jsontext.Value`; `error` is `*RPCError?` with `Code int32`, `Message`, `Data`. A transport is used by one goroutine at a time. Every blocking call takes a context; a transport checks the context between messages, and a blocked read ends when the peer closes its end. A stdio pipe that carries a deadline ends a blocked read or write at the context deadline. A pipe with no deadline support keeps the call blocked until the peer writes or closes its end.
 
 ## Requirements
 
@@ -125,6 +125,8 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - The wire types MUST hold no option of a struct value, which static JSON does not decode.
 - The stdio transport MUST send one JSON-RPC message per line, with no embedded newline.
 - The stdio transport MUST skip messages that are not the response of the request it waits for.
+- A stdio read or write on a pipe that carries a deadline MUST end at the context deadline.
+- A pipe without deadline support MAY block a read or a write until the peer writes or closes its end.
 
 ## Errors
 
@@ -146,6 +148,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountInitialize` pins `listChanged` false.
 - `TestMountCallNonObjectArguments` and `TestClientCallNonObjectArguments` pin the object shape of `arguments` on the server and on the client.
 - `TestMountCallEmptyText` pins the `text` member of an empty result.
+- `TestStdioDeadlineWithoutReply` pins a read that ends at the context deadline on a pipe, with both ends open.
 - `TestMountInitialize`, `TestMountToolsList` and `TestMountCall` replay the specification's example requests (`lifecycle/initialize-request.json`, `tools/tools-call-request.json`) at the server and check the response members the seam can carry.
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
