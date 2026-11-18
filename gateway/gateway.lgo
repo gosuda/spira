@@ -1,0 +1,273 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
+)
+
+type Route struct {
+	Host        string?
+	PathPrefix  string
+	StripPrefix bool
+	To          []string
+	Stages      []web.Stage
+}
+
+func Mount(r *web.Router, routes []Route, policy resilience.Policy) {
+	for i := range routes {
+		rl := newRelay(routes[i], policy)
+		h := stageChain(routes[i].Stages, proxyHandler(newProxy(rl)))
+		for _, pattern := range routePatterns(routes[i].Host, routes[i].PathPrefix) {
+			r.Handle("", pattern, h)
+		}
+	}
+}
+
+func newRelay(rt Route, policy resilience.Policy) *relay {
+	requirePrefix(rt.PathPrefix)
+	if len(rt.To) == 0 {
+		panic($"gateway: route {rt.PathPrefix}: no upstream")
+	}
+	hops := make([]upstream, 0, len(rt.To))
+	for _, raw := range rt.To {
+		hops = append(hops, upstream{base: parseUpstream(raw, rt.PathPrefix), breaker: ownBreaker(policy.Breaker)})
+	}
+	return &relay{prefix: rt.PathPrefix, strip: rt.StripPrefix, timeout: policy.Timeout, body: badGatewayBody(), hops: hops}
+}
+
+func badGatewayBody() []byte {
+	body, err := json.Marshal(web.Problem{Title: "Bad Gateway", Status: http.StatusBadGateway})
+	if err != nil {
+		panic(fmt.Errorf("gateway: encode bad gateway problem: %w", err))
+	}
+	return body
+}
+
+func requirePrefix(prefix string) {
+	if !strings.HasPrefix(prefix, "/") {
+		panic($"gateway: route {prefix}: path prefix must start with /")
+	}
+}
+
+func parseUpstream(raw string, prefix string) *url.URL {
+	u, err := url.Parse(raw)
+	if upstreamOK(u, err) {
+		return u
+	}
+	panic($"gateway: route {prefix}: upstream {raw} is not an absolute http or https URL")
+}
+
+func upstreamOK(u *url.URL?, err error) bool {
+	if err != nil {
+		return false
+	}
+	if u == nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return u.Host != ""
+}
+
+func ownBreaker(template *resilience.Breaker?) *resilience.Breaker? {
+	if b := template; b != nil {
+		return &resilience.Breaker{Window: b.Window, FailureRate: b.FailureRate, OpenFor: b.OpenFor, Now: b.Now}
+	}
+	return nil
+}
+
+func routePatterns(host string?, prefix string) []string {
+	name := ""
+	if v := host; v != nil {
+		name = v
+	}
+	if prefix == "/" {
+		return []string{name + "/"}
+	}
+	return []string{name + prefix, name + prefix + "/"}
+}
+
+func proxyHandler(px *httputil.ReverseProxy) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: px}, nil
+	}
+}
+
+func stageChain(stages []web.Stage, last web.Handler) web.Handler {
+	h := last
+	for i := len(stages) - 1; i >= 0; i-- {
+		h = stages[i](h)
+	}
+	return h
+}
+
+func newProxy(rl *relay) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite:       rewriteForwarded,
+		Transport:     rl,
+		FlushInterval: -1,
+	}
+}
+
+func rewriteForwarded(pr *httputil.ProxyRequest) {
+	pr.SetXForwarded()
+}
+
+type upstream struct {
+	base    *url.URL
+	breaker *resilience.Breaker?
+}
+
+type relay struct {
+	prefix  string
+	strip   bool
+	timeout time.Duration
+	body    []byte
+	hops    []upstream
+	turn    atomic.Uint64
+}
+
+func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := int(rl.turn.Add(1)-1) % len(rl.hops)
+	again := replays(req)
+	var cause error
+	for i := range rl.hops {
+		resp, err := rl.send(req, &rl.hops[(start+i)%len(rl.hops)])
+		if err != nil {
+			cause = err
+		} else {
+			if r := resp; r != nil {
+				return r, nil
+			}
+		}
+		if !again {
+			break
+		}
+	}
+	slog.Error("gateway: no upstream served the route", "prefix", rl.prefix, "error", cause)
+	return rl.refusal(), nil
+}
+
+func replays(req *http.Request) bool {
+	if req.Body == nil || req.Body == http.NoBody {
+		return true
+	}
+	return false
+}
+
+func (rl *relay) send(req *http.Request, u *upstream) (*http.Response?, error) {
+	p := resilience.Policy{Timeout: rl.timeout, Breaker: u.breaker}
+	return resilience.Do(req.Context(), p, func(_ context.Context) (*http.Response?, error) {
+		return rl.deliver(req, u.base)
+	})
+}
+
+func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, error) {
+	outctx, cancel := context.WithCancel(req.Context())
+	timer := time.AfterFunc(rl.timeout, cancel)
+	resp, err := http.DefaultTransport.RoundTrip(rl.outbound(req, base, outctx))
+	if err != nil {
+		timer.Stop()
+		cancel()
+		return resp, err
+	}
+	if upstreamFailed(resp.StatusCode) {
+		timer.Stop()
+		cancel()
+		resp.Body.Close()?
+		return nil, fmt.Errorf("gateway: upstream answered %d", resp.StatusCode)
+	}
+	if !timer.Stop() && outctx.Err() != nil {
+		cancel()
+		resp.Body.Close()?
+		return nil, fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout)
+	}
+	resp.Body = &releasingBody{inner: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+type releasingBody struct {
+	inner  io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *releasingBody) Read(p []byte) (int, error) {
+	return b.inner.Read(p)
+}
+
+func (b *releasingBody) Close() error {
+	err := b.inner.Close()
+	b.cancel()
+	return err
+}
+
+func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context) *http.Request {
+	target := *req.URL
+	target.Scheme = base.Scheme
+	target.Host = base.Host
+	target.Path = targetPath(base.Path, rl.tail(req.URL.Path))
+	target.RawPath = ""
+	out := req.WithContext(actx)
+	out.URL = &target
+	out.Host = ""
+	return out
+}
+
+func (rl *relay) tail(path string) string {
+	if !rl.strip {
+		return path
+	}
+	t := strings.TrimPrefix(path, rl.prefix)
+	if t == "" {
+		return "/"
+	}
+	return t
+}
+
+func targetPath(base string, tail string) string {
+	if base == "" || base == "/" {
+		if tail == "" {
+			return "/"
+		}
+		return tail
+	}
+	switch {
+	case strings.HasSuffix(base, "/") && strings.HasPrefix(tail, "/"):
+		return base + tail[1:]
+	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(tail, "/"):
+		return base + "/" + tail
+	}
+	return base + tail
+}
+
+func upstreamFailed(status int) bool {
+	switch status {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func (rl *relay) refusal() *http.Response {
+	return &http.Response{
+		StatusCode:    http.StatusBadGateway,
+		Status:        "502 Bad Gateway",
+		Header:        http.Header{"Content-Type": []string{"application/problem+json"}},
+		Body:          io.NopCloser(bytes.NewReader(rl.body)),
+		ContentLength: int64(len(rl.body)),
+	}
+}
