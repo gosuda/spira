@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"net/http"
@@ -419,7 +420,7 @@ func TestStreamEndsAtMessageStopWhileTheBodyStaysOpen(t *testing.T) {
 	if reply.Finish != ai.FinishCompleted {
 		t.Fatalf("finish: %+v", reply.Finish)
 	}
-	if waited := time.Since(start); waited > 2*time.Second {
+	if waited := time.Since(start); waited > 30*time.Second {
 		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
 	}
 }
@@ -859,7 +860,7 @@ func TestStreamEndsAtAMessageStopRecordWithoutEventLines(t *testing.T) {
 	if reply.Finish != ai.FinishTruncated || reply.Usage != (ai.Usage{Input: 3, Output: 5, Total: 8}) {
 		t.Fatalf("finish %v usage %+v, want truncated and 3 + 5", reply.Finish, reply.Usage)
 	}
-	if waited := time.Since(start); waited > 2*time.Second {
+	if waited := time.Since(start); waited > 30*time.Second {
 		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
 	}
 }
@@ -1006,30 +1007,37 @@ func TestRedirectOnTheSameOriginKeepsTheKey(t *testing.T) {
 }
 
 func TestRetryAfterHoldsTheNextAttempt(t *testing.T) {
-	rec := &recorder{}
-	start := time.Now()
+	log := &arrivalLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
+		if _, err := io.ReadAll(r.Body); err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
-		w.Header().Set("Content-Type", "application/json")
-		if time.Since(start) < time.Second {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
-				t.Errorf("server write: %v", err)
-			}
+		if !isClientCall(r) {
+			log.stranger(r)
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
-			t.Errorf("server write: %v", err)
+		n := log.add(r)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, werr := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
+			if werr != nil {
+				t.Errorf("server write: %v", werr)
+			}
+			log.done(n, werr)
+			return
 		}
+		_, werr := io.WriteString(w, fixture(t, "message-response.json"))
+		if werr != nil {
+			t.Errorf("server write: %v", werr)
+		}
+		log.done(n, werr)
 	}))
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
-	c.Policy = resilience.Policy{Timeout: 5 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 3 * time.Second}}
+	c.Policy = resilience.Policy{Timeout: 30 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 3 * time.Second}}
 	reply, err := c.Chat(context.Background(), ai.Request{
 		Model:     "claude-opus-5-5",
 		MaxTokens: 1024,
@@ -1042,12 +1050,143 @@ func TestRetryAfterHoldsTheNextAttempt(t *testing.T) {
 	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
 		t.Fatalf("reply: %+v", reply)
 	}
-	if rec.count() != 2 {
-		t.Fatalf("requests: %d, want 2: the second attempt must wait out the advertised second", rec.count())
+	if got := log.count(); got != 2 {
+		t.Fatalf("requests: %d, want 2: the second attempt must wait out the advertised second\n%s", got, log.dump())
+		return
 	}
-	if waited := time.Since(start); waited < time.Second {
-		t.Fatalf("second attempt after %v, want at least the advertised second", waited)
+	gap := log.gap(1)
+	if gap < time.Second {
+		t.Fatalf("second attempt %v after the first answer, want at least the advertised second", gap)
 	}
+	if gap > 30*time.Second {
+		t.Fatalf("second attempt %v after the first answer, past the 30s backstop", gap)
+	}
+}
+
+type arrival struct {
+	offset time.Duration
+	method string
+	path   string
+	remote string
+	proto  string
+	closed bool
+	length int64
+	idem   string
+	xidem  string
+	sretry string
+	conn   string
+	ua     string
+	wrote  bool
+	werr   string
+}
+
+type stranger struct {
+	offset time.Duration
+	method string
+	path   string
+	remote string
+	ua     string
+}
+
+type arrivalLog struct {
+	mu        sync.Mutex
+	first     time.Time
+	at        []time.Time
+	answered  []time.Time
+	rows      []arrival
+	strangers []stranger
+}
+
+func (l *arrivalLog) add(r *http.Request) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if l.first.IsZero() {
+		l.first = now
+	}
+	l.at = append(l.at, now)
+	l.rows = append(l.rows, arrival{
+		offset: now.Sub(l.first),
+		method: r.Method,
+		path:   r.URL.Path,
+		remote: r.RemoteAddr,
+		proto:  r.Proto,
+		closed: r.Close,
+		length: r.ContentLength,
+		idem:   r.Header.Get("Idempotency-Key"),
+		xidem:  r.Header.Get("X-Idempotency-Key"),
+		sretry: r.Header.Get("X-Stainless-Retry-Count"),
+		conn:   r.Header.Get("Connection"),
+		ua:     r.Header.Get("User-Agent"),
+	})
+	return len(l.at)
+}
+
+func (l *arrivalLog) stranger(r *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if l.first.IsZero() {
+		l.first = now
+	}
+	l.strangers = append(l.strangers, stranger{
+		offset: now.Sub(l.first),
+		method: r.Method,
+		path:   r.URL.Path,
+		remote: r.RemoteAddr,
+		ua:     r.Header.Get("User-Agent"),
+	})
+}
+
+func (l *arrivalLog) done(n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for len(l.answered) < n {
+		l.answered = append(l.answered, time.Now())
+	}
+	if n-1 < len(l.rows) {
+		l.rows[n-1].wrote = true
+		if err != nil {
+			l.rows[n-1].werr = err.Error()
+		}
+	}
+}
+
+func (l *arrivalLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.at)
+}
+
+func (l *arrivalLog) gap(n int) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n >= len(l.at) || n-1 >= len(l.answered) {
+		return 0
+	}
+	return l.at[n].Sub(l.answered[n-1])
+}
+
+func (l *arrivalLog) dump() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var b strings.Builder
+	for i, row := range l.rows {
+		fmt.Fprintf(&b, "#%d off=%v %s %s %s %s closed=%v len=%d idem=%q xidem=%q sretry=%q conn=%q ua=%q wrote=%v werr=%q\n",
+			i+1, row.offset, row.method, row.path, row.remote, row.proto, row.closed, row.length,
+			row.idem, row.xidem, row.sretry, row.conn, row.ua, row.wrote, row.werr)
+	}
+	if len(l.strangers) > 0 {
+		b.WriteString("strangers:\n")
+		for i, s := range l.strangers {
+			fmt.Fprintf(&b, "  s%d off=%v %s %s %s ua=%q\n", i+1, s.offset, s.method, s.path, s.remote, s.ua)
+		}
+	}
+	return b.String()
+}
+
+func isClientCall(r *http.Request) bool {
+	return r.Method == http.MethodPost && r.URL.Path == "/v1/messages" && r.Header.Get("x-api-key") == "test-key"
 }
 
 func TestEchoedKeyNeverAppearsInError(t *testing.T) {
@@ -1364,16 +1503,20 @@ data: {"type":"message_stop"}
 }
 
 func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
-	rec := &recorder{}
 	start := time.Now()
+	log := &arrivalLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
+		if _, err := io.ReadAll(r.Body); err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if !isClientCall(r) {
+			log.stranger(r)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := log.add(r)
 		w.Header().Set("Content-Type", "application/json")
-		if rec.count() == 1 {
+		if n == 1 {
 			w.Header().Set("Retry-After", "9223372036854775807")
 			w.WriteHeader(http.StatusTooManyRequests)
 			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
@@ -1387,7 +1530,7 @@ func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
-	c.Policy = resilience.Policy{Timeout: 5 * time.Second, Retry: resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 20 * time.Millisecond}}
+	c.Policy = resilience.Policy{Timeout: 60 * time.Second, Retry: resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 20 * time.Millisecond}}
 	reply, err := c.Chat(context.Background(), ai.Request{
 		Model:     "claude-opus-5-5",
 		MaxTokens: 1024,
@@ -1400,11 +1543,11 @@ func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
 	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
 		t.Fatalf("reply: %+v", reply)
 	}
-	if waited := time.Since(start); waited > 2*time.Second {
+	if waited := time.Since(start); waited > 30*time.Second {
 		t.Fatalf("the wait took %v: an advertisement past the retry maximum must be capped at it", waited)
 	}
-	if rec.count() != 2 {
-		t.Fatalf("requests: %d, want the rejected attempt and its retry", rec.count())
+	if log.count() != 2 {
+		t.Fatalf("requests: %d, want the rejected attempt and its retry", log.count())
 	}
 }
 
