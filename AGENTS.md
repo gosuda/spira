@@ -12,7 +12,7 @@ spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). I
 
 ## Toolchain environment
 
-The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113, #114, #116, #117, #118, #119 and #123 applied. The comptime packages need #102, `just eject` needs #103 and #118, `resilience` needs #109, and an interpolated string whose text holds a quote, a backquote or `//` needs #119. #116 rejects an exported comptime generic that names an unexported identifier of its package, so such a generic calls only exported names. #123 lets `just eject` accept an anonymous struct with field tags as the type argument of a comptime generic. Every command needs:
+The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113, #114, #116, #117, #118, #119 and #123 applied. The comptime packages need #102, `just eject` needs #103 and #118, `resilience` needs #109, and an interpolated string whose text holds a quote, a backquote or `//` needs #119. #116 rejects an exported comptime generic that names an unexported identifier of its package, so such a generic calls only exported names. #123 lets `just eject` accept an anonymous struct with field tags as the type argument of a comptime generic. The worktree also holds one fix that upstream has not merged: `cmd/compile/internal/logos: apply caller JSON options to static structs`. `cmd/sqlc-gen-spira` needs it to reject an unknown option key. Every command needs:
 
 ```sh
 export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
