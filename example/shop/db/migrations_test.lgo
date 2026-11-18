@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gosuda/spira/db"
 	shopdb "github.com/gosuda/spira/example/shop/db"
@@ -22,23 +23,37 @@ func dsnFor(t *testing.T) string {
 	return fmt.Sprintf("file:spira_shopdb_%s?mode=memory&cache=shared&_pragma=foreign_keys(1)", key)
 }
 
-func openPool(t *testing.T) *db.Pool {
+const callTimeout = 30 * time.Second
+
+func bounded(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func openPool(t *testing.T) *db.Pool? {
 	t.Helper()
 	pool, err := db.Open("sqlite", dsnFor(t))
 	if err != nil {
-		panic(fmt.Sprintf("shopdb_test: open %s: %v", t.Name(), err))
+		t.Fatalf("open %s: %v", t.Name(), err)
+		return nil
 	}
 	if pool == nil {
-		panic("shopdb_test: Open returned no pool")
-	}
-	if serr := pool.Start(t.Context()); serr != nil {
-		panic(fmt.Sprintf("shopdb_test: start %s: %v", t.Name(), serr))
+		t.Fatalf("open %s: no pool and no error", t.Name())
+		return nil
 	}
 	t.Cleanup(func() {
-		if err := pool.Stop(context.Background()); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
 			t.Errorf("Stop: %v", err)
 		}
 	})
+	if err := pool.Start(bounded(t)); err != nil {
+		t.Fatalf("start %s: %v", t.Name(), err)
+		return nil
+	}
 	return pool
 }
 
@@ -54,7 +69,7 @@ func loadSteps(t *testing.T) []migrate.Step {
 
 func tableNames(t *testing.T, pool *db.Pool) []string {
 	t.Helper()
-	rows, err := pool.QueryContext(t.Context(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+	rows, err := pool.QueryContext(bounded(t), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
 	if err != nil {
 		t.Fatalf("tableNames: %v", err)
 		return nil
@@ -82,7 +97,7 @@ func tableNames(t *testing.T, pool *db.Pool) []string {
 
 func storedNames(t *testing.T, pool *db.Pool) []string {
 	t.Helper()
-	rows, err := pool.QueryContext(t.Context(), "SELECT name FROM spira_migrations ORDER BY name")
+	rows, err := pool.QueryContext(bounded(t), "SELECT name FROM spira_migrations ORDER BY name")
 	if err != nil {
 		t.Fatalf("storedNames: %v", err)
 		return nil
@@ -117,10 +132,10 @@ func closeRows(t *testing.T, rows *sql.Rows) {
 
 func seed(t *testing.T, pool *db.Pool) {
 	t.Helper()
-	if _, err := pool.ExecContext(t.Context(), "INSERT INTO users (id, name, password_hash) VALUES (1, 'ada', 'phc-hash')"); err != nil {
+	if _, err := pool.ExecContext(bounded(t), "INSERT INTO users (id, name, password_hash) VALUES (1, 'ada', 'phc-hash')"); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	if _, err := pool.ExecContext(t.Context(), "INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'mug', 900, 5, '2026-01-01 10:00:00')"); err != nil {
+	if _, err := pool.ExecContext(bounded(t), "INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'mug', 900, 5, '2026-01-01 10:00:00')"); err != nil {
 		t.Fatalf("seed product: %v", err)
 	}
 }
@@ -151,8 +166,11 @@ func TestLoadReturnsStepsInOrder(t *testing.T) {
 
 func TestApplyAppliesAndReapplies(t *testing.T) {
 	pool := openPool(t)
+	if pool == nil {
+		return
+	}
 	steps := loadSteps(t)
-	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
 		t.Fatalf("Apply: %v", err)
 		return
 	}
@@ -161,7 +179,7 @@ func TestApplyAppliesAndReapplies(t *testing.T) {
 		t.Fatalf("tables after Apply = %v, want 6 user tables plus spira_migrations", before)
 		return
 	}
-	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
 		t.Fatalf("second Apply: %v", err)
 		return
 	}
@@ -179,8 +197,11 @@ func TestApplyAppliesAndReapplies(t *testing.T) {
 
 func TestCheckReversiblePasses(t *testing.T) {
 	pool := openPool(t)
+	if pool == nil {
+		return
+	}
 	steps := loadSteps(t)
-	if err := migrate.CheckReversible(t.Context(), pool, steps); err != nil {
+	if err := migrate.CheckReversible(bounded(t), pool, steps); err != nil {
 		t.Fatalf("CheckReversible: %v", err)
 		return
 	}
@@ -241,8 +262,11 @@ func queryStatements(t *testing.T) []string {
 
 func TestQueryStatementsPrepare(t *testing.T) {
 	pool := openPool(t)
+	if pool == nil {
+		return
+	}
 	steps := loadSteps(t)
-	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
 		t.Fatalf("Apply: %v", err)
 		return
 	}
@@ -264,7 +288,7 @@ func TestQueryStatementsPrepare(t *testing.T) {
 			t.Fatalf("%s: %v", label, err)
 			return
 		}
-		stmt, err := handle.PrepareContext(t.Context(), expanded)
+		stmt, err := handle.PrepareContext(bounded(t), expanded)
 		if err != nil {
 			t.Fatalf("%s: prepare: %v", label, err)
 			return
@@ -278,13 +302,16 @@ func TestQueryStatementsPrepare(t *testing.T) {
 
 func TestForeignKeysEnforced(t *testing.T) {
 	pool := openPool(t)
+	if pool == nil {
+		return
+	}
 	steps := loadSteps(t)
-	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
 		t.Fatalf("Apply: %v", err)
 		return
 	}
 	seed(t, pool)
-	if _, err := pool.ExecContext(t.Context(), "INSERT INTO orders (id, user_id, status, total, created_at) VALUES (1, 1, 'open', 0, '2026-01-01 10:00:00')"); err != nil {
+	if _, err := pool.ExecContext(bounded(t), "INSERT INTO orders (id, user_id, status, total, created_at) VALUES (1, 1, 'open', 0, '2026-01-01 10:00:00')"); err != nil {
 		t.Fatalf("seed order: %v", err)
 		return
 	}
@@ -298,7 +325,7 @@ func TestForeignKeysEnforced(t *testing.T) {
 		{name: "order line for a missing order", insert: "INSERT INTO order_lines (order_id, product_id, quantity, unit_price) VALUES (999, 1, 1, 900)"},
 		{name: "order line for a missing product", insert: "INSERT INTO order_lines (order_id, product_id, quantity, unit_price) VALUES (1, 999, 1, 900)"},
 	} {
-		_, err := pool.ExecContext(t.Context(), tc.insert)
+		_, err := pool.ExecContext(bounded(t), tc.insert)
 		if err == nil {
 			t.Fatalf("%s was accepted", tc.name)
 			return
@@ -312,13 +339,16 @@ func TestForeignKeysEnforced(t *testing.T) {
 
 func TestCheckConstraintsReject(t *testing.T) {
 	pool := openPool(t)
+	if pool == nil {
+		return
+	}
 	steps := loadSteps(t)
-	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
 		t.Fatalf("Apply: %v", err)
 		return
 	}
 	seed(t, pool)
-	_, quantityErr := pool.ExecContext(t.Context(), "INSERT INTO cart_items (owner_kind, owner_key, product_id, quantity) VALUES ('session', 's1', 1, 0)")
+	_, quantityErr := pool.ExecContext(bounded(t), "INSERT INTO cart_items (owner_kind, owner_key, product_id, quantity) VALUES ('session', 's1', 1, 0)")
 	if quantityErr == nil {
 		t.Fatal("cart quantity 0 was accepted")
 		return
@@ -327,7 +357,7 @@ func TestCheckConstraintsReject(t *testing.T) {
 		t.Fatalf("quantity error = %q, want a check violation", quantityErr.Error())
 		return
 	}
-	_, statusErr := pool.ExecContext(t.Context(), "INSERT INTO orders (user_id, status, total, created_at) VALUES (1, 'lost', 0, '2026-01-01 10:00:00')")
+	_, statusErr := pool.ExecContext(bounded(t), "INSERT INTO orders (user_id, status, total, created_at) VALUES (1, 'lost', 0, '2026-01-01 10:00:00')")
 	if statusErr == nil {
 		t.Fatal("order status 'lost' was accepted")
 		return
