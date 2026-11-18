@@ -127,7 +127,7 @@ func txRunOne(t *testing.T, pool *db.Pool, i int, calls int) error {
 	ctx, cancel := context.WithTimeout(t.Context(), txCallTimeout)
 	defer cancel()
 	for j := 0; j < calls; j++ {
-		q := txQueryText((i + j) % 300)
+		q := txQueryText(i*calls + j)
 		if _, err := db.Exec(ctx, pool, q); err != nil {
 			return fmt.Errorf("call %d query %q: %w", j, q, err)
 		}
@@ -150,8 +150,8 @@ func TestPreparedStatementSurvivesEvictionUnderConcurrentLoad(t *testing.T) {
 	if err := spawn(); err != nil {
 		t.Fatalf("concurrent prepared statements: %v", err)
 	}
-	if got := pool.Prepared(); got > txCacheLimit {
-		t.Fatalf("Prepared() = %d, want at most %d", got, txCacheLimit)
+	if got := pool.Prepared(); got != txCacheLimit {
+		t.Fatalf("Prepared() = %d, want %d after %d distinct statements evicted", got, txCacheLimit, workers*callsEach)
 	}
 }
 
