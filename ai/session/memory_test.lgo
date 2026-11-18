@@ -1,0 +1,38 @@
+package session
+
+import (
+	"fmt"
+	"testing"
+	"time"
+)
+
+func storedSessions(s *Service) int {
+	count := 0
+	s.store.WithLock(func(m *memory) { count = len(m.logs) })
+	return count
+}
+
+func TestExpiredSessionsAreFreedWhenALaterSessionOpens(t *testing.T) {
+	now := time.Now()
+	s := &Service{TTL: time.Hour, Now: func() time.Time { return now }}
+	for i := range 3 {
+		if _, err := s.Ensure(fmt.Sprintf("old-%d", i)); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+	}
+	now = now.Add(30 * time.Minute)
+	if _, err := s.Ensure("young"); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	now = now.Add(45 * time.Minute)
+	if _, err := s.Ensure("new"); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	if got := storedSessions(s); got != 2 {
+		t.Fatalf("the store holds %d sessions, want the 2 that are not expired", got)
+	}
+	if s.Find("young") == nil {
+		t.Fatalf("the sweep removed a session that is not expired")
+	}
+}

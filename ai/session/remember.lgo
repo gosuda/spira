@@ -1,0 +1,128 @@
+// Translated and changed by spira from Spring AI,
+// advisors/spring-ai-session-advisor/src/main/java/org/springframework/ai/session/advisor/PromptHistoryAdvisor.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package session
+
+import (
+	"context"
+	"iter"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type remember struct {
+	svc  *Service
+	id   string
+	next ai.Model
+}
+
+func Remember(s *Service, id string) ai.Layer {
+	return func(next ai.Model) ai.Model {
+		return remember{svc: s, id: id, next: next}
+	}
+}
+
+func (r remember) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	version, prompt, err := r.prepare(ctx, req)
+	if err != nil {
+		return ai.Reply{}, err
+	}
+	reply, err := r.next.Chat(ctx, withPrompt(req, prompt))
+	if err != nil {
+		return ai.Reply{}, err
+	}
+	if err := r.record(ctx, version, req, reply); err != nil {
+		return ai.Reply{}, err
+	}
+	return reply, nil
+}
+
+func (r remember) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	version, prompt, err := r.prepare(ctx, req)
+	if err != nil {
+		yield ai.Chunk{}, err
+		return
+	}
+	var chunks []ai.Chunk
+	for chunk, cerr := range r.next.Stream(ctx, withPrompt(req, prompt)) {
+		if cerr != nil {
+			yield ai.Chunk{}, cerr
+			return
+		}
+		chunks = append(chunks, chunk)
+		yield chunk, nil
+	}
+	reply, cerr := ai.Collect(sliceSeq(chunks))
+	if cerr != nil {
+		yield ai.Chunk{}, cerr
+		return
+	}
+	if rerr := r.record(ctx, version, req, reply); rerr != nil {
+		yield ai.Chunk{}, rerr
+	}
+}
+
+func withPrompt(req ai.Request, prompt []ai.Message) ai.Request {
+	out := req
+	out.Messages = prompt
+	return out
+}
+
+func (r remember) prepare(ctx context.Context, req ai.Request) (int64, []ai.Message, error) {
+	if _, err := r.svc.Ensure(r.id); err != nil {
+		return 0, nil, err
+	}
+	version, err := r.svc.Version(ctx, r.id)
+	if err != nil {
+		return 0, nil, err
+	}
+	stored, err := r.svc.Active(ctx, r.id)
+	if err != nil {
+		return 0, nil, err
+	}
+	return version, History(stored, req.Messages), nil
+}
+
+func (r remember) record(ctx context.Context, version int64, req ai.Request, reply ai.Reply) error {
+	var events []Event
+	if tail := LastUserOrTool(req.Messages); tail != nil {
+		events = append(events, Event{
+			ID:      newID(),
+			Session: r.id,
+			At:      r.svc.now(),
+			Type:    EventMessage,
+			Message: tail,
+		})
+	}
+	events = append(events, Event{
+		ID:      newID(),
+		Session: r.id,
+		At:      r.svc.now(),
+		Type:    EventMessage,
+		Message: reply.Message,
+	})
+	for {
+		ok, err := r.svc.Append(ctx, r.id, version, events...)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if _, err := r.svc.Ensure(r.id); err != nil {
+			return err
+		}
+		version, err = r.svc.Version(ctx, r.id)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func sliceSeq(chunks []ai.Chunk) iter.Seq2[ai.Chunk, error] {
+	for _, chunk := range chunks {
+		yield chunk, nil
+	}
+}
