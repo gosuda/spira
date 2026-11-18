@@ -3,15 +3,17 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"logos/sync"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gosuda/spira/db"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const insertThing = "INSERT INTO things (n) VALUES (?)"
@@ -268,6 +270,84 @@ func TestDialectOfRejectsParseTimeInThePassword(t *testing.T) {
 	}
 	if err.Error() != "db: mysql DSN needs parseTime=true" {
 		t.Fatalf("error = %q, want db: mysql DSN needs parseTime=true", err.Error())
+	}
+}
+
+type stopOutcome struct {
+	err  sync.Locked[error]
+	done chan struct{}
+}
+
+func detached(work func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	context.AfterFunc(ctx, work)
+	cancel()
+}
+
+func registerBlockingFunction(ctx context.Context, started chan struct{}, release chan struct{}) string {
+	block := func(_ *sqlite.FunctionContext, _ []driver.Value) (driver.Value, error) {
+		select {
+		case started <- struct{}{}:
+		case <-ctx.Done():
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return int64(1), nil
+	}
+	name := fmt.Sprintf("spira_block_stop_%d", time.Now().UnixNano())
+	if err := sqlite.RegisterScalarFunction(name, 0, block); err != nil {
+		panic(fmt.Sprintf("db_test: register function: %v", err))
+	}
+	return name
+}
+
+func TestStopReturnsByItsDeadlineWhileAStatementRuns(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	blocker := registerBlockingFunction(ctx, started, release)
+	pool := openPool(t)
+	statement := &stopOutcome{done: make(chan struct{})}
+	detached(func() {
+		_, qerr := pool.ExecContext(ctx, "SELECT "+blocker+"()")
+		statement.err.WithLock(func(e *error) { *e = qerr })
+		close(statement.done)
+	})
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the blocking statement did not start")
+	}
+	stopCtx, stopCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer stopCancel()
+	stop := &stopOutcome{done: make(chan struct{})}
+	detached(func() {
+		serr := pool.Stop(stopCtx)
+		stop.err.WithLock(func(e *error) { *e = serr })
+		close(stop.done)
+	})
+	returnedInTime := true
+	select {
+	case <-stop.done:
+	case <-time.After(2 * time.Second):
+		returnedInTime = false
+	}
+	close(release)
+	select {
+	case <-statement.done:
+	case <-ctx.Done():
+		t.Fatal("the blocking statement did not finish after its release")
+	}
+	if !returnedInTime {
+		t.Fatal("Stop did not return by its 50ms deadline while a cached statement ran")
+	}
+	var serr error
+	stop.err.WithLock(func(e *error) { serr = *e })
+	if !errors.Is(serr, context.DeadlineExceeded) || !strings.HasPrefix(serr.Error(), "db: stop:") {
+		t.Fatalf("Stop error = %v, want db: stop: context deadline exceeded", serr)
 	}
 }
 

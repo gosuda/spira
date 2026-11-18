@@ -94,6 +94,8 @@ func (d *OptionDest[V]) Scan(src any) error
 - `Pool` MUST implement [app.Part](app.md).
 - `Start` MUST ping the database.
 - `Stop` MUST close each prepared statement before it closes the database handle.
+- `Stop` MUST return when its context ends, even if a statement still runs.
+- After such a return, the close MUST continue and finish when the statement ends.
 - The package MUST NOT import a database driver.
 
 ### Transactions
@@ -162,6 +164,7 @@ func (d *OptionDest[V]) Scan(src any) error
 
 - `db: unknown driver "<name>"` when the driver name is not one of the four names above.
 - `db: mysql DSN needs parseTime=true` when the query part of a `mysql` DSN does not turn `parseTime` on.
+- `db: stop: <cause>` when the context of `Stop` ends before the close finishes. `<cause>` is the context error.
 - `db: open <driver>: <cause>` when `sql.Open` fails.
 - `db: ping: <cause>` when `Start` cannot ping.
 - `db: close: <cause>` when the handle close fails. The cause joins the statement close error and the handle error.
@@ -188,6 +191,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestDialectOfMatchesEachDriverName` proves the four driver names.
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
 - `TestDialectOfRejectsParseTimeInThePassword` proves that `parseTime=true` outside the query part does not count.
+- `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the bounded `Stop`. A registered SQL function holds the statement open until the test releases it.
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
 - `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
 - `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.

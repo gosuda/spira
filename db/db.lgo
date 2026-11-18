@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"logos/sync"
 	"strings"
 )
 
@@ -131,12 +132,42 @@ func (p *Pool) Start(ctx context.Context) error {
 }
 
 func (p *Pool) Stop(ctx context.Context) error {
-	closeErr := p.stmts.closeStmts()
-	handleErr := p.handle.Close()
-	if handleErr != nil {
-		return fmt.Errorf("db: close: %w", errors.Join(closeErr, handleErr))
+	run := &poolClose{done: make(chan struct{})}
+	joinCtx, joinCancel := context.WithCancel(context.Background())
+	context.AfterFunc(joinCtx, func() {
+		p.closeAll(run)
+	})
+	joinCancel()
+	select {
+	case <-run.done:
+	case <-ctx.Done():
+		return fmt.Errorf("db: stop: %w", ctx.Err())
 	}
-	return closeErr
+	var err error
+	run.err.WithLock(func(e *error) {
+		err = *e
+	})
+	return err
+}
+
+type poolClose struct {
+	err  sync.Locked[error]
+	done chan struct{}
+}
+
+func (p *Pool) closeAll(run *poolClose) {
+	stmtErr := p.stmts.closeStmts()
+	handleErr := p.handle.Close()
+	var result error
+	if handleErr != nil {
+		result = fmt.Errorf("db: close: %w", errors.Join(stmtErr, handleErr))
+	} else {
+		result = stmtErr
+	}
+	run.err.WithLock(func(e *error) {
+		*e = result
+	})
+	close(run.done)
 }
 
 func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error) {
