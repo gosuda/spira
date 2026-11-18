@@ -1,7 +1,9 @@
 package live_test
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -44,6 +46,7 @@ func readCorpus(t *testing.T) []corpusLine {
 	data, err := os.ReadFile(corpusPath(t))
 	if err != nil {
 		t.Fatalf("read corpus: %v", err)
+		return nil
 	}
 	var lines []corpusLine
 	for i, row := range strings.Split(strings.TrimSpace(string(data)), "\n") {
@@ -111,22 +114,57 @@ func probeEmittedFields(t *testing.T) map[string]bool {
 	t.Helper()
 	events := make(chan live.Event, 1)
 	ts, serveDone := serveEvents(t, rawHandler(events))
-	resp := openStream(t, ts)
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return nil
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return nil
+	}
 	defer closeBody(t, resp.Body)
-	tap, g := startTap(t, resp.Body)
-	expectHeartbeat(t, tap)
-	events <- live.Event{Name: "corpus", Body: view.T("first\nsecond")}
-	messages := []string{": live\n\n", nextMessage(t, tap, 3*time.Second)}
-	closeBody(t, resp.Body)
-	awaitServe(t, serveDone)
-	if err := g.Wait(); err != nil {
+	tap := newStreamTap()
+	drive := &streamDrive{body: resp.Body, tap: tap, events: events, serveDone: serveDone}
+	if err := drive.probe(t.Context()); err != nil {
 		t.Fatalf("client group: %v", err)
+		return nil
 	}
 	tokens := map[string]bool{}
-	for _, m := range messages {
+	for _, m := range drive.messages {
 		collectFieldTokens(tokens, m)
 	}
 	return tokens
+}
+
+func (c *streamDrive) probe(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.probeSteps(ctx)
+	}
+	return nil
+}
+
+func (c *streamDrive) probeSteps(ctx context.Context) error {
+	beat, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if beat != ": live\n\n" {
+		return fmt.Errorf("first message %q, want the heartbeat comment", beat)
+	}
+	if err := c.emit(ctx, live.Event{Name: "corpus", Body: view.T("first\nsecond")}); err != nil {
+		return err
+	}
+	first, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	c.messages = append(c.messages, beat, first)
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return awaitServeErr(ctx, c.serveDone)
 }
 
 func collectFieldTokens(tokens map[string]bool, message string) {
