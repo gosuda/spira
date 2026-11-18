@@ -71,6 +71,33 @@ func (p *Pool) Prepared() int {
 	return p.stmts.size()
 }
 
+func (p *Pool) Prepare(ctx context.Context, query string) error {
+	q, skip := unmarked(query)
+	if skip {
+		return prepareDirect(ctx, p.handle, q)
+	}
+	stmt, err := p.stmts.prepare(ctx, p.handle, q)
+	if err != nil {
+		return err
+	}
+	if stmt == nil {
+		return errors.New("db: prepared statement missing")
+	}
+	p.stmts.release(q)
+	return nil
+}
+
+func prepareDirect(ctx context.Context, handle *sql.DB, q string) error {
+	stmt, err := handle.PrepareContext(ctx, q)
+	if err != nil {
+		return fmt.Errorf("db: prepare: %w", err)
+	}
+	if cerr := stmt.Close(); cerr != nil {
+		return fmt.Errorf("db: prepare close: %w", cerr)
+	}
+	return nil
+}
+
 func (p *Pool) Start(ctx context.Context) error {
 	if err := p.handle.PingContext(ctx); err != nil {
 		return fmt.Errorf("db: ping: %w", err)

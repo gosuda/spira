@@ -1,0 +1,85 @@
+package db_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/db"
+)
+
+func prepareCtx(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	return context.WithTimeout(t.Context(), txCallTimeout)
+}
+
+func TestPrepareRejectsAMissingTable(t *testing.T) {
+	pool := openPool(t)
+	ctx, cancel := prepareCtx(t)
+	defer cancel()
+	err := pool.Prepare(ctx, "SELECT n FROM no_such_prepare_table")
+	if err == nil {
+		t.Fatal("Prepare accepted a statement against a missing table")
+	}
+	if !strings.HasPrefix(err.Error(), "db: prepare:") {
+		t.Fatalf("Prepare error = %q, want the db: prepare: prefix", err.Error())
+	}
+}
+
+func TestPrepareFeedsLaterQueriesThroughTheCache(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	insertThingRow(t, pool)
+	ctx, cancel := prepareCtx(t)
+	defer cancel()
+	before := pool.Prepared()
+	if err := pool.Prepare(ctx, "SELECT n FROM things"); err != nil {
+		panic($"db_test: prepare: {err}")
+	}
+	if got := pool.Prepared(); got != before+1 {
+		t.Fatalf("Prepared() = %d right after Prepare, want %d", got, before+1)
+	}
+	rows, err := db.Query[int64](ctx, pool, "SELECT n FROM things")
+	if err != nil {
+		panic($"db_test: query after prepare: {err}")
+	}
+	if len(rows) != 1 || rows[0] != 7 {
+		t.Fatalf("query after prepare = %v, want [7]", rows)
+	}
+	if got := pool.Prepared(); got != before+1 {
+		t.Fatalf("Prepared() = %d after Query of the same text, want %d", got, before+1)
+	}
+}
+
+func TestPrepareOfMarkedTextStaysUncached(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	insertThingRow(t, pool)
+	ctx, cancel := prepareCtx(t)
+	defer cancel()
+	before := pool.Prepared()
+	marked := db.In("SELECT n FROM things WHERE n IN (/*SLICE:ns*/?)", "ns", 1)
+	if err := pool.Prepare(ctx, marked); err != nil {
+		panic($"db_test: prepare marked: {err}")
+	}
+	if got := pool.Prepared(); got != before {
+		t.Fatalf("Prepared() = %d after preparing marked text, want %d", got, before)
+	}
+}
+
+func TestPrepareLeavesNoStatementHeld(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	ctx, cancel := prepareCtx(t)
+	defer cancel()
+	for i := range 300 {
+		if err := pool.Prepare(ctx, fmt.Sprintf("SELECT n + %d FROM things", i)); err != nil {
+			t.Fatalf("prepare %d: %v", i, err)
+			return
+		}
+	}
+	if !pool.RetiredStatementsEmpty() {
+		t.Fatal("a statement that Prepare loaded stayed held after its eviction")
+	}
+}
