@@ -739,3 +739,117 @@ func TestNaNKeyLoadNeverJoinsAFlight(t *testing.T) {
 	}
 }
 
+func cancelWhenJoined(c *cache.Memory[string, int], need int, cancel context.CancelFunc) error {
+	joined := waitUntil(func() bool { return cache.FlightWaiters(c, "k") == need }, 5*time.Second)
+	cancel()
+	if !joined {
+		return fmt.Errorf("cache test: %d waiters never joined the flight", need)
+	}
+	return nil
+}
+
+func TestLeaderCancelRestartsLoadForWaiters(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	defer leaderCancel()
+	started := make(chan struct{})
+	var calls atomic.Int64
+	load := func(lctx context.Context) (int, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-lctx.Done()
+			return 0, lctx.Err()
+		}
+		return 41, nil
+	}
+	vals := make([]int, 3)
+	errs := make([]error, 3)
+	leaderErrs := make([]error, 1)
+	run := func() error {
+		go group (t.Context()) {
+			go {
+				_, leaderErrs[0] = cache.Load(leaderCtx, c, "k", load)
+			}
+			for i := range 3 {
+				go {
+					<-started
+					vals[i], errs[i] = cache.Load(t.Context(), c, "k", load)
+				}
+			}
+			go {
+				<-started
+				cancelWhenJoined(c, 3, leaderCancel)?
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	if !errors.Is(leaderErrs[0], context.Canceled) {
+		t.Fatalf("leader error = %v, want its own context.Canceled", leaderErrs[0])
+		return
+	}
+	for i := range 3 {
+		if errs[i] != nil {
+			t.Fatalf("waiter %d error = %v, want none: the leader's cancellation is not the waiters' failure", i, errs[i])
+			return
+		}
+		if vals[i] != 41 {
+			t.Fatalf("waiter %d = %d, want 41 from the restarted load", i, vals[i])
+			return
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("load ran %d times, want 2: one cancelled flight, one restart", calls.Load())
+	}
+}
+
+func TestLeaderOrdinaryFailureStillReachesWaiters(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	defer leaderCancel()
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	boom := errors.New("cache test: boom")
+	load := func(lctx context.Context) (int, error) {
+		calls.Add(1)
+		close(started)
+		<-release
+		return 0, boom
+	}
+	errs := make([]error, 3)
+	run := func() error {
+		go group (t.Context()) {
+			go {
+				_, errs[0] = cache.Load(leaderCtx, c, "k", load)
+			}
+			for i := range 2 {
+				go {
+					<-started
+					_, errs[i+1] = cache.Load(t.Context(), c, "k", load)
+				}
+			}
+			go {
+				<-started
+				releaseWhenJoined(c, 2, release)?
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	for i := range 3 {
+		if !errors.Is(errs[i], boom) {
+			t.Fatalf("caller %d error = %v, want boom: an ordinary failure under a live context is shared", i, errs[i])
+			return
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("load ran %d times, want 1", calls.Load())
+	}
+}

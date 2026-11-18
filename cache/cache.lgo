@@ -36,9 +36,10 @@ type flight[K comparable, V any] struct {
 }
 
 type outcome[V any] struct {
-	ok    bool
-	value V
-	err   error
+	ok      bool
+	value   V
+	err     error
+	restart bool
 }
 
 func NewMemory[K comparable, V any](capacity int, ttl time.Duration) *Memory[K, V] {
@@ -129,48 +130,53 @@ func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load f
 	if k != k {
 		return load(ctx)
 	}
-	nf := &flight[K, V]{}
-	lead := false
-	hit := false
-	var ch chan outcome[V]
-	var out outcome[V]
-	c.store.WithLock(func(s *store[K, V]) {
-		el := s.element(k)
-		if el != nil {
-			it := el.Value.(*item[K, V])
-			if !c.expired(it.at) {
-				s.order.MoveToFront(el)
-				out = outcome[V]{ok: true, value: it.val}
-				hit = true
+	for {
+		nf := &flight[K, V]{}
+		lead := false
+		hit := false
+		var ch chan outcome[V]
+		var out outcome[V]
+		c.store.WithLock(func(s *store[K, V]) {
+			el := s.element(k)
+			if el != nil {
+				it := el.Value.(*item[K, V])
+				if !c.expired(it.at) {
+					s.order.MoveToFront(el)
+					out = outcome[V]{ok: true, value: it.val}
+					hit = true
+					return
+				}
+				s.order.Remove(el)
+				delete(s.entries, k)
+			}
+			if fl, ok := s.flights[k]; ok {
+				ch = make(chan outcome[V], 1)
+				fl.waiters = append(fl.waiters, ch)
 				return
 			}
-			s.order.Remove(el)
-			delete(s.entries, k)
+			s.flights[k] = nf
+			lead = true
+		})
+		if hit {
+			return c.finish(out)
 		}
-		if fl, ok := s.flights[k]; ok {
-			ch = make(chan outcome[V], 1)
-			fl.waiters = append(fl.waiters, ch)
-			return
+		if !lead {
+			w, again := c.wait(ctx, ch)
+			if again {
+				continue
+			}
+			return c.finish(w)
 		}
-		s.flights[k] = nf
-		lead = true
-	})
-	if hit {
-		return c.finish(out)
+		return c.runLoad(ctx, k, nf, load)
 	}
-	if !lead {
-		return c.wait(ctx, ch)
-	}
-	return c.runLoad(ctx, k, nf, load)
 }
 
-func (c *Memory[K, V]) wait(ctx context.Context, ch chan outcome[V]) (V, error) {
+func (c *Memory[K, V]) wait(ctx context.Context, ch chan outcome[V]) (outcome[V], bool) {
 	select {
 	case out := <-ch:
-		return c.finish(out)
+		return out, out.restart
 	case <-ctx.Done():
-		var zero V
-		return zero, ctx.Err()
+		return outcome[V]{err: ctx.Err()}, false
 	}
 }
 
@@ -195,6 +201,7 @@ func (c *Memory[K, V]) runLoad(ctx context.Context, k K, f *flight[K, V], load f
 		out.ok = true
 		out.value = v
 	}
+	again := err != nil && ctx.Err() != nil
 	c.store.WithLock(func(s *store[K, V]) {
 		delete(s.flights, k)
 		if err == nil && !f.superseded {
@@ -202,7 +209,11 @@ func (c *Memory[K, V]) runLoad(ctx context.Context, k K, f *flight[K, V], load f
 		}
 	})
 	for _, w := range f.waiters {
-		sendOutcome(w, out)
+		if again {
+			sendOutcome(w, outcome[V]{restart: true})
+		} else {
+			sendOutcome(w, out)
+		}
 	}
 	return c.finish(out)
 }
