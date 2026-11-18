@@ -14,3 +14,10 @@ Translated units:
   spring-ai-model/src/main/java/org/springframework/ai/chat/model/MessageAggregator.java
 - ai/collect_test.lgo, from
   spring-ai-model/src/test/java/org/springframework/ai/chat/model/MessageAggregatorTests.java
+- ai/run.lgo, from
+  spring-ai-model/src/main/java/org/springframework/ai/model/tool/DefaultToolCallingManager.java,
+  ToolCallLimits.java and ToolCallDecisions.java in that directory, and
+  spring-ai-client-chat/src/main/java/org/springframework/ai/chat/client/advisor/ToolCallingAdvisor.java
+- ai/run_test.lgo, from
+  spring-ai-model/src/test/java/org/springframework/ai/model/tool/DefaultToolCallingManagerDecisionsTests.java
+  and DefaultToolCallingManagerTest.java in that directory

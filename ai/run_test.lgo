@@ -1,0 +1,469 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-model/src/test/java/org/springframework/ai/model/tool/DefaultToolCallingManagerDecisionsTests.java
+// and DefaultToolCallingManagerTest.java in the same directory.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai_test
+
+import (
+	"context"
+	"errors"
+	"iter"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type scripted struct {
+	replies []ai.Reply
+	seen    []ai.Request
+	fail    error
+}
+
+func (s *scripted) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	s.seen = append(s.seen, req)
+	if s.fail != nil {
+		return ai.Reply{}, s.fail
+	}
+	if len(s.seen) > len(s.replies) {
+		return ai.Reply{}, errors.New("run test: the script holds no more replies")
+	}
+	return s.replies[len(s.seen)-1], nil
+}
+
+func (s *scripted) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	yield ai.Chunk{}, errors.New("run test: stream is not scripted")
+}
+
+type toolLog struct {
+	ran       []string
+	arguments []string
+}
+
+func (l *toolLog) tool(name string, result string) ai.Tool {
+	return ai.Tool{Name: name, Description: name, Schema: `{"type":"object"}`, Call: func(ctx context.Context, arguments string) (string, error) {
+		l.ran = append(l.ran, name)
+		l.arguments = append(l.arguments, arguments)
+		return result, nil
+	}}
+}
+
+func (l *toolLog) tools() []ai.Tool {
+	flight := l.tool("book_flight", "booked")
+	flight.Confirm = true
+	ticket := l.tool("ticket", "VX205-14C")
+	ticket.Confirm = true
+	ticket.Direct = true
+	return []ai.Tool{flight, l.tool("weather", "sunny"), ticket}
+}
+
+func asking(calls ...ai.ToolCall) ai.Reply {
+	parts := []ai.Part{ai.Text{Text: ""}}
+	for _, call := range calls {
+		parts = append(parts, call)
+	}
+	return ai.Reply{Message: ai.Message{Role: ai.RoleAssistant, Parts: parts}, Finish: ai.FinishToolCall, Usage: ai.Usage{Input: 10, Output: 2, Total: 12}, ID: "r1", Model: "m"}
+}
+
+func saying(text string) ai.Reply {
+	return ai.Reply{Message: ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{ai.Text{Text: text}}}, Finish: ai.FinishCompleted, Usage: ai.Usage{Input: 20, Output: 5, Total: 25}, ID: "r2", Model: "m"}
+}
+
+func call(id string, tool string) ai.ToolCall {
+	return ai.ToolCall{ID: id, Name: tool, Arguments: "{}"}
+}
+
+func question() []ai.Message {
+	return []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Book VX205"}}}}
+}
+
+func resultsOf(m ai.Message) []string {
+	var out []string
+	for _, part := range m.Parts {
+		if result, isResult := part.(ai.ToolResult); isResult {
+			out = append(out, result.ID+"="+result.Content)
+		}
+	}
+	return out
+}
+
+func textOf(m ai.Message) string {
+	var b strings.Builder
+	for _, part := range m.Parts {
+		if text, isText := part.(ai.Text); isText {
+			b.WriteString(text.Text)
+		}
+	}
+	return b.String()
+}
+
+func requireStrings(t *testing.T, what string, got []string, want ...string) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Fatalf("%s = %q, want %q", what, got, want)
+	}
+}
+
+func TestRunExecutesACallThatNeedsNoConfirmationAndReturnsTheFinalReply(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather")), saying("It is sunny.")}}
+	reply, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "weather")
+	if got := textOf(reply.Message); got != "It is sunny." {
+		t.Fatalf("final text = %q", got)
+	}
+	if len(model.seen) != 2 || len(model.seen[1].Messages) != 3 {
+		t.Fatalf("model saw %d requests; the second holds %d messages, want 2 and 3", len(model.seen), len(model.seen[len(model.seen)-1].Messages))
+		return
+	}
+	requireStrings(t, "results sent to the model", resultsOf(model.seen[1].Messages[2]), "c1=sunny")
+	if want := (ai.Usage{Input: 30, Output: 7, Total: 37}); reply.Usage != want {
+		t.Fatalf("usage = %+v, want the sum over both rounds %+v", reply.Usage, want)
+	}
+	if reply.ID != "r2" {
+		t.Fatalf("id = %q, want the id of the last reply", reply.ID)
+	}
+}
+
+func pause(t *testing.T, log *toolLog, calls ...ai.ToolCall) *ai.ConfirmError? {
+	t.Helper()
+	model := &scripted{replies: []ai.Reply{asking(calls...)}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{})
+	paused := &ai.ConfirmError{}
+	if !errors.As(err, &paused) {
+		t.Fatalf("Run error = %v, want a ConfirmError", err)
+		return nil
+	}
+	return paused
+}
+
+func resume(log *toolLog, paused *ai.ConfirmError, decisions ...ai.Decision) (*scripted, ai.Reply, error) {
+	model := &scripted{replies: []ai.Reply{saying("Done.")}}
+	reply, err := ai.Run(context.Background(), model, ai.Request{Messages: paused.Messages, Tools: log.tools(), Decisions: decisions}, ai.Limits{})
+	return model, reply, err
+}
+
+func TestRunPausesTheWholeBatchBeforeAnyCallRunsWhenOneNeedsConfirmation(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c0", "weather"), call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	requireStrings(t, "waiting", paused.Waiting, "c1")
+	requireStrings(t, "ran", log.ran)
+	if len(paused.Messages) != 2 || paused.Messages[1].Role != ai.RoleAssistant {
+		t.Fatalf("paused conversation = %+v, want the question and the reply", paused.Messages)
+	}
+}
+
+func TestRunResumesAnAllowedCallAndHoldsTheReplyOnce(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	model, reply, err := resume(log, paused, ai.Decision{Call: "c1"})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "book_flight")
+	if len(model.seen) != 1 || len(model.seen[0].Messages) != 3 {
+		t.Fatalf("model saw %d requests after the resume, the first with %d messages; want 1 and 3", len(model.seen), len(model.seen[0].Messages))
+		return
+	}
+	requireStrings(t, "results", resultsOf(model.seen[0].Messages[2]), "c1=booked")
+	if len(model.seen[0].Decisions) != 0 {
+		t.Fatal("the decisions reached the model")
+	}
+	if got := textOf(reply.Message); got != "Done." {
+		t.Fatalf("final text = %q", got)
+	}
+}
+
+func TestRunAnswersADeniedCallWithItsMessageWithoutRunningIt(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	model, _, err := resume(log, paused, ai.Decision{Call: "c1", Deny: "Too expensive."})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran)
+	requireStrings(t, "results", resultsOf(model.seen[0].Messages[2]), "c1=Too expensive.")
+}
+
+func TestRunNeedsADecisionForEveryCallOfTheReply(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"), call("c2", "weather"))
+	if paused == nil {
+		return
+	}
+	_, _, err := resume(log, paused, ai.Decision{Call: "c1", Deny: ""})
+	if err == nil || !strings.Contains(err.Error(), "missing: [c2]") {
+		t.Fatalf("error = %v, want one that names the missing decision for c2", err)
+		return
+	}
+	requireStrings(t, "ran after the refused resume", log.ran)
+	model, _, rerr := resume(log, paused, ai.Decision{Call: "c1", Deny: ""}, ai.Decision{Call: "c2"})
+	if rerr != nil {
+		t.Fatalf("resume: %v", rerr)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "weather")
+	requireStrings(t, "results", resultsOf(model.seen[0].Messages[2]), "c1="+ai.DenyMessage, "c2=sunny")
+}
+
+func TestRunRefusesADecisionAboutACallTheReplyDoesNotHold(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	_, _, err := resume(log, paused, ai.Decision{Call: "other"})
+	if err == nil || !strings.Contains(err.Error(), "'other'") {
+		t.Fatalf("error = %v, want one that names the key 'other'", err)
+	}
+	requireStrings(t, "ran", log.ran)
+}
+
+func TestRunRefusesTwoDecisionsAboutOneCall(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	_, _, err := resume(log, paused, ai.Decision{Call: "c1"}, ai.Decision{Call: "c1", Deny: "No."})
+	if err == nil || !strings.Contains(err.Error(), "two decisions") {
+		t.Fatalf("error = %v, want one that refuses two decisions for c1", err)
+	}
+	requireStrings(t, "ran", log.ran)
+}
+
+func TestRunUsesTheDecisionsForTheResumedBatchOnly(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "book_flight"))
+	if paused == nil {
+		return
+	}
+	model := &scripted{replies: []ai.Reply{asking(call("w1", "weather")), saying("Booked, and it is sunny.")}}
+	request := ai.Request{Messages: paused.Messages, Tools: log.tools(), Decisions: []ai.Decision{{Call: "c1"}}}
+	reply, err := ai.Run(t.Context(), model, request, ai.Limits{})
+	if err != nil {
+		t.Fatalf("Run: %v; the decision for c1 was applied to a later batch", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "book_flight", "weather")
+	if got := textOf(reply.Message); got != "Booked, and it is sunny." {
+		t.Fatalf("final text = %q", got)
+	}
+}
+
+func TestRunRefusesAnAllowedCallWhoseToolTheRequestDoesNotCarry(t *testing.T) {
+	conversation := append(question(), asking(call("c1", "book_flight")).Message)
+	model := &scripted{replies: []ai.Reply{saying("Done.")}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: conversation, Decisions: []ai.Decision{{Call: "c1"}}}, ai.Limits{})
+	if err == nil || !strings.Contains(err.Error(), "'book_flight'") {
+		t.Fatalf("error = %v, want one that names the tool", err)
+		return
+	}
+	_, derr := ai.Run(t.Context(), model, ai.Request{Messages: conversation, Decisions: []ai.Decision{{Call: "c1", Deny: ""}}}, ai.Limits{})
+	if derr != nil {
+		t.Fatalf("a denied call needs no tool, got %v", derr)
+		return
+	}
+	requireStrings(t, "results", resultsOf(model.seen[0].Messages[2]), "c1="+ai.DenyMessage)
+}
+
+func TestRunReturnsToolResultsDirectlyOnlyWhenEveryCallRanAndAskedForIt(t *testing.T) {
+	log := &toolLog{}
+	alone := pause(t, log, call("c1", "ticket"))
+	if alone == nil {
+		return
+	}
+	model, reply, err := resume(log, alone, ai.Decision{Call: "c1"})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+		return
+	}
+	if len(model.seen) != 0 {
+		t.Fatalf("the model was called %d times after a direct result", len(model.seen))
+	}
+	if reply.Message.Role != ai.RoleTool {
+		t.Fatalf("direct reply role = %q, want tool", reply.Message.Role)
+	}
+	requireStrings(t, "direct results", resultsOf(reply.Message), "c1=VX205-14C")
+
+	mixed := pause(t, log, call("c1", "ticket"), call("c2", "book_flight"))
+	if mixed == nil {
+		return
+	}
+	again, final, merr := resume(log, mixed, ai.Decision{Call: "c1"}, ai.Decision{Call: "c2", Deny: "No."})
+	if merr != nil {
+		t.Fatalf("resume: %v", merr)
+		return
+	}
+	if len(again.seen) != 1 || final.Message.Role != ai.RoleAssistant {
+		t.Fatalf("a batch with a denied call returned directly: model calls %d, role %q", len(again.seen), final.Message.Role)
+	}
+	requireStrings(t, "ran", log.ran, "ticket", "ticket")
+}
+
+func TestRunNamesACallByItsPositionWhenItsIDIsMissingSharedOrLooksLikeAPosition(t *testing.T) {
+	log := &toolLog{}
+	paused := pause(t, log, call("c1", "weather"), call("", "book_flight"))
+	if paused == nil {
+		return
+	}
+	requireStrings(t, "waiting", paused.Waiting, "#1")
+	model, _, err := resume(log, paused, ai.Decision{Call: "c1"}, ai.Decision{Call: "#1"})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+		return
+	}
+	requireStrings(t, "ran", log.ran, "weather", "book_flight")
+	requireStrings(t, "results keep the ids of the model", resultsOf(model.seen[0].Messages[2]), "c1=sunny", "=booked")
+
+	shared := pause(t, log, call("c1", "book_flight"), call("c1", "weather"), call("#9", "book_flight"))
+	if shared == nil {
+		return
+	}
+	requireStrings(t, "waiting for calls that share an id", shared.Waiting, "#0", "#2")
+	_, _, serr := resume(log, shared, ai.Decision{Call: "c1"})
+	if serr == nil || !strings.Contains(serr.Error(), "no tool call has the key 'c1'") {
+		t.Fatalf("error = %v, want one that refuses the shared id as a key", serr)
+	}
+}
+
+func repeating(n int) []ai.Reply {
+	var replies []ai.Reply
+	for range n {
+		replies = append(replies, asking(call("c", "weather")))
+	}
+	return replies
+}
+
+func TestRunStopsAtTheLimitForOneToolAndKeepsTheResultsItGathered(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: repeating(5)}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{PerTool: 2})
+	breach := &ai.LimitError{}
+	if !errors.As(err, &breach) {
+		t.Fatalf("error = %v, want a LimitError", err)
+		return
+	}
+	if (breach.Tool ?? "") != "weather" || breach.Limit != 2 {
+		t.Fatalf("breach = tool %v limit %d, want weather and 2", breach.Tool, breach.Limit)
+	}
+	requireStrings(t, "ran", log.ran, "weather", "weather")
+	last := breach.Messages[len(breach.Messages)-1]
+	want := "c=Tool call limit (2) exceeded for tool 'weather'. No further calls to this tool are allowed in this turn."
+	requireStrings(t, "results in the breach", resultsOf(last), want)
+	if len(breach.Messages) != 7 {
+		t.Fatalf("breach holds %d messages, want the question and three rounds of reply and results", len(breach.Messages))
+	}
+}
+
+func TestRunStopsAtTheLimitForTheTurnWithTheResultsOfTheSameBatch(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("a", "weather"), call("b", "weather"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{PerTurn: 1})
+	breach := &ai.LimitError{}
+	if !errors.As(err, &breach) {
+		t.Fatalf("error = %v, want a LimitError", err)
+		return
+	}
+	if breach.Tool != nil || breach.Limit != 1 {
+		t.Fatalf("breach = tool %v limit %d, want no tool and 1", breach.Tool, breach.Limit)
+	}
+	last := breach.Messages[len(breach.Messages)-1]
+	requireStrings(t, "results in the breach", resultsOf(last), "a=sunny", "b=Total tool call limit (1) exceeded for this turn. No further tool calls are allowed.")
+}
+
+func TestRunCountsCallsFromTheLastUserMessageOnly(t *testing.T) {
+	log := &toolLog{}
+	earlier := []ai.Message{
+		{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "first question"}}},
+		asking(call("old", "weather")).Message,
+		{Role: ai.RoleTool, Parts: []ai.Part{ai.ToolResult{ID: "old", Name: "weather", Content: "rain"}}},
+		saying("It rains.").Message,
+		{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "and now?"}}},
+	}
+	model := &scripted{replies: []ai.Reply{asking(call("new", "weather")), saying("Sunny now.")}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: earlier, Tools: log.tools()}, ai.Limits{PerTool: 1})
+	if err != nil {
+		t.Fatalf("Run: %v; a call of an earlier turn counted against this turn", err)
+	}
+	requireStrings(t, "ran", log.ran, "weather")
+}
+
+func TestRunFailsOnAToolTheRequestDoesNotCarry(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "nope"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{})
+	if err == nil || !strings.Contains(err.Error(), `no tool named "nope"`) {
+		t.Fatalf("error = %v, want one that names the unknown tool", err)
+	}
+}
+
+func TestRunGivesBlankArgumentsToTheToolAsAnEmptyObject(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(ai.ToolCall{ID: "c1", Name: "weather", Arguments: " "}), saying("ok")}}
+	if _, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{}); err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	requireStrings(t, "arguments", log.arguments, "{}")
+}
+
+func failing(name string, cause error) ai.Tool {
+	return ai.Tool{Name: name, Call: func(ctx context.Context, arguments string) (string, error) {
+		return "", cause
+	}}
+}
+
+func TestRunTurnsAToolErrorIntoTheResultOfThatCall(t *testing.T) {
+	tools := []ai.Tool{failing("named", errors.New("city not found")), failing("silent", errors.New(" "))}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "named"), call("c2", "silent")), saying("ok")}}
+	if _, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: tools}, ai.Limits{}); err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	requireStrings(t, "results", resultsOf(model.seen[1].Messages[2]), "c1=city not found", "c2=tool silent failed")
+}
+
+func TestRunEndsWhenTheContextEndsDuringATool(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	stopping := ai.Tool{Name: "weather", Call: func(ctx context.Context, arguments string) (string, error) {
+		cancel()
+		return "sunny", nil
+	}}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather")), saying("never")}}
+	_, err := ai.Run(ctx, model, ai.Request{Messages: question(), Tools: []ai.Tool{stopping}}, ai.Limits{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want the context error", err)
+	}
+	if len(model.seen) != 1 {
+		t.Fatalf("the model was called %d times after the context ended", len(model.seen))
+	}
+}
+
+var errModelDown = errors.New("run test: model down")
+
+func TestRunWrapsTheModelError(t *testing.T) {
+	model := &scripted{fail: errModelDown}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question()}, ai.Limits{})
+	if !errors.Is(err, errModelDown) || !strings.HasPrefix(err.Error(), "ai: run: ") {
+		t.Fatalf("error = %v, want the model error behind the ai: run: prefix", err)
+	}
+}
