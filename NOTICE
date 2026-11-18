@@ -2,3 +2,15 @@ spira
 Copyright 2026 metaphorics (metaphoric-dev)
 
 This product is licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes code and test cases translated from Spring AI
+(https://github.com/spring-projects/spring-ai), revision
+4cce4caa9653092624b20ae1113633b3ad97d256.
+Copyright 2023-present the original author or authors.
+Licensed under the Apache License, Version 2.0.
+Spring AI ships no NOTICE file at that revision.
+Translated units:
+- ai/collect.lgo, from
+  spring-ai-model/src/main/java/org/springframework/ai/chat/model/MessageAggregator.java
+- ai/collect_test.lgo, from
+  spring-ai-model/src/test/java/org/springframework/ai/chat/model/MessageAggregatorTests.java
