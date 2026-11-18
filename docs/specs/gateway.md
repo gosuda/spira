@@ -33,6 +33,8 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 
 - The proxy MUST keep the request method.
 - The proxy MUST keep the query string.
+- When the upstream URL has a query, the proxy MUST send that query before the request query.
+- The proxy MUST join those two queries with `&`.
 - The proxy MUST keep the request body.
 - The proxy MUST set `X-Forwarded-For` from the client address.
 - The proxy MUST set `X-Forwarded-Host` from the inbound host.
@@ -99,6 +101,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestPrefixStrippedOrKeptByFlagAndShoppingNotRouted` proves strip, a kept prefix, and that `/shopping` does not select `/shop`.
 - `TestUpstreamBasePathIsJoinedBeforeTheStrippedTail` proves the base-path join.
 - `TestPercentEncodedPathArrivesEncoded` proves that an encoded slash stays encoded, with and without strip.
+- `TestUpstreamQueryLeadsTheRequestQuery` proves the upstream query alone and joined with a request query.
 - `TestForwardedHeadersHoldInboundValuesAndDropForgedOnes` proves the three forwarded headers and that a forged value is dropped.
 - `TestUpstreamsTakeTurns` proves the rotation across the upstream list.
 - `TestHostRouteMatchesOnlyItsHost` proves that a host route rejects another host.

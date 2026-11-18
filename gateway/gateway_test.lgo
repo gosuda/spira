@@ -446,6 +446,30 @@ func TestPercentEncodedPathArrivesEncoded(t *testing.T) {
 	}
 }
 
+func TestUpstreamQueryLeadsTheRequestQuery(t *testing.T) {
+	notes := make(chan upstreamNote, 2)
+	up := echoUpstream(t, notes)
+	gw := serveGateway(t, []gateway.Route{{
+		PathPrefix:  "/shop",
+		StripPrefix: true,
+		To:          []string{up.URL + "/base?locale=en"},
+	}}, plainPolicy())
+	for _, tc := range []struct {
+		path string
+		want string
+	}{{"/shop/catalog?page=2", "locale=en&page=2"}, {"/shop/catalog", "locale=en"}} {
+		resp, err := http.Get(gw.URL + tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBody(t, resp)
+		n := awaitNote(t, notes)
+		if n.Path != "/base/catalog" || n.Query != tc.want {
+			t.Fatalf("%s reached the upstream as %s?%s want /base/catalog?%s", tc.path, n.Path, n.Query, tc.want)
+		}
+	}
+}
+
 func TestMountPanicsOnBadRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
