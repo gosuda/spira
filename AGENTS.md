@@ -35,7 +35,7 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 - Concurrency only through `go group`. Shared mutable state lives in `logos/sync.Locked[T]`. No package-level mutable state. [Edsger W. Dijkstra]
 - Every blocking call takes a `context.Context` and a timeout. [John Carmack]
 - Struct tags name wire fields only (`json`, `path`, `query`, `header`, `form`, `cookie`, `body`, `env`, `col`). A tag never selects behavior. [Claude Shannon]
-- Cross-cutting behavior is an ordered list of `web.Stage` values written in code. [Edsger W. Dijkstra]
+- Cross-cutting behavior is an ordered list of `web.Stage` values written in code. Every stage boundary is settled: the reply or the error that a handler or a stage returns is written at once, `next` returns `nil, nil`, and a stage reads the outcome from `ctx.Status()`. [Edsger W. Dijkstra]
 - Errors are `(T, error)` with `?`, wrapped as `fmt.Errorf("<package>: <what>: %w", err)`. Absence is `T?`. Panic only for programmer errors at registration time. [Tony Hoare]
 - Third-party modules: `golang.org/x/crypto` in `auth`; database drivers only in tests, `example/` and generated applications. Resolve versions with `logos get`; never type one from memory. [Richard Feynman]
 - Tests run the real parts: in-memory SQLite and `net/http/httptest`. [John Carmack]
@@ -70,7 +70,7 @@ The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A
 - Island `when`: a closed set of values. An unknown value keeps the fallback and logs one error. [Tony Hoare]
 - Island props: one JSON object. Malformed JSON, or a value that is not a plain object, keeps the fallback: no mount, no child removal, one error log. [Tony Hoare]
 - Events: `live.Events` writes a named `event:` line before each `data:` body and sends a heartbeat comment. The stream ends when the client disconnects. [Claude Shannon]
-- Fragments: a request with `HX-Request` gets the fragment without the document shell, and the response carries `Vary: HX-Request`. [Claude Shannon]
+- Fragments: a request with `HX-Request`, and without `HX-Boosted` and `HX-History-Restore-Request`, gets the fragment without the document shell. A page response carries `Vary: HX-Request, HX-Boosted, HX-History-Restore-Request`. [Claude Shannon]
 - Corpus: `wire/corpus.jsonl` holds one JSON object per line (`name`, `request`, `response`, `reject`). The LoGOs tests and the vitest tests both read this file; neither keeps a copy. [Richard Feynman]
 
 ## Finding protocol
