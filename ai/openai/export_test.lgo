@@ -1,0 +1,40 @@
+package openai
+
+import "time"
+
+func IsStall(err error) bool {
+	return isStall(err)
+}
+
+type IdleProbe struct {
+	Resets int
+	Fired  bool
+	limit  time.Duration
+	fire   func()
+}
+
+func (p *IdleProbe) Reset(d time.Duration) bool {
+	p.Resets++
+	p.limit = d
+	return true
+}
+
+func (p *IdleProbe) Stop() bool {
+	return true
+}
+
+func (p *IdleProbe) Fire() {
+	p.Fired = true
+	p.fire()
+}
+
+func ArmIdleProbe() (*IdleProbe, func()) {
+	probe := &IdleProbe{}
+	prev := newIdleTimer
+	newIdleTimer = func(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool) {
+		probe.limit = limit
+		probe.fire = onIdle
+		return probe.Reset, probe.Stop
+	}
+	return probe, func() { newIdleTimer = prev }
+}
