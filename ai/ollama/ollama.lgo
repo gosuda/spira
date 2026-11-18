@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -308,8 +309,26 @@ func usageOf(resp *chatResponse) ai.Usage {
 	return ai.Usage{Input: int(resp.PromptEvalCount), Output: int(resp.EvalCount), Total: int(resp.PromptEvalCount + resp.EvalCount)}
 }
 
+func formatOf(format string) (jsontext.Value, error) {
+	switch format {
+	case "":
+		return nil, nil
+	case "json":
+		return jsontext.Value(`"json"`), nil
+	}
+	schema := jsontext.Value(format)
+	if schema.Kind() != jsontext.KindBeginObject || !schema.IsValid() {
+		return nil, errors.New("ai/ollama: format is not json and not a JSON object")
+	}
+	return schema, nil
+}
+
 func requestOf(req ai.Request, stream bool) (chatRequest, error) {
-	out := chatRequest{Model: req.Model ?? "", Stream: stream, Format: req.Format ?? ""}
+	format, err := formatOf(req.Format ?? "")
+	if err != nil {
+		return chatRequest{}, err
+	}
+	out := chatRequest{Model: req.Model ?? "", Stream: stream, Format: format}
 	for _, m := range req.Messages {
 		wire, err := messageOf(m)
 		if err != nil {

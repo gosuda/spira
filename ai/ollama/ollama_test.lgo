@@ -8,6 +8,7 @@ package ollama_test
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"io"
 	"iter"
@@ -195,6 +196,45 @@ func TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen(t *testing.T) {
 	}
 	if waited := time.Since(start); waited > time.Second {
 		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	}
+}
+
+func TestFormatGoesOutAsJSONModeOrAsASchemaObject(t *testing.T) {
+	var calls atomic.Int64
+	var got struct {
+		Format jsontext.Value `json:"format"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read body: %v", err)
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Errorf("request body %s: %v", data, err)
+		}
+		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)(w, r)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	mode := "json"
+	chatReply(t, c, ai.Request{Model: "llama3.2", Format: mode})
+	if string(got.Format) != `"json"` {
+		t.Fatalf("format = %s, want the JSON string json", got.Format)
+	}
+	schema := `{"type":"object","required":["city"]}`
+	chatReply(t, c, ai.Request{Model: "llama3.2", Format: schema})
+	if canonical(t, got.Format) != canonical(t, []byte(schema)) {
+		t.Fatalf("format = %s, want the schema as a JSON object", got.Format)
+	}
+	sent := calls.Load()
+	for _, bad := range []string{`"type"`, `{"type":`, `[1]`} {
+		if _, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2", Format: bad}); err == nil || !strings.Contains(err.Error(), "ai/ollama: format is not json") {
+			t.Fatalf("Chat with format %s: err = %v, want the format error", bad, err)
+		}
+	}
+	if calls.Load() != sent {
+		t.Fatalf("a bad format reached the server %d times", calls.Load()-sent)
 	}
 }
 

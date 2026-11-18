@@ -5,6 +5,8 @@
 
 package ollama
 
+import "encoding/json/jsontext"
+
 type wireMessage struct {
 	Role      string         `json:"role"`
 	Content   string         `json:"content"`
@@ -38,7 +40,7 @@ type chatRequest struct {
 	Model    string         `json:"model"`
 	Messages []wireMessage  `json:"messages"`
 	Stream   bool           `json:"stream"`
-	Format   string         `json:"format,omitempty"`
+	Format   jsontext.Value `json:"format,omitempty"`
 	Tools    []wireTool     `json:"tools,omitempty"`
 	Options  map[string]any `json:"options,omitempty"`
 }

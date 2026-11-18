@@ -36,6 +36,9 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - That answer MUST NOT count as a failure for the breaker.
 - Any other failing answer MUST be retried under `Policy.Retry`.
 - An option that the request does not set MUST be absent from the JSON.
+- A `Format` of `json` MUST go out as the JSON string `json`.
+- A `Format` that is a JSON object MUST go out as that object.
+- Any other `Format` MUST be an error before the request is sent.
 - A stream that ends before `done` MUST yield an error chunk and no reply.
 - Tool call arguments that are not a JSON object MUST be an error before the request is sent.
 
@@ -44,6 +47,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `ai/ollama: <status>: <body>` when the provider returns a failing status.
 - `ai/ollama: stream ended before done` when the stream is cut.
 - `ai/ollama: tool call <name>: arguments are not a JSON object: <cause>` for bad arguments in a message.
+- `ai/ollama: format is not json and not a JSON object` when `Format` is any other text.
 - `ai/ollama: encode request: <cause>`, `ai/ollama: read response: <cause>` and `ai/ollama: decode response: <cause>` for the JSON and body steps.
 
 ## Proof
@@ -55,6 +59,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestClientErrorIsFinal` proves that a 400 answer costs one request. The test server counts the requests.
 - `TestServerErrorIsRetried` proves that a 500 answer is retried.
 - `TestEmbedReturnsEmbeddingsInInputOrder` proves the embed path and the vector order.
+- `TestFormatGoesOutAsJSONModeOrAsASchemaObject` proves the two wire forms of `Format` and the error for any other text.
 - No test needs a key or the network.
 
 ## Not in scope
