@@ -1,6 +1,7 @@
 package web_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json/v2"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -776,6 +778,66 @@ func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
 	assertProblemJSON(t, rec, http.StatusInternalServerError)
 	if seen != http.StatusInternalServerError {
 		t.Fatalf("outer stage read status %d want 500", seen)
+	}
+}
+
+func TestDelegateHijackUpgrade(t *testing.T) {
+	upgrader := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		rc := http.NewResponseController(w)
+		conn, buf, err := rc.Hijack()
+		if err != nil {
+			http.Error(w, "hijack unavailable: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if cerr := conn.Close(); cerr != nil {
+				t.Errorf("hijacked close: %v", cerr)
+			}
+		}()
+		if _, err := buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n\r\nhello-ws"); err != nil {
+			return
+		}
+		if err := buf.Flush(); err != nil {
+			return
+		}
+	})
+	r := web.NewRouter()
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: upgrader}, nil
+	})
+	srv := httptest.NewServer(r)
+	defer func() {
+		srv.Close()
+	}()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			t.Errorf("client close: %v", cerr)
+		}
+	}()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: %s\r\n\r\n", strings.TrimPrefix(srv.URL, "http://")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+	}
+	if got := strings.TrimSpace(line); got != "HTTP/1.1 101 Switching Protocols" {
+		t.Fatalf("status line %q want the raw 101 upgrade", got)
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if !strings.Contains(string(rest), "hello-ws") {
+		t.Fatalf("payload %q lacks the upgraded frame", string(rest))
 	}
 }
 

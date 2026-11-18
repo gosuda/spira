@@ -261,6 +261,10 @@ func (s *statusWriter) WriteHeader(code int) {
 	s.wrote = true
 }
 
+func (s *statusWriter) Unwrap() http.ResponseWriter {
+	return s.inner
+}
+
 func (s *statusWriter) Write(b []byte) (int, error) {
 	if !s.wrote {
 		s.status = http.StatusOK
