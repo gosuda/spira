@@ -216,17 +216,28 @@ func TestHTTPRecordsServerErrorClass(t *testing.T) {
 	}
 }
 
-func TestUnmatchedPathAddsNoSeries(t *testing.T) {
+func TestRouteMissesAreCountedUnderOneRouteLabel(t *testing.T) {
 	r, reg := newMeteredRouter()
-	if rec := meteredGet(r, "/users/1"); rec.Code != http.StatusOK {
-		t.Fatalf("GET /users/1 status = %d, want 200", rec.Code)
+	for _, path := range []string{"/nowhere/at/all", "/another/miss"} {
+		if rec := meteredGet(r, path); rec.Code != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want 404", path, rec.Code)
+		}
 	}
-	before := countRouteSeries(t, exposition(t, reg))
-	if rec := meteredGet(r, "/nowhere/at/all"); rec.Code != http.StatusNotFound {
-		t.Fatalf("unmatched path status = %d, want 404", rec.Code)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("POST", "/users/1", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /users/1 status = %d, want 405", rec.Code)
 	}
-	after := countRouteSeries(t, exposition(t, reg))
-	if after != before {
-		t.Fatalf("route series grew from %d to %d after an unmatched request", before, after)
+	text := exposition(t, reg)
+	samples := parseMetricLines(t, text)
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "unmatched", "status": "4xx"}); !ok || s.value != "2" {
+		t.Fatalf("series for two unmatched GET requests = %+v, want value 2", s)
+	}
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "POST", "route": "unmatched", "status": "4xx"}); !ok || s.value != "1" {
+		t.Fatalf("series for a method the route does not allow = %+v, want value 1", s)
+	}
+	if n := countRouteSeries(t, text); n != 1 {
+		t.Fatalf("route labels after three misses = %d, want 1", n)
 	}
 }
+

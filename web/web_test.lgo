@@ -779,3 +779,43 @@ func TestInvalidReplyStatusBecomesProblemUnderRecover(t *testing.T) {
 	}
 }
 
+func TestUnmatchedRequestsRunRootStages(t *testing.T) {
+	groupRan := false
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Root-Stage", "ran")
+			return next(ctx)
+		}
+	})
+	r.Handle("GET", "/users", okReply)
+	r.Group("/api", func(g *web.Router) {
+		g.Use(func(next web.Handler) web.Handler {
+			return func(ctx *web.Context) (web.Reply, error) {
+				groupRan = true
+				return next(ctx)
+			}
+		})
+		g.Handle("GET", "/items", okReply)
+	})
+	miss := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	if miss.Code != http.StatusNotFound {
+		t.Fatalf("unmatched path status %d want 404", miss.Code)
+	}
+	if miss.Header().Get("X-Root-Stage") != "ran" {
+		t.Fatal("root stage did not run for an unmatched path")
+	}
+	wrong := call(t, r, httptest.NewRequest(http.MethodPost, "/users", nil))
+	if wrong.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status %d want 405", wrong.Code)
+	}
+	if !strings.Contains(wrong.Header().Get("Allow"), "GET") {
+		t.Fatalf("Allow %q lacks GET", wrong.Header().Get("Allow"))
+	}
+	if wrong.Header().Get("X-Root-Stage") != "ran" {
+		t.Fatal("root stage did not run for a method mismatch")
+	}
+	if groupRan {
+		t.Fatal("group stage ran for a request outside its prefix")
+	}
+}

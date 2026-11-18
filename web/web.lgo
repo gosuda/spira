@@ -83,7 +83,15 @@ func (r *Router) Routes() const []RouteInfo {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	r.mux.ServeHTTP(w, req)
+	unrouted, pattern := r.mux.Handler(req)
+	if pattern != "" {
+		r.mux.ServeHTTP(w, req)
+		return
+	}
+	root := r.rootRouter()
+	served(root, root.stages, func(_ *Context) (Reply, error) {
+		return Delegate{To: unrouted}, nil
+	}).ServeHTTP(w, req)
 }
 
 func served(root *Router, stages []Stage, h Handler) http.HandlerFunc {
