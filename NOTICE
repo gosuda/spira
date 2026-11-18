@@ -21,3 +21,8 @@ Translated units:
 - ai/run_test.lgo, from
   spring-ai-model/src/test/java/org/springframework/ai/model/tool/DefaultToolCallingManagerDecisionsTests.java
   and DefaultToolCallingManagerTest.java in that directory
+- ai/search.lgo, from
+  spring-ai-tool-search-tool/src/main/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndex.java
+  and advisors/spring-ai-tool-search-advisor/src/main/java/org/springframework/ai/chat/client/advisor/toolsearch/ToolSearchToolCallingAdvisor.java
+- ai/search_test.lgo, from
+  spring-ai-tool-search-tool/src/test/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndexTests.java
