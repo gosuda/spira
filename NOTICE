@@ -26,3 +26,8 @@ Translated units:
   and advisors/spring-ai-tool-search-advisor/src/main/java/org/springframework/ai/chat/client/advisor/toolsearch/ToolSearchToolCallingAdvisor.java
 - ai/search_test.lgo, from
   spring-ai-tool-search-tool/src/test/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndexTests.java
+- ai/ollama/wire.lgo, from
+  models/spring-ai-ollama/src/main/java/org/springframework/ai/ollama/api/OllamaApi.java
+- ai/ollama/ollama_test.lgo, from
+  models/spring-ai-ollama/src/test/java/org/springframework/ai/ollama/OllamaChatModelTests.java
+  and OllamaEmbeddingModelTests.java in that directory

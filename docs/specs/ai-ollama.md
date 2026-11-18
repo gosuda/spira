@@ -11,8 +11,9 @@ The package holds behavior translated from Spring AI.
 ```lgo
 type Client struct {
 	BaseURL string
-	Key     string
+	Model   string
 	HTTP    *http.Client
+	Policy  resilience.Policy
 }
 
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error)
@@ -20,35 +21,40 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, error)
 ```
 
-The plan states the three fields and the methods. It does not state the type name `Client` or the field name `HTTP`.
+`Model` names the model for `Embed`, which takes no model argument. Ollama sends no key.
 
 ## Requirements
 
-- `Chat` MUST send `POST <BaseURL>/api/chat`.
-- `Chat` MUST read NDJSON that ends at `done`.
-- `Chat` MUST read tool arguments as JSON objects.
-- `Chat` MUST read `prompt_eval_count` and `eval_count` into usage.
+- `Chat` MUST send `POST <BaseURL>/api/chat` with `stream` false.
+- `Stream` MUST send the same request with `stream` true.
+- `Stream` MUST read NDJSON that ends at the object with `done` true.
+- A tool call MUST carry its arguments as one complete JSON object text.
+- Usage MUST come from `prompt_eval_count` and `eval_count`.
 - `Embed` MUST send `POST <BaseURL>/api/embed`.
-- Non-streamed calls MUST go through `client` with a `resilience.Policy`.
-- A 400 answer MUST be final.
-- A 500 answer MUST be retried.
-- A 429 answer MUST be retried.
-- An error MUST name the package, the status and the body as `ai/ollama: <status>: <body>`.
-- The key MUST NOT appear in an error or a log.
-- A cut stream MUST yield an error chunk and no reply.
+- `Embed` MUST return the vectors in input order.
+- `Chat` and `Embed` MUST run each attempt under `resilience.Do` with `Policy`.
+- A 4xx answer other than 408 and 429 MUST end the call after one attempt.
+- That answer MUST NOT count as a failure for the breaker.
+- Any other failing answer MUST be retried under `Policy.Retry`.
+- An option that the request does not set MUST be absent from the JSON.
+- A stream that ends before `done` MUST yield an error chunk and no reply.
+- Tool call arguments that are not a JSON object MUST be an error before the request is sent.
 
 ## Errors
 
 - `ai/ollama: <status>: <body>` when the provider returns a failing status.
-- The stream error when the stream ends before `done`.
+- `ai/ollama: stream ended before done` when the stream is cut.
+- `ai/ollama: tool call <name>: arguments are not a JSON object: <cause>` for bad arguments in a message.
+- `ai/ollama: encode request: <cause>`, `ai/ollama: read response: <cause>` and `ai/ollama: decode response: <cause>` for the JSON and body steps.
 
 ## Proof
 
-- The reference request JSON for a prompt with one tool is the request body oracle.
-- A cut stream test proves the error chunk and no reply.
-- A 400 test proves the answer is final.
-- A 500 test proves the answer is retried.
-- A 429 test proves the answer is retried.
+- `TestChatRequestBodyMatchesReferenceShape` compares the request body with the reference JSON for a prompt with one tool.
+- `TestStreamCollectsCompleteToolCall` replays an NDJSON stream through `ai.Collect` and requires one complete tool call.
+- `TestStreamCutBeforeDoneYieldsErrorAndNoReply` proves the error chunk for a cut stream.
+- `TestClientErrorIsFinal` proves that a 400 answer costs one request. The test server counts the requests.
+- `TestServerErrorIsRetried` proves that a 500 answer is retried.
+- `TestEmbedReturnsEmbeddingsInInputOrder` proves the embed path and the vector order.
 - No test needs a key or the network.
 
 ## Not in scope

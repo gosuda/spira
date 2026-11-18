@@ -1,0 +1,303 @@
+// Test cases translated and changed by spira from Spring AI,
+// models/spring-ai-ollama/src/test/java/org/springframework/ai/ollama/OllamaChatModelTests.java
+// and models/spring-ai-ollama/src/test/java/org/springframework/ai/ollama/OllamaEmbeddingModelTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ollama_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"io"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/ollama"
+	"github.com/gosuda/spira/resilience"
+)
+
+const ndjsonToolStream = `{"model":"llama3.2","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"","thinking":"Need the tool."},"done":false}
+{"model":"llama3.2","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"getWeather","arguments":{"city":"Seoul"}}}]},"done":false}
+{"model":"llama3.2","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done_reason":"tool_calls","done":true,"prompt_eval_count":12,"eval_count":34}
+`
+
+const ndjsonCutStream = `{"model":"mistral","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"Hel"},"done":false}
+{"model":"mistral","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"lo"},"done":false}
+`
+
+func testClient(srv *httptest.Server) *ollama.Client {
+	return &ollama.Client{
+		BaseURL: srv.URL,
+		Model:   "llama3.2",
+		HTTP:    srv.Client(),
+		Policy:  resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}},
+	}
+}
+
+func serveBody(t *testing.T, status int, contentType string, body string) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}
+}
+
+func canonical(t *testing.T, raw []byte) string {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("canonical: %v", err)
+	}
+	out, err := json.Marshal(v, json.Deterministic(true))
+	if err != nil {
+		t.Fatalf("canonical marshal: %v", err)
+	}
+	return string(out)
+}
+
+func sampleRequest() ai.Request {
+	return ai.Request{
+		Model: "llama3.2",
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Weather in Seoul?"}}},
+		},
+		Tools: []ai.Tool{{
+			Name:        "getWeather",
+			Description: "Get the weather for a city",
+			Schema:      `{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`,
+			Call: func(ctx context.Context, arguments string) (string, error) {
+				return "{}", nil
+			},
+		}},
+		Temperature: f64(0.7),
+		TopK:        i32(40),
+	}
+}
+
+func wantChatBody(t *testing.T) string {
+	t.Helper()
+	return canonical(t, []byte(`{"model":"llama3.2","stream":false,"messages":[{"role":"user","content":"Weather in Seoul?"}],"tools":[{"type":"function","function":{"name":"getWeather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"options":{"temperature":0.7,"top_k":40}}`))
+}
+
+func TestChatRequestBodyMatchesReferenceShape(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			t.Errorf("path = %q, want /api/chat", r.URL.Path)
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read body: %v", err)
+		}
+		got = data
+		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)(w, r)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	if _, err := c.Chat(context.Background(), sampleRequest()); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	gotJSON, wantJSON := canonical(t, got), wantChatBody(t)
+	if gotJSON != wantJSON {
+		t.Fatalf("request body = %s\nwant           = %s", gotJSON, wantJSON)
+	}
+}
+
+func TestStreamCollectsCompleteToolCall(t *testing.T) {
+	srv := httptest.NewServer(serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonToolStream))
+	defer srv.Close()
+	c := testClient(srv)
+	chunks := collectAll(c.Stream(context.Background(), ai.Request{Model: "llama3.2", Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Weather?"}}}}}))
+	for i, ch := range chunks {
+		t.Logf("chunk %d: %+v err=%v", i, ch.chunk, ch.err)
+	}
+	reply := collectReply(t, c.Stream(context.Background(), ai.Request{Model: "llama3.2", Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Weather?"}}}}}))
+	parts := reply.Message.Parts
+	if len(parts) != 2 {
+		t.Fatalf("parts = %+v, want reasoning and one tool call", parts)
+	}
+	reasoning, ok := parts[0].(ai.Reasoning)
+	if !ok || reasoning.Text != "Need the tool." {
+		t.Fatalf("part 0 = %+v, want Reasoning{Need the tool.}", parts[0])
+	}
+	call, ok := parts[1].(ai.ToolCall)
+	if !ok {
+		t.Fatalf("part 1 = %+v, want ToolCall", parts[1])
+	}
+	if call.ID != "call_1" || call.Name != "getWeather" {
+		t.Fatalf("tool call = %+v, want call_1 getWeather", call)
+	}
+	var args struct {
+		City string `json:"city"`
+	}
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		t.Fatalf("arguments %q is not a JSON object: %v", call.Arguments, err)
+	}
+	if args.City != "Seoul" {
+		t.Fatalf("arguments city = %q, want Seoul", args.City)
+	}
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish = %q, want tool_call", reply.Finish)
+	}
+	if reply.Usage.Input != 12 || reply.Usage.Output != 34 || reply.Usage.Total != 46 {
+		t.Fatalf("usage = %+v, want 12/34/46", reply.Usage)
+	}
+	if reply.Model != "llama3.2" {
+		t.Fatalf("model = %q, want llama3.2", reply.Model)
+	}
+}
+
+func TestStreamCutBeforeDoneYieldsErrorAndNoReply(t *testing.T) {
+	srv := httptest.NewServer(serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonCutStream))
+	defer srv.Close()
+	c := testClient(srv)
+	chunks := collectAll(c.Stream(context.Background(), ai.Request{Model: "mistral"}))
+	if len(chunks) == 0 {
+		t.Fatal("no chunks")
+	}
+	last := chunks[len(chunks)-1]
+	if last.err == nil || !strings.Contains(last.err.Error(), "before done") {
+		t.Fatalf("last error = %v, want stream ended before done", last.err)
+	}
+	if _, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "mistral"})); err == nil {
+		t.Fatal("Collect err=nil, want the cut-stream error")
+	}
+}
+
+func TestClientErrorIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		serveBody(t, http.StatusBadRequest, "application/json", `{"error":"bad request"}`)(w, r)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2"})
+	if err == nil {
+		t.Fatal("err=nil, want the 400 answer")
+	}
+	if !strings.Contains(err.Error(), "ai/ollama: 400:") {
+		t.Fatalf("err = %v, want ai/ollama: 400: prefix", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("server saw %d calls, want 1: a 400 is final", calls.Load())
+	}
+}
+
+func TestServerErrorIsRetried(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			serveBody(t, http.StatusInternalServerError, "application/json", `{"error":"boom"}`)(w, r)
+			return
+		}
+		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}`)(w, r)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	reply := chatReply(t, c, ai.Request{Model: "llama3.2"})
+	if calls.Load() != 2 {
+		t.Fatalf("server saw %d calls, want 2: a 500 is retried", calls.Load())
+	}
+	if len(reply.Message.Parts) != 1 {
+		t.Fatalf("parts = %+v, want one text part", reply.Message.Parts)
+	}
+	text, ok := reply.Message.Parts[0].(ai.Text)
+	if !ok || text.Text != "ok" {
+		t.Fatalf("part = %+v, want Text{ok}", reply.Message.Parts[0])
+	}
+}
+
+func TestEmbedReturnsEmbeddingsInInputOrder(t *testing.T) {
+	type embedRequest struct {
+		Model    string   `json:"model"`
+		Input    []string `json:"input"`
+		Truncate bool     `json:"truncate"`
+	}
+	var got embedRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/embed" {
+			t.Errorf("path = %q, want /api/embed", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Errorf("embed request body: %v", err)
+		}
+		serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","embeddings":[[1,2,3],[4,5,6]]}`)(w, r)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	embeddings := embedAll(t, c, []string{"first", "second"})
+	if len(got.Input) != 2 || got.Input[0] != "first" || got.Input[1] != "second" {
+		t.Fatalf("input = %v, want [first second]", got.Input)
+	}
+	if len(embeddings) != 2 || len(embeddings[0]) != 3 || embeddings[0][0] != 1 || embeddings[1][2] != 6 {
+		t.Fatalf("embeddings = %v, want [[1 2 3] [4 5 6]]", embeddings)
+	}
+}
+
+type collected struct {
+	chunk ai.Chunk
+	err   error
+}
+
+func collectAll(stream iter.Seq2[ai.Chunk, error]) []collected {
+	var out []collected
+	for chunk, err := range stream {
+		out = append(out, collected{chunk: chunk, err: err})
+	}
+	return out
+}
+
+func collectReply(t *testing.T, stream iter.Seq2[ai.Chunk, error]) ai.Reply {
+	t.Helper()
+	reply, err := ai.Collect(stream)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+		return ai.Reply{}
+	}
+	return reply
+}
+
+func chatReply(t *testing.T, c *ollama.Client, req ai.Request) ai.Reply {
+	t.Helper()
+	reply, err := c.Chat(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return ai.Reply{}
+	}
+	return reply
+}
+
+func embedAll(t *testing.T, c *ollama.Client, texts []string) [][]float32 {
+	t.Helper()
+	embeddings, err := c.Embed(context.Background(), texts)
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+		return nil
+	}
+	return embeddings
+}
+
+func f64(v float64) float64? {
+	return v
+}
+
+func i32(v int) int? {
+	return v
+}
