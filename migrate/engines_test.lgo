@@ -3,9 +3,13 @@
 package migrate_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gosuda/spira/db"
 	"github.com/gosuda/spira/migrate"
@@ -39,6 +43,135 @@ func TestEnginePartialDDLMySQL(t *testing.T) {
 	err = migrate.Apply(t.Context(), pool, steps)
 	if !errors.Is(err, migrate.ErrPartialDDL) {
 		t.Fatalf("Apply error = %v, want migrate.ErrPartialDDL", err)
+		return
+	}
+}
+
+func engineDSN(t *testing.T, name string) string {
+	t.Helper()
+	dsn := os.Getenv(name)
+	if dsn == "" {
+		t.Fatalf("%s is empty; run `just engines`", name)
+		return ""
+	}
+	return dsn
+}
+
+func engineScratchTarget(driver string, dsn string) (string, []string, []string) {
+	switch driver {
+	case "pgx":
+		return dsn + "&search_path=spira_rev_pg",
+			[]string{"DROP SCHEMA IF EXISTS spira_rev_pg CASCADE", "CREATE SCHEMA spira_rev_pg"},
+			[]string{"DROP SCHEMA IF EXISTS spira_rev_pg CASCADE"}
+	case "mysql":
+		return strings.Replace(dsn, "spira_test", "spira_rev_my", 1),
+			[]string{"DROP DATABASE IF EXISTS spira_rev_my", "CREATE DATABASE spira_rev_my"},
+			[]string{"DROP DATABASE IF EXISTS spira_rev_my"}
+	case "sqlserver":
+		return strings.Replace(dsn, "spira_test", "spira_rev_ms", 1),
+			[]string{"IF DB_ID('spira_rev_ms') IS NOT NULL DROP DATABASE spira_rev_ms", "CREATE DATABASE spira_rev_ms"},
+			[]string{"IF DB_ID('spira_rev_ms') IS NOT NULL DROP DATABASE spira_rev_ms"}
+	default:
+		panic(fmt.Sprintf("migrate_test: unknown engine driver %q", driver))
+	}
+}
+
+func engineScratchPool(t *testing.T, driver string, dsnVar string) *db.Pool {
+	t.Helper()
+	dsn := engineDSN(t, dsnVar)
+	testDSN, setup, teardown := engineScratchTarget(driver, dsn)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	admin, err := db.Open(driver, dsn)
+	if err != nil {
+		panic(fmt.Sprintf("migrate_test: db.Open(%s): %v", driver, err))
+	}
+	if admin == nil {
+		panic(fmt.Sprintf("migrate_test: db.Open(%s) returned no pool", driver))
+	}
+	if serr := admin.Start(ctx); serr != nil {
+		panic(fmt.Sprintf("migrate_test: start admin %s: %v", driver, serr))
+	}
+	for _, q := range setup {
+		if _, err := db.Exec(ctx, admin, q); err != nil {
+			panic(fmt.Sprintf("migrate_test: setup %s: %v", q, err))
+		}
+	}
+	pool, err := db.Open(driver, testDSN)
+	if err != nil {
+		panic(fmt.Sprintf("migrate_test: db.Open(%s): %v", driver, err))
+	}
+	if pool == nil {
+		panic(fmt.Sprintf("migrate_test: db.Open(%s) returned no pool", driver))
+	}
+	if serr := pool.Start(ctx); serr != nil {
+		panic(fmt.Sprintf("migrate_test: start %s: %v", driver, serr))
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer ccancel()
+		if serr := pool.Stop(cctx); serr != nil {
+			t.Errorf("stop: %v", serr)
+		}
+		for _, q := range teardown {
+			if _, err := db.Exec(cctx, admin, q); err != nil {
+				t.Errorf("teardown %q: %v", q, err)
+			}
+		}
+		if serr := admin.Stop(cctx); serr != nil {
+			t.Errorf("stop admin: %v", serr)
+		}
+	})
+	return pool
+}
+
+func TestEngineCheckReversiblePostgres(t *testing.T) {
+	pool := engineScratchPool(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	good := []migrate.Step{{Name: "0001_rev_good", Up: "CREATE TABLE rev_good (id BIGINT PRIMARY KEY, name TEXT NOT NULL)", Down: "DROP TABLE rev_good"}}
+	if err := migrate.CheckReversible(ctx, pool, good); err != nil {
+		t.Fatalf("CheckReversible(good) = %v", err)
+		return
+	}
+	bad := []migrate.Step{{Name: "0001_rev_bad", Up: "CREATE TABLE rev_bad (id BIGINT PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL)", Down: "ALTER TABLE rev_bad DROP COLUMN b"}}
+	err := migrate.CheckReversible(ctx, pool, bad)
+	if !errors.Is(err, migrate.ErrNotReversible) || !strings.Contains(err.Error(), "migrate: 0001_rev_bad down does not restore the schema") {
+		t.Fatalf("CheckReversible(bad) = %v, want not-reversible naming 0001_rev_bad", err)
+		return
+	}
+}
+
+func TestEngineCheckReversibleMySQL(t *testing.T) {
+	pool := engineScratchPool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	good := []migrate.Step{{Name: "0001_rev_good", Up: "CREATE TABLE rev_good (id BIGINT PRIMARY KEY, name VARCHAR(500) NOT NULL)", Down: "DROP TABLE rev_good"}}
+	if err := migrate.CheckReversible(ctx, pool, good); err != nil {
+		t.Fatalf("CheckReversible(good) = %v", err)
+		return
+	}
+	bad := []migrate.Step{{Name: "0001_rev_bad", Up: "CREATE TABLE rev_bad (id BIGINT PRIMARY KEY, a VARCHAR(500) NOT NULL, b VARCHAR(500) NOT NULL)", Down: "ALTER TABLE rev_bad DROP COLUMN b"}}
+	err := migrate.CheckReversible(ctx, pool, bad)
+	if !errors.Is(err, migrate.ErrNotReversible) || !strings.Contains(err.Error(), "migrate: 0001_rev_bad down does not restore the schema") {
+		t.Fatalf("CheckReversible(bad) = %v, want not-reversible naming 0001_rev_bad", err)
+		return
+	}
+}
+
+func TestEngineCheckReversibleMSSQL(t *testing.T) {
+	pool := engineScratchPool(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	good := []migrate.Step{{Name: "0001_rev_good", Up: "CREATE TABLE rev_good (id BIGINT PRIMARY KEY, name VARCHAR(500) NOT NULL)", Down: "DROP TABLE rev_good"}}
+	if err := migrate.CheckReversible(ctx, pool, good); err != nil {
+		t.Fatalf("CheckReversible(good) = %v", err)
+		return
+	}
+	bad := []migrate.Step{{Name: "0001_rev_bad", Up: "CREATE TABLE rev_bad (id BIGINT PRIMARY KEY, a VARCHAR(500) NOT NULL, b VARCHAR(500) NOT NULL)", Down: "ALTER TABLE rev_bad DROP COLUMN b"}}
+	err := migrate.CheckReversible(ctx, pool, bad)
+	if !errors.Is(err, migrate.ErrNotReversible) || !strings.Contains(err.Error(), "migrate: 0001_rev_bad down does not restore the schema") {
+		t.Fatalf("CheckReversible(bad) = %v, want not-reversible naming 0001_rev_bad", err)
 		return
 	}
 }
