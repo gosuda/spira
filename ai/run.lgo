@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/gosuda/spira/fault"
 )
 
 const DenyMessage = "The user did not allow this tool call."
@@ -73,7 +75,7 @@ func Run(ctx context.Context, m Model, req Request, limits Limits) (Reply, error
 			round.Decisions = nil
 			reply, err := m.Chat(ctx, round)
 			if err != nil {
-				return Reply{}, fmt.Errorf("ai: run: %w", err)
+				return Reply{}, ErrModelFailed.Wrap(fmt.Errorf("ai: run: %w", err))
 			}
 			usage = usage.plus(reply.Usage)
 			last = reply
@@ -142,14 +144,14 @@ func (b *batch) run(ctx context.Context) (Message, error) {
 	keys := callKeys(b.calls)
 	if len(b.decisions) == 0 {
 		if waiting := b.waiting(keys); len(waiting) > 0 {
-			return Message{}, &ConfirmError{Waiting: waiting, Messages: b.history, Reply: Reply{Usage: b.usage, ID: b.last.ID, Model: b.last.Model}}
+			return Message{}, ErrConfirmationRequired.Wrap(&ConfirmError{Waiting: waiting, Messages: b.history, Reply: Reply{Usage: b.usage, ID: b.last.ID, Model: b.last.Model}})
 		}
 	} else if err := b.checkDecisions(keys); err != nil {
-		return Message{}, err
+		return Message{}, ErrInvalidDecision.Wrap(err)
 	}
 	for i, call := range b.calls {
 		if b.denial(keys[i]) == nil && toolNamed(b.tools, call.Name) == nil {
-			return Message{}, fmt.Errorf("ai: run: no tool named %q", call.Name)
+			return Message{}, ErrUnknownTool.Wrap(fmt.Errorf("ai: run: no tool named %q", call.Name))
 		}
 	}
 	b.counts, b.total = priorCalls(b.history)
@@ -162,7 +164,7 @@ func (b *batch) run(ctx context.Context) (Message, error) {
 			}
 			b.unanswered(keys, i+1, limit.text())
 			limit.Messages = append(slices.Clone(b.history), Message{Role: RoleTool, Parts: b.results})
-			return Message{}, limit
+			return Message{}, ErrToolLimitExceeded.Wrap(limit)
 		}
 	}
 	return Message{Role: RoleTool, Parts: b.results}, nil
@@ -194,7 +196,7 @@ func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 	}
 	tool := toolNamed(b.tools, call.Name)
 	if tool == nil {
-		return fmt.Errorf("ai: run: no tool named %q", call.Name)
+		return ErrUnknownTool.Wrap(fmt.Errorf("ai: run: no tool named %q", call.Name))
 	}
 	b.direct = b.direct && tool.Direct
 	b.ran++
@@ -208,7 +210,7 @@ func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 
 func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
 	if cerr := ctx.Err(); cerr != nil {
-		return "", fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr)
+		return "", ErrModelFailed.Wrap(fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr))
 	}
 	arguments := call.Arguments
 	if strings.TrimSpace(arguments) == "" {
@@ -216,15 +218,22 @@ func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
 	}
 	content, err := tool.Call(ctx, arguments)
 	if cerr := ctx.Err(); cerr != nil {
-		return "", fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr)
+		return "", ErrModelFailed.Wrap(fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr))
 	}
 	if err == nil {
 		return content, nil
 	}
-	if text := err.Error(); strings.TrimSpace(text) != "" {
+	if text := toolErrorText(err); strings.TrimSpace(text) != "" {
 		return text, nil
 	}
 	return "tool " + call.Name + " failed", nil
+}
+
+func toolErrorText(err error) string {
+	if fault.Of(err) != nil {
+		return fault.Public(err).Message
+	}
+	return err.Error()
 }
 
 func (l Limits) breach(tool string, count int, total int) *LimitError? {

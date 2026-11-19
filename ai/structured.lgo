@@ -8,16 +8,9 @@ package ai
 
 import (
 	"encoding/json/v2"
-	"errors"
 	"fmt"
 	"strings"
 )
-
-var ErrEmpty = errors.New("ai: structured: empty answer")
-
-var ErrTooLarge = errors.New("ai: structured: answer exceeds the size limit of 1048576 bytes")
-
-var ErrUnterminatedFence = errors.New("ai: structured: unterminated code fence")
 
 const structuredLimit = 1 << 20
 
@@ -31,11 +24,11 @@ func FormatInstruction() string {
 func Structured[T any](text string) (T, error) {
 	var zero T
 	if len(text) > structuredLimit {
-		return zero, ErrTooLarge
+		return zero, ErrAnswerTooLarge.Wrap(fmt.Errorf("ai: structured: answer exceeds the size limit of 1048576 bytes"))
 	}
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
-		return zero, ErrEmpty
+		return zero, ErrEmptyAnswer.Wrap(fmt.Errorf("ai: structured: empty answer"))
 	}
 	var bare T
 	if uerr := json.Unmarshal([]byte(trimmed), &bare); uerr == nil {
@@ -47,7 +40,7 @@ func Structured[T any](text string) (T, error) {
 	}
 	var out T
 	if uerr := json.Unmarshal([]byte(doc), &out); uerr != nil {
-		return zero, fmt.Errorf("ai: structured: decode: %w", uerr)
+		return zero, ErrInvalidAnswer.Wrap(fmt.Errorf("ai: structured: decode: %w", uerr))
 	}
 	return out, nil
 }
@@ -55,7 +48,7 @@ func Structured[T any](text string) (T, error) {
 func structuredDocument(text string) (string, error) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
-		return "", ErrEmpty
+		return "", ErrEmptyAnswer.Wrap(fmt.Errorf("ai: structured: empty answer"))
 	}
 	if idx := strings.Index(trimmed, "```"); idx >= 0 {
 		return fencedDocument(trimmed[idx:])
@@ -70,11 +63,11 @@ func fencedDocument(from string) (string, error) {
 	}
 	end := fenceClose(rest)
 	if end < 0 {
-		return "", ErrUnterminatedFence
+		return "", ErrUnterminatedFence.Wrap(fmt.Errorf("ai: structured: unterminated code fence"))
 	}
 	inner := strings.TrimSpace(rest[:end])
 	if inner == "" {
-		return "", ErrEmpty
+		return "", ErrEmptyAnswer.Wrap(fmt.Errorf("ai: structured: empty answer"))
 	}
 	return inner, nil
 }
