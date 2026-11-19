@@ -240,8 +240,8 @@ func TestPeerCloseEchoedOnceThenEnds(t *testing.T) {
 }
 
 func awaitTooLarge(ctx context.Context, c *websocket.Conn) error {
-	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrMessageTooLarge) {
-		return fmt.Errorf("next error = %w, want ErrMessageTooLarge", err)
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrTooLarge) {
+		return fmt.Errorf("next error = %w, want ErrTooLarge", err)
 	}
 	return nil
 }
@@ -262,8 +262,8 @@ func TestFaultFrameOverLimitSends1009(t *testing.T) {
 }
 
 func awaitInvalidUTF8(ctx context.Context, c *websocket.Conn) error {
-	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrInvalidUTF8) {
-		return fmt.Errorf("next error = %w, want ErrInvalidUTF8", err)
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrProtocolError) {
+		return fmt.Errorf("next error = %w, want ErrProtocolError", err)
 	}
 	return nil
 }
@@ -284,8 +284,8 @@ func TestFaultInvalidUTF8Sends1007(t *testing.T) {
 }
 
 func awaitReservedBits(ctx context.Context, c *websocket.Conn) error {
-	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrReservedBits) {
-		return fmt.Errorf("next error = %w, want ErrReservedBits", err)
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrProtocolError) {
+		return fmt.Errorf("next error = %w, want ErrProtocolError", err)
 	}
 	return nil
 }

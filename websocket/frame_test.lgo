@@ -207,67 +207,64 @@ func refuse(t *testing.T, raw []byte, limit int64) error {
 
 func TestRefuseReservedBits(t *testing.T) {
 	err := refuse(t, []byte{0xc1, 0x00}, frameLimit)
-	if !errors.Is(err, websocket.ErrReservedBits) {
-		t.Fatalf("error = %v, want ErrReservedBits", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
 	}
 }
 
 func TestRefuseUnknownOpcode(t *testing.T) {
 	for _, opcode := range []uint8{0x3, 0x4, 0x5, 0x6, 0x7, 0xb, 0xc, 0xd, 0xe, 0xf} {
 		err := refuse(t, []byte{0x80 | opcode, 0x00}, frameLimit)
-		if !errors.Is(err, websocket.ErrUnknownOpcode) {
-			t.Fatalf("opcode 0x%x: error = %v, want ErrUnknownOpcode", opcode, err)
+		if !errors.Is(err, websocket.ErrProtocolError) {
+			t.Fatalf("opcode 0x%x: error = %v, want ErrProtocolError", opcode, err)
 		}
 	}
 }
 
 func TestRefuseControlTooLarge(t *testing.T) {
 	err := refuse(t, []byte{0x89, 0x7e, 0x00, 0x7e}, frameLimit)
-	if !errors.Is(err, websocket.ErrControlTooLarge) {
-		t.Fatalf("error = %v, want ErrControlTooLarge", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
 	}
 }
 func TestRefuseControlTooLarge64(t *testing.T) {
 	err := refuse(t, []byte{0x89, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}, frameLimit)
-	if !errors.Is(err, websocket.ErrControlTooLarge) {
-		t.Fatalf("error = %v, want ErrControlTooLarge", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
 	}
 }
-
 func TestRefuseFragmentedControl(t *testing.T) {
 	err := refuse(t, []byte{0x09, 0x00}, frameLimit)
-	if !errors.Is(err, websocket.ErrFragmentedControl) {
-		t.Fatalf("error = %v, want ErrFragmentedControl", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
 	}
 }
 
 func TestRefuseLengthTopBit(t *testing.T) {
 	err := refuse(t, []byte{0x82, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, frameLimit)
-	if !errors.Is(err, websocket.ErrLengthTopBit) {
-		t.Fatalf("error = %v, want ErrLengthTopBit", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
 	}
 }
-
 func TestRefuseShortLength16(t *testing.T) {
 	for _, length := range []int{5, 125} {
 		err := refuse(t, []byte{0x82, 0x7e, byte(length >> 8), byte(length)}, frameLimit)
-		if !errors.Is(err, websocket.ErrNonMinimalLength) {
-			t.Fatalf("length %d: error = %v, want ErrNonMinimalLength", length, err)
+		if !errors.Is(err, websocket.ErrProtocolError) {
+			t.Fatalf("length %d: error = %v, want ErrProtocolError", length, err)
 		}
 	}
 }
 
 func TestRefuseShortLength64(t *testing.T) {
 	err := refuse(t, []byte{0x82, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00}, frameLimit)
-	if !errors.Is(err, websocket.ErrNonMinimalLength) {
-		t.Fatalf("error = %v, want ErrNonMinimalLength", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
 	}
 }
-
 func TestRefusePayloadOverLimit(t *testing.T) {
 	err := refuse(t, []byte{0x82, 0x05}, 4)
-	if !errors.Is(err, websocket.ErrPayloadTooLarge) {
-		t.Fatalf("error = %v, want ErrPayloadTooLarge", err)
+	if !errors.Is(err, websocket.ErrTooLarge) {
+		t.Fatalf("error = %v, want ErrTooLarge", err)
 	}
 }
 

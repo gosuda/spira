@@ -6,13 +6,13 @@ import (
 	"errors"
 )
 
-var ErrReservedBits = errors.New("websocket: reserved bits set")
-var ErrUnknownOpcode = errors.New("websocket: unknown opcode")
-var ErrControlTooLarge = errors.New("websocket: control frame too large")
-var ErrFragmentedControl = errors.New("websocket: fragmented control frame")
-var ErrLengthTopBit = errors.New("websocket: length top bit set")
-var ErrNonMinimalLength = errors.New("websocket: non-minimal length")
-var ErrPayloadTooLarge = errors.New("websocket: payload too large")
+var errReservedBits = errors.New("websocket: reserved bits set")
+var errUnknownOpcode = errors.New("websocket: unknown opcode")
+var errControlTooLarge = errors.New("websocket: control frame too large")
+var errFragmentedControl = errors.New("websocket: fragmented control frame")
+var errLengthTopBit = errors.New("websocket: length top bit set")
+var errNonMinimalLength = errors.New("websocket: non-minimal length")
+var errPayloadTooLarge = errors.New("websocket: payload too large")
 
 type header struct {
 	fin    bool
@@ -34,25 +34,25 @@ func readHeader(r *bufio.Reader, limit int64) (header, error) {
 	h.rsv2 = b0&0x20 != 0
 	h.rsv3 = b0&0x10 != 0
 	if h.rsv1 || h.rsv2 || h.rsv3 {
-		return header{}, ErrReservedBits
+		return header{}, ErrProtocolError.Wrap(errReservedBits)
 	}
 	h.opcode = b0 & 0x0f
 	if h.opcode != 0x0 && h.opcode != 0x1 && h.opcode != 0x2 && h.opcode != 0x8 && h.opcode != 0x9 && h.opcode != 0xa {
-		return header{}, ErrUnknownOpcode
+		return header{}, ErrProtocolError.Wrap(errUnknownOpcode)
 	}
 	h.masked = b1&0x80 != 0
 	length := readLength(r, b1&0x7f)?
 	h.length = int64(length)
 	if h.opcode >= 0x8 {
 		if !h.fin {
-			return header{}, ErrFragmentedControl
+			return header{}, ErrProtocolError.Wrap(errFragmentedControl)
 		}
 		if h.length > 125 {
-			return header{}, ErrControlTooLarge
+			return header{}, ErrProtocolError.Wrap(errControlTooLarge)
 		}
 	}
 	if h.length > limit {
-		return header{}, ErrPayloadTooLarge
+		return header{}, ErrTooLarge.Wrap(errPayloadTooLarge)
 	}
 	if h.masked {
 		for i := range 4 {
@@ -72,7 +72,7 @@ func readLength(r *bufio.Reader, short uint8) (uint64, error) {
 		lo := r.ReadByte()?
 		length := uint64(hi)<<8 | uint64(lo)
 		if length < 126 {
-			return 0, ErrNonMinimalLength
+			return 0, ErrProtocolError.Wrap(errNonMinimalLength)
 		}
 		return length, nil
 	}
@@ -82,10 +82,10 @@ func readLength(r *bufio.Reader, short uint8) (uint64, error) {
 		length = length<<8 | uint64(b)
 	}
 	if length>>63 != 0 {
-		return 0, ErrLengthTopBit
+		return 0, ErrProtocolError.Wrap(errLengthTopBit)
 	}
 	if length < 65536 {
-		return 0, ErrNonMinimalLength
+		return 0, ErrProtocolError.Wrap(errNonMinimalLength)
 	}
 	return length, nil
 }

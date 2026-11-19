@@ -70,8 +70,8 @@ func TestParseCloseOneByte(t *testing.T) {
 		t.Fatalf("parse one byte: want error, got nil")
 		return
 	}
-	if !errors.Is(err, websocket.ErrClosePayload) {
-		t.Fatalf("parse one byte error = %v, want ErrClosePayload", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("parse one byte error = %v, want ErrProtocolError", err)
 	}
 }
 
@@ -109,8 +109,8 @@ func TestParseCloseInvalidUTF8(t *testing.T) {
 		t.Fatalf("parse invalid UTF-8: want error, got nil")
 		return
 	}
-	if !errors.Is(err, websocket.ErrCloseUTF8) {
-		t.Fatalf("parse invalid UTF-8 error = %v, want ErrCloseUTF8", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("parse invalid UTF-8 error = %v, want ErrProtocolError", err)
 	}
 }
 
@@ -130,8 +130,8 @@ func TestAppendCloseReasonLimits(t *testing.T) {
 		t.Fatalf("append 124 byte reason: want error, got nil")
 		return
 	}
-	if !errors.Is(err, websocket.ErrCloseTooLong) {
-		t.Fatalf("append 124 byte reason error = %v, want ErrCloseTooLong", err)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("append 124 byte reason error = %v, want ErrProtocolError", err)
 	}
 }
 
@@ -141,8 +141,8 @@ func TestAppendCloseRefusesBadCode(t *testing.T) {
 		_, err := websocket.ExposedCloseAppend(nil, code, "")
 		if err == nil {
 			t.Fatalf("append code %d: want error, got nil", code)
-		} else if !errors.Is(err, websocket.ErrCloseCode) {
-			t.Fatalf("append code %d error = %v, want ErrCloseCode", code, err)
+		} else if !errors.Is(err, websocket.ErrProtocolError) {
+			t.Fatalf("append code %d error = %v, want ErrProtocolError", code, err)
 		}
 	}
 }

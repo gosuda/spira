@@ -89,7 +89,7 @@ func TestEngineFragmentedHelloWithPing(t *testing.T) {
 
 func TestEngineRefusesStrayContinuation(t *testing.T) {
 	e, _ := engineOver(t, maskedFrame(true, 0x0, []byte("lo")), 64, true)
-	mustRefuse(t, e, websocket.ErrStrayContinuation)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 }
 
 func TestEngineRefusesNewDataWhileOpen(t *testing.T) {
@@ -97,22 +97,22 @@ func TestEngineRefusesNewDataWhileOpen(t *testing.T) {
 	stream = append(stream, maskedFrame(false, 0x1, []byte("Hel"))...)
 	stream = append(stream, maskedFrame(true, 0x1, []byte("lo"))...)
 	e, _ := engineOver(t, stream, 64, true)
-	mustRefuse(t, e, websocket.ErrFragmentInProgress)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 }
 
 func TestEngineRefusesUnmaskedInServerRole(t *testing.T) {
 	e, _ := engineOver(t, plainFrame(true, 0x1, []byte("Hello")), 64, true)
-	mustRefuse(t, e, websocket.ErrMaskMismatch)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 }
 
 func TestEngineRefusesMaskedInClientRole(t *testing.T) {
 	e, _ := engineOver(t, maskedFrame(true, 0x1, []byte("Hello")), 64, false)
-	mustRefuse(t, e, websocket.ErrMaskMismatch)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 }
 
 func TestEngineRefusesMessageOverLimit(t *testing.T) {
 	e, r := engineOver(t, maskedFrame(true, 0x2, []byte("Hello")), 4, true)
-	mustRefuse(t, e, websocket.ErrMessageTooLarge)
+	mustRefuse(t, e, websocket.ErrTooLarge)
 	if r.Buffered() != 5 {
 		t.Fatalf("buffered = %d, want 5 unread payload bytes", r.Buffered())
 	}
@@ -123,7 +123,7 @@ func TestEngineRefusesFragmentedTotalOverLimit(t *testing.T) {
 	stream = append(stream, maskedFrame(false, 0x2, []byte("Hel"))...)
 	stream = append(stream, maskedFrame(true, 0x0, []byte("lo!"))...)
 	e, _ := engineOver(t, stream, 4, true)
-	mustRefuse(t, e, websocket.ErrMessageTooLarge)
+	mustRefuse(t, e, websocket.ErrTooLarge)
 }
 
 func TestEngineAcceptsControlOverMessageLimit(t *testing.T) {
@@ -143,7 +143,7 @@ func TestEngineRefusesInvalidPrefixBeforeLastFragment(t *testing.T) {
 	stream = append(stream, maskedFrame(false, 0x1, []byte{0xff})...)
 	stream = append(stream, maskedFrame(true, 0x0, []byte("lo"))...)
 	e, r := engineOver(t, stream, 64, true)
-	mustRefuse(t, e, websocket.ErrInvalidUTF8)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 	if r.Buffered() != 8 {
 		t.Fatalf("buffered = %d, want 8 unread second-frame bytes", r.Buffered())
 	}
@@ -151,12 +151,12 @@ func TestEngineRefusesInvalidPrefixBeforeLastFragment(t *testing.T) {
 
 func TestEngineRefusesOverlongEncoding(t *testing.T) {
 	e, _ := engineOver(t, maskedFrame(true, 0x1, []byte{0xc0, 0xaf}), 64, true)
-	mustRefuse(t, e, websocket.ErrInvalidUTF8)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 }
 
 func TestEngineRefusesLoneSurrogate(t *testing.T) {
 	e, _ := engineOver(t, maskedFrame(true, 0x1, []byte{0xed, 0xa0, 0x80}), 64, true)
-	mustRefuse(t, e, websocket.ErrInvalidUTF8)
+	mustRefuse(t, e, websocket.ErrProtocolError)
 }
 
 func TestEngineAcceptsSplitFourByteRune(t *testing.T) {

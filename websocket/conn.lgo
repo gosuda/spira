@@ -13,8 +13,6 @@ import (
 	"logos/sync"
 )
 
-var ErrClosed = errors.New("websocket: connection closed")
-
 type Kind uint8
 
 const (
@@ -54,7 +52,7 @@ func (c *Conn) isClosed() bool {
 
 func closedErr(err error) error {
 	if errors.Is(err, net.ErrClosed) {
-		return ErrClosed
+		return ErrClosed.Wrap(err)
 	}
 	return err
 }
@@ -62,16 +60,16 @@ func closedErr(err error) error {
 func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error) {
 	if err := checkUpgrade(r); err != nil {
 		writeHandshakeError(w, err)
-		return nil, err
+		return nil, ErrHandshakeFailed.Wrap(err)
 	}
 	if err := checkOrigin(r, cfg.AllowedOrigins); err != nil {
 		writeHandshakeError(w, err)
-		return nil, err
+		return nil, ErrForbiddenOrigin.Wrap(err)
 	}
 	sub, err := pickSubprotocol(r.Header.Values("Sec-WebSocket-Protocol"), cfg.Subprotocols)
 	if err != nil {
 		writeHandshakeError(w, err)
-		return nil, err
+		return nil, ErrHandshakeFailed.Wrap(err)
 	}
 	return serveUpgrade(w, r, sub, limitOf(cfg))
 }
@@ -90,7 +88,7 @@ func serveUpgrade(w http.ResponseWriter, r *http.Request, subprotocol string, li
 	headers, err := upgradeHeaders(r.Header.Get("Sec-WebSocket-Key"), subprotocol)
 	if err != nil {
 		writeHandshakeError(w, err)
-		return nil, err
+		return nil, ErrHandshakeFailed.Wrap(err)
 	}
 	conn, rw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -175,7 +173,7 @@ func ParseClose(payload []byte) (uint16, string, error) {
 
 func (c *Conn) Next(ctx context.Context) (Kind, []byte, error) {
 	if c.isClosed() {
-		return 0, nil, ErrClosed
+		return 0, nil, ErrClosed.Err()
 	}
 	if err := c.readDeadline(ctx); err != nil {
 		return 0, nil, err
@@ -224,7 +222,7 @@ func (c *Conn) receiveClose(ctx context.Context, payload []byte) (Kind, []byte, 
 		return 0, nil, c.failClosed(ctx, err)
 	}
 	if code != 1005 && !validCloseCode(code) {
-		return 0, nil, c.failClosed(ctx, ErrCloseCode)
+		return 0, nil, c.failClosed(ctx, ErrProtocolError.Wrap(errCloseCode))
 	}
 	if serr := c.sendFrame(ctx, 0x8, payload); serr != nil {
 		return 0, nil, errors.Join(serr, c.closeConn())
@@ -237,7 +235,7 @@ func (c *Conn) failClosed(ctx context.Context, cause error) error {
 		if cerr := c.closeConn(); cerr != nil {
 			return errors.Join(ErrClosed, cerr)
 		}
-		return ErrClosed
+		return ErrClosed.Err()
 	}
 	if code, ok := closeCodeFor(cause); ok {
 		if serr := c.sendFrame(ctx, 0x8, closePayload(code)); serr != nil {
@@ -264,19 +262,19 @@ func closeCodeFor(err error) (uint16, bool) {
 }
 
 func isTooLarge(err error) bool {
-	return errors.Is(err, ErrMessageTooLarge) || errors.Is(err, ErrPayloadTooLarge)
+	return errors.Is(err, errMessageTooLarge) || errors.Is(err, errPayloadTooLarge)
 }
 
 func isBadEncoding(err error) bool {
-	return errors.Is(err, ErrInvalidUTF8) || errors.Is(err, ErrCloseUTF8)
+	return errors.Is(err, errInvalidUTF8) || errors.Is(err, errCloseUTF8)
 }
 
 func isFrameFault(err error) bool {
-	return errors.Is(err, ErrReservedBits) || errors.Is(err, ErrUnknownOpcode) || errors.Is(err, ErrControlTooLarge) || errors.Is(err, ErrFragmentedControl) || errors.Is(err, ErrLengthTopBit) || errors.Is(err, ErrNonMinimalLength)
+	return errors.Is(err, errReservedBits) || errors.Is(err, errUnknownOpcode) || errors.Is(err, errControlTooLarge) || errors.Is(err, errFragmentedControl) || errors.Is(err, errLengthTopBit) || errors.Is(err, errNonMinimalLength)
 }
 
 func isSessionFault(err error) bool {
-	return errors.Is(err, ErrStrayContinuation) || errors.Is(err, ErrFragmentInProgress) || errors.Is(err, ErrMaskMismatch) || errors.Is(err, ErrClosePayload) || errors.Is(err, ErrCloseCode)
+	return errors.Is(err, errStrayContinuation) || errors.Is(err, errFragmentInProgress) || errors.Is(err, errMaskMismatch) || errors.Is(err, errClosePayload) || errors.Is(err, errCloseCode)
 }
 
 func closePayload(code uint16) []byte {
@@ -297,14 +295,14 @@ func (c *Conn) Ping(ctx context.Context, payload []byte) error {
 
 func (c *Conn) sendControl(ctx context.Context, opcode uint8, payload []byte) error {
 	if len(payload) > 125 {
-		return ErrControlTooLarge
+		return ErrProtocolError.Wrap(errControlTooLarge)
 	}
 	return c.sendFrame(ctx, opcode, payload)
 }
 
 func (c *Conn) sendFrame(ctx context.Context, opcode uint8, payload []byte) error {
 	if c.isClosed() {
-		return ErrClosed
+		return ErrClosed.Err()
 	}
 	if err := c.writeDeadline(ctx); err != nil {
 		return err
@@ -312,7 +310,7 @@ func (c *Conn) sendFrame(ctx context.Context, opcode uint8, payload []byte) erro
 	var werr error
 	c.guard.WithLock(func(g *connGuard) {
 		if g.closed {
-			werr = ErrClosed
+			werr = ErrClosed.Err()
 			return
 		}
 		werr = c.writeLocked(opcode, payload)
@@ -339,10 +337,10 @@ func (c *Conn) writeLocked(opcode uint8, payload []byte) error {
 
 func (c *Conn) CloseWithCode(ctx context.Context, code uint16, reason string) error {
 	if !validCloseCode(code) {
-		return ErrCloseCode
+		return ErrProtocolError.Wrap(errCloseCode)
 	}
 	if !utf8.ValidString(reason) {
-		return ErrCloseUTF8
+		return ErrProtocolError.Wrap(errCloseUTF8)
 	}
 	payload, err := appendClose(nil, code, reason)
 	if err != nil {
@@ -375,7 +373,7 @@ func (c *Conn) closeConn() error {
 
 func (c *Conn) readDeadline(ctx context.Context) error {
 	if c.isClosed() {
-		return ErrClosed
+		return ErrClosed.Err()
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -389,7 +387,7 @@ func (c *Conn) readDeadline(ctx context.Context) error {
 
 func (c *Conn) writeDeadline(ctx context.Context) error {
 	if c.isClosed() {
-		return ErrClosed
+		return ErrClosed.Err()
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {

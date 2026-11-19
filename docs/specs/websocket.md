@@ -25,13 +25,13 @@ func readLength(r *bufio.Reader, short uint8) (uint64, error)
 func appendHeader(dst []byte, h header) []byte
 func mask(key [4]byte, offset int, data []byte) int
 
-var ErrReservedBits = errors.New("websocket: reserved bits set")
-var ErrUnknownOpcode = errors.New("websocket: unknown opcode")
-var ErrControlTooLarge = errors.New("websocket: control frame too large")
-var ErrFragmentedControl = errors.New("websocket: fragmented control frame")
-var ErrLengthTopBit = errors.New("websocket: length top bit set")
-var ErrNonMinimalLength = errors.New("websocket: non-minimal length")
-var ErrPayloadTooLarge = errors.New("websocket: payload too large")
+var errReservedBits = errors.New("websocket: reserved bits set")
+var errUnknownOpcode = errors.New("websocket: unknown opcode")
+var errControlTooLarge = errors.New("websocket: control frame too large")
+var errFragmentedControl = errors.New("websocket: fragmented control frame")
+var errLengthTopBit = errors.New("websocket: length top bit set")
+var errNonMinimalLength = errors.New("websocket: non-minimal length")
+var errPayloadTooLarge = errors.New("websocket: payload too large")
 
 const handshakeGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -67,10 +67,10 @@ const (
 	ServerError     Code = 1011
 )
 
-var ErrClosePayload = errors.New("websocket: close payload too short")
-var ErrCloseUTF8 = errors.New("websocket: close reason not UTF-8")
-var ErrCloseCode = errors.New("websocket: close code not allowed")
-var ErrCloseTooLong = errors.New("websocket: close reason too long")
+var errClosePayload = errors.New("websocket: close payload too short")
+var errCloseUTF8 = errors.New("websocket: close reason not UTF-8")
+var errCloseCode = errors.New("websocket: close code not allowed")
+var errCloseTooLong = errors.New("websocket: close reason too long")
 
 func parseClose(payload []byte) (uint16, string, error)
 func validCloseCode(code uint16) bool
@@ -99,11 +99,11 @@ type engine struct {
 	valid  int
 }
 
-var ErrStrayContinuation = errors.New("websocket: unexpected continuation frame")
-var ErrFragmentInProgress = errors.New("websocket: new data frame while fragmented message is open")
-var ErrMaskMismatch = errors.New("websocket: mask bit does not match endpoint role")
-var ErrMessageTooLarge = errors.New("websocket: message exceeds size limit")
-var ErrInvalidUTF8 = errors.New("websocket: text message is not valid UTF-8")
+var errStrayContinuation = errors.New("websocket: unexpected continuation frame")
+var errFragmentInProgress = errors.New("websocket: new data frame while fragmented message is open")
+var errMaskMismatch = errors.New("websocket: mask bit does not match endpoint role")
+var errMessageTooLarge = errors.New("websocket: message exceeds size limit")
+var errInvalidUTF8 = errors.New("websocket: text message is not valid UTF-8")
 
 func newEngine(r *bufio.Reader, limit int64, server bool) *engine
 func (e *engine) next() (kind, []byte, error)
@@ -139,7 +139,12 @@ type Conn struct {
 	// unexported fields
 }
 
-var ErrClosed = errors.New("websocket: connection closed")
+var ErrClosed = fault.New("websocket.closed", fault.Canceled, "The connection is closed.")
+var ErrHandshakeFailed = fault.New("websocket.handshake_failed", fault.Invalid, "The websocket handshake failed.")
+var ErrForbiddenOrigin = fault.New("websocket.forbidden_origin", fault.Forbidden, "The websocket origin is forbidden.")
+var ErrProtocolError = fault.New("websocket.protocol_error", fault.Invalid, "The websocket protocol was violated.")
+var ErrTooLarge = fault.New("websocket.too_large", fault.TooLarge, "The websocket message is too large.")
+func Faults() []*fault.Error
 
 func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error)
 func ServeHijacked(conn net.Conn, rw *bufio.ReadWriter, subprotocol string, limit int64) *Conn
@@ -154,7 +159,8 @@ func (c *Conn) CloseWithCode(ctx context.Context, code uint16, reason string) er
 func (c *Conn) Close() error
 ```
 
-`header` moves no payload bytes and opens no connection. `readHeader` reads 2 to 14 header bytes and never reads payload bytes. `acceptKey`, `checkUpgrade`, `upgradeStatus`, `handshakeFailureHeaders`, `upgradeHeaders`, `pickSubprotocol`, `checkOrigin` and `sameOrigin` are pure header checks. `parseClose`, `validCloseCode` and `appendClose` move no frame bytes. `engine` reads frames from a `*bufio.Reader` and assembles messages; it opens no connection and starts no goroutine. `Conn` owns one hijacked connection, answers pings, echoes one close and ends. External tests reach each unexported name above through the `Exposed` probes in `export_test.lgo`, `handshake_export_test.lgo` and `close_export_test.lgo`; the public names are tested directly.
+`header` moves no payload bytes and opens no connection. `readHeader` reads 2 to 14 header bytes and never reads payload bytes. `acceptKey`, `checkUpgrade`, `upgradeStatus`, `handshakeFailureHeaders`, `upgradeHeaders`, `pickSubprotocol`, `checkOrigin` and `sameOrigin` are pure header checks. `parseClose`, `validCloseCode` and `appendClose` move no frame bytes. `engine` reads frames from a `*bufio.Reader` and assembles messages; it opens no connection and starts no goroutine. `Conn` owns one hijacked connection, answers pings, echoes one close and ends.
+Each detection site wraps its unexported cause in the declared fault for that class. The frame, engine and close codecs surface `ErrProtocolError` or `ErrTooLarge` through the `Exposed` probes in `export_test.lgo` and `close_export_test.lgo`. The handshake checks keep their unexported causes for the status map and surface them through `handshake_export_test.lgo`.
 
 ## Requirements
 
@@ -162,16 +168,16 @@ func (c *Conn) Close() error
 
 - `readHeader` MUST read 2 to 14 header bytes.
 - `readHeader` MUST move no payload bytes.
-- `readHeader` MUST fail on set rsv1, rsv2 or rsv3 with `ErrReservedBits`.
-- Each opcode in 0x3 to 0x7 and 0xB to 0xF MUST fail with `ErrUnknownOpcode`.
-- `readHeader` MUST fail on a fragmented control frame with `ErrFragmentedControl`.
-- `readHeader` MUST fail on a control payload above 125 bytes with `ErrControlTooLarge`.
-- A 64-bit control length of 65536 MUST fail with `ErrControlTooLarge`.
+- `readHeader` MUST fail on set rsv1, rsv2 or rsv3 with `ErrProtocolError`.
+- Each opcode in 0x3 to 0x7 and 0xB to 0xF MUST fail with `ErrProtocolError`.
+- `readHeader` MUST fail on a fragmented control frame with `ErrProtocolError`.
+- `readHeader` MUST fail on a control payload above 125 bytes with `ErrProtocolError`.
+- A 64-bit control length of 65536 MUST fail with `ErrProtocolError`.
 - Length 126 MUST pass as a minimal 16-bit length.
 - Length 125 MUST fail as a non-minimal 16-bit length.
-- `readHeader` MUST fail on a 64-bit length with the top bit set with `ErrLengthTopBit`.
-- `readHeader` MUST fail on a non-minimal 16-bit or 64-bit length with `ErrNonMinimalLength`.
-- `readHeader` MUST fail on a payload above the caller limit with `ErrPayloadTooLarge`.
+- `readHeader` MUST fail on a 64-bit length with the top bit set with `ErrProtocolError`.
+- `readHeader` MUST fail on a non-minimal 16-bit or 64-bit length with `ErrProtocolError`.
+- `readHeader` MUST fail on a payload above the caller limit with `ErrTooLarge`.
 - A limit of 0 MUST admit empty payloads only.
 - Large vectors MUST carry real payload bytes, masked where the header says masked.
 - `appendHeader` MUST encode a read header back to the exact consumed bytes.
@@ -216,7 +222,7 @@ func (c *Conn) Close() error
 
 ### Connection (RFC 6455 sections 5.4, 5.5, 5.6, 6, 7)
 
-- `Upgrade` MUST write each handshake failure status itself and return the cause.
+- `Upgrade` MUST write each handshake failure status itself and return the fault.
 - `Upgrade` MUST answer 101 with `Upgrade`, `Connection`, `Accept` and the subprotocol.
 - `Upgrade` MUST hijack the connection and return a `Conn` over it.
 - `ServeHijacked` MUST panic on a nil connection or buffer.
@@ -228,13 +234,12 @@ func (c *Conn) Close() error
 - `Next` MUST echo a valid peer close once and end the connection.
 - `Next` after the close MUST return `ErrClosed`.
 - `Next` and each write method MUST observe the closed state before touching the connection.
-- `Next` MUST send 1009 for a message past the limit, 1007 for bad UTF-8, 1002 otherwise.
-- `Next` MUST derive read and write deadlines from the context deadline.
-- Concurrent writes MUST serialize through the one connection gate.
-- The caller MUST NOT call `Next` beside another `Next`.
 - `CloseWithCode` MUST send one close frame and end the connection.
 - `Close` MUST close the connection so later calls return `ErrClosed`.
 - `ParseClose` MUST decode a close payload exactly like `parseClose`.
+- `Upgrade` MUST return `ErrHandshakeFailed` for a check failure and `ErrForbiddenOrigin` for a foreign origin.
+- `Upgrade` MUST send no body text with a failure status.
+- Each close frame the server sends on a protocol fault MUST carry the code only and no reason text.
 
 ### Close payload and codes (RFC 6455 sections 5.5.1, 7.1.5, 7.1.6, 7.4)
 
@@ -242,11 +247,11 @@ func (c *Conn) Close() error
 - `parseClose` MUST return code 1005 with empty reason and no error for empty payload.
 - `parseClose` MUST decode the first two payload bytes as code in network order.
 - `parseClose` MUST decode remaining payload bytes as reason.
-- `parseClose` MUST fail with `ErrCloseUTF8` when reason holds invalid UTF-8.
+- `parseClose` MUST fail with `ErrProtocolError` when reason holds invalid UTF-8.
 - `validCloseCode` MUST accept 1000 through 1003, 1007 through 1014 and 3000 through 4999.
 - `validCloseCode` MUST reject codes below 1000 and above 4999, 1004 to 1006, 1015, and 1016 to 2999.
-- `appendClose` MUST fail with `ErrCloseCode` for a code `validCloseCode` rejects.
-- `appendClose` MUST fail with `ErrCloseTooLong` when code plus reason exceeds 125 bytes.
+- `appendClose` MUST fail with `ErrProtocolError` for a code `validCloseCode` rejects.
+- `appendClose` MUST fail with `ErrProtocolError` when code plus reason exceeds 125 bytes.
 - `appendClose` MUST encode code in network order followed by reason bytes.
 - `appendClose` MUST never truncate reason.
 
@@ -257,13 +262,13 @@ func (c *Conn) Close() error
 - `next` MUST return each ping, pong and close frame as its own event.
 - `next` MUST preserve a partial data message across a control event.
 - Kind values MUST be 1 for text, 2 for binary, 3 for ping, 4 for pong and 5 for close.
-- A continuation frame with no open message MUST fail with `ErrStrayContinuation`.
-- A data frame while a message stays open MUST fail with `ErrFragmentInProgress`.
-- A frame with the wrong mask bit MUST fail with `ErrMaskMismatch`.
+- A continuation frame with no open message MUST fail with `ErrProtocolError`.
+- A data frame while a message stays open MUST fail with `ErrProtocolError`.
+- A frame with the wrong mask bit MUST fail with `ErrProtocolError`.
 - Server role MUST want masked frames.
 - Client role MUST want unmasked frames.
-- A message past the size limit MUST fail with `ErrMessageTooLarge` before payload bytes enter memory.
-- A text message outside valid UTF-8 MUST fail with `ErrInvalidUTF8`, checked on each fragment.
+- A message past the size limit MUST fail with `ErrTooLarge` before payload bytes enter memory.
+- A text message outside valid UTF-8 MUST fail with `ErrProtocolError`, checked on each fragment.
 - An invalid prefix MUST fail before the last fragment arrives.
 - A code point split by a boundary MUST pass once completed.
 - The engine MUST reuse one payload buffer across messages.
@@ -271,33 +276,24 @@ func (c *Conn) Close() error
 - `next` MUST allocate nothing per message after warm-up.
 - Control payloads MUST bypass the message size limit.
 
+### Code table
+
+| Code | Kind | Message |
+| `websocket.closed` | canceled | The connection is closed. |
+| `websocket.handshake_failed` | invalid | The websocket handshake failed. |
+| `websocket.forbidden_origin` | forbidden | The websocket origin is forbidden. |
+| `websocket.protocol_error` | invalid | The websocket protocol was violated. |
+| `websocket.too_large` | too_large | The websocket message is too large. |
+
 ## Errors
 
-- `ErrReservedBits`: `websocket: reserved bits set` for a set rsv bit; a protocol error, close code 1002.
-- `ErrUnknownOpcode`: `websocket: unknown opcode` for an opcode outside 0x0, 0x1, 0x2, 0x8, 0x9, 0xA; a protocol error, close code 1002.
-- `ErrControlTooLarge`: `websocket: control frame too large` for a control payload above 125 bytes; a protocol error, close code 1002.
-- `ErrFragmentedControl`: `websocket: fragmented control frame` for a control frame without fin; a protocol error, close code 1002.
-- `ErrLengthTopBit`: `websocket: length top bit set` for a 64-bit length with the top bit set; a protocol error, close code 1002.
-- `ErrNonMinimalLength`: `websocket: non-minimal length` for a 16-bit length under 126 or a 64-bit length under 65536; a protocol error, close code 1002.
-- `ErrPayloadTooLarge`: `websocket: payload too large` for a payload above the caller limit; close code 1009 when it bounds a message.
-- `errHandshakeMethod`: `websocket: handshake requires GET method`, answered with HTTP 405 and no close code.
-- `errHandshakeProtocol`: `websocket: handshake requires HTTP/1.1 or later`, answered with HTTP 400 and no close code.
-- `errHandshakeConnection`: `websocket: handshake requires Connection header with upgrade token`, answered with HTTP 400 and no close code.
-- `errHandshakeUpgrade`: `websocket: handshake requires Upgrade header with websocket token`, answered with HTTP 400 and no close code.
-- `errHandshakeVersion`: `websocket: handshake requires Sec-WebSocket-Version 13`, answered with HTTP 426, header `Sec-WebSocket-Version: 13`, and no close code.
-- `errHandshakeKey`: `websocket: handshake requires Sec-WebSocket-Key with base64 of 16 bytes`, answered with HTTP 400 and no close code.
-- `errHandshakeSubprotocol`: `websocket: Sec-WebSocket-Protocol must be an RFC 7230 token`, answered with HTTP 400 and no close code.
-- `errHandshakeOrigin`: `websocket: handshake origin not allowed` for a foreign origin, answered with HTTP 403 and no close code.
-- `ErrClosePayload`: `websocket: close payload too short` for a one-byte close payload; a protocol error, close code 1002.
-- `ErrCloseUTF8`: `websocket: close reason not UTF-8` for a close reason outside valid UTF-8; close code 1007.
-- `ErrCloseCode`: `websocket: close code not allowed` for a code `validCloseCode` rejects; a peer code sends 1002, a local call sends nothing.
-- `ErrCloseTooLong`: `websocket: close reason too long` when code plus reason exceeds 125 bytes; local only, no close code sent.
-- `ErrStrayContinuation`: `websocket: unexpected continuation frame` for a continuation with no open message; a protocol error, close code 1002.
-- `ErrFragmentInProgress`: `websocket: new data frame while fragmented message is open` for a data frame while a message stays open; a protocol error, close code 1002.
-- `ErrMaskMismatch`: `websocket: mask bit does not match endpoint role` for a frame with the wrong mask bit; a protocol error, close code 1002.
-- `ErrMessageTooLarge`: `websocket: message exceeds size limit` for a message past the size limit; close code 1009.
-- `ErrInvalidUTF8`: `websocket: text message is not valid UTF-8` for a text message outside valid UTF-8; close code 1007.
-- `ErrClosed`: `websocket: connection closed` after the close handshake; local only, no close code sent.
+- `websocket.closed`: `ErrClosed`, kind `canceled`, message `The connection is closed.` Returned after the close handshake; local only, no close code sent.
+- `websocket.handshake_failed`: `ErrHandshakeFailed`, kind `invalid`, message `The websocket handshake failed.` The cause is the unexported check error and selects the status.
+- `websocket.forbidden_origin`: `ErrForbiddenOrigin`, kind `forbidden`, message `The websocket origin is forbidden.` The cause is `errHandshakeOrigin`; answered with HTTP 403 and no body text.
+- `websocket.protocol_error`: `ErrProtocolError`, kind `invalid`, message `The websocket protocol was violated.` The cause is the unexported detection error and selects the close code.
+- The close code MUST be 1002 for a frame or session fault, and 1007 for bad UTF-8.
+- A sent close frame MUST carry the code only and no reason text.
+- `websocket.too_large`: `ErrTooLarge`, kind `too_large`, message `The websocket message is too large.` The cause is the unexported limit error; answered with 1009 and no reason text.
 - `websocket: hijack: <cause>` when the upgrade cannot take over the connection.
 - `websocket: write upgrade status`, `write upgrade header`, `write upgrade end` and `flush upgrade` when the 101 reply fails.
 - `websocket: write frame header`, `write frame payload` and `flush frame` when a data, ping or close frame fails.
@@ -309,15 +305,15 @@ func (c *Conn) Close() error
 - `TestRFCDataFrames` proves that unmasked text, masked text and fragment heads read and encode back.
 - `TestRFCControlFrames` proves that the ping and pong vectors read and encode back.
 - `TestRFCLargeFrames` proves that the 126-byte, 256-byte, 65536-byte and masked 64-bit vectors carry real payload bytes.
-- `TestRefuseReservedBits` proves that a set rsv bit fails with `ErrReservedBits`.
-- `TestRefuseUnknownOpcode` proves that each opcode in 0x3 to 0x7 and 0xB to 0xF fails with `ErrUnknownOpcode`.
-- `TestRefuseControlTooLarge` proves that a 16-bit control length of 126 fails with `ErrControlTooLarge`.
-- `TestRefuseControlTooLarge64` proves that a minimal 64-bit control length of 65536 fails with `ErrControlTooLarge`.
-- `TestRefuseFragmentedControl` proves that a control frame without fin fails with `ErrFragmentedControl`.
-- `TestRefuseLengthTopBit` proves that a 64-bit length with the top bit set fails with `ErrLengthTopBit`.
-- `TestRefuseShortLength16` proves that 16-bit lengths 5 and 125 fail with `ErrNonMinimalLength`.
-- `TestRefuseShortLength64` proves that a short 64-bit length fails with `ErrNonMinimalLength`.
-- `TestRefusePayloadOverLimit` proves that a payload above the caller limit fails with `ErrPayloadTooLarge`.
+- `TestRefuseReservedBits` proves that a set rsv bit fails with `ErrProtocolError`.
+- `TestRefuseUnknownOpcode` proves that each opcode in 0x3 to 0x7 and 0xB to 0xF fails with `ErrProtocolError`.
+- `TestRefuseControlTooLarge` proves that a 16-bit control length of 126 fails with `ErrProtocolError`.
+- `TestRefuseControlTooLarge64` proves that a minimal 64-bit control length of 65536 fails with `ErrProtocolError`.
+- `TestRefuseFragmentedControl` proves that a control frame without fin fails with `ErrProtocolError`.
+- `TestRefuseLengthTopBit` proves that a 64-bit length with the top bit set fails with `ErrProtocolError`.
+- `TestRefuseShortLength16` proves that 16-bit lengths 5 and 125 fail with `ErrProtocolError`.
+- `TestRefuseShortLength64` proves that a short 64-bit length fails with `ErrProtocolError`.
+- `TestRefusePayloadOverLimit` proves that a payload above the caller limit fails with `ErrTooLarge`.
 - `TestMaskMatchesByteLoop` proves that `mask` matches the byte loop for lengths 0 to 40 and offsets 0 to 3.
 - `TestReadHeaderZeroAllocs` proves that a warmed `readHeader` allocates nothing.
 - `FuzzFrame` proves that any input either fails `readHeader` or encodes back to the consumed bytes.
@@ -359,30 +355,35 @@ func (c *Conn) Close() error
 - `TestCloseValidBoundary` proves the accepted and refused code ranges of `validCloseCode`.
 - `TestCloseCodesMatchSketch` proves that `Normal`, `Unsupported`, `PolicyViolation` and `ServerError` equal 1000, 1003, 1008 and 1011.
 - `TestParseCloseEmpty` proves that an empty payload returns code 1005 with empty reason and no error.
-- `TestParseCloseOneByte` proves that a one-byte payload fails with `ErrClosePayload`.
+- `TestParseCloseOneByte` proves that a one-byte payload fails with `ErrProtocolError`.
 - `TestParseCloseCodeOnly` proves that a two-byte payload decodes the code in network order with empty reason.
 - `TestParseCloseCodeReason` proves that a longer payload decodes code 1000 and reason `bye`.
-- `TestParseCloseInvalidUTF8` proves that an invalid UTF-8 reason fails with `ErrCloseUTF8`.
-- `TestAppendCloseReasonLimits` proves that a 123-byte reason fits in 125 bytes and a 124-byte reason fails with `ErrCloseTooLong`.
-- `TestAppendCloseRefusesBadCode` proves that each refused code fails with `ErrCloseCode`.
+- `TestParseCloseInvalidUTF8` proves that an invalid UTF-8 reason fails with `ErrProtocolError`.
+- `TestAppendCloseReasonLimits` proves that a 123-byte reason fits in 125 bytes and a 124-byte reason fails with `ErrProtocolError`.
+- `TestAppendCloseRefusesBadCode` proves that each refused code fails with `ErrProtocolError`.
 - `TestCloseRoundTrip` proves that an appended close payload parses back to its code and reason.
 - `TestEngineFragmentedHelloWithPing` proves that a ping arrives first and fragments assemble to `Hello`.
-- `TestEngineRefusesStrayContinuation` proves that a continuation with no open message fails with `ErrStrayContinuation`.
-- `TestEngineRefusesNewDataWhileOpen` proves that a data frame while a message stays open fails with `ErrFragmentInProgress`.
-- `TestEngineRefusesUnmaskedInServerRole` proves that an unmasked frame in server role fails with `ErrMaskMismatch`.
-- `TestEngineRefusesMaskedInClientRole` proves that a masked frame in client role fails with `ErrMaskMismatch`.
-- `TestEngineRefusesMessageOverLimit` proves that a message past the limit fails with `ErrMessageTooLarge` and leaves payload bytes buffered.
-- `TestEngineRefusesFragmentedTotalOverLimit` proves that a fragmented total past the limit fails with `ErrMessageTooLarge`.
+- `TestEngineRefusesStrayContinuation` proves that a continuation with no open message fails with `ErrProtocolError`.
+- `TestEngineRefusesNewDataWhileOpen` proves that a data frame while a message stays open fails with `ErrProtocolError`.
+- `TestEngineRefusesUnmaskedInServerRole` proves that an unmasked frame in server role fails with `ErrProtocolError`.
+- `TestEngineRefusesMaskedInClientRole` proves that a masked frame in client role fails with `ErrProtocolError`.
+- `TestEngineRefusesMessageOverLimit` proves that a message past the limit fails with `ErrTooLarge` and leaves payload bytes buffered.
+- `TestEngineRefusesFragmentedTotalOverLimit` proves that a fragmented total past the limit fails with `ErrTooLarge`.
 - `TestEngineAcceptsControlOverMessageLimit` proves that a 5-byte ping passes a 4-byte message limit.
 - `TestEngineRefusesInvalidPrefixBeforeLastFragment` proves that an invalid prefix fails before the last fragment arrives.
-- `TestEngineRefusesOverlongEncoding` proves that an overlong encoding fails with `ErrInvalidUTF8`.
-- `TestEngineRefusesLoneSurrogate` proves that a lone surrogate fails with `ErrInvalidUTF8`.
+- `TestEngineRefusesOverlongEncoding` proves that an overlong encoding fails with `ErrProtocolError`.
+- `TestEngineRefusesLoneSurrogate` proves that a lone surrogate fails with `ErrProtocolError`.
 - `TestEngineAcceptsSplitFourByteRune` proves that a rune split across fragments passes once completed.
 - `TestEngineNextZeroAllocs` proves that a warmed `next` allocates nothing per message.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` holds each spec table code once with its kind and message.
+- `TestFaultHandshakeFailedInvalidMethod` proves that a non-GET handshake answers 405 with `ErrHandshakeFailed`.
+- `TestFaultForbiddenOriginRejected` proves that a foreign origin answers 403 with `ErrForbiddenOrigin` and hides the origin and secrets from the public view.
+- `TestFaultPublicHidesFrameBytes` proves that a protocol fault hides hostile frame bytes from the public view and sends 1002 with no reason text.
+- `TestFaultClosedAfterClose` proves that calls after the close fail with `ErrClosed`.
 - `TestPeerCloseEchoedOnceThenEnds` proves that a peer close with code 1000 is echoed once and the connection ends.
-- `TestFaultFrameOverLimitSends1009` proves that a message past the limit fails with `ErrMessageTooLarge` and sends 1009.
-- `TestFaultInvalidUTF8Sends1007` proves that invalid UTF-8 text fails with `ErrInvalidUTF8` and sends 1007.
-- `TestFaultReservedBitSends1002` proves that a set reserved bit fails with `ErrReservedBits` and sends 1002.
+- `TestFaultFrameOverLimitSends1009` proves that a message past the limit fails with `ErrTooLarge` and sends 1009.
+- `TestFaultInvalidUTF8Sends1007` proves that invalid UTF-8 text fails with `ErrProtocolError` and sends 1007.
+- `TestFaultReservedBitSends1002` proves that a set reserved bit fails with `ErrProtocolError` and sends 1002.
 - `TestPingAnsweredWithPong` proves that a ping arrives as an event and the peer gets its pong.
 - `TestBinaryEchoRoundTrip1KiB` proves that a 1024-byte binary message echoes back byte for byte.
 - `TestExpiredContextFailsFast` proves that an expired context fails a read and a write.

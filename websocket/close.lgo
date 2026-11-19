@@ -15,22 +15,22 @@ const (
 	ServerError     Code = 1011
 )
 
-var ErrClosePayload = errors.New("websocket: close payload too short")
-var ErrCloseUTF8 = errors.New("websocket: close reason not UTF-8")
-var ErrCloseCode = errors.New("websocket: close code not allowed")
-var ErrCloseTooLong = errors.New("websocket: close reason too long")
+var errClosePayload = errors.New("websocket: close payload too short")
+var errCloseUTF8 = errors.New("websocket: close reason not UTF-8")
+var errCloseCode = errors.New("websocket: close code not allowed")
+var errCloseTooLong = errors.New("websocket: close reason too long")
 
 func parseClose(payload []byte) (uint16, string, error) {
 	if len(payload) == 0 {
 		return 1005, "", nil
 	}
 	if len(payload) == 1 {
-		return 0, "", ErrClosePayload
+		return 0, "", ErrProtocolError.Wrap(errClosePayload)
 	}
 	code := binary.BigEndian.Uint16(payload[:2])
 	reason := string(payload[2:])
 	if !utf8.ValidString(reason) {
-		return 0, "", ErrCloseUTF8
+		return 0, "", ErrProtocolError.Wrap(errCloseUTF8)
 	}
 	return code, reason, nil
 }
@@ -62,10 +62,10 @@ func validCloseCode(code uint16) bool {
 
 func appendClose(dst []byte, code uint16, reason string) ([]byte, error) {
 	if !validCloseCode(code) {
-		return nil, ErrCloseCode
+		return nil, ErrProtocolError.Wrap(errCloseCode)
 	}
 	if len(reason)+2 > 125 {
-		return nil, ErrCloseTooLong
+		return nil, ErrProtocolError.Wrap(errCloseTooLong)
 	}
 	dst = append(dst, byte(code>>8), byte(code))
 	dst = append(dst, reason...)
