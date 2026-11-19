@@ -192,16 +192,17 @@ func TestFaultPublicHidesSecretsAndHostile(t *testing.T) {
 
 func TestConstraintCleanupOnEarlyReturn(t *testing.T) {
 	pool := openPool(t)
-	const table = "fault_cleanup_uniq"
-	flow := func() {
-		faultExec(t, pool, "CREATE TABLE "+table+" (n INTEGER NOT NULL UNIQUE)")
-		defer func() {
-			if _, derr := db.Exec(context.Background(), pool, "DROP TABLE "+table); derr != nil {
-				t.Errorf("cleanup drop %s: %v", table, derr)
-			}
-		}()
+	ran := false
+	withConstraintProbe(t, t.Context(), pool, constraintProbe{
+		table: "fault_cleanup_uniq",
+		mark:  "?",
+		check: func(dupErr error) {
+			ran = true
+		},
+	})
+	if !ran {
+		t.Fatal("probe body did not run")
 		return
 	}
-	flow()
-	faultExec(t, pool, "CREATE TABLE "+table+" (n INTEGER NOT NULL UNIQUE)")
+	faultExec(t, pool, "CREATE TABLE fault_cleanup_uniq (n INTEGER NOT NULL UNIQUE)")
 }
