@@ -33,6 +33,7 @@ A file that starts with the line `Status: specified; the package is not in the t
 - [openapi](openapi.md): the OpenAPI document of a router.
 - [client](client.md): outbound JSON calls.
 - [gateway](gateway.md): reverse proxy over static upstreams.
+- [http3](http3.md): the HTTP/3 server over QUIC with Alt-Svc discovery.
 
 ## Pages and the browser
 

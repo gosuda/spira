@@ -9,5 +9,5 @@ portability = "deny"
 pedantic = "warn"
 
 [capabilities]
-transitive_exec_allowlist = ["golang.org/x/sys/unix", "modernc.org/libc"]
-transitive_net_allowlist = ["golang.org/x/sys/unix", "modernc.org/libc", "github.com/go-sql-driver/mysql", "github.com/jackc/pgx/v5/pgconn", "github.com/jackc/pgx/v5/stdlib", "github.com/microsoft/go-mssqldb"]
+transitive_exec_allowlist = ["golang.org/x/sys/unix", "modernc.org/libc", "golang.org/x/net/internal/socket/**"]
+transitive_net_allowlist = ["golang.org/x/sys/unix", "modernc.org/libc", "github.com/go-sql-driver/mysql", "github.com/jackc/pgx/v5/pgconn", "github.com/jackc/pgx/v5/stdlib", "github.com/microsoft/go-mssqldb", "github.com/quic-go/quic-go/**", "github.com/quic-go/quic-go/http3/**", "golang.org/x/net/internal/socket/**"]
