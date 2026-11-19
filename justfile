@@ -5,13 +5,16 @@ export GOROOT := logos_root
 export GOTOOLCHAIN := "local"
 export PATH := logos_root / "bin" + ":" + env_var("PATH")
 
-gate: build lint test web
+gate: build lint test web slop
 
 build:
     logos build ./...
 
 lint:
     logos lint ./...
+
+slop:
+    sloplint check --mode threshold --strictness standard --fail-on major --root "{{justfile_directory()}}"
 
 test:
     logos test -race -count=1 ./...

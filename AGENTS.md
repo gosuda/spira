@@ -23,6 +23,7 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 ## Gates
 
 - `just gate` MUST exit 0 before every commit. The native `.git/hooks/pre-commit` runs it. [Tony Hoare]
+- `just slop` MUST exit 0 before every commit: sloplint at the standard profile over the TypeScript, JavaScript and shell files, failing on major findings; `.lgo` files are not parsed until gosuda/sloplint#37 lands. [Tony Hoare]
 - `just eject` MUST exit 0 at the end of every unit of work. An eject failure is a finding. [Tony Hoare]
 - A change that adds behavior lands only after its new tests have been seen to fail on the tree without the change. [Tony Hoare]
 
