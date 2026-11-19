@@ -239,6 +239,7 @@ type Server struct {
 }
 
 func (s *Server) Start(ctx context.Context) error
+func (s *Server) Serve(ctx context.Context, l net.Listener) error
 func (s *Server) Stop(ctx context.Context) error
 func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 ```
@@ -395,8 +396,11 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `AccessLog` MUST log the method, the route, the status, the duration and the request id.
 - `AccessLog` MUST log the request when the handler aborts the stream.
 - The logged route MUST be the mux pattern, or the URL path when the pattern is empty.
-- `Start` and `Stop` MUST be usable as an [app](app.md) part.
 - `Start` MUST listen before it returns.
+- `Start` MUST listen on `Addr`, then serve the listener as `Serve` does.
+- `Serve` MUST serve the caller listener instead of listening on `Addr`.
+- `Serve` MUST take ownership of the listener when it succeeds.
+- `Serve` MUST fail before serving and MUST NOT close the listener when the server is started, the router is nil, or `TLS` holds no certificate, `GetCertificate` or `GetConfigForClient`.
 - A cancelled start context MUST NOT stop the server.
 - The server MUST pass `OPTIONS *` to the router.
 - `Stop` MUST wait for an in-flight request until `ShutdownGrace` ends.

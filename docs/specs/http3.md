@@ -20,6 +20,7 @@ type Server struct {
 
 func (s *Server) AltSvc() web.Stage
 func (s *Server) Start(ctx context.Context) error
+func (s *Server) Serve(ctx context.Context, l net.Listener, conn net.PacketConn) error
 func (s *Server) Stop(ctx context.Context) error
 
 var ErrH3NeedsTLS = fault.New("http3.h3_needs_tls", fault.Internal, "HTTP/3 needs a TLS configuration.")
@@ -38,6 +39,10 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 - `H3` MUST stay false unless the application wants HTTP/3.
 - When `H3` is true, `Start` MUST open one UDP listener on `Addr` before it returns.
 - The UDP listener MUST use the same port as the TCP listener.
+- When `Addr` holds port 0, `Start` MUST bind TCP first on port 0, then UDP on the bound TCP port.
+- On a UDP conflict `Start` MUST release both sockets and MUST try again a bounded number of times.
+- `Serve` MUST serve the caller sockets instead of binding `Addr`.
+- `Serve` MUST NOT close the caller sockets when it fails.
 - When `H3` is true and `TLS` is nil, `Start` MUST fail and MUST NOT listen.
 - The UDP listener MUST negotiate only ALPN `h3`.
 - The UDP listener MUST use TLS 1.3 with no older version.
