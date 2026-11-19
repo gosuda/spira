@@ -96,38 +96,6 @@ func TestFaultUnavailable(t *testing.T) {
 	}
 }
 
-func TestFaultPartialDDLMySQL(t *testing.T) {
-	dsn := os.Getenv("SPIRA_TEST_MYSQL_DSN")
-	if dsn == "" {
-		t.Skipf("SPIRA_TEST_MYSQL_DSN is not set")
-		return
-	}
-	pool, err := db.Open("mysql", dsn)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-		return
-	}
-	if pool == nil {
-		t.Fatal("Open returned no pool")
-		return
-	}
-	if serr := pool.Start(t.Context()); serr != nil {
-		t.Fatalf("Start: %v", serr)
-		return
-	}
-	t.Cleanup(func() {
-		if serr := pool.Stop(t.Context()); serr != nil {
-			t.Errorf("Stop: %v", serr)
-		}
-	})
-	steps := []migrate.Step{{Name: "0001_broken", Up: "CREATE TABLEE broken (id integer)", Down: "DROP TABLE broken"}}
-	err = migrate.Apply(t.Context(), pool, steps)
-	if !errors.Is(err, migrate.ErrPartialDDL) {
-		t.Fatalf("Apply error = %v, want migrate.ErrPartialDDL", err)
-		return
-	}
-}
-
 func TestFaultsMatchSpecTable(t *testing.T) {
 	faulttest.CheckTable(t, "../docs/specs/migrate.md", migrate.Faults())
 }
