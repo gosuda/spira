@@ -5,12 +5,14 @@ import { createEffect, createSignal } from "solid-js";
 
 export const solidDisposable = {
 	cleaned: false,
+	cleanups: 0,
 	effectRuns: 0,
 	setGo: null as ((value: number) => void) | null,
 };
 
 export function resetSolidDisposable(): void {
 	solidDisposable.cleaned = false;
+	solidDisposable.cleanups = 0;
 	solidDisposable.effectRuns = 0;
 	solidDisposable.setGo = null;
 }
@@ -24,6 +26,7 @@ export default function Disposable(): JSX.Element {
 			solidDisposable.effectRuns += 1;
 			return () => {
 				solidDisposable.cleaned = true;
+				solidDisposable.cleanups += 1;
 			};
 		},
 	);

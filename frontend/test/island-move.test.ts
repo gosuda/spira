@@ -145,7 +145,7 @@ describe("island moves", () => {
 		await flushDispose();
 		await flushDispose();
 		expect(reactLoads).toBe(1);
-		expect(reactDisposable.cleaned).toBe(false);
+		expect(reactDisposable.cleanups).toBe(0);
 		expect(el.querySelector("span")?.textContent).toBe(text);
 		expect(box.contains(el)).toBe(true);
 	});
@@ -158,8 +158,11 @@ describe("island moves", () => {
 		});
 		el.remove();
 		await vi.waitFor(() => {
-			expect(reactDisposable.cleaned).toBe(true);
+			expect(reactDisposable.cleanups).toBe(1);
 		});
+		await flushDispose();
+		await flushDispose();
+		expect(reactDisposable.cleanups).toBe(1);
 		expect(reactLoads).toBe(1);
 	});
 
@@ -174,8 +177,36 @@ describe("island moves", () => {
 		box.append(el);
 		el.remove();
 		await vi.waitFor(() => {
-			expect(reactDisposable.cleaned).toBe(true);
+			expect(reactDisposable.cleanups).toBe(1);
 		});
+		await flushDispose();
+		await flushDispose();
+		expect(reactDisposable.cleanups).toBe(1);
 		expect(reactLoads).toBe(1);
+	});
+
+	test("a re-inserted island mounts again and disposes the new mount once", async () => {
+		resetReactDisposable();
+		const el = island(reactEntry);
+		await vi.waitFor(() => {
+			expect(el.querySelector("span")?.textContent).toBe("react go 0");
+		});
+		el.remove();
+		await vi.waitFor(() => {
+			expect(reactDisposable.cleanups).toBe(1);
+		});
+		document.body.append(el);
+		await vi.waitFor(() => {
+			expect(el.querySelector("span")?.textContent).toBe("react go 0");
+		});
+		expect(reactLoads).toBe(2);
+		el.remove();
+		await vi.waitFor(() => {
+			expect(reactDisposable.cleanups).toBe(2);
+		});
+		await flushDispose();
+		await flushDispose();
+		expect(reactDisposable.cleanups).toBe(2);
+		expect(reactLoads).toBe(2);
 	});
 });

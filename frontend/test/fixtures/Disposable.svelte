@@ -10,6 +10,7 @@
 		svelteDisposable.effectRuns += 1;
 		return () => {
 			svelteDisposable.cleaned = true;
+			svelteDisposable.cleanups += 1;
 		};
 	});
 </script>

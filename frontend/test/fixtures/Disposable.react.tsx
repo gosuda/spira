@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 export const reactDisposable = {
 	cleaned: false,
+	cleanups: 0,
 	effectRuns: 0,
 	lastGo: -1,
 	setGo: null as ((value: number) => void) | null,
@@ -9,6 +10,7 @@ export const reactDisposable = {
 
 export function resetReactDisposable(): void {
 	reactDisposable.cleaned = false;
+	reactDisposable.cleanups = 0;
 	reactDisposable.effectRuns = 0;
 	reactDisposable.lastGo = -1;
 	reactDisposable.setGo = null;
@@ -22,6 +24,7 @@ export default function Disposable() {
 		reactDisposable.lastGo = go;
 		return () => {
 			reactDisposable.cleaned = true;
+			reactDisposable.cleanups += 1;
 		};
 	}, [go]);
 	return <span>{`react go ${go}`}</span>;

@@ -62,6 +62,7 @@ describe("island disposal", () => {
 		await sleep(20);
 		expect(span?.textContent).toBe("solid go 0");
 		expect(solidDisposable.effectRuns).toBe(runs);
+		expect(solidDisposable.cleanups).toBe(1);
 	});
 
 	test("removing a React island unmounts its root", async () => {
@@ -86,6 +87,7 @@ describe("island disposal", () => {
 		expect(span?.textContent).toBe("react go 0");
 		expect(reactDisposable.effectRuns).toBe(runs);
 		expect(reactDisposable.lastGo).toBe(0);
+		expect(reactDisposable.cleanups).toBe(1);
 	});
 
 	test("removing a Svelte island unmounts its component", async () => {
@@ -108,5 +110,6 @@ describe("island disposal", () => {
 		await sleep(20);
 		expect(span?.textContent).toBe("svelte go 0");
 		expect(svelteDisposable.effectRuns).toBe(runs);
+		expect(svelteDisposable.cleanups).toBe(1);
 	});
 });
