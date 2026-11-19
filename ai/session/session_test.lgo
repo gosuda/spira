@@ -1440,6 +1440,24 @@ func TestRunRecordsOnceWhenRememberHidesInsideSearch(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events (user+reply), got %d", len(events))
 	}
+
+}
+
+func TestRememberNestedSameSessionRecordsOnce(t *testing.T) {
+	s := &session.Service{}
+	model := &scripted{chat: chatAnswer("Hello!")}
+	client := serveModel(t, model)
+	stacked := session.Remember(s, "a")(session.Remember(s, "b")(session.Remember(s, "a")(client)))
+	if _, err := stacked.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}); err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	if events := eventsOf(t, s, "a"); len(events) != 2 {
+		t.Fatalf("session a holds %d events, want the turn once", len(events))
+	}
+	if events := eventsOf(t, s, "b"); len(events) != 2 {
+		t.Fatalf("session b holds %d events, want the turn once", len(events))
+	}
 }
 
 func TestRememberStreamLateFailureAppendsNothing(t *testing.T) {

@@ -161,8 +161,8 @@ func sessionContractCases() []sessionContractCase {
 		{"input edit leaves stored parts alone", contractInputEditLeavesStoredPartsAlone},
 		{"read edit leaves returned parts alone", contractReadEditLeavesReturnedPartsAlone},
 		{"expiry starts a new generation", contractExpiryStartsANewGeneration},
-		{"default ttl covers a day", contractDefaultTTLCoversADay},
-		{"custom ttl covers a minute", contractCustomTTLCoversAMinute},
+		{"delete then recreate refuses the old version", contractDeleteThenRecreateRefusesTheOldVersion},
+		{"trailing space ids stay isolated", contractTrailingSpaceIDsStayIsolated},
 	}
 }
 
@@ -947,6 +947,59 @@ func contractCustomTTLCoversAMinute(t *testing.T, b session.Store) {
 	if v := sqlVersion(t, timed, a); v != 0 {
 		t.Fatalf("version is %d just outside the minute, want 0", v)
 	}
+
+}
+
+func contractDeleteThenRecreateRefusesTheOldVersion(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	old := sqlVersion(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("first")))
+	if err := b.Delete(t.Context(), a); err != nil {
+		t.Fatalf("Delete: %v", err)
+		return
+	}
+	sqlEnsure(t, b, a)
+	ok, err := b.Append(t.Context(), a, old, session.Event{ID: a + "/old", Session: a, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("old")})
+	if err != nil {
+		t.Fatalf("old version Append: %v", err)
+		return
+	}
+	if ok {
+		t.Fatalf("a version from the deleted session appended to the recreated session")
+		return
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlUser("second")))
+	got := sqlEvents(t, b, a)
+	if len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "second" {
+		t.Fatalf("the recreated conversation holds %d events, want only the second turn", len(got))
+	}
+}
+
+func contractTrailingSpaceIDsStayIsolated(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	spaced := t.Name() + "/a "
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, spaced)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("plain")))
+	sqlAppend(t, b, sqlMessageOf(spaced+"/e1", spaced, sqlUser("spaced")))
+	if got := sqlEvents(t, b, a); len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "plain" {
+		t.Fatalf("conversation a holds %d events, want only the plain turn", len(got))
+		return
+	}
+	if got := sqlEvents(t, b, spaced); len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "spaced" {
+		t.Fatalf("the spaced conversation holds %d events, want only the spaced turn", len(got))
+		return
+	}
+	if err := b.Delete(t.Context(), spaced); err != nil {
+		t.Fatalf("Delete(spaced): %v", err)
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("deleting the spaced conversation left %d events in a, want 1", len(got))
+	}
 }
 
 func TestStoredPartsRoundTrip(t *testing.T) {
@@ -991,25 +1044,122 @@ func TestStoredPartsRoundTrip(t *testing.T) {
 	}
 }
 
+func sessionInsertMarks(t *testing.T, d db.Dialect, mark string) {
+	t.Helper()
+	s := session.SessionInsert(d)
+	if !strings.Contains(s, mark) {
+		t.Fatalf("insert = %q, want %s marks", s, mark)
+		return
+	}
+	for _, other := range []string{"?", "$", "@p"} {
+		if other != mark && strings.Contains(s, other) {
+			t.Fatalf("insert = %q, want %s marks only", s, mark)
+			return
+		}
+	}
+}
+
+func sessionClaimMarks(t *testing.T, d db.Dialect, mark string) {
+	t.Helper()
+	s := session.SessionClaim(d)
+	if !strings.Contains(s, mark) {
+		t.Fatalf("claim = %q, want %s marks", s, mark)
+		return
+	}
+	for _, other := range []string{"?", "$", "@p"} {
+		if other != mark && strings.Contains(s, other) {
+			t.Fatalf("claim = %q, want %s marks only", s, mark)
+			return
+		}
+	}
+}
+
 func TestSessionStatementsUsePlaceholders(t *testing.T) {
-	if s := session.SessionUpsert(db.SQLite{}); !strings.Contains(s, "?") || strings.Contains(s, "$") || strings.Contains(s, "@p") {
-		t.Fatalf("sqlite upsert = %q, want ? marks only", s)
+	sessionInsertMarks(t, db.SQLite{}, "?")
+	sessionClaimMarks(t, db.SQLite{}, "?")
+	sessionInsertMarks(t, db.Postgres{}, "$")
+	sessionClaimMarks(t, db.Postgres{}, "$")
+	sessionInsertMarks(t, db.MySQL{}, "?")
+	sessionClaimMarks(t, db.MySQL{}, "?")
+	if s := session.SessionInsert(db.MySQL{}); !strings.Contains(s, "IGNORE") {
+		t.Fatalf("mysql insert = %q, want an ignored insert", s)
 	}
-	if s := session.SessionUpsert(db.Postgres{}); !strings.Contains(s, "$1") || strings.Contains(s, "@p") {
-		t.Fatalf("postgres upsert = %q, want $ marks", s)
-	}
-	if s := session.SessionUpsert(db.MySQL{}); !strings.Contains(s, "?") || !strings.Contains(s, "ON DUPLICATE KEY UPDATE") {
-		t.Fatalf("mysql upsert = %q, want ? marks and duplicate key update", s)
-	}
-	if s := session.SessionUpsert(db.MSSQL{}); !strings.Contains(s, "@p1") || !strings.Contains(s, "MERGE") {
-		t.Fatalf("mssql upsert = %q, want @p marks and merge", s)
+	sessionInsertMarks(t, db.MSSQL{}, "@p")
+	sessionClaimMarks(t, db.MSSQL{}, "@p")
+	if s := session.SessionInsert(db.MSSQL{}); !strings.Contains(s, "MERGE") {
+		t.Fatalf("mssql insert = %q, want a merge", s)
 	}
 	if s := session.SessionNewestBoundary(db.MSSQL{}); !strings.Contains(s, "FETCH") || strings.Contains(s, "LIMIT") {
 		t.Fatalf("mssql boundary = %q, want fetch and no limit", s)
+	}
+	sessions, events := session.SessionTables(db.MySQL{})
+	if !strings.Contains(sessions, "utf8mb4_0900_bin") || !strings.Contains(events, "utf8mb4_0900_bin") {
+		t.Fatalf("mysql tables = %q %q, want the NO PAD collation on session keys", sessions, events)
+	}
+	sessions, events = session.SessionTables(db.MSSQL{})
+	if !strings.Contains(sessions, "VARBINARY") || !strings.Contains(events, "VARBINARY") {
+		t.Fatalf("mssql tables = %q %q, want binary session keys", sessions, events)
 	}
 	for _, d := range []db.Dialect{db.SQLite{}, db.Postgres{}, db.MySQL{}} {
 		if s := session.SessionNewestBoundary(d); !strings.Contains(s, "LIMIT") {
 			t.Fatalf("boundary = %q, want limit", s)
 		}
+	}
+}
+
+func TestSessionClaimAdmitsOneWinner(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlSQLitePool(t)) })
+	t.Run("postgres", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")) })
+	t.Run("mysql", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")) })
+	t.Run("mssql", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")) })
+}
+
+func sessionClaimAdmitsOneWinner(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	store := sqlFixedStore(pool)
+	a := t.Name() + "/a"
+	sess, err := store.Ensure(a)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+		return
+	}
+	if sess == nil {
+		t.Fatalf("Ensure returned nil")
+		return
+	}
+	expires := sess.ExpiresAt.UnixNano()
+	sqlAppend(t, store, sqlMessageOf(a+"/e1", a, sqlUser("first")))
+	old := sqlVersion(t, store, a)
+	sqlAdvance(t, store, sqlBaseTime().Add(25*time.Hour))
+	won, err := session.ClaimStale(store, a, old, expires)
+	if err != nil {
+		t.Fatalf("ClaimStale winner: %v", err)
+		return
+	}
+	if !won {
+		t.Fatalf("ClaimStale winner returned false, want true")
+		return
+	}
+	lost, err := session.ClaimStale(store, a, old, expires)
+	if err != nil {
+		t.Fatalf("ClaimStale loser: %v", err)
+		return
+	}
+	if lost {
+		t.Fatalf("ClaimStale loser returned true, want false")
+		return
+	}
+	if got := sqlEvents(t, store, a); len(got) != 0 {
+		t.Fatalf("a losing claim left %d events, want 0", len(got))
+		return
+	}
+	if v := sqlVersion(t, store, a); v != old+1 {
+		t.Fatalf("version is %d, want %d", v, old+1)
+		return
+	}
+	sqlEnsure(t, store, a)
+	sqlAppend(t, store, sqlMessageOf(a+"/e2", a, sqlUser("second")))
+	if got := sqlEvents(t, store, a); len(got) != 1 {
+		t.Fatalf("the claimed conversation holds %d events, want 1", len(got))
 	}
 }

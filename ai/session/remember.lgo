@@ -32,14 +32,23 @@ type guardVal struct {
 	id string
 }
 func guarded(ctx context.Context, svc *Service, id string) bool {
-	v, ok := ctx.Value(guardKey{}).(guardVal)
+	vals, ok := ctx.Value(guardKey{}).([]guardVal)
 	if !ok {
 		return false
 	}
-	return v.svc == svc && v.id == id
+	for _, v := range vals {
+		if v.svc == svc && v.id == id {
+			return true
+		}
+	}
+	return false
 }
 func withGuard(ctx context.Context, svc *Service, id string) context.Context {
-	return context.WithValue(ctx, guardKey{}, guardVal{svc: svc, id: id})
+	vals, _ := ctx.Value(guardKey{}).([]guardVal)
+	next := make([]guardVal, 0, len(vals)+1)
+	next = append(next, vals...)
+	next = append(next, guardVal{svc: svc, id: id})
+	return context.WithValue(ctx, guardKey{}, next)
 }
 
 func Remember(s *Service, id string) ai.Layer {

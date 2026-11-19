@@ -121,7 +121,7 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `Remember` MUST store the call message again when the request resumes it but the log lacks it.
 - `History` MUST keep a stored call answerable to its result in true log order, not adjacent.
 - `Service.Run` MUST take the unwrapped model in `Turn.Model`.
-- `Service.Run` MUST refuse a `Turn.Model` that `Remember` or `Run` already wrapped.
+- `Service.Run` MUST refuse a `Turn.Model` that is directly a `Remember` or `Run` wrapper.
 - `Service.Run` MUST record every `ai.Run` turn that carries a direct tool, including a confirm resume.
 - `Remember` MUST append the turn after an append that another call made during the call.
 - `Remember` MUST append the turn to a new session when the session expires during the call.
@@ -178,6 +178,10 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `SQLStore` MUST expire a session after 24 hours by default.
 - `SQLStore` MUST keep a session just inside its TTL.
 - `SQLStore` MUST honor a set TTL.
+- Ids that differ only by a trailing space MUST name different conversations.
+- `Ensure` MUST claim a missing or expired session in one atomic step.
+- A claim that loses to another opener MUST return the live session and write nothing.
+- Session keys MUST treat trailing spaces as significant on every engine.
 
 ## Errors
 
@@ -253,7 +257,7 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `contractStaleVersionLoses` proves a stale version loses on every store.
 - `contractCompactShapesTheActiveView` proves compaction shapes the active view on every store.
 - `TestStoredPartsRoundTrip` proves every part kind, nil parts, the unknown kind and broken JSON.
-- `TestSessionStatementsUsePlaceholders` proves the per-dialect placeholders and limits.
+- `TestSessionStatementsUsePlaceholders` proves the per-dialect placeholders, limits and key comparisons.
 - `contractBlankIDIsRejected` proves the blank id error on every store.
 - `contractAppendValidationsRejectBadBatches` proves the three bad batches on every store.
 - `contractLastNMustBePositive` proves the count guard on every store.
@@ -265,6 +269,10 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `contractReadEditLeavesReturnedPartsAlone` proves read edits stay out on every store.
 - `contractDefaultTTLCoversADay` proves the 24 hour boundary on every store.
 - `contractCustomTTLCoversAMinute` proves a set TTL on every store.
+- `contractTrailingSpaceIDsStayIsolated` proves trailing-space isolation on every store.
+- `contractDeleteThenRecreateRefusesTheOldVersion` proves a deleted version stays dead on every store.
+- `TestSessionClaimAdmitsOneWinner` proves one claim wins on every engine.
+- `TestRememberNestedSameSessionRecordsOnce` proves nested layers record once.
 
 ## Not in scope
 

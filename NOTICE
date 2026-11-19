@@ -50,6 +50,12 @@ Translated units:
   advisors/spring-ai-session-advisor/src/main/java/org/springframework/ai/session/advisor/PromptHistory.java.
 - ai/session/remember.lgo, from
   advisors/spring-ai-session-advisor/src/main/java/org/springframework/ai/session/advisor/PromptHistoryAdvisor.java.
+- ai/session/sql.lgo, from
+  session-repositories/spring-ai-session-jdbc/src/main/java/org/springframework/ai/session/jdbc/JdbcSessionRepository.java,
+  JdbcSessionRepositoryDialect.java, PostgresJdbcSessionRepositoryDialect.java,
+  MysqlJdbcSessionRepositoryDialect.java, SqlServerJdbcSessionRepositoryDialect.java,
+  H2JdbcSessionRepositoryDialect.java and src/main/resources/org/springframework/ai/session/jdbc/schema-postgresql.sql,
+  schema-mysql.sql, schema-sqlserver.sql, schema-h2.sql.
 - ai/session/session_test.lgo, from
   spring-ai-session/src/test/java/org/springframework/ai/session/SessionMemoryTests.java,
   EventFilterTests.java, PromptHistoryTests.java and

@@ -1,7 +1,53 @@
 package session
 
+import (
+	"context"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/db"
+)
+
 func StoredSessions(s *Service) int {
 	count := 0
 	s.store.WithLock(func(m *memory) { count = len(m.logs) })
 	return count
+}
+
+func EncodeStoredMessage(m ai.Message) (string, error) {
+	return encodeMessage(m)
+}
+
+func DecodeStoredMessage(role string, raw string) (ai.Message?, error) {
+	return decodeMessage(role, raw)
+}
+
+func SessionInsert(d db.Dialect) string {
+	return stmtsFor(d).insertNew
+}
+
+func SessionClaim(d db.Dialect) string {
+	return stmtsFor(d).claim
+}
+
+func SessionNewestBoundary(d db.Dialect) string {
+	return stmtsFor(d).newestBoundary
+}
+
+func SessionTables(d db.Dialect) (string, string) {
+	stmts := stmtsFor(d)
+	return stmts.createSessions, stmts.createEvents
+}
+
+func ClaimStale(s *SQLStore, id string, oldVersion int64, oldExpires int64) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sqlOpTimeout)
+	defer cancel()
+	at := s.now()
+	return db.InTx[bool](ctx, s.Pool, func(tx *db.Tx) (bool, error) {
+		w := sessionTx{ctx: ctx, tx: tx, stmts: stmtsFor(s.Pool.Dialect()), id: id}
+		res, err := w.claimStale(at.UnixNano(), at.Add(s.ttl()).UnixNano(), sessionRow{Version: oldVersion, Expires: oldExpires})
+		if err != nil {
+			return false, err
+		}
+		return !res.retry, nil
+	})
 }
