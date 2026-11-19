@@ -57,8 +57,7 @@ func failureOf(reply httpReply) error {
 	}
 	payload, readErr := io.ReadAll(reply.body)
 	if readErr != nil {
-		fault := statusError(reply.status, payload)
-		joined := fmt.Errorf("%w: body read ended early: %w", fault, readErr)
+		joined := cutError(reply.status, payload, readErr)
 		if closeErr := closeBody(reply.body); closeErr != nil {
 			return errors.Join(joined, closeErr)
 		}
@@ -68,6 +67,26 @@ func failureOf(reply httpReply) error {
 		return errors.Join(statusError(reply.status, payload), closeErr)
 	}
 	return statusError(reply.status, payload)
+}
+
+func cutError(status int, payload []byte, readErr error) error {
+	if rpc := rpcErrorOf(payload); rpc != nil {
+		fault := fmt.Errorf("mcp: http status %d: %w", status, rpc)
+		return fmt.Errorf("%w: body read ended early: %w", fault, readErr)
+	}
+	fault := statusError(status, payload)
+	return fmt.Errorf("%w: body read ended early: %w", fault, readErr)
+}
+
+func rpcErrorOf(payload []byte) error {
+	reply, err := decodeEnvelope(payload)
+	if err != nil {
+		return nil
+	}
+	if e := reply.Error; e != nil {
+		return e
+	}
+	return nil
 }
 
 func decodeReply(ctx context.Context, msg Envelope, media string, body io.ReadCloser) (Envelope, error) {

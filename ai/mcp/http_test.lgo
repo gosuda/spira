@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -348,4 +349,95 @@ func TestHTTPNotifyKeepsTheStatusOfACutBody(t *testing.T) {
 	if transport.calls != 1 {
 		t.Fatalf("transport saw %d calls, want 1", transport.calls)
 	}
+}
+
+type jsonCutReader struct {
+	data []byte
+	cut  error
+}
+
+func (r *jsonCutReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.cut
+	}
+	n := min(len(p), len(r.data))
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.cut
+	}
+	return n, nil
+}
+
+func (r *jsonCutReader) Close() error {
+	return nil
+}
+
+type jsonCutTransport struct {
+	calls int
+	body  string
+	cut   error
+}
+
+func (t *jsonCutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls++
+	return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: &jsonCutReader{data: []byte(t.body), cut: t.cut}}, nil
+}
+
+func checkCutJSONRPCError(t *testing.T, err error, calls int) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("err = nil, want the 400 cut reply")
+		return
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Fatalf("err = %v, want the HTTP 400 status", err)
+		return
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+		return
+	}
+	rpcErr := &mcp.RPCError{}
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("err = %v, want the RPC error", err)
+		return
+	}
+	if rpcErr.Code != -32600 {
+		t.Fatalf("code = %d, want -32600", rpcErr.Code)
+		return
+	}
+	if calls != 1 {
+		t.Fatalf("transport saw %d calls, want 1", calls)
+	}
+}
+
+func TestHTTPKeepsStatusOnCutJSONRPCError(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}`
+	requestTransport := &jsonCutTransport{body: body, cut: io.ErrUnexpectedEOF}
+	c := mcp.NewClient(mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: requestTransport}))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	_, err := c.Call(context.Background(), "get_weather", "{}")
+	if err == nil {
+		t.Fatalf("request err = nil, want the 400 cut reply")
+		return
+	}
+	checkCutJSONRPCError(t, err, requestTransport.calls)
+	notifyTransport := &jsonCutTransport{body: body, cut: io.ErrUnexpectedEOF}
+	inner := mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: notifyTransport})
+	defer func() {
+		if err := inner.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	notifyErr := inner.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/initialized"})
+	if notifyErr == nil {
+		t.Fatalf("notify err = nil, want the 400 cut reply")
+		return
+	}
+	checkCutJSONRPCError(t, notifyErr, notifyTransport.calls)
 }

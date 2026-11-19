@@ -136,6 +136,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - A stdio line held past a deadline MUST fit in 4 MiB; beyond that later sends MUST fail without writing.
 - Deadline setup that answers `os.ErrNoDeadline` MUST fall back to blocking I/O.
 - A failing HTTP status with a cut body MUST keep the status with the read cause.
+- A failing HTTP status with a cut RPC error body MUST keep the status, the read cause and the error.
 - A stdio line over 4 MiB cut by a read error MUST report the size limit and poison the transport.
 
 ## Errors
@@ -175,6 +176,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountClientServer` covers initialize, list and call.
 - `TestHTTPRequestKeepsTheStatusOfACutBody` proves the kept status and the read cause.
 - `TestHTTPNotifyKeepsTheStatusOfACutBody` proves the kept status and the read cause.
+- `TestHTTPKeepsStatusOnCutJSONRPCError` proves the kept status, the read cause and the RPC error.
 - `TestStdioOverlongLineWithReadErrorPoisonsTransport` proves the over-limit report and the unusable transport.
 
 ## Not in scope
