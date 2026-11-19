@@ -24,6 +24,7 @@ import (
 
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/fault"
 	"github.com/gosuda/spira/resilience"
 )
 
@@ -423,10 +424,35 @@ func TestCutStreamYieldsErrorChunkAndNoReply(t *testing.T) {
 	if !errors.Is(err, openai.ErrProviderStreamCut) {
 		t.Fatalf("error: %v", err)
 	}
+	if got := fault.Public(err).Code; got != openai.ErrProviderStreamCut.Code {
+		t.Fatalf("public code = %s, want the stream cut fault, not a provider error wrap", got)
+	}
 	if _, cerr := ai.Collect(c.Stream(context.Background(), ai.Request{
 		Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Say hello"}}}},
 	})); cerr == nil {
 		t.Fatal("collect over a cut stream returned no error")
+	}
+}
+
+const sseErrorEvent = `data: {"error":{"message":"The server is overloaded","type":"server_error"}}
+
+data: [DONE]
+
+`
+
+func TestStreamErrorEventYieldsStreamCut(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", sseErrorEvent)
+	c := testClient(srv)
+	_, err := gather(c.Stream(context.Background(), askHello()))
+	if err == nil || !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("error = %v, want the stream cut fault for the error event", err)
+	}
+	if status, errType, length, ok := openai.FaultDetail(err); !ok || status != 200 || errType != "server_error" || length != len("The server is overloaded") {
+		t.Fatalf("detail = %d %q %d, want the parsed error type and the message length", status, errType, length)
+	}
+	if _, cerr := ai.Collect(c.Stream(context.Background(), askHello())); cerr == nil {
+		t.Fatal("collect over an error event returned no error and no reply")
 	}
 }
 

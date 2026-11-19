@@ -107,10 +107,16 @@ type wireCallFunction struct {
 }
 
 type wireChunk struct {
-	ID      string      `json:"id"`
-	Model   string      `json:"model"`
-	Choices []wireDelta `json:"choices"`
-	Usage   *wireUsage? `json:"usage"`
+	ID      string            `json:"id"`
+	Model   string            `json:"model"`
+	Choices []wireDelta       `json:"choices"`
+	Usage   *wireUsage?       `json:"usage"`
+	Error   *wireStreamError? `json:"error"`
+}
+
+type wireStreamError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 type wireDelta struct {
