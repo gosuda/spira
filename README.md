@@ -223,7 +223,7 @@ just gate     # build lint test web
 just eject    # logos eject to /tmp/spira-eject, then upstream go build
 ```
 
-`just engines` runs the engine-tagged tests against digest-pinned PostgreSQL, MySQL and SQL Server containers through `scripts/engines.sh`; it requires Docker. `logos.toml` forbids cgo, and the test recipe keeps `-race`.
+`just engines` runs the `TestEngine*` tests, selected with `-run Engine` and skipped without their DSN, against digest-pinned PostgreSQL, MySQL and SQL Server containers through `scripts/engines.sh`; it requires Docker. `logos.toml` forbids cgo, and the test recipe keeps `-race`.
 
 ### Contributing
 
