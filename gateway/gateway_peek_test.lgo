@@ -1,0 +1,63 @@
+package gateway_test
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/gateway"
+)
+
+func TestPeekEmptyFailsClosedOnStalledBody(t *testing.T) {
+	sctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	preq := httptest.NewRequest(http.MethodPost, "http://example.com/shop/order", stalledBody{ctx: sctx})
+	empty, body, expired := gateway.PeekEmptyForTest(preq, 200*time.Millisecond)
+	if expired == nil {
+		t.Fatalf("stalled body of unknown length must expire the empty-proof wait")
+		return
+	}
+	if empty {
+		t.Fatalf("stalled body must not prove empty")
+		return
+	}
+	if body != nil {
+		cerr := body.Close()
+		t.Fatalf("an expired wait must not hand back a body that may hold a late byte (close %v)", cerr)
+		return
+	}
+}
+
+func TestPeekEmptyPushesBackReadyByte(t *testing.T) {
+	preq := httptest.NewRequest(http.MethodPost, "http://example.com/shop/order", &streamChunks{rest: []byte("x"), step: 1})
+	preq.ContentLength = -1
+	if preq.Body == nil {
+		t.Fatal("fixture needs a body")
+		return
+	}
+	empty, body, expired := gateway.PeekEmptyForTest(preq, 2*time.Second)
+	if expired != nil {
+		t.Fatalf("ready body must not expire the wait: %v", expired)
+		return
+	}
+	if empty {
+		t.Fatalf("nonempty body must not prove empty")
+		return
+	}
+	kept, rerr := io.ReadAll(body)
+	if rerr != nil {
+		t.Fatal(rerr)
+		return
+	}
+	if cerr := body.Close(); cerr != nil {
+		t.Fatal(cerr)
+		return
+	}
+	if string(kept) != "x" {
+		t.Fatalf("pushed-back body holds %q want %q", kept, "x")
+		return
+	}
+}

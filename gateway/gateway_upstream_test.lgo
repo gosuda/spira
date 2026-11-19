@@ -689,3 +689,97 @@ func TestClientCancelNeverReportsAHeaderTimeout(t *testing.T) {
 		t.Fatalf("log %q reports a header timeout for a canceled client", line)
 	}
 }
+
+// streamChunks is a request body of unknown length: it offers no size up
+// front, so the relay must prove emptiness by reading instead of trusting a
+// header.
+type streamChunks struct {
+	rest  []byte
+	step  int
+	lag   time.Duration
+	slept bool
+}
+
+func (c *streamChunks) Read(p []byte) (int, error) {
+	if !c.slept {
+		c.slept = true
+		if c.lag > 0 {
+			time.Sleep(c.lag)
+		}
+	}
+	if len(c.rest) == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if c.step < n {
+		n = c.step
+	}
+	if len(c.rest) < n {
+		n = len(c.rest)
+	}
+	copy(p, c.rest[:n])
+	c.rest = c.rest[n:]
+	return n, nil
+}
+
+// stalledBody never yields a byte until its context ends. It proves that the
+// relay bounds the empty-proof wait instead of hanging on a stalled stream.
+type stalledBody struct {
+	ctx context.Context
+}
+
+func (b stalledBody) Read(_ []byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func TestUnknownLengthEmptyBodyFailsOver(t *testing.T) {
+	grd := newRequestGuard(t)
+	hc := grd.httpClient(t)
+	dead := deadUpstream(t)
+	var hits atomic.Int64
+	live := countingUpstream(t, grd, &hits)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{dead, live.URL}}}, plainPolicy())
+	resp, err := hc.Post(gw.URL+"/shop/order", "text/plain", &streamChunks{rest: []byte{}, step: 1})
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200 through the live upstream: an empty body of unknown length replays", resp.StatusCode)
+		return
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("the live upstream saw %d requests, want 1\n%s", hits.Load(), grd.report())
+		return
+	}
+}
+
+func TestUnknownLengthNonemptyBodyIsPreserved(t *testing.T) {
+	grd := newRequestGuard(t)
+	hc := grd.httpClient(t)
+	notes := make(chan upstreamNote, 16)
+	live := echoUpstream(t, grd, notes)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{live.URL}}}, plainPolicy())
+	resp, err := hc.Post(gw.URL+"/shop/order", "text/plain", &streamChunks{rest: []byte("hello-stream"), step: 2})
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200", resp.StatusCode)
+		return
+	}
+	select {
+	case note := <-notes:
+		if note.Body != "hello-stream" {
+			t.Fatalf("upstream saw body %q want %q: the pushed-back byte was lost", note.Body, "hello-stream")
+			return
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upstream never saw the request")
+		return
+	}
+}
