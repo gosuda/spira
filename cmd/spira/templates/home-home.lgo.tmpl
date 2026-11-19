@@ -1,0 +1,25 @@
+package home
+
+import (
+	"github.com/gosuda/spira/validate"
+	"github.com/gosuda/spira/web"
+)
+
+func Mount(r *web.Router) {
+	r.Handle("GET", "/{$}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Page{Title: "Home", Body: page()}, nil
+	})
+	web.Route(r, "POST", "/hello", func(ctx *web.Context, in HelloForm) (web.Reply, error) {
+		return web.Fragment{Body: greeting(in.Name)}, nil
+	})
+}
+
+type HelloForm struct {
+	Name string `form:"name"`
+}
+
+func (f HelloForm) Check() validate.Errors {
+	var errs validate.Errors
+	errs.Require(f.Name != "", "name", "required", "Enter a name.")
+	return errs
+}

@@ -1,0 +1,30 @@
+package home
+
+import (
+	"github.com/gosuda/spira/view"
+)
+
+func page() view.Node {
+	return view.Main(
+		view.H1(view.T("Hello")),
+		greetingForm(),
+		&view.Island{Entry: "features/home/islands/greet.svelte", Props: map[string]string{"name": "Demo"}, When: "visible", Fallback: view.P(view.T("Loading greeting."))},
+	)
+}
+
+func greetingForm() view.Node {
+	return view.Form(
+		view.Attr("method", "post"),
+		view.Attr("action", "/hello"),
+		view.Hx("post", "/hello"),
+		view.Hx("target", "#greeting"),
+		view.Hx("swap", "outerHTML"),
+		view.Label(view.Attr("for", "name"), view.T("Name")),
+		view.Input(view.Attr("type", "text"), view.Attr("id", "name"), view.Attr("name", "name")),
+		view.Button(view.Attr("type", "submit"), view.T("Greet")),
+	)
+}
+
+func greeting(name string) view.Node {
+	return view.P(view.Attr("id", "greeting"), view.T("Hello, "+name+"."))
+}

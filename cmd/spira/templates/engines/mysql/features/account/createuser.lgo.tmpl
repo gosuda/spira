@@ -1,0 +1,14 @@
+package account
+
+import (
+	"context"
+
+	"github.com/gosuda/spira/db"
+
+	"{{MODULE}}/db/store"
+)
+
+func CreateUser(ctx context.Context, q db.Querier, name string, hash string) (store.UserID, error) {
+	id := store.CreateUser(ctx, q, name, hash)?
+	return store.UserID(id), nil
+}
