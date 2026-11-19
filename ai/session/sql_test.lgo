@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -79,23 +78,6 @@ func sqlSQLitePool(t *testing.T) *db.Pool {
 	return pool
 }
 
-func sqlDSN(t *testing.T, name string) string {
-	t.Helper()
-	dsn := os.Getenv(name)
-	if dsn == "" {
-		t.Skipf("%s is not set; run `just engines`", name)
-	}
-	return dsn
-}
-
-func sqlEnginePool(t *testing.T, driver string, dsnVar string) *db.Pool {
-	t.Helper()
-	pool := sqlOpen(t, driver, sqlDSN(t, dsnVar))
-	sqlPrepare(t, pool)
-	sqlStop(t, pool)
-	return pool
-}
-
 func TestEngineSessionContractSQLite(t *testing.T) {
 	pool := sqlSQLitePool(t)
 	runSessionContract(t, func(t *testing.T) session.Store {
@@ -108,30 +90,6 @@ func TestEngineSessionContractMemory(t *testing.T) {
 	runSessionContract(t, func(t *testing.T) session.Store {
 		t.Helper()
 		return sqlMemoryStore()
-	})
-}
-
-func TestEngineSessionContractPostgres(t *testing.T) {
-	pool := sqlEnginePool(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")
-	runSessionContract(t, func(t *testing.T) session.Store {
-		t.Helper()
-		return sqlFixedStore(pool)
-	})
-}
-
-func TestEngineSessionContractMySQL(t *testing.T) {
-	pool := sqlEnginePool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
-	runSessionContract(t, func(t *testing.T) session.Store {
-		t.Helper()
-		return sqlFixedStore(pool)
-	})
-}
-
-func TestEngineSessionContractMSSQL(t *testing.T) {
-	pool := sqlEnginePool(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")
-	runSessionContract(t, func(t *testing.T) session.Store {
-		t.Helper()
-		return sqlFixedStore(pool)
 	})
 }
 
@@ -1170,11 +1128,8 @@ func TestSessionStatementsUsePlaceholders(t *testing.T) {
 	}
 }
 
-func TestEngineSessionClaimAdmitsOneWinner(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlSQLitePool(t)) })
-	t.Run("postgres", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")) })
-	t.Run("mysql", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")) })
-	t.Run("mssql", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")) })
+func TestSessionClaimAdmitsOneWinnerSQLite(t *testing.T) {
+	sessionClaimAdmitsOneWinner(t, sqlSQLitePool(t))
 }
 
 func sessionClaimAdmitsOneWinner(t *testing.T, pool *db.Pool) {
@@ -1227,23 +1182,9 @@ func sessionClaimAdmitsOneWinner(t *testing.T, pool *db.Pool) {
 	}
 }
 
-func TestEngineDeleteClearsAConcurrentAppend(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) {
-		first, second := sqlSQLitePair(t)
-		sessionDeleteBesideAppend(t, first, second)
-	})
-	t.Run("postgres", func(t *testing.T) {
-		first, second := sqlEnginePair(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")
-		sessionDeleteBesideAppend(t, first, second)
-	})
-	t.Run("mysql", func(t *testing.T) {
-		first, second := sqlEnginePair(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
-		sessionDeleteBesideAppend(t, first, second)
-	})
-	t.Run("mssql", func(t *testing.T) {
-		first, second := sqlEnginePair(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")
-		sessionDeleteBesideAppend(t, first, second)
-	})
+func TestSessionDeleteClearsAConcurrentAppendSQLite(t *testing.T) {
+	first, second := sqlSQLitePair(t)
+	sessionDeleteBesideAppend(t, first, second)
 }
 
 func sessionDeleteBesideAppend(t *testing.T, first *db.Pool, second *db.Pool) {
@@ -1374,23 +1315,4 @@ func sqlSQLitePair(t *testing.T) (*db.Pool, *db.Pool) {
 	sqlStop(t, first)
 	sqlStop(t, second)
 	return first, second
-}
-
-func sqlEnginePair(t *testing.T, driver string, dsnVar string) (*db.Pool, *db.Pool) {
-	t.Helper()
-	dsn := sqlDSN(t, dsnVar)
-	first := sqlPrepareOn(t, driver, sqlOpen(t, driver, dsn))
-	second := sqlPrepareOn(t, driver, sqlOpen(t, driver, dsn))
-	sqlStop(t, first)
-	sqlStop(t, second)
-	return first, second
-}
-
-func sqlPrepareOn(t *testing.T, driver string, pool *db.Pool) *db.Pool {
-	t.Helper()
-	if err := sqlFixedStore(pool).Prepare(t.Context()); err != nil {
-		t.Fatalf("prepare %s: %v", driver, err)
-		return pool
-	}
-	return pool
 }

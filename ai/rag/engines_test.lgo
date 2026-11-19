@@ -1,0 +1,257 @@
+//go:build engines
+
+package rag_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/db"
+)
+
+func pgPool(t *testing.T, dsn string) *db.Pool {
+	t.Helper()
+	pool, err := db.Open("pgx", dsn)
+	if err != nil {
+		panic(fmt.Sprintf("pg_test: db.Open: %v", err))
+	}
+	if pool == nil {
+		panic("pg_test: db.Open returned no pool")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		panic(fmt.Sprintf("pg_test: pool.Start: %v", err))
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("pool.Stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func pgDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv("SPIRA_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatalf("SPIRA_TEST_POSTGRES_DSN is empty; run `just engines`")
+		return ""
+	}
+	return dsn
+}
+
+type pgConfig struct {
+	pool    *db.Pool
+	table   string
+	vectors map[string][]float32
+}
+
+func pgNew(t *testing.T, ctx context.Context, config pgConfig) *rag.Pgvector {
+	t.Helper()
+	store, err := rag.NewPgvector(config.pool, pgEmbed(t, config.vectors), config.table, 3)
+	if err != nil {
+		panic(fmt.Sprintf("pg_test: NewPgvector: %v", err))
+	}
+	if store == nil {
+		panic("pg_test: NewPgvector returned no store")
+	}
+	if err := store.Setup(ctx); err != nil {
+		panic(fmt.Sprintf("pg_test: Setup: %v", err))
+	}
+	return store
+}
+
+func TestEnginePgvectorFilterAgreement(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	vectors := pgVectors()
+	pg := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_agree", vectors: vectors})
+	drama := agreeDramaDocs()
+	cases := agreeEqCases(drama)
+	cases = append(cases, agreeLogicCases(drama)...)
+	cases = append(cases, agreeEmptyCases(drama)...)
+	cases = append(cases, agreeAbsentCases(drama)...)
+	cases = append(cases, agreeExactCases()...)
+	sweep := []string{"a", "b", "c", "n1", "n2", "n3", "e1", "t1", "f1", "k1", "h1", "m1"}
+	for _, c := range cases {
+		runAgreement(t, ctx, agreeStores{pg: pg, vectors: vectors}, c)
+		if err := pg.Delete(ctx, sweep); err != nil {
+			t.Fatalf("cleanup after %s: %v", c.name, err)
+			return
+		}
+	}
+}
+
+func TestEnginePgvectorSetupIsIdempotentAndRoundTrips(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store, err := rag.NewPgvector(pool, pgEmbed(t, orderVectors), "pg_roundtrip", 3)
+	if err != nil {
+		t.Fatalf("NewPgvector: %v", err)
+		return
+	}
+	if store == nil {
+		t.Fatalf("NewPgvector returned no store")
+		return
+	}
+	if err := store.Setup(ctx); err != nil {
+		t.Fatalf("Setup: %v", err)
+		return
+	}
+	if err := store.Setup(ctx); err != nil {
+		t.Fatalf("second Setup: %v", err)
+		return
+	}
+	empty, err := store.Search(ctx, rag.Search{Query: "q"})
+	if err != nil {
+		t.Fatalf("Search of an empty store: %v", err)
+		return
+	}
+	if len(empty) != 0 {
+		t.Fatalf("an empty store gave %v", ids(empty))
+		return
+	}
+	checkPgvectorOrder(t, ctx, store)
+	top, err := store.Search(ctx, rag.Search{Query: "q"})
+	if err != nil {
+		t.Fatalf("default TopK search: %v", err)
+		return
+	}
+	if got, want := ids(top), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
+		t.Errorf("default TopK = %v, want %v", got, want)
+	}
+	half, err := store.Search(ctx, rag.Search{Query: "q", TopK: 6, Threshold: 0.5})
+	if err != nil {
+		t.Fatalf("threshold search: %v", err)
+		return
+	}
+	if got, want := ids(half), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
+		t.Errorf("threshold 0.5 = %v, want %v", got, want)
+	}
+}
+
+func TestEnginePgvectorReplaceAndDelete(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_replace", vectors: pgVectors()})
+	first := rag.Document{ID: "m1", Text: "alpha", Metadata: map[string]rag.Value{"s": txt("BG"), "n": num(2.5), "b": flag(true)}}
+	if err := store.Add(ctx, []rag.Document{first}); err != nil {
+		t.Fatalf("Add: %v", err)
+		return
+	}
+	docs, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+		return
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Search gave %d documents, want 1", len(docs))
+		return
+	}
+	if got := docs[0].Text; got != "alpha" {
+		t.Errorf("text = %q, want alpha", got)
+	}
+	if got := fmt.Sprint(docs[0].Metadata); got != "map[b:{true} n:{2.5} s:{BG}]" {
+		t.Errorf("metadata = %s, want the stored values", got)
+	}
+	second := rag.Document{ID: "m1", Text: "delta", Metadata: map[string]rag.Value{"s": txt("NL")}}
+	if err := store.Add(ctx, []rag.Document{second}); err != nil {
+		t.Fatalf("Add of a stored id: %v", err)
+		return
+	}
+	var via rag.Store = store
+	after, err := via.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search through Store: %v", err)
+		return
+	}
+	if len(after) != 1 || after[0].Text != "delta" {
+		t.Fatalf("after a replaced id: %v, want the new text", ids(after))
+		return
+	}
+	if err := store.Delete(ctx, []string{"m1", "missing"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+		return
+	}
+	gone, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search after Delete: %v", err)
+		return
+	}
+	if len(gone) != 0 {
+		t.Errorf("after Delete: %v, want no document", ids(gone))
+	}
+}
+
+func TestEnginePgvectorHostileValueLeavesTheTable(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_hostile", vectors: pgVectors()})
+	hostile := "'; DROP TABLE x; --"
+	docs := []rag.Document{
+		{ID: "h1", Text: "alpha", Metadata: map[string]rag.Value{"k": txt("safe")}},
+		{ID: "h2", Text: "bravo", Metadata: map[string]rag.Value{"k": txt("other")}},
+		{ID: "h3", Text: "charlie", Metadata: map[string]rag.Value{hostile: txt("v")}},
+	}
+	if err := store.Add(ctx, docs); err != nil {
+		t.Fatalf("Add: %v", err)
+		return
+	}
+	attack := rag.Expression{Type: rag.OpEq, Left: rag.Key{Name: "k"}, Right: rag.Filter(rag.Const{Text: hostile})}
+	none, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10, Filter: rag.Filter(attack)})
+	if err != nil {
+		t.Fatalf("Search of the hostile value: %v", err)
+		return
+	}
+	if len(none) != 0 {
+		t.Errorf("the hostile value matched %v, want no row", ids(none))
+	}
+	keyed := rag.Expression{Type: rag.OpEq, Left: rag.Key{Name: hostile}, Right: rag.Filter(rag.Const{Text: "v"})}
+	found, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10, Filter: rag.Filter(keyed)})
+	if err != nil {
+		t.Fatalf("Search of the hostile key: %v", err)
+		return
+	}
+	if got := ids(found); !slices.Equal(got, []string{"h3"}) {
+		t.Errorf("the hostile key matched %v, want [h3]", got)
+	}
+	kept, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search after the hostile filters: %v", err)
+		return
+	}
+	if got, want := ids(kept), []string{"h1", "h2", "h3"}; !slices.Equal(got, want) {
+		t.Errorf("after the hostile filters: %v, want %v", got, want)
+	}
+}
+
+func TestEnginePgvectorRefusesDimensionMismatch(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_dims", vectors: pgVectors()})
+	if err := store.Add(ctx, []rag.Document{{ID: "d", Text: "two"}}); err == nil || !strings.Contains(err.Error(), "the store holds 3") {
+		t.Errorf("Add error = %v, want the dimensions of the store", err)
+	}
+	kept, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+		return
+	}
+	if len(kept) != 0 {
+		t.Errorf("the refused batch left %v", ids(kept))
+	}
+	if _, err := store.Search(ctx, rag.Search{Query: "two"}); err == nil || !strings.Contains(err.Error(), "the store holds 3") {
+		t.Errorf("Search error = %v, want the dimensions of the store", err)
+	}
+}
