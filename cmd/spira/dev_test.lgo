@@ -198,15 +198,15 @@ func await(ctx context.Context, what string, budget time.Duration, probe func() 
 
 func backstop(t *testing.T) time.Duration {
 	t.Helper()
-	deadline, ok := t.Deadline()
-	if !ok {
-		return 2 * time.Minute
+	if deadline, ok := t.Deadline(); ok {
+		if budget := time.Until(deadline) - 10*time.Second; budget < 30*time.Second {
+			if budget < 5*time.Second {
+				return 5 * time.Second
+			}
+			return budget
+		}
 	}
-	budget := time.Until(deadline) - 30*time.Second
-	if budget < 10*time.Second {
-		return 10 * time.Second
-	}
-	return budget
+	return 30 * time.Second
 }
 
 func settle(ctx context.Context, label string, interval time.Duration, bad func() bool) error {
@@ -501,7 +501,7 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		serverEnv, err := waitForStarts(sctx, started)
+		serverEnv, err := waitForStarts(sctx, started, backstop(t))
 		if err != nil {
 			return err
 		}
@@ -517,10 +517,12 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	}
 }
 
-func waitForStarts(ctx context.Context, started <-chan spira.Start) ([]string, error) {
+func waitForStarts(ctx context.Context, started <-chan spira.Start, budget time.Duration) ([]string, error) {
 	sawServer := false
 	sawFrontend := false
 	serverEnv := []string{}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
 	for !sawServer || !sawFrontend {
 		select {
 		case ev := <-started:
@@ -533,6 +535,8 @@ func waitForStarts(ctx context.Context, started <-chan spira.Start) ([]string, e
 			}
 		case <-ctx.Done():
 			return nil, fmt.Errorf("cmd/spira test: cancelled while waiting for server and frontend start")
+		case <-timer.C:
+			return nil, fmt.Errorf("cmd/spira test: backstop expired waiting for server and frontend start")
 		}
 	}
 	return serverEnv, nil
