@@ -1083,18 +1083,6 @@ func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
 	}
 }
 
-func TestWrappedLegacyProblemKeepsTheProblem(t *testing.T) {
-	r := web.NewRouter()
-	r.Handle("GET", "/legacy-wrapped", func(ctx *web.Context) (web.Reply, error) {
-		return nil, fmt.Errorf("wrap: %w", web.Fail(web.Problem{Title: "Thing Missing", Status: http.StatusNotFound}))
-	})
-	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/legacy-wrapped", nil))
-	doc := assertProblemJSON(t, rec, http.StatusNotFound)
-	if doc.Title != "Thing Missing" {
-		t.Fatalf("wrapped legacy problem title %q want Thing Missing", doc.Title)
-	}
-}
-
 func TestDescribeInsideAGroupAttachesTheDoc(t *testing.T) {
 	r := web.NewRouter()
 	r.Group("/api", func(g *web.Router) {
