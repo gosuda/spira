@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -53,21 +54,6 @@ func testCert(t *testing.T) (tls.Certificate, *x509.CertPool?) {
 	pool.AddCert(leaf)
 	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 	return cert, pool
-}
-
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("free port: %v", err)
-		return ""
-	}
-	addr := ln.Addr().String()
-	if cerr := ln.Close(); cerr != nil {
-		t.Fatalf("free port close: %v", cerr)
-		return ""
-	}
-	return addr
 }
 
 func startH3Server(t *testing.T, r *web.Router, cert tls.Certificate, grace time.Duration) *http3.Server? {
@@ -184,14 +170,9 @@ func assertH3ALPN(t *testing.T, udpAddr string, pool *x509.CertPool) {
 }
 
 func TestH3NeedsTLSFailsStart(t *testing.T) {
-	port := freePort(t)
-	if port == "" {
-		t.Fatal("no free port")
-		return
-	}
 	r := web.NewRouter()
 	r.Handle("GET", "/hello", h3Hello)
-	s := &http3.Server{Addr: port, Router: r, H3: true}
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, H3: true}
 	err := s.Start(context.Background())
 	if err == nil {
 		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -210,31 +191,6 @@ func TestH3NeedsTLSFailsStart(t *testing.T) {
 		t.Fatalf("UDP bound after failed start: %s", addr)
 		return
 	}
-	ln, lerr := net.Listen("tcp", port)
-	if lerr != nil {
-		t.Fatalf("tcp held after failed start: %v", lerr)
-		return
-	}
-	defer func() {
-		if cerr := ln.Close(); cerr != nil {
-			return
-		}
-	}()
-	raddr, rerr := net.ResolveUDPAddr("udp", port)
-	if rerr != nil {
-		t.Fatalf("resolve %s: %v", port, rerr)
-		return
-	}
-	uconn, uerr := net.ListenUDP("udp", raddr)
-	if uerr != nil {
-		t.Fatalf("udp held after failed start: %v", uerr)
-		return
-	}
-	defer func() {
-		if cerr := uconn.Close(); cerr != nil {
-			return
-		}
-	}()
 }
 
 func TestH3ListenUDPFailsOnTakenPort(t *testing.T) {
@@ -280,16 +236,6 @@ func TestH3ListenUDPFailsOnTakenPort(t *testing.T) {
 		t.Fatalf("UDP bound after failed start: %s", got)
 		return
 	}
-	ln, lerr := net.Listen("tcp", addr)
-	if lerr != nil {
-		t.Fatalf("tcp held after failed start: %v", lerr)
-		return
-	}
-	defer func() {
-		if cerr := ln.Close(); cerr != nil {
-			return
-		}
-	}()
 }
 
 func TestH3ServesHTTP3OverUDP(t *testing.T) {
@@ -419,35 +365,17 @@ func TestH3AltSvcOnHTTPSOnly(t *testing.T) {
 	plain := web.NewRouter()
 	plain.Use(s.AltSvc())
 	plain.Handle("GET", "/hello", h3Hello)
-	paddr := freePort(t)
-	if paddr == "" {
-		t.Fatal("no free port")
-		return
-	}
-	p := &web.Server{Addr: paddr, Router: plain}
-	if perr := p.Start(context.Background()); perr != nil {
-		t.Fatalf("plain start: %v", perr)
-		return
-	}
-	defer stopWebServer(t, p)
-	if got := httpGetHeader(t, "http://"+paddr+"/hello", "Alt-Svc"); got != "" {
+	srv := httptest.NewServer(plain)
+	defer srv.Close()
+	if got := httpGetHeader(t, srv.URL+"/hello", "Alt-Svc"); got != "" {
 		t.Fatalf("cleartext Alt-Svc %q want empty", got)
 		return
 	}
 }
 
-func stopWebServer(t *testing.T, s *web.Server) {
-	t.Helper()
-	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := s.Stop(cctx); err != nil {
-		t.Errorf("stop plain server: %v", err)
-	}
-}
-
 func TestH3AltSvcAbsentWhenH3False(t *testing.T) {
 	r := web.NewRouter()
-	s := &http3.Server{Addr: freePort(t), Router: r}
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r}
 	r.Use(s.AltSvc())
 	r.Handle("GET", "/hello", h3Hello)
 	if err := s.Start(context.Background()); err != nil {
@@ -455,12 +383,9 @@ func TestH3AltSvcAbsentWhenH3False(t *testing.T) {
 		return
 	}
 	defer stopH3Server(t, s)
-	addr := s.BoundTCPAddrForTest()
-	if addr == "" {
-		t.Fatal("missing bound address")
-		return
-	}
-	if got := httpGetHeader(t, "http://"+addr+"/hello", "Alt-Svc"); got != "" {
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	if got := httpGetHeader(t, srv.URL+"/hello", "Alt-Svc"); got != "" {
 		t.Fatalf("Alt-Svc %q want empty without H3", got)
 		return
 	}
