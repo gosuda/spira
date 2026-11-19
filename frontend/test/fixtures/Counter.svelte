@@ -3,4 +3,4 @@
 	let count = $state(0);
 </script>
 
-<button type="button" data-label={label} onclick={() => (count += 1)}>{`svelte ${count}`}</button>
+<button type="button" data-label={label} data-island="svelte-fixture" onclick={() => (count += 1)}>{`svelte ${count}`}</button>

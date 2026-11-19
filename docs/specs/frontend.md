@@ -10,8 +10,8 @@ File layout:
 - `vite.config.ts`, `vitest.config.ts`
 - `src/entry.ts`, `src/island.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
-- `test/island.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`
-- `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`
+ - `test/island.test.ts`, `test/island-dispose.test.ts`, `test/island-move.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`, `test/production-build.test.ts`
+ - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`, `test/fixtures/Disposable.react.tsx`, `test/fixtures/Disposable.solid.tsx`, `test/fixtures/Disposable.svelte`, `test/fixtures/disposable-svelte.ts`, `test/fixtures/build-entry.react.ts`, `test/fixtures/build-entry.solid.ts`, `test/fixtures/build-entry.svelte.ts`
 - `test/fixtures/wasm/ticker/main.lgo`, `test/fixtures/wasm/ticker/go.mod`
 
 Scripts in `package.json`:
@@ -25,25 +25,25 @@ Exported TypeScript names:
 ```ts
 export type IslandModule = { default: unknown }
 export type IslandLoader = () => Promise<IslandModule>
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export type IslandTable = Record<string, IslandLoader>
-export type IslandMount = (
-	target: HTMLElement,
-	component: unknown,
-	props: Record<string, unknown>,
-) => void
-export class SpiraIslandElement extends HTMLElement
-export function defineIslands(table: IslandTable): void
+ export type IslandCleanup = () => void
+ export type IslandMount = (
+ 	target: HTMLElement,
+ 	component: unknown,
+ 	props: Record<string, unknown>,
+ ) => IslandCleanup | undefined
+ export class SpiraIslandElement extends HTMLElement
+ export function defineIslands(table: IslandTable): void
 export function installSlotMover(root?: ParentNode): void
-// src/adapters/react.ts and src/adapters/svelte.ts
-export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): void
-// src/adapters/solid.ts
-export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
-// src/adapters/wasm.ts
-export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): void
-export function loader(entry: string): () => Promise<{ default: unknown }>
-```
-
-`mount` is exported from each adapter. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`. Solid `mount` returns the dispose function of `render`.
+ // src/adapters/react.ts, src/adapters/svelte.ts and src/adapters/solid.ts
+ export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
+ // src/adapters/wasm.ts
+ export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): undefined
+ export function loader(entry: string): () => Promise<{ default: unknown }>
+ ```
+ 
+ `mount` is exported from each adapter. The React, Svelte and Solid adapters return a cleanup that releases the mount. The wasm adapter returns `undefined` because a started Go program has no per-island release. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`.
 
 ## Requirements
 
@@ -78,7 +78,11 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - `when="idle"` MUST start the load in `requestIdleCallback`.
 - A missing table entry MUST log one error that names the entry.
 - A missing table entry MUST leave the fallback in place.
-- Before a successful mount, the element MUST remove its child nodes.
+ - Before a successful mount, the element MUST remove its child nodes.
+ - A removed island MUST dispose its mount in a microtask unless it reconnects first.
+ - A moved island MUST keep its mount without remounting and without disposing.
+ - A stale load that resolves after its island moved MUST NOT mount.
+ - A moved wasm island MUST NOT start a second Go program.
 - The React adapter MUST call `createRoot(target).render(createElement(component, props))`.
 - The Svelte adapter MUST call Svelte 5 `mount` with `target` and `props`.
 - The Solid adapter MUST call `render` with the component and `target`.
@@ -102,7 +106,11 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - `moves template content into the matching spira-slot` proves the slot mover.
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
-- `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
+ - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
+- `test/island-move.test.ts` proves that a move keeps one mount with no dispose and no cleanup, that a removal runs one cleanup and still one after extra microtask turns, that a move followed by a removal disposes once without remounting, that a re-inserted island mounts again and disposes the new mount once, that a moved wasm island keeps one Go program, that a move during a pending load mounts only the new load, and that a stale load resolving after the new mount leaves the mount alone.
+- `test/island-dispose.test.ts` proves that removing a Solid island disposes its reactive root, removing a React island unmounts its root, and removing a Svelte island unmounts its component.
+ - `test/production-build.test.ts` proves each island table ships its component and registration key, the compiled bodies with their runtimes, production output, and the application entry that owns the island glob.
+ - It also proves a glob result derives repo relative island keys.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
 - `test/wasm-runtime.test.ts` proves the real toolchain runtime mounts the built ticker module through `spira-island` and writes the props value into its host.
 - `test/entry.test.ts` proves `spira-island` is defined and the `sse` extension is registered after `entry.ts` loads.

@@ -6,11 +6,21 @@ import * as wasmAdapter from "./adapters/wasm";
 export type IslandModule = { default: unknown };
 export type IslandLoader = () => Promise<IslandModule>;
 export type IslandTable = Record<string, IslandLoader>;
+export type IslandCleanup = () => void;
 export type IslandMount = (
 	target: HTMLElement,
 	component: unknown,
 	props: Record<string, unknown>,
-) => void;
+) => IslandCleanup | undefined;
+
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable {
+	const table: IslandTable = {};
+	for (const [path, loader] of Object.entries(modules)) {
+		const entry = path.replace(/^\.\.\/\.\.\//, "");
+		table[entry] = loader as IslandLoader;
+	}
+	return table;
+}
 
 type Adapter = { ext: string; mount: IslandMount };
 
@@ -68,8 +78,16 @@ export class SpiraIslandElement extends HTMLElement {
 	private observer: IntersectionObserver | null = null;
 	private idleId: number | null = null;
 	private activated = false;
+	private mounted = false;
+	private cleanup: IslandCleanup | null = null;
+	private disposeQueued = false;
+	private loadToken = 0;
 
 	connectedCallback(): void {
+		this.cancelPendingDispose();
+		if (this.mounted) {
+			return;
+		}
 		const when = this.getAttribute("when") ?? "visible";
 		if (!WHEN_VALUES.has(when)) {
 			this.reject(
@@ -96,9 +114,31 @@ export class SpiraIslandElement extends HTMLElement {
 		});
 		this.observer.observe(this);
 	}
-
 	disconnectedCallback(): void {
 		this.disconnect();
+		this.scheduleDispose();
+	}
+
+	private scheduleDispose(): void {
+		this.loadToken += 1;
+		if (!this.mounted) {
+			this.activated = false;
+			return;
+		}
+		if (this.cleanup === null || this.disposeQueued) {
+			return;
+		}
+		this.disposeQueued = true;
+		queueMicrotask(() => {
+			if (!this.disposeQueued) {
+				return;
+			}
+			this.disposeQueued = false;
+			this.cleanup?.();
+			this.cleanup = null;
+			this.mounted = false;
+			this.activated = false;
+		});
 	}
 
 	private disconnect(): void {
@@ -110,18 +150,25 @@ export class SpiraIslandElement extends HTMLElement {
 		}
 	}
 
+	private cancelPendingDispose(): void {
+		this.disposeQueued = false;
+	}
+
 	private activate(): void {
-		if (this.activated) {
+		if (this.activated || this.mounted) {
 			return;
 		}
 		this.activated = true;
+		if (this.cleanup !== null) {
+			return;
+		}
 		const entry = this.getAttribute("entry") ?? "";
 		const props = parseProps(this.getAttribute("props") ?? "");
 		if (props === null) {
 			console.error(`spira-island: invalid props for entry "${entry}"`);
 			return;
 		}
-		void this.load(entry, props);
+		void this.load(entry, props, this.loadToken);
 	}
 
 	private reject(message: string): void {
@@ -132,6 +179,7 @@ export class SpiraIslandElement extends HTMLElement {
 	private async load(
 		entry: string,
 		props: Record<string, unknown>,
+		token: number,
 	): Promise<void> {
 		const loader = islandTable.get(entry);
 		if (loader === undefined) {
@@ -140,11 +188,18 @@ export class SpiraIslandElement extends HTMLElement {
 		}
 		try {
 			const module = await loader();
+			if (token !== this.loadToken || !this.isConnected) {
+				return;
+			}
 			const adapter = adapterFor(entry);
 			for (const child of Array.from(this.childNodes)) {
 				child.remove();
 			}
-			adapter.mount(this, module.default, props);
+			const cleanup = adapter.mount(this, module.default, props);
+			this.mounted = true;
+			if (typeof cleanup === "function") {
+				this.cleanup = cleanup;
+			}
 		} catch (error) {
 			console.error(`spira-island: failed to mount island "${entry}"`, error);
 		}
