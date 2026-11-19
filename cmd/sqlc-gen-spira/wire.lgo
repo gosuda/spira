@@ -1,0 +1,143 @@
+package main
+
+import (
+	"encoding/json/v2"
+	"fmt"
+	"strings"
+)
+
+type Identifier struct {
+	Catalog string `json:"catalog"`
+	Schema  string `json:"schema"`
+	Name    string `json:"name"`
+}
+
+type Column struct {
+	Name         string     `json:"name"`
+	NotNull      bool       `json:"not_null"`
+	IsArray      bool       `json:"is_array"`
+	Length       int32      `json:"length"`
+	Table        Identifier `json:"table"`
+	Type         Identifier `json:"type"`
+	EmbedTable   Identifier `json:"embed_table"`
+	IsSQLCSlice  bool       `json:"is_sqlc_slice"`
+	Unsigned     bool       `json:"unsigned"`
+	ArrayDims    int32      `json:"array_dims"`
+	OriginalName string     `json:"original_name"`
+}
+
+type Table struct {
+	Rel     Identifier `json:"rel"`
+	Columns []Column   `json:"columns"`
+}
+
+type Enum struct {
+	Name string   `json:"name"`
+	Vals []string `json:"vals"`
+}
+
+type Schema struct {
+	Name   string  `json:"name"`
+	Tables []Table `json:"tables"`
+	Enums  []Enum  `json:"enums"`
+}
+
+type Catalog struct {
+	Name          string   `json:"name"`
+	DefaultSchema string   `json:"default_schema"`
+	Schemas       []Schema `json:"schemas"`
+}
+
+type Settings struct {
+	Version string   `json:"version"`
+	Engine  string   `json:"engine"`
+	Schema  []string `json:"schema"`
+	Queries []string `json:"queries"`
+	Codegen struct {
+		Out string `json:"out"`
+	} `json:"codegen"`
+}
+
+type Parameter struct {
+	Number int32  `json:"number"`
+	Column Column `json:"column"`
+	Name   string `json:"name"`
+}
+
+type Query struct {
+	Text            string      `json:"text"`
+	Name            string      `json:"name"`
+	Cmd             string      `json:"cmd"`
+	Columns         []Column    `json:"columns"`
+	Params          []Parameter `json:"params"`
+	Comments        []string    `json:"comments"`
+	Filename        string      `json:"filename"`
+	InsertIntoTable Identifier   `json:"insert_into_table"`
+}
+
+type PluginOptions struct {
+	Package   string            `json:"package"`
+	Tables    map[string]TableOpts `json:"tables"`
+	Refs      map[string]string `json:"refs"`
+	Overrides map[string]string `json:"overrides"`
+}
+
+type TableOpts struct {
+	Type    string `json:"type"`
+	Key     string `json:"key"`
+	KeyType string `json:"key_type"`
+	Version string `json:"version"`
+}
+
+type Request struct {
+	Settings      Settings `json:"settings"`
+	Catalog       Catalog  `json:"catalog"`
+	Queries       []Query  `json:"queries"`
+	SQLCVersion   string   `json:"sqlc_version"`
+	PluginOptions []byte   `json:"plugin_options"`
+	GlobalOptions []byte   `json:"global_options"`
+}
+
+type File struct {
+	Name     string `json:"name"`
+	Contents []byte `json:"contents"`
+}
+
+type Response struct {
+	Files []File `json:"files"`
+}
+
+func decodeOptions(raw []byte) (PluginOptions, error) {
+	opts := PluginOptions{}
+	if len(raw) == 0 {
+		return opts, nil
+	}
+	if err := json.Unmarshal(raw, &opts, json.RejectUnknownMembers(true)); err != nil {
+		return opts, err
+	}
+	normalizeOptions(&opts)
+	for name, typ := range opts.Overrides {
+		if !validOverrideType(typ) {
+			return opts, fmt.Errorf("overrides.%s: %q is not a type the row scanner supports", name, typ)
+		}
+	}
+	return opts, nil
+}
+
+func normalizeOptions(opts *PluginOptions) {
+	tables := map[string]TableOpts{}
+	for name, t := range opts.Tables {
+		tables[strings.ToLower(name)] = t
+	}
+	opts.Tables = tables
+	refs := map[string]string{}
+	for name, target := range opts.Refs {
+		refs[strings.ToLower(name)] = strings.ToLower(target)
+	}
+	opts.Refs = refs
+	overs := map[string]string{}
+	for name, typ := range opts.Overrides {
+		overs[strings.ToLower(name)] = typ
+	}
+	opts.Overrides = overs
+}

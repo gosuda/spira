@@ -1,0 +1,129 @@
+package main
+
+import "strings"
+
+var initialisms = map[string]bool{
+	"api": true, "css": true, "db": true, "html": true, "http": true,
+	"https": true, "id": true, "ip": true, "json": true, "sql": true,
+	"toml": true, "ts": true, "uuid": true, "url": true, "xml": true,
+	"yaml": true,
+}
+
+func goName(s string) string {
+	var b strings.Builder
+	word := ""
+	upper := true
+	flush := func() {
+		if word == "" {
+			return
+		}
+		lw := strings.ToLower(word)
+		if initialisms[lw] ?? false {
+			b.WriteString(strings.ToUpper(word))
+		} else {
+			b.WriteString(strings.ToUpper(word[:1]))
+			b.WriteString(word[1:])
+		}
+		word = ""
+		upper = true
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case isASCIILetter(c):
+			if upper {
+				word += string(lowerByte(c))
+			} else {
+				word += string(c)
+			}
+			upper = false
+		case isASCIIDigit(c):
+			flush()
+			b.WriteByte(c)
+			upper = true
+		default:
+			flush()
+		}
+	}
+	flush()
+	name := b.String()
+	if name == "" {
+		return "V"
+	}
+	if isASCIIDigit(name[0]) {
+		return "X" + name
+	}
+	return name
+}
+
+func goField(s string) string {
+	return goName(s)
+}
+
+func isGoKeyword(s string) bool {
+	switch s {
+	case "break", "case", "chan", "const", "continue", "default", "defer",
+		"else", "fallthrough", "for", "func", "go", "goto", "if", "import",
+		"interface", "map", "package", "range", "return", "select", "struct",
+		"switch", "type", "var":
+		return true
+	}
+	return false
+}
+
+func isASCIILetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func isASCIIDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func lowerByte(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
+
+func isGoIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	if !isASCIILetter(s[0]) && s[0] != '_' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !isASCIILetter(c) && !isASCIIDigit(c) && c != '_' {
+			return false
+		}
+	}
+	return !isGoKeyword(s)
+}
+func validOverrideType(s string) bool {
+	if strings.HasSuffix(s, "?") {
+		return validOverrideType(s[:len(s)-1])
+	}
+	switch s {
+	case "time.Time", "[]byte", "string", "bool",
+		"int", "int8", "int16", "int32", "int64",
+		"float32", "float64":
+		return true
+	}
+	if s == "" || !isASCIILetter(s[0]) {
+		return false
+	}
+	if s[0] < 'A' || s[0] > 'Z' {
+		return false
+	}
+	return isGoIdent(s)
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
