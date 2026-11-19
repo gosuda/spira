@@ -254,16 +254,16 @@ func (p *filterParser) parseKey() (Key, error) {
 }
 
 func (p *filterParser) parseComparison(key Key) (Filter, error) {
-	operator := p.tok.kind
+	operator := p.tok
 	p.next()
-	if op, ok := compareOps[operator]; ok {
+	if op, ok := compareOps[operator.kind]; ok {
 		c, err := p.parseConst()
 		if err != nil {
 			return nil, err
 		}
 		return Expression{Type: op, Left: key, Right: Filter(c)}, nil
 	}
-	switch operator {
+	switch operator.kind {
 	case tokIn:
 		return p.parseInclusion(key, OpIn)
 	case tokNin:
@@ -276,7 +276,7 @@ func (p *filterParser) parseComparison(key Key) (Filter, error) {
 	case tokIs:
 		return p.parseNullTest(key)
 	}
-	return nil, fmt.Errorf("position %d: expected an operator after the key", p.tok.pos)
+	return nil, fmt.Errorf("position %d: expected an operator after the key", operator.pos)
 }
 
 func (p *filterParser) parseNullTest(key Key) (Filter, error) {

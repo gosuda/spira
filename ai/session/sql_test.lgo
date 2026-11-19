@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -614,8 +615,8 @@ func contractBlankIDIsRejected(t *testing.T, b session.Store) {
 		t.Fatalf("Ensure blank id reported no error")
 		return
 	}
-	if err.Error() != "ai/session: session id must not be blank" {
-		t.Fatalf("Ensure blank id error = %q, want the blank id error", err.Error())
+	if !errors.Is(err, session.ErrBlankID) {
+		t.Fatalf("Ensure blank id error = %q, want the blank id fault", err.Error())
 		return
 	}
 	_, blerr := b.Ensure("   ")
@@ -623,8 +624,8 @@ func contractBlankIDIsRejected(t *testing.T, b session.Store) {
 		t.Fatalf("Ensure blank id reported no error")
 		return
 	}
-	if blerr.Error() != "ai/session: session id must not be blank" {
-		t.Fatalf("Ensure blank id error = %q, want the blank id error", blerr.Error())
+	if !errors.Is(blerr, session.ErrBlankID) {
+		t.Fatalf("Ensure blank id error = %q, want the blank id fault", blerr.Error())
 		return
 	}
 }
@@ -642,8 +643,8 @@ func contractAppendValidationsRejectBadBatches(t *testing.T, b session.Store) {
 		t.Fatalf("system Append reported no error")
 		return
 	}
-	if syserr.Error() != "ai/session: Append: system messages are not stored in a session" {
-		t.Fatalf("system Append error = %q, want the system message error", syserr.Error())
+	if !errors.Is(syserr, session.ErrSystemMessage) {
+		t.Fatalf("system Append error = %q, want the system message fault", syserr.Error())
 		return
 	}
 	_, emptyerr := b.Append(t.Context(), a, stale)
@@ -651,8 +652,8 @@ func contractAppendValidationsRejectBadBatches(t *testing.T, b session.Store) {
 		t.Fatalf("empty Append reported no error")
 		return
 	}
-	if emptyerr.Error() != "ai/session: Append: no events" {
-		t.Fatalf("empty Append error = %q, want the no events error", emptyerr.Error())
+	if !errors.Is(emptyerr, session.ErrEmptyBatch) {
+		t.Fatalf("empty Append error = %q, want the empty batch fault", emptyerr.Error())
 		return
 	}
 	foreign := session.Event{ID: c + "/e1", Session: c, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("x")}
@@ -661,8 +662,8 @@ func contractAppendValidationsRejectBadBatches(t *testing.T, b session.Store) {
 		t.Fatalf("foreign Append reported no error")
 		return
 	}
-	if want := fmt.Sprintf("ai/session: Append: event belongs to session %q, not %q", c, a); forerr.Error() != want {
-		t.Fatalf("foreign Append error = %q, want %q", forerr.Error(), want)
+	if !errors.Is(forerr, session.ErrForeignEvent) {
+		t.Fatalf("foreign Append error = %v, want the foreign event fault", forerr)
 		return
 	}
 	if got := sqlEvents(t, b, a); len(got) != 0 {
@@ -687,8 +688,8 @@ func contractLastNMustBePositive(t *testing.T, b session.Store) {
 		t.Fatalf("LastN -3 reported no error")
 		return
 	}
-	if negerr.Error() != "ai/session: LastN: n must be positive" {
-		t.Fatalf("LastN -3 error = %q, want the count error", negerr.Error())
+	if !errors.Is(negerr, session.ErrInvalidCount) {
+		t.Fatalf("LastN -3 error = %q, want the count fault", negerr.Error())
 	}
 }
 
@@ -1016,8 +1017,8 @@ func contractOverlongIDIsRefused(t *testing.T, b session.Store) {
 		t.Fatalf("Ensure of a %d byte id reported no error", len(long))
 		return
 	}
-	if want := "ai/session: session id is 256 bytes, the limit is 255"; err.Error() != want {
-		t.Fatalf("overlong id error = %q, want %q", err.Error(), want)
+	if !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("overlong id error = %v, want the id limit fault", err)
 		return
 	}
 	edge := strings.Repeat("k", 255)
@@ -1029,8 +1030,8 @@ func contractOverlongIDIsRefused(t *testing.T, b session.Store) {
 		return
 	}
 	longEvent := session.Event{ID: long + "/e1", Session: edge, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("lost")}
-	if _, err := b.Append(t.Context(), edge, sqlVersion(t, b, edge), longEvent); err == nil || err.Error() != "ai/session: event id is 259 bytes, the limit is 255" {
-		t.Fatalf("overlong event id Append error = %v, want the limit error", err)
+	if _, err := b.Append(t.Context(), edge, sqlVersion(t, b, edge), longEvent); !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("overlong event id Append error = %v, want the id limit fault", err)
 		return
 	}
 	if kept := sqlEvents(t, b, edge); len(kept) != 1 {
@@ -1038,8 +1039,8 @@ func contractOverlongIDIsRefused(t *testing.T, b session.Store) {
 		return
 	}
 	overlong := session.Event{ID: long + "/e1", Session: long, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("lost")}
-	if _, err := b.Append(t.Context(), long, 0, overlong); err == nil || err.Error() != "ai/session: session id is 256 bytes, the limit is 255" {
-		t.Fatalf("overlong Append error = %v, want the limit error", err)
+	if _, err := b.Append(t.Context(), long, 0, overlong); !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("overlong Append error = %v, want the id limit fault", err)
 		return
 	}
 	if found := b.Find(long); found != nil {

@@ -75,12 +75,12 @@ func Faults() []*fault.Error
 - A stall MUST yield `openai.provider_stream_cut` and satisfy `IsStall`.
 - A 4xx answer other than 408 and 429 MUST surface as `openai.provider_rejected`.
 - A 429 answer MUST surface as `openai.provider_rate_limited`.
-- Any other failing answer MUST surface as `openai.provider_unavailable`.
+- Any other failing answer MUST surface as `openai.provider_error`.
 - A failing status MUST win over a failed error-body read, keeping the read cause.
 - A status fault cause MUST hold the status, the parsed error type and the body length.
 - A status fault cause MUST NOT hold the body text or the key.
 - A body over its limit MUST surface as `openai.provider_too_large`.
-- An inconsistent embedding answer MUST surface as `openai.provider_unavailable`.
+- An inconsistent embedding answer MUST surface as `openai.provider_error`.
 - A zero Policy.Timeout MUST fall back to the default idle bound.
 - A caller cancel MUST yield `openai.provider_stream_cut` and satisfy `errors.Is` with `context.Canceled`.
 - The key MUST NOT appear in an error or a log.
@@ -100,9 +100,9 @@ func Faults() []*fault.Error
 
 - `openai.provider_rejected` MUST surface for a 4xx answer other than 408 and 429.
 - `openai.provider_rate_limited` MUST surface for a 429 answer.
-- `openai.provider_unavailable` MUST surface for a 5xx answer, a 408 answer and a transport failure.
+- `openai.provider_error` MUST surface for a 5xx answer, a 408 answer and a transport failure.
 - `openai.provider_too_large` MUST surface for a body over its limit.
-- `openai.provider_stream_cut` MUST surface for a cut stream, a broken record and a stall.
+- `openai.provider_stream_cut` MUST surface for a cut stream, a broken record, an error event and a stall.
 - `openai.invalid_request` MUST surface for a bad `Format` and a bad tool schema.
 
 ## Proof
@@ -112,7 +112,8 @@ func Faults() []*fault.Error
 - `TestStreamCollectsTheReferenceReply` proves a stream that ends at `data: [DONE]` yields the reference reply through `ai.Collect`.
 - `TestStreamToolCallAssemblesFragments` proves fragments assemble into one complete tool call.
 - `TestStreamEndsAtDoneWhileTheBodyStaysOpen` proves the stream ends at `data: [DONE]` while the server keeps the body open.
-- `TestCutStreamYieldsErrorChunkAndNoReply` proves the error for a stream cut before `data: [DONE]`.
+- `TestCutStreamYieldsErrorChunkAndNoReply` proves the error for a stream cut before `data: [DONE]` and the public code of the cut.
+- `TestStreamErrorEventYieldsStreamCut` proves an error event ends the stream as the stream cut fault with the parsed type.
 - `TestStreamOfAStalledProviderEndsAtThePolicyTimeout` proves the error for a provider that stops sending.
 - `TestStreamKeepsAProviderWhoseEventsStayInsideTheTimeout` proves the idle bound resets on every line read and never fires.
 - `TestStreamKeepsReceivingToolFragments` proves tool-only fragments reset the idle bound and assemble into one call.

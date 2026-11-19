@@ -7,7 +7,6 @@ package session
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"iter"
 
@@ -60,7 +59,7 @@ func Remember(s *Service, id string) ai.Layer {
 func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error) {
 	switch t.Model.(type) {
 	case remember, recorderModel:
-		return ai.Reply{}, errors.New("ai/session: run: model is already wrapped by session; pass the unwrapped model")
+		return ai.Reply{}, ErrAlreadyWrapped.Err()
 	}
 	rec := &recorder{}
 	reply, err := ai.Run(ctx, rec.wrap(Remember(s, id)(t.Model)), t.Request, t.Limits)

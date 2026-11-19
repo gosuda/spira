@@ -19,6 +19,7 @@ import (
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/ai/openai"
 	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/fault"
 	"github.com/gosuda/spira/resilience"
 )
 
@@ -152,5 +153,45 @@ func TestAugmentWithNoDocumentUsesTheEmptyContextText(t *testing.T) {
 	want := "The user query is outside your knowledge base.\nPolitely inform the user that you can't answer it.\n"
 	if got := recordedPrompt(t, catcher); got != want {
 		t.Fatalf("empty context prompt:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestAugmentKeepsTypedSearchFaults(t *testing.T) {
+	store := newStore(t, map[string][]float32{"What is retrieval?": {1, 0, 0}, "doc": {0, 1, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "doc"})
+	_, client := chatPair(t, "ok")
+	ask := ai.Request{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "What is retrieval?"}}},
+		},
+	}
+	limited := ai.Wrap(client, rag.Augment(store.Search, rag.Search{TopK: -1}))
+	_, err := limited.Chat(t.Context(), ask)
+	if err == nil {
+		t.Fatal("a negative TopK must fail the augmented call")
+		return
+	}
+	topFault := fault.Of(err)
+	if topFault == nil {
+		t.Fatalf("TopK error = %v, carries no fault", err)
+		return
+	}
+	if topFault.Code != rag.ErrInvalidRequest.Code {
+		t.Fatalf("TopK error = %v, want the outermost rag.invalid_request fault", err)
+	}
+	keyless := rag.Filter(rag.Expression{Type: rag.OpEq, Left: rag.Const{Text: "x"}, Right: rag.Filter(rag.Const{Text: "x"})})
+	filtered := ai.Wrap(client, rag.Augment(store.Search, rag.Search{Filter: keyless}))
+	_, ferr := filtered.Chat(t.Context(), ask)
+	if ferr == nil {
+		t.Fatal("a keyless filter must fail the augmented call")
+		return
+	}
+	keyFault := fault.Of(ferr)
+	if keyFault == nil {
+		t.Fatalf("filter error = %v, carries no fault", ferr)
+		return
+	}
+	if keyFault.Code != rag.ErrInvalidFilter.Code {
+		t.Fatalf("filter error = %v, want the outermost rag.invalid_filter fault", ferr)
 	}
 }

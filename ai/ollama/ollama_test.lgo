@@ -298,6 +298,24 @@ func TestStreamCallerCancelYieldsPrefixedCancelError(t *testing.T) {
 	}
 }
 
+func TestStreamCanceledBeforeHeadersYieldsStreamCut(t *testing.T) {
+	srv := httptest.NewServer(serveBody(t, http.StatusOK, "application/x-ndjson", ndjsonOneLine))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	chunks := collectAll(testClient(srv).Stream(ctx, ai.Request{Model: "llama3.2"}))
+	if len(chunks) == 0 {
+		t.Fatal("no chunks")
+	}
+	last := chunks[len(chunks)-1]
+	if last.err == nil || !errors.Is(last.err, ollama.ErrProviderStreamCut) {
+		t.Fatalf("last error = %v, want the stream cut fault", last.err)
+	}
+	if !errors.Is(last.err, context.Canceled) {
+		t.Fatalf("last error = %v, want context.Canceled", last.err)
+	}
+}
+
 func TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen(t *testing.T) {
 	var held atomic.Int64
 	handlerDone := make(chan struct{})

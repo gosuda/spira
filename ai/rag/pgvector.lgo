@@ -360,6 +360,26 @@ func filterWhere(f Filter?, start int) (string, []any, error) {
 	return " AND (" + fragment + ")", b.args, nil
 }
 
+const filterMismatchMark = "ai/rag: filter type mismatch"
+
+func filterMismatch(err error) bool {
+	return err != nil && strings.Contains(err.Error(), filterMismatchMark)
+}
+
+func searchError(err error) error {
+	if filterMismatch(err) {
+		return ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: pgvector search: %w", err))
+	}
+	return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector search: %w", err))
+}
+
+func scanError(err error) error {
+	if filterMismatch(err) {
+		return ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
+	}
+	return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
+}
+
 func (p *Pgvector) searchRows(ctx context.Context, plan searchPlan) ([]Document, error) {
 	query := "SELECT id, content, metadata, (embedding <=> $1::vector) AS distance FROM " + p.table + " WHERE (embedding <=> $1::vector) <= $2" + plan.where + " ORDER BY distance ASC, id ASC LIMIT $3"
 	full := make([]any, 0, len(plan.args)+3)
@@ -367,7 +387,7 @@ func (p *Pgvector) searchRows(ctx context.Context, plan searchPlan) ([]Document,
 	full = append(full, plan.args...)
 	rows, err := p.pool.QueryContext(ctx, query, full...)
 	if err != nil {
-		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector search: %w", err))
+		return nil, searchError(err)
 	}
 	if rows == nil {
 		return nil, ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector search returned no rows handle"))
@@ -390,7 +410,7 @@ func scanDocuments(rows *sql.Rows) ([]Document, error) {
 		out = append(out, doc)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
+		return nil, scanError(err)
 	}
 	if out == nil {
 		return []Document{}, nil
@@ -680,7 +700,7 @@ func casedCompare(mark string, expected string, compare string, op Op) string {
 	if op == OpNe {
 		present = "TRUE"
 	}
-	raise := "(CAST(('ai/rag: filter type mismatch on ' || " + mark + " || ': ' || jsonb_typeof(metadata -> " + mark + ")) AS integer) = 0)"
+	raise := "(CAST(('" + filterMismatchMark + " on ' || " + mark + " || ': ' || jsonb_typeof(metadata -> " + mark + ")) AS integer) = 0)"
 	return "(CASE WHEN NOT jsonb_exists(metadata, " + mark + ") THEN " + absent + " WHEN (jsonb_typeof(metadata -> " + mark + ") = 'null') THEN " + present + " WHEN (jsonb_typeof(metadata -> " + mark + ") IS DISTINCT FROM " + expected + ") THEN " + raise + " ELSE " + compare + " END)"
 }
 

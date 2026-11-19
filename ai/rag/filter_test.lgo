@@ -7,6 +7,7 @@
 package rag_test
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -176,6 +177,14 @@ func TestParseFilterRefusesWhatTheGrammarRefuses(t *testing.T) {
 		}
 	}
 }
+
+func TestParseFilterReportsTheOperatorPosition(t *testing.T) {
+	_, err := rag.ParseFilter("country = 'BG'")
+	if err == nil || !errors.Is(err, rag.ErrInvalidFilter) || !strings.Contains(err.Error(), "position 8:") {
+		t.Errorf("ParseFilter(%q) error = %v, want the invalid_filter fault at position 8", "country = 'BG'", err)
+	}
+}
+
 func TestMemoryFilterWithNaNMetadataMatchesOnlyInequality(t *testing.T) {
 	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
 	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{"n": num(math.NaN())}})

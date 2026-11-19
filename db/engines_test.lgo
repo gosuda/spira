@@ -203,23 +203,33 @@ func engineOpenPool(t *testing.T, c engineCase) (*db.Pool, context.Context, cont
 	return pool, ctx, cancel
 }
 
-func engineDuplicateKey(t *testing.T, ctx context.Context, pool *db.Pool, c engineCase) error {
+type constraintProbe struct {
+	table string
+	mark  string
+	check func(dupErr error)
+}
+
+func withConstraintProbe(t *testing.T, ctx context.Context, pool *db.Pool, p constraintProbe) {
 	t.Helper()
-	table := c.Table + "_uniq"
-	if _, err := db.Exec(ctx, pool, "CREATE TABLE "+table+" (n integer not null unique)"); err != nil {
-		t.Fatalf("create %s: %v", table, err)
-		return err
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE "+p.table+" (n integer not null unique)"); err != nil {
+		t.Fatalf("create %s: %v", p.table, err)
+		return
 	}
-	if _, err := db.Exec(ctx, pool, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(7)); err != nil {
-		t.Fatalf("seed %s: %v", table, err)
-		return err
+	defer func() {
+		if _, derr := db.Exec(context.Background(), pool, "DROP TABLE "+p.table); derr != nil {
+			t.Errorf("drop %s: %v", p.table, derr)
+		}
+	}()
+	if _, err := db.Exec(ctx, pool, "INSERT INTO "+p.table+" (n) VALUES ("+p.mark+")", int64(7)); err != nil {
+		t.Fatalf("seed %s: %v", p.table, err)
+		return
 	}
-	_, err := db.Exec(ctx, pool, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(7))
-	if err == nil {
-		t.Fatalf("duplicate insert into %s succeeded", table)
-		return nil
+	_, dupErr := db.Exec(ctx, pool, "INSERT INTO "+p.table+" (n) VALUES ("+p.mark+")", int64(7))
+	if dupErr == nil {
+		t.Fatalf("duplicate insert into %s succeeded", p.table)
+		return
 	}
-	return err
+	p.check(dupErr)
 }
 
 func innermostText(err error) string {
@@ -239,24 +249,25 @@ func checkEngineConstraint(t *testing.T, c engineCase, inner string, prefix bool
 			t.Errorf("pool.Stop: %v", serr)
 		}
 	})
-	err := engineDuplicateKey(t, ctx, pool, c)
-	if !errors.Is(err, db.ErrConstraintViolation) {
-		t.Fatalf("%s duplicate insert error = %v, want db.ErrConstraintViolation", c.Driver, err)
-		return
-	}
-	innerText := innermostText(err)
-	matched := strings.Contains(innerText, inner)
-	if prefix {
-		matched = strings.HasPrefix(innerText, inner)
-	}
-	if !matched {
-		t.Fatalf("%s innermost error = %q, want it to hold %q", c.Driver, innerText, inner)
-		return
-	}
-	if _, derr := db.Exec(ctx, pool, "DROP TABLE "+c.Table+"_uniq"); derr != nil {
-		t.Fatalf("drop %s_uniq: %v", c.Table, derr)
-		return
-	}
+	withConstraintProbe(t, ctx, pool, constraintProbe{
+		table: c.Table + "_uniq",
+		mark:  c.Mark,
+		check: func(dupErr error) {
+			if !errors.Is(dupErr, db.ErrConstraintViolation) {
+				t.Fatalf("%s duplicate insert error = %v, want db.ErrConstraintViolation", c.Driver, dupErr)
+				return
+			}
+			innerText := innermostText(dupErr)
+			matched := strings.Contains(innerText, inner)
+			if prefix {
+				matched = strings.HasPrefix(innerText, inner)
+			}
+			if !matched {
+				t.Fatalf("%s innermost error = %q, want it to hold %q", c.Driver, innerText, inner)
+				return
+			}
+		},
+	})
 }
 
 func TestEnginePostgresConstraintViolation(t *testing.T) {

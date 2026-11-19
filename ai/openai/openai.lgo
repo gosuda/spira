@@ -119,6 +119,9 @@ func streamDoError(ctx context.Context, err error) error {
 	if cause := context.Cause(ctx); cause != nil {
 		return ErrProviderStreamCut.Wrap(cause)
 	}
+	if errors.Is(err, ErrProviderStreamCut) {
+		return err
+	}
 	return ErrProviderError.Wrap(err)
 }
 
@@ -592,6 +595,13 @@ func eventLine(text string, state *streamState) iter.Seq2[ai.Chunk, error] {
 	var chunk wireChunk
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(fmt.Errorf("decode stream event: %w", err))
+		return
+	}
+	if chunk.Error != nil && len(chunk.Choices) == 0 {
+		state.done = true
+		var empty wireStreamError
+		wireErr := *(chunk.Error ?? &empty)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(&statusDetail{status: 200, errType: wireErr.Type, length: len(wireErr.Message)})
 		return
 	}
 	for part, err := range deltaParts(&chunk) {

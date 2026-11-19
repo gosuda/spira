@@ -94,6 +94,18 @@ type Turn struct {
 }
 
 func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
+
+var ErrBlankID = fault.New("session.blank_id", fault.Invalid, "The session id must not be blank.")
+var ErrIDTooLarge = fault.New("session.id_too_large", fault.TooLarge, "The id exceeds the 255-byte limit.")
+var ErrEmptyBatch = fault.New("session.empty_batch", fault.Invalid, "The append batch is empty.")
+var ErrSystemMessage = fault.New("session.system_message", fault.Invalid, "A system message is not stored.")
+var ErrForeignEvent = fault.New("session.foreign_event", fault.Invalid, "The event names another session.")
+var ErrInvalidCount = fault.New("session.invalid_count", fault.Invalid, "The count must be positive.")
+var ErrAlreadyWrapped = fault.New("session.already_wrapped", fault.Invalid, "The model is already wrapped.")
+var ErrContention = fault.New("session.contention", fault.Unavailable, "The session store is busy.")
+var ErrStoredMessage = fault.New("session.stored_message", fault.Internal, "The stored message is invalid.")
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -189,6 +201,33 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - Session and event ids MUST share one 255-byte limit on every engine.
 - Reads and `Delete` MUST treat an id longer than 255 bytes as a missing session.
 - `Delete` MUST retire the session row before it clears the events of that session.
+- `Service` and `SQLStore` MUST share one validation fault per bad batch.
+- A blank id MUST map to `session.blank_id` with no id in the message.
+- An id over 255 bytes MUST map to `session.id_too_large` on every store.
+- An empty batch MUST map to `session.empty_batch`.
+- A system message MUST map to `session.system_message` before any version check.
+- An event of another session MUST map to `session.foreign_event` with both ids in the cause.
+- A non-positive count MUST map to `session.invalid_count` on every store.
+- A double-wrapped model MUST map to `session.already_wrapped`.
+- A claim that fails eight times MUST map to `session.contention`.
+- A stored message that is not JSON or holds an unknown part MUST map to `session.stored_message`.
+- Storage failures MUST pass the `db` fault through with the operation name.
+- A tool loop failure MUST pass the `ai` fault through with the run name.
+- Public views MUST NOT carry ids, message text, SQL text or driver text.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `session.already_wrapped` | invalid | The model is already wrapped. |
+| `session.blank_id` | invalid | The session id must not be blank. |
+| `session.contention` | unavailable | The session store is busy. |
+| `session.empty_batch` | invalid | The append batch is empty. |
+| `session.foreign_event` | invalid | The event names another session. |
+| `session.id_too_large` | too_large | The id exceeds the 255-byte limit. |
+| `session.invalid_count` | invalid | The count must be positive. |
+| `session.stored_message` | internal | The stored message is invalid. |
+| `session.system_message` | invalid | A system message is not stored. |
 
 ## Errors
 
@@ -198,6 +237,14 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `Service` MUST return an error when `LastN` gets a non-positive count.
 - `SQLStore` MUST return an error for an unknown stored part kind.
 - `SQLStore` MUST return an error for a stored message that is not JSON.
+- Validation paths MUST return session faults with secrets only in the cause.
+- Storage paths MUST return the `db` fault with the operation name.
+- `Ensure` contention MUST map to `session.contention` after eight attempts.
+- Unknown and expired sessions MUST stay absent with no error code.
+- `Run` with a wrapped model MUST map to `session.already_wrapped`.
+- Stored message failures MUST map to `session.stored_message` with the detail in the cause.
+- Database failures MUST keep matching their `db` fault with `errors.Is`.
+- `lockConflict` MUST match the driver text through the fault chain.
 
 ## Proof
 
@@ -283,6 +330,18 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `TestEngineDeleteClearsAConcurrentAppend` proves a concurrent append leaves no rows after `Delete` on every engine.
 - `TestEngineSQLiteConcurrentEnsureOpensOneSession` proves two overlapping opens on SQLite share one session.
 - `TestRememberNestedSameSessionRecordsOnce` proves nested layers record once.
+- `TestSessionFaultsMatchSpecTable` proves the declared faults match the code table. Planted fault: a code missing from the table.
+- `TestSessionFaultBlankID` proves the blank id fault through `Ensure`. Planted fault: comparing the error text.
+- `TestSessionFaultIDTooLarge` proves the id limit fault for sessions and events. Planted fault: naming the byte count.
+- `TestSessionFaultEmptyBatch` proves the empty batch fault through `Append`. Planted fault: accepting zero events.
+- `TestSessionFaultSystemMessage` proves the system message fault before the version check. Planted fault: storing the message.
+- `TestSessionFaultForeignEvent` proves the foreign event fault with ids in the cause. Planted fault: echoing an id.
+- `TestSessionFaultInvalidCount` proves the count fault through `LastN`. Planted fault: allowing a zero window.
+- `TestSessionFaultAlreadyWrapped` proves the wrapped model fault through `Run`. Planted fault: running the wrapped model.
+- `TestSessionFaultContention` proves the contention fault after eight failed claims. Planted fault: retrying forever.
+- `TestSessionFaultStoredMessage` proves the stored message fault for broken JSON and unknown parts. Planted fault: decoding the row.
+- `TestSessionFaultDBPassthrough` proves storage failures keep the `db` fault. Planted fault: replacing it with a session code.
+- `TestSessionFaultAdversarialNoLeak` proves hostile ids and text stay out of public views. Planted fault: leaking a secret.
 
 ## Not in scope
 

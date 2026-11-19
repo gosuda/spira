@@ -8,6 +8,7 @@ package rag_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http/httptest"
@@ -21,6 +22,7 @@ import (
 	"github.com/gosuda/spira/ai/openai"
 	"github.com/gosuda/spira/ai/rag"
 	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/fault"
 	"github.com/gosuda/spira/resilience"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -428,6 +430,49 @@ func TestPgvectorSearchReportsEmbedFailures(t *testing.T) {
 	}
 }
 
+func TestPgvectorFilterMismatchMapsToInvalidFilter(t *testing.T) {
+	marker := errors.New(`ERROR: ai/rag: filter type mismatch on "genre": string (SQLSTATE P0001)`)
+	if !rag.ProbeFilterMismatch(marker) {
+		t.Fatalf("ProbeFilterMismatch = false, want true for the mismatch marker")
+	}
+	if rag.ProbeFilterMismatch(errors.New("connection refused")) {
+		t.Fatalf("ProbeFilterMismatch = true, want false without the marker")
+	}
+	searchFault := fault.Of(rag.ProbeSearchError(marker))
+	if searchFault == nil {
+		t.Fatalf("search error carries no fault, want the outermost rag.invalid_filter fault")
+		return
+	}
+	if searchFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("search error = %v, want the outermost rag.invalid_filter fault", rag.ProbeSearchError(marker))
+	}
+	scanFault := fault.Of(rag.ProbeScanError(marker))
+	if scanFault == nil {
+		t.Fatalf("scan error carries no fault, want the outermost rag.invalid_filter fault")
+		return
+	}
+	if scanFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("scan error = %v, want the outermost rag.invalid_filter fault", rag.ProbeScanError(marker))
+	}
+	plain := errors.New("connection refused")
+	plainSearch := fault.Of(rag.ProbeSearchError(plain))
+	if plainSearch == nil {
+		t.Fatalf("search error carries no fault, want the outermost rag.store_failed fault")
+		return
+	}
+	if plainSearch.Code != rag.ErrStoreFailed.Code {
+		t.Errorf("search error = %v, want the outermost rag.store_failed fault", rag.ProbeSearchError(plain))
+	}
+	plainScan := fault.Of(rag.ProbeScanError(plain))
+	if plainScan == nil {
+		t.Fatalf("scan error carries no fault, want the outermost rag.store_failed fault")
+		return
+	}
+	if plainScan.Code != rag.ErrStoreFailed.Code {
+		t.Errorf("scan error = %v, want the outermost rag.store_failed fault", rag.ProbeScanError(plain))
+	}
+}
+
 func pgVectors() map[string][]float32 {
 	unit := []float32{1, 0, 0}
 	return map[string][]float32{
@@ -577,9 +622,7 @@ func runAgreement(t *testing.T, ctx context.Context, stores agreeStores, c agree
 	memDocs, memErr := mem.Search(ctx, rag.Search{Query: "q", Filter: filter})
 	pgDocs, pgErr := stores.pg.Search(ctx, rag.Search{Query: "q", Filter: filter})
 	if c.fail {
-		if memErr == nil || pgErr == nil {
-			t.Errorf("%s: memory error = %v, pgvector error = %v, want both to fail", c.name, memErr, pgErr)
-		}
+		checkAgreementFailure(t, c, memErr, pgErr)
 		return
 	}
 	if memErr != nil || pgErr != nil {
@@ -591,6 +634,30 @@ func runAgreement(t *testing.T, ctx context.Context, stores agreeStores, c agree
 	}
 	if got, want := ids(pgDocs), ids(memDocs); !slices.Equal(got, want) {
 		t.Errorf("%s: pgvector ids = %v, memory ids = %v", c.name, got, want)
+	}
+}
+
+func checkAgreementFailure(t *testing.T, c agreeCase, memErr error, pgErr error) {
+	t.Helper()
+	if memErr == nil || pgErr == nil {
+		t.Errorf("%s: memory error = %v, pgvector error = %v, want both to fail", c.name, memErr, pgErr)
+		return
+	}
+	memFault := fault.Of(memErr)
+	if memFault == nil {
+		t.Errorf("%s: memory error = %v, carries no fault", c.name, memErr)
+		return
+	}
+	pgFault := fault.Of(pgErr)
+	if pgFault == nil {
+		t.Errorf("%s: pgvector error = %v, carries no fault", c.name, pgErr)
+		return
+	}
+	if memFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("%s: memory fault = %v, want the outermost rag.invalid_filter fault", c.name, memErr)
+	}
+	if pgFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("%s: pgvector fault = %v, want the outermost rag.invalid_filter fault", c.name, pgErr)
 	}
 }
 

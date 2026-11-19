@@ -62,8 +62,8 @@ func Faults() []*fault.Error
 - Tool call arguments that are not a JSON object MUST surface as `ollama.invalid_request` before the request is sent.
 - A 4xx answer other than 408 and 429 MUST surface as `ollama.provider_rejected`.
 - A 429 answer MUST surface as `ollama.provider_rate_limited`.
-- Any other failing answer MUST surface as `ollama.provider_unavailable`.
-- A provider error field MUST surface as `ollama.provider_unavailable` with the body length.
+- Any other failing answer MUST surface as `ollama.provider_error`.
+- A provider error field MUST surface as `ollama.provider_error` with the body length.
 - A status fault cause MUST hold the status and the body length.
 - A status fault cause MUST NOT hold the body text.
 
@@ -92,6 +92,7 @@ func Faults() []*fault.Error
 - `TestChatRequestBodyMatchesReferenceShape` compares the request body with the reference JSON for a prompt with one tool.
 - `TestStreamCutBeforeDoneYieldsErrorAndNoReply` proves the error chunk for a cut stream.
 - `TestStreamCallerCancelYieldsPrefixedCancelError` proves a caller cancel yields the stream cut fault and keeps the cause.
+- `TestStreamCanceledBeforeHeadersYieldsStreamCut` proves a cancel before headers yields the stream cut fault and keeps the cause.
 - `TestStreamEndsAtTheDoneRecordWhileTheBodyStaysOpen` proves that the stream ends at `done` while the server keeps the body open.
 - `TestClientErrorIsFinal` proves that a 400 answer costs one request as the provider rejection. The test server counts the requests.
 - `TestServerErrorIsRetried` proves that a 500 answer is retried as the provider error.
