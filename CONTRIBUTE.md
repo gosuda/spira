@@ -28,7 +28,7 @@ The [specifications](docs/specs/README.md) hold the contract of each package.
 4. Make the change. Run the test again. The run MUST pass.
 5. Run `just gate` before every commit. The hook `.git/hooks/pre-commit` runs the same gate and stops the commit when it fails.
 6. Run `just eject` at the end of the unit of work. An eject failure is a finding. See "Findings".
-7. Engine tests run in Docker containers. Use `scripts/engines.sh <command>` to run a command with the engine DSNs set. The script pins each image by digest and removes its containers on exit.
+7. Start engine tests from a clean tree. Run them only through `just engines`. Do not call `scripts/engines.sh` directly for a test run. The recipe sets the engine DSNs. The script pins each image by digest and removes its containers on exit.
 
 ## Commits
 
