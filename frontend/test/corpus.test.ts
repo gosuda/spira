@@ -112,6 +112,24 @@ function loadCorpus(): CorpusLine[] {
 
 const corpus = loadCorpus();
 
+const REQUIRED_CORPUS_CASES = [
+	"slot-id-well-formed",
+	"slot-id-wrong-prefix",
+	"slot-id-fifteen-hex",
+	"slot-id-uppercase-hex",
+	"slot-id-missing-index",
+	"slot-id-quote-bracket",
+	"island-when-valid",
+	"island-when-load",
+	"island-when-idle",
+	"island-when-unknown",
+	"island-props-object",
+	"island-props-nested-object",
+	"island-props-malformed",
+	"island-props-array",
+	"island-props-string",
+] as const;
+
 const loader = vi.fn(() => Promise.resolve({ default: reactFixture }));
 const table: IslandTable = {
 	"example/shop/react.react.tsx": loader,
@@ -186,6 +204,34 @@ describe("wire corpus", () => {
 			}
 		},
 	);
+});
+
+describe("wire corpus coverage", () => {
+	test("required cases are present", () => {
+		const byName = new Map(corpus.map((line) => [line.name, line] as const));
+		for (const name of REQUIRED_CORPUS_CASES) {
+			if (!byName.has(name)) {
+				throw new Error(`wire/corpus.jsonl lacks required case "${name}"`);
+			}
+		}
+	});
+
+	test("no unknown owned cases", () => {
+		const required = new Set<string>(REQUIRED_CORPUS_CASES);
+		for (const line of corpus) {
+			if (
+				line.request.kind === "slot-id" ||
+				line.request.kind === "island-when" ||
+				line.request.kind === "island-props"
+			) {
+				if (!required.has(line.name)) {
+					throw new Error(
+						`corpus case "${line.name}" is not in the required list`,
+					);
+				}
+			}
+		}
+	});
 });
 
 async function checkSlotId(id: string, expectedValid: boolean): Promise<void> {

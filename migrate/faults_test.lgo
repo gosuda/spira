@@ -1,0 +1,159 @@
+package migrate_test
+
+import (
+	"errors"
+	"os"
+	"testing"
+	"testing/fstest"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/migrate"
+)
+
+func TestFaultMissingDown(t *testing.T) {
+	fsys := fstest.MapFS{
+		"0001_only.up.sql": &fstest.MapFile{Data: []byte("CREATE TABLE only_one (id integer)")},
+	}
+	_, err := migrate.Load(fsys)
+	if !errors.Is(err, migrate.ErrMissingDown) {
+		t.Fatalf("Load error = %v, want migrate.ErrMissingDown", err)
+		return
+	}
+	_, err = migrate.Load(os.DirFS("testdata/downonly"))
+	if !errors.Is(err, migrate.ErrMissingDown) {
+		t.Fatalf("Load error = %v, want migrate.ErrMissingDown", err)
+		return
+	}
+}
+
+func TestFaultOrderMismatch(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	err := migrate.Apply(t.Context(), pool, []migrate.Step{steps[1], steps[0]})
+	if !errors.Is(err, migrate.ErrOrderMismatch) {
+		t.Fatalf("Apply error = %v, want migrate.ErrOrderMismatch", err)
+		return
+	}
+}
+
+func TestFaultNotReversible(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "badpair")
+	err := migrate.CheckReversible(t.Context(), pool, steps)
+	if !errors.Is(err, migrate.ErrNotReversible) {
+		t.Fatalf("CheckReversible error = %v, want migrate.ErrNotReversible", err)
+		return
+	}
+}
+
+func TestFaultScratchNotEmpty(t *testing.T) {
+	pool := openPool(t)
+	if _, err := db.Exec(t.Context(), pool, "CREATE TABLE scratch_left (id integer)"); err != nil {
+		t.Fatalf("seed: %v", err)
+		return
+	}
+	steps := loadSteps(t, "good")
+	err := migrate.CheckReversible(t.Context(), pool, steps)
+	if !errors.Is(err, migrate.ErrScratchNotEmpty) {
+		t.Fatalf("CheckReversible error = %v, want migrate.ErrScratchNotEmpty", err)
+		return
+	}
+}
+
+func TestFaultUnavailable(t *testing.T) {
+	_, err := migrate.Load(os.DirFS("/nonexistent-fault-dir"))
+	if !errors.Is(err, migrate.ErrUnavailable) {
+		t.Fatalf("Load error = %v, want migrate.ErrUnavailable", err)
+		return
+	}
+	pool, oerr := db.Open("sqlite", dsnFor(t))
+	if oerr != nil {
+		t.Fatalf("Open: %v", oerr)
+		return
+	}
+	if pool == nil {
+		t.Fatal("Open returned no pool")
+		return
+	}
+	if serr := pool.Start(t.Context()); serr != nil {
+		t.Fatalf("Start: %v", serr)
+		return
+	}
+	if serr := pool.Stop(t.Context()); serr != nil {
+		t.Fatalf("Stop: %v", serr)
+		return
+	}
+	steps := loadSteps(t, "good")
+	err = migrate.Apply(t.Context(), pool, steps)
+	if !errors.Is(err, migrate.ErrUnavailable) {
+		t.Fatalf("Apply error = %v, want migrate.ErrUnavailable", err)
+		return
+	}
+}
+
+func TestFaultPartialDDLMySQL(t *testing.T) {
+	dsn := os.Getenv("SPIRA_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skipf("SPIRA_TEST_MYSQL_DSN is not set")
+		return
+	}
+	pool, err := db.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatal("Open returned no pool")
+		return
+	}
+	if serr := pool.Start(t.Context()); serr != nil {
+		t.Fatalf("Start: %v", serr)
+		return
+	}
+	t.Cleanup(func() {
+		if serr := pool.Stop(t.Context()); serr != nil {
+			t.Errorf("Stop: %v", serr)
+		}
+	})
+	steps := []migrate.Step{{Name: "0001_broken", Up: "CREATE TABLEE broken (id integer)", Down: "DROP TABLE broken"}}
+	err = migrate.Apply(t.Context(), pool, steps)
+	if !errors.Is(err, migrate.ErrPartialDDL) {
+		t.Fatalf("Apply error = %v, want migrate.ErrPartialDDL", err)
+		return
+	}
+}
+
+func TestFaultsMatchSpecTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/migrate.md", migrate.Faults())
+}
+
+func TestFaultPublicHidesSecretsAndHostile(t *testing.T) {
+	hostile := "<script>alert(1)</script>"
+	secret := "sk-live-secret-value"
+	fsys := fstest.MapFS{
+		hostile + ".up.sql": &fstest.MapFile{Data: []byte("CREATE TABLE h (id integer)")},
+	}
+	_, lerr := migrate.Load(fsys)
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, lerr), hostile)
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if aerr := migrate.Apply(t.Context(), pool, steps); aerr != nil {
+		t.Fatalf("Apply: %v", aerr)
+		return
+	}
+	renamed := []migrate.Step{{Name: hostile, Up: steps[0].Up, Down: steps[0].Down}, steps[1]}
+	oerr := migrate.Apply(t.Context(), pool, renamed)
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, oerr), hostile)
+	bad := []migrate.Step{steps[0], steps[1], {Name: "0003_bad", Up: "SELECT * FROM " + secret, Down: "SELECT 1"}}
+	uerr := migrate.Apply(t.Context(), pool, bad)
+	if !errors.Is(uerr, db.ErrStatementFailed) {
+		t.Fatalf("Apply error = %v, want db.ErrStatementFailed", uerr)
+		return
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, uerr), secret)
+}

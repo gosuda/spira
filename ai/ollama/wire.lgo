@@ -1,0 +1,68 @@
+// Translated and changed by spira from Spring AI,
+// models/spring-ai-ollama/src/main/java/org/springframework/ai/ollama/api/OllamaApi.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ollama
+
+import "encoding/json/jsontext"
+
+type wireMessage struct {
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	Thinking  string         `json:"thinking,omitempty"`
+	ToolCalls []wireToolCall `json:"tool_calls,omitempty"`
+	ToolName  string         `json:"tool_name,omitempty"`
+}
+
+type wireToolCall struct {
+	ID       string           `json:"id,omitempty"`
+	Function wireToolFunction `json:"function"`
+}
+
+type wireToolFunction struct {
+	Name      string         `json:"name,omitempty"`
+	Arguments map[string]any `json:"arguments,omitempty"`
+}
+
+type wireTool struct {
+	Type     string       `json:"type"`
+	Function wireFunction `json:"function"`
+}
+
+type wireFunction struct {
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+type chatRequest struct {
+	Model    string         `json:"model"`
+	Messages []wireMessage  `json:"messages"`
+	Stream   bool           `json:"stream"`
+	Format   jsontext.Value `json:"format,omitzero"`
+	Tools    []wireTool     `json:"tools,omitempty"`
+	Options  map[string]any `json:"options,omitempty"`
+}
+
+type chatResponse struct {
+	Model           string       `json:"model"`
+	Message         wireMessage  `json:"message"`
+	HasMessage      bool         `json:"-"`
+	Done            bool         `json:"done"`
+	DoneReason      string       `json:"done_reason,omitempty"`
+	PromptEvalCount int64        `json:"prompt_eval_count"`
+	EvalCount       int64        `json:"eval_count"`
+	Error           string       `json:"error"`
+}
+
+type embedRequest struct {
+	Model    string   `json:"model"`
+	Input    []string `json:"input"`
+	Truncate bool     `json:"truncate"`
+}
+
+type embedResponse struct {
+	Model      string      `json:"model"`
+	Embeddings [][]float32 `json:"embeddings"`
+}

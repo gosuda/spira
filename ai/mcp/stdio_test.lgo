@@ -1,0 +1,542 @@
+package mcp_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"encoding/json/jsontext"
+
+	"github.com/gosuda/spira/ai/mcp"
+)
+
+type fakeServer struct {
+	t           *testing.T
+	steps       []step
+	next        int
+	initialized bool
+}
+
+func (s *fakeServer) handle(msg mcp.Envelope) (string, bool) {
+	if msg.Method == "notifications/initialized" {
+		s.initialized = true
+		assertInitializedFixture(s.t, msg)
+		return "", false
+	}
+	if strings.HasPrefix(msg.Method, "notifications/") {
+		return "", false
+	}
+	if msg.Method != "initialize" && !s.initialized {
+		return s.reject(msg, -32600, "not initialized"), true
+	}
+	if s.next >= len(s.steps) || s.steps[s.next].method != msg.Method {
+		return s.reject(msg, -32602, "unexpected method "+msg.Method), true
+	}
+	st := s.steps[s.next]
+	if st.params != "" && mustNormalizeText(st.params) != mustNormalize(msg.Params) {
+		return s.reject(msg, -32602, "unexpected params for "+msg.Method), true
+	}
+	s.next++
+	return st.respond(s.t, msg)
+}
+
+func (s *fakeServer) reject(req mcp.Envelope, code int32, message string) string {
+	s.t.Errorf("fake server rejected a message: %d %s", code, message)
+	reply := mcp.Envelope{JSONRPC: "2.0", ID: req.ID, Error: &mcp.RPCError{Code: code, Message: message}}
+	out, err := json.Marshal(reply)
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+func assertInitializedFixture(t *testing.T, msg mcp.Envelope) {
+	t.Helper()
+	out, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+		return
+	}
+	if got, want := canon(t, out), canonFixture(t, "lifecycle/initialized-notification.json"); got != want {
+		t.Errorf("initialized notification %s, want %s", got, want)
+	}
+}
+
+type stdioPump struct {
+	fake   *fakeServer
+	client *os.File
+	server *os.File
+	sink   *os.File
+	pending []byte
+}
+
+func newStdioTransport(t *testing.T, steps []step) (mcp.Transport, func()) {
+	t.Helper()
+	serverRead, clientWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return nil, nil
+	}
+	clientRead, serverWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return nil, nil
+	}
+	pump := &stdioPump{fake: &fakeServer{t: t, steps: steps}, client: clientRead, server: serverRead, sink: serverWrite}
+	transport := mcp.NewStdio(pump, clientWrite)
+	if transport == nil {
+		t.Fatal("no stdio transport")
+		return nil, nil
+	}
+	return transport, func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close stdio transport: %v", err)
+		}
+	}
+}
+
+func (p *stdioPump) Read(b []byte) (int, error) {
+	p.pump()
+	return p.client.Read(b)
+}
+
+func (p *stdioPump) pump() {
+	chunk := make([]byte, 64*1024)
+	n, err := p.server.Read(chunk)
+	if n > 0 {
+		p.pending = append(p.pending, chunk[:n]...)
+	}
+	if err != nil && n == 0 {
+		return
+	}
+	for {
+		i := bytes.IndexByte(p.pending, '\n')
+		if i < 0 {
+			return
+		}
+		line := strings.TrimSpace(string(p.pending[:i]))
+		p.pending = p.pending[i+1:]
+		p.line(line)
+	}
+}
+
+func (p *stdioPump) line(line string) {
+	if line == "" {
+		return
+	}
+	var msg mcp.Envelope
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		p.reply(p.fake.reject(mcp.Envelope{}, -32700, "parse error"))
+		return
+	}
+	reply, ok := p.fake.handle(msg)
+	if ok {
+		p.reply(reply)
+	}
+}
+
+func (p *stdioPump) reply(line string) {
+	if _, err := fmt.Fprintf(p.sink, "%s\n", line); err != nil {
+		p.fake.t.Errorf("stdio fake write: %v", err)
+	}
+}
+
+func TestStdioDeadlineWithoutReply(t *testing.T) {
+	serverRead, serverWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return
+	}
+	clientRead, clientWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return
+	}
+	transport := mcp.NewStdio(serverRead, clientWrite)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverWrite.Close(); err != nil {
+			t.Errorf("close server write: %v", err)
+		}
+	}()
+	defer func() {
+		if err := clientRead.Close(); err != nil {
+			t.Errorf("close client read: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	start := time.Now()
+	_, err = transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("1"), Method: "tools/list"})
+	cancel()
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("request against a silent subprocess: %v, want context deadline exceeded", err)
+	}
+	if elapsed > 900*time.Millisecond {
+		t.Errorf("request returned after %v, want the 100ms deadline", elapsed)
+	}
+
+	replyLine := "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n"
+	if _, err := serverWrite.Write([]byte(replyLine)); err != nil {
+		t.Fatalf("write reply: %v", err)
+		return
+	}
+	reply, err := transport.Request(context.Background(), mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("2"), Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("request after an expired deadline, both ends open: %v", err)
+		return
+	}
+	if string(reply.ID) != "2" {
+		t.Errorf("reply id %s, want 2", reply.ID)
+	}
+}
+
+func TestStdioPartialWritePoisonsTransport(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return
+	}
+	defer func() {
+		if err := readEnd.Close(); err != nil {
+			t.Errorf("close pipe read end: %v", err)
+		}
+	}()
+	transport := mcp.NewStdio(bytes.NewReader(nil), writeEnd)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	fillStdioPipe(t, writeEnd)
+	drainStdioPipe(t, readEnd, 2*os.Getpagesize())
+	pad := strings.Repeat("a", 8*os.Getpagesize())
+	first := mcp.Envelope{JSONRPC: "2.0", Method: "tools/call", Params: jsontext.Value(`{"probe":"first-probe","pad":"` + pad + `"}`)}
+	if err := notifyStdio(transport, first, 200*time.Millisecond); err == nil {
+		t.Fatalf("first send over a nearly full pipe ended without an error")
+		return
+	}
+	encoded, merr := json.Marshal(first)
+	if merr != nil {
+		t.Fatalf("encode first frame: %v", merr)
+		return
+	}
+	want := append(encoded, '\n')
+	got := drainStdioAll(t, readEnd)
+	at := bytes.IndexByte(got, '{')
+	if at < 0 {
+		t.Fatalf("the pipe holds no byte of the first frame")
+		return
+	}
+	if part := got[at:]; len(part) == 0 || len(part) >= len(want) || !bytes.HasPrefix(want, part) {
+		t.Fatalf("first frame prefix holds %d of %d bytes", len(part), len(want))
+		return
+	}
+	second := mcp.Envelope{JSONRPC: "2.0", Method: "notifications/second-probe"}
+	if err := notifyStdio(transport, second, 500*time.Millisecond); err == nil || !strings.Contains(err.Error(), "unusable") {
+		t.Errorf("second send: %v, want the unusable transport", err)
+	}
+	drained := drainStdioAll(t, readEnd)
+	if bytes.Contains(drained, []byte("second-probe")) {
+		t.Errorf("the second frame reached the pipe after a partial write")
+	}
+}
+
+func notifyStdio(transport mcp.Transport, msg mcp.Envelope, wait time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	return transport.Notify(ctx, msg)
+}
+
+func fillStdioPipe(t *testing.T, w *os.File) {
+	t.Helper()
+	chunk := make([]byte, 65536)
+	for {
+		if err := w.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			t.Fatalf("arm pipe write: %v", err)
+			return
+		}
+		n, err := w.Write(chunk)
+		if err != nil || n < len(chunk) {
+			return
+		}
+	}
+}
+
+func drainStdioPipe(t *testing.T, r *os.File, n int) {
+	t.Helper()
+	if err := r.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("arm pipe read: %v", err)
+		return
+	}
+	if _, err := io.ReadFull(r, make([]byte, n)); err != nil {
+		t.Fatalf("drain pipe: %v", err)
+		return
+	}
+}
+
+func drainStdioAll(t *testing.T, r *os.File) []byte {
+	t.Helper()
+	if err := r.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("arm pipe read: %v", err)
+		return nil
+	}
+	drained, err := io.ReadAll(r)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("drain pipe: %v", err)
+		return nil
+	}
+	return drained
+}
+
+func TestStdioSplitReplyAcrossDeadline(t *testing.T) {
+	serverRead, serverWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return
+	}
+	clientRead, clientWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return
+	}
+	transport := mcp.NewStdio(serverRead, clientWrite)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverWrite.Close(); err != nil {
+			t.Errorf("close server write: %v", err)
+		}
+	}()
+	defer func() {
+		if err := clientRead.Close(); err != nil {
+			t.Errorf("close client read: %v", err)
+		}
+	}()
+	first := "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n"
+	second := "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n"
+	if _, err := serverWrite.Write([]byte(first[:20])); err != nil {
+		t.Fatalf("write reply prefix: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err = transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("1"), Method: "tools/list"})
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("request over a split reply: %v, want context deadline exceeded", err)
+		return
+	}
+	if _, err := serverWrite.Write([]byte(first[20:] + second)); err != nil {
+		t.Fatalf("write reply suffix: %v", err)
+		return
+	}
+	reply, err := transport.Request(context.Background(), mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("2"), Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("request after a split reply: %v", err)
+		return
+	}
+	if string(reply.ID) != "2" {
+		t.Errorf("reply id %s, want 2", reply.ID)
+	}
+}
+
+type noDeadlineReader struct {
+	data []byte
+}
+
+func (r *noDeadlineReader) Read(b []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func (r *noDeadlineReader) SetReadDeadline(time.Time) error {
+	return os.ErrNoDeadline
+}
+
+type noDeadlineWriter struct {
+	buf bytes.Buffer
+}
+
+func (w *noDeadlineWriter) Write(b []byte) (int, error) {
+	return w.buf.Write(b)
+}
+
+func (w *noDeadlineWriter) SetWriteDeadline(time.Time) error {
+	return os.ErrNoDeadline
+}
+
+func TestStdioWithoutDeadlineSupport(t *testing.T) {
+	reply := "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"tools\":[]}}\n"
+	sink := &noDeadlineWriter{}
+	transport := mcp.NewStdio(&noDeadlineReader{data: []byte(reply)}, sink)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	notice := mcp.Envelope{JSONRPC: "2.0", Method: "notifications/initialized"}
+	if err := transport.Notify(context.Background(), notice); err != nil {
+		t.Fatalf("notify without deadline support: %v", err)
+		return
+	}
+	if !strings.Contains(sink.buf.String(), "notifications/initialized") {
+		t.Errorf("the notification never reached the sink")
+	}
+	answer, err := transport.Request(context.Background(), mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("9"), Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("request without deadline support: %v", err)
+		return
+	}
+	if string(answer.ID) != "9" {
+		t.Errorf("reply id %s, want 9", answer.ID)
+	}
+}
+
+func TestStdioPendingBound(t *testing.T) {
+	serverRead, serverWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+		return
+	}
+	transport := mcp.NewStdio(serverRead, io.Discard)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverWrite.Close(); err != nil {
+			t.Errorf("close server write: %v", err)
+		}
+	}()
+	backstop, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	written, refused, err := drivePendingBound(t, serverWrite, transport, backstop)
+	if err != nil {
+		t.Fatalf("drive pending: %v", err)
+		return
+	}
+	if !refused && backstop.Err() != nil {
+		t.Fatalf("backstop: wrote %d bytes without a refusal, want the bound near %d", written, 4<<20)
+		return
+	}
+	if err := transport.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/done"}); err == nil || !strings.Contains(err.Error(), "unusable") {
+		t.Errorf("send after an overlong line: %v, want the unusable transport", err)
+	}
+}
+
+type pendingFeed struct {
+	w *os.File
+	transport mcp.Transport
+	written atomic.Int64
+	refused atomic.Bool
+	done atomic.Bool
+	target int64
+}
+
+func feedChunks(t *testing.T, f *pendingFeed, ctx context.Context, stop context.CancelFunc) {
+	t.Helper()
+	chunk := make([]byte, 65536)
+	for !f.refused.Load() && !f.done.Load() && f.written.Load() < f.target && ctx.Err() == nil {
+		n, err := f.w.Write(chunk)
+		if err == nil {
+			f.written.Add(int64(n))
+			continue
+		}
+		if n > 0 {
+			f.written.Add(int64(n))
+		}
+		if f.refused.Load() || f.done.Load() || ctx.Err() != nil {
+			break
+		}
+		t.Errorf("fill pipe: %v", err)
+		break
+	}
+	if !f.refused.Load() {
+		f.done.Store(true)
+		stop()
+	}
+}
+
+func pollPending(t *testing.T, f *pendingFeed, ctx context.Context) {
+	t.Helper()
+	ask := mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("8"), Method: "tools/list"}
+	for !f.refused.Load() && !f.done.Load() && f.written.Load() < f.target && ctx.Err() == nil {
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		_, err := f.transport.Request(reqCtx, ask)
+		cancel()
+		if err == nil {
+			t.Errorf("request over a newline-less peer ended without an error")
+			break
+		}
+		if strings.Contains(err.Error(), "unusable") {
+			f.refused.Store(true)
+			if err := f.w.SetWriteDeadline(time.Now()); err != nil {
+				t.Errorf("wake writer: %v", err)
+			}
+			break
+		}
+	}
+}
+
+func drivePendingBound(t *testing.T, w *os.File, transport mcp.Transport, ctx context.Context) (int64, bool, error) {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false, errors.New("drive pending needs a deadline")
+	}
+	if err := w.SetWriteDeadline(deadline); err != nil {
+		return 0, false, fmt.Errorf("arm pipe write: %w", err)
+	}
+	feedCtx, stopFeed := context.WithCancel(ctx)
+	defer stopFeed()
+	feed := &pendingFeed{w: w, transport: transport, target: int64(5 << 20)}
+	go group (feedCtx) {
+		go {
+			feedChunks(t, feed, feedCtx, stopFeed)
+		}
+		go {
+			pollPending(t, feed, feedCtx)
+		}
+	}
+	return feed.written.Load(), feed.refused.Load(), nil
+}
+
+func TestStdioOverlongLineWithReadErrorPoisonsTransport(t *testing.T) {
+	over := strings.Repeat("x", (4<<20)+1)
+	transport := mcp.NewStdio(bytes.NewReader([]byte(over)), io.Discard)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	_, err := transport.Request(context.Background(), mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("1"), Method: "tools/list"})
+	if err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("err = %v, want the overlong line report", err)
+		return
+	}
+	if serr := transport.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/done"}); serr == nil || !strings.Contains(serr.Error(), "unusable") {
+		t.Fatalf("send after an overlong line: %v, want the unusable transport", serr)
+		return
+	}
+}

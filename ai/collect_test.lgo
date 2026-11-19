@@ -172,6 +172,21 @@ func TestCollectStartsANewResponseWhenAnIndexRestartsWithoutAnID(t *testing.T) {
 	)
 }
 
+func TestCollectStartsANewGroupWhenALaterSlotOpensBeforeAnEarlierSlotFinishes(t *testing.T) {
+	call := ai.ToolCall{Name: "getWeather", Arguments: "{}"}
+	got := collectParts(t,
+		delta("", 0, ai.Reasoning{Text: "round one"}),
+		delta("", 1, ai.Text{Text: "Checking. "}),
+		whole("", 2, call),
+		delta("", 0, ai.Reasoning{Text: "round two"}),
+		delta("", 1, ai.Text{Text: "Sunny."}),
+	)
+	requireParts(t, got,
+		ai.Reasoning{Text: "round one"}, ai.Text{Text: "Checking. "}, call,
+		ai.Reasoning{Text: "round two"}, ai.Text{Text: "Sunny."},
+	)
+}
+
 func TestCollectStartsANewResponseWhenACompleteSlotIsHitAgainWithoutAnID(t *testing.T) {
 	got := collectParts(t,
 		whole("", 0, ai.Reasoning{Text: "one"}),

@@ -1,0 +1,274 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/SimpleVectorStore.java,
+// SearchRequest.java and SimpleVectorStoreFilterExpressionEvaluator.java, and
+// spring-ai-document/src/main/java/org/springframework/ai/document/Document.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strings"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type Value interface {
+	Text | Number | Flag
+}
+
+type Text struct {
+	Text string
+}
+
+type Number struct {
+	Number float64
+}
+
+type Flag struct {
+	Flag bool
+}
+
+type Document struct {
+	ID       string
+	Text     string
+	Metadata map[string]Value
+	Score    float64?
+}
+
+type Search struct {
+	Query     string
+	TopK      int = 4
+	Threshold float64
+	Filter    Filter?
+}
+
+type Memory struct {
+	Embed ai.Embedder
+
+	state sync.Locked[memory]
+}
+
+type memory struct {
+	dims    int
+	index   map[string]int
+	entries []entry
+	squares []float64
+	vectors []float32
+}
+
+type entry struct {
+	id   string
+	text string
+	meta map[string]Value
+}
+
+type hit struct {
+	at    int
+	score float64
+}
+
+func (m *Memory) Add(ctx context.Context, docs []Document) error {
+	if m.Embed == nil {
+		return ErrInvalidRequest.Wrap(errors.New("ai/rag: memory needs an embedder"))
+	}
+	if len(docs) == 0 {
+		return ErrInvalidRequest.Wrap(errors.New("ai/rag: add needs a document"))
+	}
+	texts := make([]string, len(docs))
+	for i, d := range docs {
+		if strings.TrimSpace(d.ID) == "" {
+			return ErrInvalidRequest.Wrap(errors.New("ai/rag: document needs an id"))
+		}
+		texts[i] = d.Text
+	}
+	vectors, err := m.Embed.Embed(ctx, texts)
+	if err != nil {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed documents: %w", err))
+	}
+	if len(vectors) != len(docs) {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for %d documents", len(vectors), len(docs)))
+	}
+	squares, err := squaredLengths(docs, vectors)
+	if err != nil {
+		return ErrInvalidRequest.Wrap(err)
+	}
+	var refused error
+	m.state.WithLock(func(s *memory) {
+		if s.dims != 0 && len(vectors[0]) != s.dims {
+			refused = ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: document %s has %d dimensions, the store holds %d", docs[0].ID, len(vectors[0]), s.dims))
+			return
+		}
+		s.dims = len(vectors[0])
+		for i, d := range docs {
+			s.put(d, vectors[i], squares[i])
+		}
+	})
+	return refused
+}
+
+func squaredLengths(docs []Document, vectors [][]float32) ([]float64, error) {
+	squares := make([]float64, len(docs))
+	for i, d := range docs {
+		if len(vectors[i]) == 0 {
+			return nil, fmt.Errorf("ai/rag: document %s has an empty embedding", d.ID)
+		}
+		if len(vectors[i]) != len(vectors[0]) {
+			return nil, fmt.Errorf("ai/rag: document %s has %d dimensions, document %s has %d", d.ID, len(vectors[i]), docs[0].ID, len(vectors[0]))
+		}
+		square, err := squaredLength(vectors[i])
+		if err != nil {
+			return nil, fmt.Errorf("ai/rag: document %s: %w", d.ID, err)
+		}
+		squares[i] = square
+	}
+	return squares, nil
+}
+
+func squaredLength(vector []float32) (float64, error) {
+	square := dot(vector, vector)
+	if square == 0 {
+		return 0, errors.New("zero vector")
+	}
+	if math.IsNaN(square) || math.IsInf(square, 0) {
+		return 0, errors.New("vector with a value that is not finite")
+	}
+	return square, nil
+}
+
+func (s *memory) put(d Document, vector []float32, square float64) {
+	if s.index == nil {
+		s.index = map[string]int{}
+	}
+	stored := entry{id: d.ID, text: d.Text, meta: maps.Clone(d.Metadata)}
+	if at := s.index[d.ID]; at != nil {
+		s.entries[at] = stored
+		s.squares[at] = square
+		copy(s.vectors[at*s.dims:(at+1)*s.dims], vector)
+		return
+	}
+	s.index[d.ID] = len(s.entries)
+	s.entries = append(s.entries, stored)
+	s.squares = append(s.squares, square)
+	s.vectors = append(s.vectors, vector...)
+}
+
+func (m *Memory) Delete(ctx context.Context, ids const []string) error {
+	if err := ctx.Err(); err != nil {
+		return ErrStoreFailed.Wrap(err)
+	}
+	m.state.WithLock(func(s *memory) {
+		for _, id := range ids {
+			s.drop(id)
+		}
+	})
+	return nil
+}
+
+func (s *memory) drop(id string) {
+	at := s.index[id]
+	if at == nil {
+		return
+	}
+	last := len(s.entries) - 1
+	if at != last {
+		copy(s.vectors[at*s.dims:(at+1)*s.dims], s.vectors[last*s.dims:])
+		s.entries[at] = s.entries[last]
+		s.squares[at] = s.squares[last]
+		s.index[s.entries[at].id] = at
+	}
+	s.entries[last] = entry{}
+	s.entries = s.entries[:last]
+	s.squares = s.squares[:last]
+	s.vectors = s.vectors[:last*s.dims]
+	delete(s.index, id)
+}
+
+func (m *Memory) Search(ctx context.Context, q Search) ([]Document, error) {
+	if m.Embed == nil {
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: memory needs an embedder"))
+	}
+	if q.TopK < 0 {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: topK must not be negative, got %d", q.TopK))
+	}
+	if q.Threshold < 0 || q.Threshold > 1 {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: similarity threshold must be in [0, 1], got %v", q.Threshold))
+	}
+	vectors, err := m.Embed.Embed(ctx, []string{q.Query})
+	if err != nil {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed query: %w", err))
+	}
+	if len(vectors) != 1 {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for the query", len(vectors)))
+	}
+	square, err := squaredLength(vectors[0])
+	if err != nil {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query: %w", err))
+	}
+	var found []Document
+	var refused error
+	m.state.WithLock(func(s *memory) {
+		docs, err := s.nearest(vectors[0], square, q)
+		if err != nil {
+			refused = err
+			return
+		}
+		found = docs
+	})
+	if refused != nil {
+		return nil, refused
+	}
+	return found, nil
+}
+
+func (s *memory) nearest(query []float32, square float64, q Search) ([]Document, error) {
+	if len(s.entries) == 0 {
+		return []Document{}, nil
+	}
+	if len(query) != s.dims {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query vector has %d dimensions, the store holds %d", len(query), s.dims))
+	}
+	hits := make([]hit, 0, len(s.entries))
+	for at := range s.entries {
+		if f := q.Filter; f != nil {
+			keep, err := evalFilter(f, s.entries[at].meta)
+			if err != nil {
+				return nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: filter: %w", err))
+			}
+			if !keep {
+				continue
+			}
+		}
+		score := dot(query, s.vectors[at*s.dims:(at+1)*s.dims]) / math.Sqrt(square*s.squares[at])
+		if score >= q.Threshold {
+			hits = append(hits, hit{at: at, score: score})
+		}
+	}
+	slices.SortFunc(hits, func(a hit, b hit) int {
+		return cmp.Or(cmp.Compare(b.score, a.score), cmp.Compare(s.entries[a.at].id, s.entries[b.at].id))
+	})
+	hits = hits[:min(q.TopK, len(hits))]
+	docs := make([]Document, len(hits))
+	for i, h := range hits {
+		stored := s.entries[h.at]
+		docs[i] = Document{ID: stored.id, Text: stored.text, Metadata: maps.Clone(stored.meta), Score: h.score}
+	}
+	return docs, nil
+}
+
+func dot(a []float32, b []float32) float64 {
+	sum := 0.0
+	for i := range a {
+		sum += float64(a[i]) * float64(b[i])
+	}
+	return sum
+}

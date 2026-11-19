@@ -1,0 +1,108 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-model/src/main/java/org/springframework/ai/converter/BeanOutputConverter.java
+// and spring-ai-model/src/main/java/org/springframework/ai/converter/MarkdownCodeBlockCleaner.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ai
+
+import (
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+var ErrEmpty = errors.New("ai: structured: empty answer")
+
+var ErrTooLarge = errors.New("ai: structured: answer exceeds the size limit of 1048576 bytes")
+
+var ErrUnterminatedFence = errors.New("ai: structured: unterminated code fence")
+
+const structuredLimit = 1 << 20
+
+func FormatInstruction() string {
+	return "Your response should be in JSON format.\n" +
+		"Do not include any explanations, only provide a RFC8259 compliant JSON response following this format without deviation.\n" +
+		"Do not include markdown code blocks in your response.\n" +
+		"Remove the ```json markdown from the output."
+}
+
+func Structured[T any](text string) (T, error) {
+	var zero T
+	if len(text) > structuredLimit {
+		return zero, ErrTooLarge
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return zero, ErrEmpty
+	}
+	var bare T
+	if uerr := json.Unmarshal([]byte(trimmed), &bare); uerr == nil {
+		return bare, nil
+	}
+	doc, err := structuredDocument(trimmed)
+	if err != nil {
+		return zero, err
+	}
+	var out T
+	if uerr := json.Unmarshal([]byte(doc), &out); uerr != nil {
+		return zero, fmt.Errorf("ai: structured: decode: %w", uerr)
+	}
+	return out, nil
+}
+
+func structuredDocument(text string) (string, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", ErrEmpty
+	}
+	if idx := strings.Index(trimmed, "```"); idx >= 0 {
+		return fencedDocument(trimmed[idx:])
+	}
+	return trimmed, nil
+}
+
+func fencedDocument(from string) (string, error) {
+	rest := from[3:]
+	if nl := strings.Index(rest, "\n"); nl >= 0 && fenceClose(rest[:nl]) < 0 {
+		rest = rest[nl+1:]
+	}
+	end := fenceClose(rest)
+	if end < 0 {
+		return "", ErrUnterminatedFence
+	}
+	inner := strings.TrimSpace(rest[:end])
+	if inner == "" {
+		return "", ErrEmpty
+	}
+	return inner, nil
+}
+
+func fenceClose(s string) int {
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] == '"' {
+			i = stringEnd(s, i)
+			continue
+		}
+		if s[i] == '`' && s[i+1] == '`' && s[i+2] == '`' {
+			return i
+		}
+	}
+	return -1
+}
+
+func stringEnd(s string, open int) int {
+	i := open + 1
+	for i < len(s) {
+		if s[i] == '\\' {
+			i += 2
+			continue
+		}
+		if s[i] == '"' {
+			return i
+		}
+		i++
+	}
+	return len(s)
+}

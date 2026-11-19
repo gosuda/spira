@@ -11,8 +11,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	"logos/sync"
 
 	"github.com/gosuda/spira/resilience"
 	"github.com/gosuda/spira/web"
@@ -28,11 +29,14 @@ type Route struct {
 
 func Mount(r *web.Router, routes []Route, policy resilience.Policy) {
 	for i := range routes {
-		rl := newRelay(routes[i], policy)
-		h := stageChain(routes[i].Stages, proxyHandler(newProxy(rl)))
-		for _, pattern := range routePatterns(routes[i].Host, routes[i].PathPrefix) {
-			r.Handle("", pattern, h)
-		}
+		rt := routes[i]
+		h := proxyHandler(newProxy(newRelay(rt, policy)))
+		r.Group("", func(g *web.Router) {
+			g.Use(rt.Stages...)
+			for _, pattern := range routePatterns(rt.Host, rt.PathPrefix) {
+				g.Handle("", pattern, h)
+			}
+		})
 	}
 }
 
@@ -59,6 +63,9 @@ func badGatewayBody() []byte {
 func requirePrefix(prefix string) {
 	if !strings.HasPrefix(prefix, "/") {
 		panic($"gateway: route {prefix}: path prefix must start with /")
+	}
+	if strings.ContainsAny(prefix, "{}*") {
+		panic($"gateway: route {prefix}: path prefix must not contain wildcards")
 	}
 }
 
@@ -98,21 +105,17 @@ func routePatterns(host string?, prefix string) []string {
 	if prefix == "/" {
 		return []string{name + "/"}
 	}
-	return []string{name + prefix, name + prefix + "/"}
+	patterns := []string{name + prefix}
+	if !strings.HasSuffix(prefix, "/") {
+		patterns = append(patterns, name+prefix+"/")
+	}
+	return patterns
 }
 
 func proxyHandler(px *httputil.ReverseProxy) web.Handler {
 	return func(ctx *web.Context) (web.Reply, error) {
 		return web.Delegate{To: px}, nil
 	}
-}
-
-func stageChain(stages []web.Stage, last web.Handler) web.Handler {
-	h := last
-	for i := len(stages) - 1; i >= 0; i-- {
-		h = stages[i](h)
-	}
-	return h
 }
 
 func newProxy(rl *relay) *httputil.ReverseProxy {
@@ -138,11 +141,15 @@ type relay struct {
 	timeout time.Duration
 	body    []byte
 	hops    []upstream
-	turn    atomic.Uint64
+	turn    sync.Locked[int]
 }
 
 func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
-	start := int(rl.turn.Add(1)-1) % len(rl.hops)
+	var start int
+	rl.turn.WithLock(func(next *int) {
+		start = *next
+		*next = (start + 1) % len(rl.hops)
+	})
 	again := replays(req)
 	var cause error
 	for i := range rl.hops {
@@ -180,21 +187,23 @@ func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, err
 	outctx, cancel := context.WithCancel(req.Context())
 	timer := time.AfterFunc(rl.timeout, cancel)
 	resp, err := http.DefaultTransport.RoundTrip(rl.outbound(req, base, outctx))
+	missed := !timer.Stop() && req.Context().Err() == nil
 	if err != nil {
-		timer.Stop()
 		cancel()
-		return resp, err
+		if missed {
+			return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
+		}
+		return nil, ErrBadGateway.Wrap(err)
+	}
+	if missed {
+		cancel()
+		resp.Body.Close()?
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 	}
 	if upstreamFailed(resp.StatusCode) {
-		timer.Stop()
 		cancel()
 		resp.Body.Close()?
-		return nil, fmt.Errorf("gateway: upstream answered %d", resp.StatusCode)
-	}
-	if !timer.Stop() && outctx.Err() != nil {
-		cancel()
-		resp.Body.Close()?
-		return nil, fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout)
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered %d", resp.StatusCode))
 	}
 	resp.Body = &releasingBody{inner: resp.Body, cancel: cancel}
 	return resp, nil
@@ -219,37 +228,76 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	target := *req.URL
 	target.Scheme = base.Scheme
 	target.Host = base.Host
-	target.Path = targetPath(base.Path, rl.tail(req.URL.Path))
-	target.RawPath = ""
+	joined := targetPath(base.EscapedPath(), rl.escapedTail(req.URL.EscapedPath(), req.Pattern))
+	target.Path = unescaped(joined)
+	target.RawPath = joined
+	target.RawQuery = joinedQuery(base.RawQuery, req.URL.RawQuery)
 	out := req.WithContext(actx)
 	out.URL = &target
 	out.Host = ""
 	return out
 }
 
-func (rl *relay) tail(path string) string {
+func (rl *relay) escapedTail(path string, pattern string) string {
 	if !rl.strip {
 		return path
 	}
-	t := strings.TrimPrefix(path, rl.prefix)
-	if t == "" {
-		return "/"
+	return cutEscapedSuffix(path, rl.mounted(pattern))
+}
+
+func cutEscapedSuffix(path string, mounted string) string {
+	segs := strings.Split(path, "/")
+	want := strings.Split(mounted, "/")
+	end := len(want)
+	if strings.HasSuffix(mounted, "/") {
+		end = end - 1
 	}
-	return t
+	for i := 1; i < end; i++ {
+		if i >= len(segs) {
+			return path
+		}
+		if !segmentMatches(segs[i], want[i]) {
+			return path
+		}
+	}
+	rest := segs[end:]
+	joined := strings.Join(rest, "/")
+	if strings.HasPrefix(joined, "/") {
+		return joined
+	}
+	return "/" + joined
+}
+
+func segmentMatches(raw string, want string) bool {
+	dec, err := url.PathUnescape(raw)
+	if err != nil {
+		return raw == want
+	}
+	return dec == want
+}
+
+func unescaped(joined string) string {
+	dec, err := url.PathUnescape(joined)
+	if err != nil {
+		panic($"gateway: escaped join {joined} is not a valid escaped path")
+	}
+	return dec
+}
+
+func (rl *relay) mounted(pattern string) string {
+	path := pattern[max(strings.IndexByte(pattern, '/'), 0):]
+	if strings.HasSuffix(rl.prefix, "/") {
+		return path
+	}
+	return strings.TrimSuffix(path, "/")
 }
 
 func targetPath(base string, tail string) string {
 	if base == "" || base == "/" {
-		if tail == "" {
-			return "/"
-		}
 		return tail
 	}
-	switch {
-	case strings.HasSuffix(base, "/") && strings.HasPrefix(tail, "/"):
+	if strings.HasSuffix(base, "/") {
 		return base + tail[1:]
-	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(tail, "/"):
-		return base + "/" + tail
 	}
 	return base + tail
 }
@@ -270,4 +318,11 @@ func (rl *relay) refusal() *http.Response {
 		Body:          io.NopCloser(bytes.NewReader(rl.body)),
 		ContentLength: int64(len(rl.body)),
 	}
+}
+
+func joinedQuery(fixed string, own string) string {
+	if fixed == "" || own == "" {
+		return fixed + own
+	}
+	return fixed + "&" + own
 }

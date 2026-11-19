@@ -408,3 +408,35 @@ func TestContentType(t *testing.T) {
 		t.Fatalf("Content-Type = %q", ct)
 	}
 }
+
+func TestRejectsCounterNameCollidingWithHistogramSamples(t *testing.T) {
+	reg := meter.NewRegistry()
+	reg.Histogram("latency", "help", []float64{1})
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for counter latency_count beside histogram latency")
+		}
+	}()
+	reg.Counter("latency_count", "help")
+}
+
+func TestRejectsHistogramNameCollidingWithCounterSamples(t *testing.T) {
+	reg := meter.NewRegistry()
+	reg.Counter("latency_count", "help")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for histogram latency beside counter latency_count")
+		}
+	}()
+	reg.Histogram("latency", "help", []float64{1})
+}
+
+func TestRejectsLabelNameStartingWithTwoUnderscores(t *testing.T) {
+	reg := meter.NewRegistry()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for the label name __name__")
+		}
+	}()
+	reg.Counter("c", "help", "__name__")
+}

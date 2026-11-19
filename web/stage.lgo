@@ -3,6 +3,7 @@ package web
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,9 @@ func Recover() Stage {
 func guarded(ctx *Context, next Handler) (Reply, error) {
 	defer func() {
 		if p := recover(); p != nil {
+			if err, ok := p.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(http.ErrAbortHandler)
+			}
 			slog.Error("web: panic recovered", "value", fmt.Sprint(p))
 			ctx.root.answerProblem(ctx, internalProblem())
 		}
@@ -89,14 +93,22 @@ func AccessLog(log *slog.Logger) Stage {
 	return func(next Handler) Handler {
 		return func(ctx *Context) (Reply, error) {
 			start := time.Now()
+			returned := false
+			defer func() {
+				args := []any{
+					"method", ctx.Request.Method,
+					"route", routeName(ctx.Request),
+					"status", ctx.Status(),
+					"duration", time.Since(start).String(),
+					"request_id", ctx.writer.Header().Get("X-Request-Id"),
+				}
+				if !returned {
+					args = append(args, "aborted", true)
+				}
+				log.Info("web: request", args...)
+			}()
 			_, err := next(ctx)
-			log.Info("web: request",
-				"method", ctx.Request.Method,
-				"route", routeName(ctx.Request),
-				"status", ctx.Status(),
-				"duration", time.Since(start).String(),
-				"request_id", ctx.writer.Header().Get("X-Request-Id"),
-			)
+			returned = true
 			return nil, err
 		}
 	}
@@ -111,6 +123,10 @@ func routeName(req *http.Request) string {
 
 func (c *Context) Status() int {
 	return c.writer.status
+}
+
+func (c *Context) Wrote() bool {
+	return c.writer.wrote
 }
 
 var cacheControlKey = NewKey[string]("web.cache-control")

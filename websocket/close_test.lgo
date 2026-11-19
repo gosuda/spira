@@ -1,0 +1,167 @@
+package websocket_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func TestCloseValidBoundary(t *testing.T) {
+	cases := []struct {
+		code uint16
+		want bool
+	}{
+		{999, false},
+		{1000, true},
+		{1003, true},
+		{1004, false},
+		{1005, false},
+		{1006, false},
+		{1007, true},
+		{1011, true},
+		{1015, false},
+		{1016, false},
+		{2999, false},
+		{3000, true},
+		{4999, true},
+		{5000, false},
+	}
+	for _, c := range cases {
+		if got := websocket.ExposedCloseValid(c.code); got != c.want {
+			t.Fatalf("validCloseCode(%d) = %v, want %v", c.code, got, c.want)
+		}
+	}
+}
+
+func TestCloseCodesMatchSketch(t *testing.T) {
+	if uint16(websocket.Normal) != 1000 {
+		t.Fatalf("Normal = %d, want 1000", uint16(websocket.Normal))
+	}
+	if uint16(websocket.Unsupported) != 1003 {
+		t.Fatalf("Unsupported = %d, want 1003", uint16(websocket.Unsupported))
+	}
+	if uint16(websocket.PolicyViolation) != 1008 {
+		t.Fatalf("PolicyViolation = %d, want 1008", uint16(websocket.PolicyViolation))
+	}
+	if uint16(websocket.ServerError) != 1011 {
+		t.Fatalf("ServerError = %d, want 1011", uint16(websocket.ServerError))
+	}
+}
+
+func TestParseCloseEmpty(t *testing.T) {
+	code, reason, err := websocket.ExposedCloseParse(nil)
+	if err != nil {
+		t.Fatalf("parse empty: %v", err)
+		return
+	}
+	if code != 1005 {
+		t.Fatalf("parse empty code = %d, want 1005", code)
+	}
+	if reason != "" {
+		t.Fatalf("parse empty reason = %q, want empty", reason)
+	}
+}
+
+func TestParseCloseOneByte(t *testing.T) {
+	_, _, err := websocket.ExposedCloseParse([]byte{0x03})
+	if err == nil {
+		t.Fatalf("parse one byte: want error, got nil")
+		return
+	}
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("parse one byte error = %v, want ErrProtocolError", err)
+	}
+}
+
+func TestParseCloseCodeOnly(t *testing.T) {
+	code, reason, err := websocket.ExposedCloseParse([]byte{0x03, 0xe8})
+	if err != nil {
+		t.Fatalf("parse code only: %v", err)
+		return
+	}
+	if code != 1000 {
+		t.Fatalf("parse code only = %d, want 1000", code)
+	}
+	if reason != "" {
+		t.Fatalf("parse code only reason = %q, want empty", reason)
+	}
+}
+
+func TestParseCloseCodeReason(t *testing.T) {
+	code, reason, err := websocket.ExposedCloseParse([]byte{0x03, 0xe8, 0x62, 0x79, 0x65})
+	if err != nil {
+		t.Fatalf("parse code reason: %v", err)
+		return
+	}
+	if code != 1000 {
+		t.Fatalf("parse code reason code = %d, want 1000", code)
+	}
+	if reason != "bye" {
+		t.Fatalf("parse code reason = %q, want bye", reason)
+	}
+}
+
+func TestParseCloseInvalidUTF8(t *testing.T) {
+	_, _, err := websocket.ExposedCloseParse([]byte{0x03, 0xe8, 0xff})
+	if err == nil {
+		t.Fatalf("parse invalid UTF-8: want error, got nil")
+		return
+	}
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("parse invalid UTF-8 error = %v, want ErrProtocolError", err)
+	}
+}
+
+func TestAppendCloseReasonLimits(t *testing.T) {
+	ok := strings.Repeat("a", 123)
+	out, err := websocket.ExposedCloseAppend(nil, 1000, ok)
+	if err != nil {
+		t.Fatalf("append 123 byte reason: %v", err)
+		return
+	}
+	if len(out) != 125 {
+		t.Fatalf("append 123 byte reason length = %d, want 125", len(out))
+	}
+	tooLong := strings.Repeat("a", 124)
+	_, err = websocket.ExposedCloseAppend(nil, 1000, tooLong)
+	if err == nil {
+		t.Fatalf("append 124 byte reason: want error, got nil")
+		return
+	}
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("append 124 byte reason error = %v, want ErrProtocolError", err)
+	}
+}
+
+func TestAppendCloseRefusesBadCode(t *testing.T) {
+	bad := []uint16{999, 1004, 1005, 1006, 1015, 1016, 2999, 5000}
+	for _, code := range bad {
+		_, err := websocket.ExposedCloseAppend(nil, code, "")
+		if err == nil {
+			t.Fatalf("append code %d: want error, got nil", code)
+		} else if !errors.Is(err, websocket.ErrProtocolError) {
+			t.Fatalf("append code %d error = %v, want ErrProtocolError", code, err)
+		}
+	}
+}
+
+func TestCloseRoundTrip(t *testing.T) {
+	out, err := websocket.ExposedCloseAppend(nil, 1000, "bye")
+	if err != nil {
+		t.Fatalf("round trip append: %v", err)
+		return
+	}
+	code, reason, err := websocket.ExposedCloseParse(out)
+	if err != nil {
+		t.Fatalf("round trip parse: %v", err)
+		return
+	}
+	if code != 1000 {
+		t.Fatalf("round trip code = %d, want 1000", code)
+	}
+	if reason != "bye" {
+		t.Fatalf("round trip reason = %q, want bye", reason)
+	}
+}

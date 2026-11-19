@@ -1,0 +1,438 @@
+package schema
+
+import (
+	"comptime"
+	"fmt"
+	"strings"
+	"time"
+
+	"logos/rt"
+)
+
+type Schema interface { Object | Array | Optional | String | Integer | Number | Boolean }
+
+type Node struct {
+	Value Schema
+}
+
+type Object struct {
+	Fields []Field
+}
+type Field struct {
+	Name string
+	Wire string
+	Source string
+	Schema *Node
+}
+
+type Array struct {
+	Items *Node
+}
+
+type Optional struct {
+	Items *Node
+}
+
+type String struct {
+	Format string
+}
+
+type Integer struct{}
+
+type Number struct{}
+
+type Boolean struct{}
+
+const (
+	FormatDateTime = "date-time"
+	FormatDuration = "duration"
+)
+
+func Of[T any]() Schema {
+	const if comptime.IsStruct[T]() {
+		return ObjectOf[T]()
+	} else {
+		var zero T
+		found, ok := LeafOf(any(&zero))
+		if !ok {
+			panic(fmt.Sprintf("schema: %T: unsupported type", zero))
+		}
+		return found
+	}
+}
+
+func ObjectOf[T any]() Schema {
+	var val T
+	object := Object{}
+	unsupported := ""
+	const for _, f := range comptime.Fields[T]() {
+		wire := WireName(f.Tag.Get("json"), f.Name)
+		if wire != "" {
+			found, ok := FieldOf[f.Type](any(&val.[f]))
+			if ok {
+				object.Fields = append(object.Fields, Field{Name: f.Name, Wire: wire, Schema: &Node{Value: found}})
+			} else {
+				unsupported = f.Name
+			}
+		}
+	}
+	if unsupported != "" {
+		panic(fmt.Sprintf("schema: %T.%s: unsupported type", val, unsupported))
+	}
+	return object
+}
+
+func FieldOf[F any](ptr any) (Schema, bool) {
+	if found, ok := LeafOf(ptr); ok {
+		return found, true
+	}
+	const if comptime.IsStruct[F]() {
+		return ObjectOf[F](), true
+	} else {
+		return NamedOf[F]()
+	}
+}
+
+func NamedOf[F any]() (Schema, bool) {
+	const switch F {
+	case ~string:
+		return String{}, true
+	case ~bool:
+		return Boolean{}, true
+	}
+	return NamedIntOf[F]()
+}
+
+func NamedIntOf[F any]() (Schema, bool) {
+	const switch F {
+	case ~int:
+		return Integer{}, true
+	case ~int8:
+		return Integer{}, true
+	case ~int16:
+		return Integer{}, true
+	case ~int32:
+		return Integer{}, true
+	case ~int64:
+		return Integer{}, true
+	}
+	return NamedUintOf[F]()
+}
+
+func NamedUintOf[F any]() (Schema, bool) {
+	const switch F {
+	case ~uint:
+		return Integer{}, true
+	case ~uint8:
+		return Integer{}, true
+	case ~uint16:
+		return Integer{}, true
+	case ~uint32:
+		return Integer{}, true
+	case ~uint64:
+		return Integer{}, true
+	}
+	return NamedFloatOf[F]()
+}
+
+func NamedFloatOf[F any]() (Schema, bool) {
+	const switch F {
+	case ~float32:
+		return Number{}, true
+	case ~float64:
+		return Number{}, true
+	}
+	return nil, false
+}
+
+func WireName(tag string, name string) string {
+	wire := tag
+	if comma := strings.Index(tag, ","); comma >= 0 {
+		wire = tag[:comma]
+	}
+	if wire == "-" {
+		return ""
+	}
+	if wire == "" {
+		return name
+	}
+	return wire
+}
+
+func LeafOf(ptr any) (Schema, bool) {
+	if found, ok := leafScalar(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafInt(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafUint(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafOptionA(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafOptionB(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafSliceA(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafSliceB(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafOptSliceA(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafOptSliceB(ptr); ok {
+		return found, true
+	}
+	if found, ok := leafOptionSliceA(ptr); ok {
+		return found, true
+	}
+	return leafOptionSliceB(ptr)
+}
+
+func leafScalar(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *string:
+		return String{}, true
+	case *bool:
+		return Boolean{}, true
+	case *[]byte:
+		return String{}, true
+	case *float32:
+		return Number{}, true
+	case *float64:
+		return Number{}, true
+	case *time.Time:
+		return String{Format: FormatDateTime}, true
+	case *time.Duration:
+		return String{Format: FormatDuration}, true
+	}
+	return nil, false
+}
+
+func leafInt(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *int:
+		return Integer{}, true
+	case *int8:
+		return Integer{}, true
+	case *int16:
+		return Integer{}, true
+	case *int32:
+		return Integer{}, true
+	case *int64:
+		return Integer{}, true
+	}
+	return nil, false
+}
+
+func leafUint(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *uint:
+		return Integer{}, true
+	case *uint8:
+		return Integer{}, true
+	case *uint16:
+		return Integer{}, true
+	case *uint32:
+		return Integer{}, true
+	case *uint64:
+		return Integer{}, true
+	}
+	return nil, false
+}
+
+func leafOptionA(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *rt.Option[string]:
+		return optNode(String{}), true
+	case *rt.Option[bool]:
+		return optNode(Boolean{}), true
+	case *rt.Option[int]:
+		return optNode(Integer{}), true
+	case *rt.Option[int8]:
+		return optNode(Integer{}), true
+	case *rt.Option[int16]:
+		return optNode(Integer{}), true
+	case *rt.Option[int32]:
+		return optNode(Integer{}), true
+	case *rt.Option[int64]:
+		return optNode(Integer{}), true
+	case *rt.Option[uint]:
+		return optNode(Integer{}), true
+	case *rt.Option[uint8]:
+		return optNode(Integer{}), true
+	}
+	return nil, false
+}
+
+func leafOptionB(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *rt.Option[uint16]:
+		return optNode(Integer{}), true
+	case *rt.Option[uint32]:
+		return optNode(Integer{}), true
+	case *rt.Option[uint64]:
+		return optNode(Integer{}), true
+	case *rt.Option[float32]:
+		return optNode(Number{}), true
+	case *rt.Option[float64]:
+		return optNode(Number{}), true
+	case *rt.Option[[]byte]:
+		return optNode(String{}), true
+	case *rt.Option[time.Time]:
+		return optNode(String{Format: FormatDateTime}), true
+	case *rt.Option[time.Duration]:
+		return optNode(String{Format: FormatDuration}), true
+	}
+	return nil, false
+}
+
+func leafSliceA(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *[]string:
+		return leafNode(String{}), true
+	case *[]bool:
+		return leafNode(Boolean{}), true
+	case *[]int:
+		return leafNode(Integer{}), true
+	case *[]int8:
+		return leafNode(Integer{}), true
+	case *[]int16:
+		return leafNode(Integer{}), true
+	case *[]int32:
+		return leafNode(Integer{}), true
+	case *[]int64:
+		return leafNode(Integer{}), true
+	}
+	return nil, false
+}
+
+func leafSliceB(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *[]uint:
+		return leafNode(Integer{}), true
+	case *[]uint16:
+		return leafNode(Integer{}), true
+	case *[]uint32:
+		return leafNode(Integer{}), true
+	case *[]uint64:
+		return leafNode(Integer{}), true
+	case *[]float32:
+		return leafNode(Number{}), true
+	case *[]float64:
+		return leafNode(Number{}), true
+	case *[]time.Time:
+		return leafNode(String{Format: FormatDateTime}), true
+	case *[]time.Duration:
+		return leafNode(String{Format: FormatDuration}), true
+	}
+	return nil, false
+}
+
+func leafOptSliceA(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *[]rt.Option[string]:
+		return optArrayNode(String{}), true
+	case *[]rt.Option[bool]:
+		return optArrayNode(Boolean{}), true
+	case *[]rt.Option[int]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[int8]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[int16]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[int32]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[int64]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[uint]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[uint8]:
+		return optArrayNode(Integer{}), true
+	}
+	return nil, false
+}
+
+func leafOptSliceB(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *[]rt.Option[uint16]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[uint32]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[uint64]:
+		return optArrayNode(Integer{}), true
+	case *[]rt.Option[float32]:
+		return optArrayNode(Number{}), true
+	case *[]rt.Option[float64]:
+		return optArrayNode(Number{}), true
+	case *[]rt.Option[[]byte]:
+		return optArrayNode(String{}), true
+	case *[]rt.Option[time.Time]:
+		return optArrayNode(String{Format: FormatDateTime}), true
+	case *[]rt.Option[time.Duration]:
+		return optArrayNode(String{Format: FormatDuration}), true
+	}
+	return nil, false
+}
+
+func leafOptionSliceA(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *rt.Option[[]string]:
+		return optSliceNode(String{}), true
+	case *rt.Option[[]bool]:
+		return optSliceNode(Boolean{}), true
+	case *rt.Option[[]int]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]int8]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]int16]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]int32]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]int64]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]uint]:
+		return optSliceNode(Integer{}), true
+	}
+	return nil, false
+}
+
+func leafOptionSliceB(ptr any) (Schema, bool) {
+	switch ptr.(type) {
+	case *rt.Option[[]uint16]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]uint32]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]uint64]:
+		return optSliceNode(Integer{}), true
+	case *rt.Option[[]float32]:
+		return optSliceNode(Number{}), true
+	case *rt.Option[[]float64]:
+		return optSliceNode(Number{}), true
+	case *rt.Option[[]time.Time]:
+		return optSliceNode(String{Format: FormatDateTime}), true
+	case *rt.Option[[]time.Duration]:
+		return optSliceNode(String{Format: FormatDuration}), true
+	}
+	return nil, false
+}
+
+func leafNode(item Schema) Schema {
+	return Array{Items: &Node{Value: item}}
+}
+
+func optNode(item Schema) Schema {
+	return Optional{Items: &Node{Value: item}}
+}
+
+func optArrayNode(item Schema) Schema {
+	return Array{Items: &Node{Value: Optional{Items: &Node{Value: item}}}}
+}
+
+func optSliceNode(item Schema) Schema {
+	return Optional{Items: &Node{Value: Array{Items: &Node{Value: item}}}}
+}

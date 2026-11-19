@@ -1,0 +1,649 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-vector-store/src/main/antlr4/org/springframework/ai/vectorstore/filter/antlr4/Filters.g4,
+// spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/filter/Filter.java,
+// FilterExpressionTextParser.java and
+// spring-ai-vector-store/src/main/java/org/springframework/ai/vectorstore/SimpleVectorStoreFilterExpressionEvaluator.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"cmp"
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+)
+
+type Op string
+
+const (
+	OpAnd       Op = "AND"
+	OpOr        Op = "OR"
+	OpEq        Op = "EQ"
+	OpNe        Op = "NE"
+	OpGt        Op = "GT"
+	OpGte       Op = "GTE"
+	OpLt        Op = "LT"
+	OpLte       Op = "LTE"
+	OpIn        Op = "IN"
+	OpNin       Op = "NIN"
+	OpNot       Op = "NOT"
+	OpIsNull    Op = "ISNULL"
+	OpIsNotNull Op = "ISNOTNULL"
+)
+
+type Filter interface {
+	filter()
+}
+
+type Expression struct {
+	Type  Op
+	Left  Filter
+	Right Filter?
+}
+
+func (Expression) filter() {}
+
+type Group struct {
+	Inner Filter
+}
+
+func (Group) filter() {}
+
+type Key struct {
+	Name string
+}
+
+func (Key) filter() {}
+
+type Const struct {
+	Text    string?
+	Integer int64?
+	Decimal float64?
+	Flag    bool?
+}
+
+func (Const) filter() {}
+
+type Array struct {
+	Items []Const
+}
+
+func (Array) filter() {}
+
+func ParseFilter(text string) (Filter, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, ErrInvalidFilter.Wrap(errors.New("ai/rag: parse filter: expression is empty"))
+	}
+	p := &filterParser{src: text}
+	p.next()
+	if p.tok.kind == tokWhere {
+		p.next()
+	}
+	f, err := p.parseOr()
+	if err != nil {
+		return nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: parse filter: %w", err))
+	}
+	if p.tok.kind != tokEOF {
+		return nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: parse filter: position %d: trailing text after the expression", p.tok.pos))
+	}
+	if g, ok := f.(Group); ok {
+		return g.Inner, nil
+	}
+	return f, nil
+}
+
+type tokenKind int
+
+const (
+	tokEOF tokenKind = iota
+	tokWhere
+	tokAnd
+	tokOr
+	tokIn
+	tokNin
+	tokNot
+	tokIs
+	tokNull
+	tokTrue
+	tokFalse
+	tokIdent
+	tokQuoted
+	tokInt
+	tokLong
+	tokDecimal
+	tokEq
+	tokNe
+	tokGt
+	tokGte
+	tokLt
+	tokLte
+	tokLParen
+	tokRParen
+	tokLBracket
+	tokRBracket
+	tokComma
+	tokDot
+	tokBad
+)
+
+var keywords = map[string]tokenKind{
+	"where": tokWhere, "WHERE": tokWhere,
+	"and": tokAnd, "AND": tokAnd,
+	"or": tokOr, "OR": tokOr,
+	"in": tokIn, "IN": tokIn,
+	"nin": tokNin, "NIN": tokNin,
+	"not": tokNot, "NOT": tokNot,
+	"is": tokIs, "IS": tokIs,
+	"null": tokNull, "NULL": tokNull,
+	"true": tokTrue, "TRUE": tokTrue,
+	"false": tokFalse, "FALSE": tokFalse,
+	"l": tokLong, "L": tokLong,
+}
+
+var symbols = map[string]tokenKind{
+	"(": tokLParen, ")": tokRParen, "[": tokLBracket, "]": tokRBracket, ",": tokComma, ".": tokDot,
+	"==": tokEq, "!=": tokNe, ">=": tokGte, "<=": tokLte, ">": tokGt, "<": tokLt, "&&": tokAnd, "||": tokOr,
+}
+
+var compareOps = map[tokenKind]Op{
+	tokEq: OpEq, tokNe: OpNe, tokGt: OpGt, tokGte: OpGte, tokLt: OpLt, tokLte: OpLte,
+}
+
+type token struct {
+	kind tokenKind
+	text string
+	pos int
+}
+
+type filterParser struct {
+	src string
+	pos int
+	tok token
+}
+
+func (p *filterParser) parseOr() (Filter, error) {
+	left, err := p.parseAnd()
+	if err != nil {
+		return nil, err
+	}
+	for p.tok.kind == tokOr {
+		p.next()
+		right, err := p.parseAnd()
+		if err != nil {
+			return nil, err
+		}
+		left = Expression{Type: OpOr, Left: left, Right: right}
+	}
+	return left, nil
+}
+
+func (p *filterParser) parseAnd() (Filter, error) {
+	left, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	for p.tok.kind == tokAnd {
+		p.next()
+		right, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		left = Expression{Type: OpAnd, Left: left, Right: right}
+	}
+	return left, nil
+}
+
+func (p *filterParser) parseOperand() (Filter, error) {
+	switch p.tok.kind {
+	case tokNot:
+		p.next()
+		negated, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		return Expression{Type: OpNot, Left: negated}, nil
+	case tokLParen:
+		p.next()
+		inner, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(tokRParen, ")"); err != nil {
+			return nil, err
+		}
+		return Group{Inner: inner}, nil
+	}
+	key, err := p.parseKey()
+	if err != nil {
+		return nil, err
+	}
+	return p.parseComparison(key)
+}
+
+func (p *filterParser) expect(kind tokenKind, want string) error {
+	if p.tok.kind != kind {
+		return fmt.Errorf("position %d: expected %s", p.tok.pos, want)
+	}
+	p.next()
+	return nil
+}
+
+func (p *filterParser) parseKey() (Key, error) {
+	first := p.tok
+	switch first.kind {
+	case tokQuoted:
+		p.next()
+		return Key{Name: unquote(first.text)}, nil
+	case tokIdent:
+		p.next()
+		if p.tok.kind != tokDot {
+			return Key{Name: first.text}, nil
+		}
+		p.next()
+		second := p.tok
+		if err := p.expect(tokIdent, "a name after the dot"); err != nil {
+			return Key{}, err
+		}
+		return Key{Name: first.text + "." + second.text}, nil
+	}
+	return Key{}, fmt.Errorf("position %d: expected a key", first.pos)
+}
+
+func (p *filterParser) parseComparison(key Key) (Filter, error) {
+	operator := p.tok
+	p.next()
+	if op, ok := compareOps[operator.kind]; ok {
+		c, err := p.parseConst()
+		if err != nil {
+			return nil, err
+		}
+		return Expression{Type: op, Left: key, Right: Filter(c)}, nil
+	}
+	switch operator.kind {
+	case tokIn:
+		return p.parseInclusion(key, OpIn)
+	case tokNin:
+		return p.parseInclusion(key, OpNin)
+	case tokNot:
+		if err := p.expect(tokIn, "IN after NOT"); err != nil {
+			return nil, err
+		}
+		return p.parseInclusion(key, OpNin)
+	case tokIs:
+		return p.parseNullTest(key)
+	}
+	return nil, fmt.Errorf("position %d: expected an operator after the key", operator.pos)
+}
+
+func (p *filterParser) parseNullTest(key Key) (Filter, error) {
+	op := OpIsNull
+	if p.tok.kind == tokNot {
+		p.next()
+		op = OpIsNotNull
+	}
+	if err := p.expect(tokNull, "NULL"); err != nil {
+		return nil, err
+	}
+	return Expression{Type: op, Left: key}, nil
+}
+
+func (p *filterParser) parseInclusion(key Key, op Op) (Filter, error) {
+	if err := p.expect(tokLBracket, "["); err != nil {
+		return nil, err
+	}
+	items := []Const{}
+	for {
+		c, err := p.parseConst()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, c)
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.next()
+	}
+	if err := p.expect(tokRBracket, "] or a comma"); err != nil {
+		return nil, err
+	}
+	return Expression{Type: op, Left: key, Right: Filter(Array{Items: items})}, nil
+}
+
+func (p *filterParser) parseConst() (Const, error) {
+	tok := p.tok
+	p.next()
+	switch tok.kind {
+	case tokQuoted:
+		return Const{Text: unquote(tok.text)}, nil
+	case tokTrue:
+		return Const{Flag: true}, nil
+	case tokFalse:
+		return Const{Flag: false}, nil
+	case tokInt:
+		n, err := strconv.ParseInt(tok.text, 10, 64)
+		if err != nil {
+			return Const{}, fmt.Errorf("position %d: bad integer", tok.pos)
+		}
+		if p.tok.kind == tokLong {
+			p.next()
+		}
+		return Const{Integer: n}, nil
+	case tokDecimal:
+		d, err := strconv.ParseFloat(tok.text, 64)
+		if err != nil {
+			return Const{}, fmt.Errorf("position %d: bad decimal", tok.pos)
+		}
+		return Const{Decimal: d}, nil
+	}
+	return Const{}, fmt.Errorf("position %d: expected a constant", tok.pos)
+}
+
+func unquote(quoted string) string {
+	quote := quoted[:1]
+	inner := strings.ReplaceAll(quoted[1:len(quoted)-1], `\`+quote, quote)
+	return strings.ReplaceAll(inner, `\\`, `\`)
+}
+
+func (p *filterParser) next() {
+	p.skipSpace()
+	if p.pos == len(p.src) {
+		p.tok = token{kind: tokEOF, text: "the end of the expression", pos: p.pos}
+		return
+	}
+	start := p.pos
+	c := p.src[p.pos]
+	switch {
+	case isDigit(c) || c == '+' || c == '-' || (c == '.' && p.digitAt(p.pos+1)):
+		p.tok = p.lexNumber()
+	case isLetter(c) || c == '_':
+		p.tok = p.lexWord()
+	case c == '\'' || c == '"':
+		p.tok = p.lexQuoted(c)
+	default:
+		p.tok = p.lexSymbol()
+	}
+	p.tok.pos = start
+}
+
+func (p *filterParser) skipSpace() {
+	for p.pos < len(p.src) && strings.IndexByte(" \t\r\n", p.src[p.pos]) >= 0 {
+		p.pos++
+	}
+}
+
+func (p *filterParser) digitAt(at int) bool {
+	return at < len(p.src) && isDigit(p.src[at])
+}
+
+func (p *filterParser) lexSymbol() token {
+	for _, size := range []int{2, 1} {
+		if p.pos+size > len(p.src) {
+			continue
+		}
+		text := p.src[p.pos : p.pos+size]
+		if kind, ok := symbols[text]; ok {
+			p.pos += size
+			return token{kind: kind, text: text}
+		}
+	}
+	text := p.src[p.pos : p.pos+1]
+	p.pos = len(p.src)
+	return token{kind: tokBad, text: text}
+}
+
+func (p *filterParser) lexQuoted(quote byte) token {
+	start := p.pos
+	p.pos++
+	for p.pos < len(p.src) {
+		c := p.src[p.pos]
+		p.pos++
+		if c == quote {
+			return token{kind: tokQuoted, text: p.src[start:p.pos]}
+		}
+		if c == '\\' && p.pos < len(p.src) {
+			p.pos++
+		}
+	}
+	return token{kind: tokBad, text: p.src[start:]}
+}
+
+func (p *filterParser) lexNumber() token {
+	sign := ""
+	if c := p.src[p.pos]; c == '+' || c == '-' {
+		if c == '-' {
+			sign = "-"
+		}
+		p.pos++
+		p.skipSpace()
+	}
+	whole := p.digits()
+	if p.pos < len(p.src) && p.src[p.pos] == '.' {
+		p.pos++
+		fraction := p.digits()
+		if whole == "" && fraction == "" {
+			return token{kind: tokBad, text: sign + "."}
+		}
+		return token{kind: tokDecimal, text: sign + whole + "." + fraction}
+	}
+	if whole == "" {
+		return token{kind: tokBad, text: sign}
+	}
+	return token{kind: tokInt, text: sign + whole}
+}
+
+func (p *filterParser) digits() string {
+	start := p.pos
+	for p.digitAt(p.pos) {
+		p.pos++
+	}
+	return p.src[start:p.pos]
+}
+
+func (p *filterParser) lexWord() token {
+	start := p.pos
+	for p.pos < len(p.src) && (isLetter(p.src[p.pos]) || isDigit(p.src[p.pos]) || p.src[p.pos] == '_') {
+		p.pos++
+	}
+	word := p.src[start:p.pos]
+	if kind, ok := keywords[word]; ok {
+		return token{kind: kind, text: word}
+	}
+	return token{kind: tokIdent, text: word}
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func isLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func evalFilter(f Filter, meta map[string]Value) (bool, error) {
+	if g, ok := f.(Group); ok {
+		return evalFilter(g.Inner, meta)
+	}
+	e, ok := f.(Expression)
+	if !ok {
+		return false, errors.New("a key, a constant or a list stands where a condition must stand")
+	}
+	switch e.Type {
+	case OpAnd, OpOr:
+		return evalJunction(e, meta)
+	case OpNot:
+		negated, err := evalFilter(e.Left, meta)
+		if err != nil {
+			return false, err
+		}
+		return !negated, nil
+	case OpIn, OpNin:
+		return evalInclusion(e, meta)
+	case OpIsNull, OpIsNotNull:
+		return evalNullTest(e, meta)
+	}
+	return evalComparison(e, meta)
+}
+
+func evalJunction(e Expression, meta map[string]Value) (bool, error) {
+	left, err := evalFilter(e.Left, meta)
+	if err != nil {
+		return false, err
+	}
+	if left == (e.Type == OpOr) {
+		return left, nil
+	}
+	right := e.Right
+	if right == nil {
+		return false, fmt.Errorf("%s needs a right operand", e.Type)
+	}
+	return evalFilter(right, meta)
+}
+
+func evalNullTest(e Expression, meta map[string]Value) (bool, error) {
+	key, ok := e.Left.(Key)
+	if !ok {
+		return false, fmt.Errorf("%s needs a key on the left", e.Type)
+	}
+	_, held := meta[key.Name]
+	return held == (e.Type == OpIsNotNull), nil
+}
+
+func evalComparison(e Expression, meta map[string]Value) (bool, error) {
+	order, ok := compareOrders[e.Type]
+	if !ok {
+		return false, fmt.Errorf("unknown operator %q", e.Type)
+	}
+	key, right, err := operands(e)
+	if err != nil {
+		return false, err
+	}
+	c, ok := right.(Const)
+	if !ok {
+		return false, fmt.Errorf("%s needs a constant on the right", e.Type)
+	}
+	if isNaNValue(meta[key.Name]) {
+		return e.Type == OpNe, nil
+	}
+	n, err := compareConst(meta[key.Name], c)
+	if err != nil {
+		return false, fmt.Errorf("key %q: %w", key.Name, err)
+	}
+	return order(n), nil
+}
+
+var compareOrders = map[Op]func(int) bool{
+	OpEq:  func(n int) bool { return n == 0 },
+	OpNe:  func(n int) bool { return n != 0 },
+	OpGt:  func(n int) bool { return n > 0 },
+	OpGte: func(n int) bool { return n >= 0 },
+	OpLt:  func(n int) bool { return n < 0 },
+	OpLte: func(n int) bool { return n <= 0 },
+}
+
+func evalInclusion(e Expression, meta map[string]Value) (bool, error) {
+	key, right, err := operands(e)
+	if err != nil {
+		return false, err
+	}
+	list, ok := right.(Array)
+	if !ok {
+		return false, fmt.Errorf("%s needs a list on the right", e.Type)
+	}
+	if isNaNValue(meta[key.Name]) {
+		return e.Type == OpNin, nil
+	}
+	for _, item := range list.Items {
+		n, err := compareConst(meta[key.Name], item)
+		if err != nil {
+			return false, fmt.Errorf("key %q: %w", key.Name, err)
+		}
+		if n == 0 {
+			return e.Type == OpIn, nil
+		}
+	}
+	return e.Type == OpNin, nil
+}
+
+func operands(e Expression) (Key, Filter, error) {
+	key, ok := e.Left.(Key)
+	if !ok {
+		return Key{}, Key{}, fmt.Errorf("%s needs a key on the left", e.Type)
+	}
+	right := e.Right
+	if right == nil {
+		return Key{}, Key{}, fmt.Errorf("%s needs a right operand", e.Type)
+	}
+	return key, right, nil
+}
+
+func isNaNValue(held Value?) bool {
+	if held == nil {
+		return false
+	}
+	switch have := held.(type) {
+	case Number:
+		return math.IsNaN(have.Number)
+	case Text:
+		return false
+	case Flag:
+		return false
+	case nil:
+		return false
+	}
+	return false
+}
+
+func compareConst(held Value?, want Const) (int, error) {
+	if held == nil {
+		return -1, nil
+	}
+	switch have := held.(type) {
+	case Text:
+		if text := want.Text; text != nil {
+			return strings.Compare(have.Text, text), nil
+		}
+	case Number:
+		return compareNumber(have.Number, want)
+	case Flag:
+		if flag := want.Flag; flag != nil {
+			return cmp.Compare(rank(have.Flag), rank(flag)), nil
+		}
+	case nil:
+		return -1, nil
+	}
+	return 0, errConstType
+}
+
+var errConstType = errors.New("the metadata value and the constant have different types")
+
+func compareNumber(have float64, want Const) (int, error) {
+	if integer := want.Integer; integer != nil {
+		return compareInteger(have, integer), nil
+	}
+	if decimal := want.Decimal; decimal != nil {
+		return cmp.Compare(have, decimal), nil
+	}
+	return 0, errConstType
+}
+
+func compareInteger(have float64, want int64) int {
+	nearest := float64(want)
+	if n := cmp.Compare(have, nearest); n != 0 {
+		return n
+	}
+	if nearest >= 1<<63 {
+		return 1
+	}
+	return cmp.Compare(int64(nearest), want)
+}
+
+func rank(flag bool) int {
+	if flag {
+		return 1
+	}
+	return 0
+}

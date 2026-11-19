@@ -1,0 +1,155 @@
+// Byte-pair encoding for the cl100k_base vocabulary. The split pattern and the
+// greedy lowest-rank merge follow the cl100k_base tokenizer as vendored in
+// tiktoken-rs src/vendor_tiktoken.rs and src/tiktoken_ext/openai_public.rs.
+// The ranks come from the embedded vocabulary file. The caller holds the
+// parsed tables in an Encoder and reuses it. No network call runs.
+
+package rag
+
+import (
+	_ "embed"
+	"encoding/base64"
+	"fmt"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+//go:embed cl100k_base.tiktoken
+var vocabulary string
+
+var piecePattern = regexp.MustCompile(`\A(?:'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+\z|\s*[\r\n]|\s+)`)
+
+type Encoder struct {
+	ranks map[string]int
+	blobs map[int][]byte
+}
+
+func NewEncoder() (*Encoder?, error) {
+	ranks := make(map[string]int)
+	blobs := make(map[int][]byte)
+	for _, line := range strings.Split(vocabulary, "\n") {
+		if line == "" {
+			continue
+		}
+		at := strings.IndexByte(line, ' ')
+		if at < 0 {
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: bad vocabulary line"))
+		}
+		token, err := base64.StdEncoding.DecodeString(line[:at])
+		if err != nil {
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: bad vocabulary line: %w", err))
+		}
+		rank, err := strconv.Atoi(line[at+1:])
+		if err != nil {
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: bad vocabulary rank: %w", err))
+		}
+		ranks[string(token)] = rank
+		blobs[rank] = token
+	}
+	if len(ranks) == 0 {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: the embedded vocabulary holds no ranks"))
+	}
+	return &Encoder{ranks: ranks, blobs: blobs}, nil
+}
+
+func (e *Encoder) encode(text string) ([]int, error) {
+	out := make([]int, 0, len(text)/4+1)
+	for _, piece := range splitPieces(text) {
+		if rank, ok := e.ranks[piece]; ok {
+			out = append(out, rank)
+			continue
+		}
+		merged, err := mergePiece([]byte(piece), e.ranks)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, merged...)
+	}
+	return out, nil
+}
+
+func (e *Encoder) decode(tokens []int) (string, error) {
+	raw := make([]byte, 0, len(tokens)*4+1)
+	for _, token := range tokens {
+		blob, ok := e.blobs[token]
+		if !ok {
+			return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: unknown token %d", token))
+		}
+		raw = append(raw, blob...)
+	}
+	return string(raw), nil
+}
+
+func splitPieces(text string) []string {
+	pieces := make([]string, 0, len(text)/8+1)
+	at := 0
+	for at < len(text) {
+		piece := nextPiece(text[at:])
+		pieces = append(pieces, piece)
+		at += len(piece)
+	}
+	return pieces
+}
+
+func nextPiece(rest string) string {
+	if piece, ok := spacePiece(rest); ok {
+		return piece
+	}
+	if piece := piecePattern.FindString(rest); piece != "" {
+		return piece
+	}
+	for _, r := range rest {
+		return string(r)
+	}
+	return ""
+}
+
+func spacePiece(rest string) (string, bool) {
+	n := 0
+	for n < len(rest) && (rest[n] == ' ' || rest[n] == '\t' || rest[n] == '\f') {
+		n++
+	}
+	if n < 2 || n >= len(rest) {
+		return "", false
+	}
+	if c := rest[n]; c == '\n' || c == '\r' {
+		return "", false
+	}
+	return rest[:n-1], true
+}
+
+func mergePiece(piece []byte, ranks map[string]int) ([]int, error) {
+	bounds := make([]int, len(piece)+1)
+	for i := range bounds {
+		bounds[i] = i
+	}
+	for len(bounds) > 2 {
+		best := -1
+		bestRank := 0
+		for i := 0; i+2 < len(bounds); i++ {
+			rank, ok := ranks[string(piece[bounds[i]:bounds[i+2]])]
+			if !ok {
+				continue
+			}
+			if best < 0 || rank < bestRank {
+				best = i
+				bestRank = rank
+			}
+		}
+		if best < 0 {
+			break
+		}
+		bounds = slices.Delete(bounds, best+1, best+2)
+	}
+	out := make([]int, 0, len(bounds)-1)
+	for i := 0; i+1 < len(bounds); i++ {
+		rank, ok := ranks[string(piece[bounds[i]:bounds[i+1]])]
+		if !ok {
+			return nil, fmt.Errorf("ai/rag: split: no token for %q", piece[bounds[i]:bounds[i+1]])
+		}
+		out = append(out, rank)
+	}
+	return out, nil
+}

@@ -1,0 +1,111 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/transformation/RewriteQueryTransformer.java,
+// spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/transformation/TranslationQueryTransformer.java,
+// spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/transformation/CompressionQueryTransformer.java
+// and spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/expansion/MultiQueryExpander.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+)
+
+func Rewrite(ctx context.Context, m ai.Model, query string) (string, error) {
+	prompt := "Given a user query, rewrite it to provide better results when querying a vector store.\nRemove any irrelevant information, and ensure the query is concise and specific.\n\nOriginal query:\n" + query + "\n\nRewritten query:\n"
+	out, err := ask(ctx, m, prompt)
+	if err != nil {
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: rewrite: %w", err))
+	}
+	return orQuery(out, query), nil
+}
+
+func Translate(ctx context.Context, m ai.Model, query string, language string) (string, error) {
+	prompt := "Given a user query, translate it to " + language + ".\nIf the query is already in " + language + ", return it unchanged.\nIf you don't know the language of the query, return it unchanged.\nDo not add explanations nor any other text.\n\nOriginal query: " + query + "\n\nTranslated query:\n"
+	out, err := ask(ctx, m, prompt)
+	if err != nil {
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: translate: %w", err))
+	}
+	return orQuery(out, query), nil
+}
+
+func Compress(ctx context.Context, m ai.Model, history []ai.Message, query string) (string, error) {
+	prompt := "Given the following conversation history and a follow-up query, your task is to synthesize\na concise, standalone query that incorporates the context from the history.\nEnsure the standalone query is clear, specific, and maintains the user's intent.\n\nConversation history:\n" + historyText(history) + "\n\nFollow-up query:\n" + query + "\n\nStandalone query:\n"
+	out, err := ask(ctx, m, prompt)
+	if err != nil {
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: compress: %w", err))
+	}
+	return orQuery(out, query), nil
+}
+
+func Expand(ctx context.Context, m ai.Model, query string, n int) ([]string, error) {
+	prompt := "You are an expert at information retrieval and search optimization.\nYour task is to generate " + strconv.Itoa(n) + " different versions of the given query.\n\nEach variant must cover different perspectives or aspects of the topic,\nwhile maintaining the core intent of the original query. The goal is to\nexpand the search space and improve the chances of finding relevant information.\n\nDo not explain your choices or add any other text.\nProvide the query variants separated by newlines.\n\nOriginal query: " + query + "\n\nQuery variants:\n"
+	out, err := ask(ctx, m, prompt)
+	if err != nil {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: expand: %w", err))
+	}
+	if strings.TrimSpace(out) == "" {
+		return []string{query}, nil
+	}
+	variants := strings.Split(out, "\n")
+	for len(variants) > 0 && variants[len(variants)-1] == "" {
+		variants = variants[:len(variants)-1]
+	}
+	if len(variants) != n {
+		return []string{query}, nil
+	}
+	queries := []string{query}
+	for _, v := range variants {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		queries = append(queries, v)
+	}
+	return queries, nil
+}
+
+func ask(ctx context.Context, m ai.Model, prompt string) (string, error) {
+	reply, err := m.Chat(ctx, ai.Request{Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: prompt}}}}})
+	if err != nil {
+		return "", err
+	}
+	return replyText(reply), nil
+}
+
+func orQuery(text string, query string) string {
+	if strings.TrimSpace(text) == "" {
+		return query
+	}
+	return text
+}
+
+func replyText(reply ai.Reply) string {
+	var b strings.Builder
+	for _, p := range reply.Message.Parts {
+		if t, ok := p.(ai.Text); ok {
+			b.WriteString(t.Text)
+		}
+	}
+	return b.String()
+}
+
+func historyText(history []ai.Message) string {
+	var lines []string
+	for _, m := range history {
+		if m.Role != ai.RoleUser && m.Role != ai.RoleAssistant {
+			continue
+		}
+		if m.Role == ai.RoleUser {
+			lines = append(lines, "USER: "+userText(m))
+			continue
+		}
+		lines = append(lines, "ASSISTANT: "+userText(m))
+	}
+	return strings.Join(lines, "\n")
+}

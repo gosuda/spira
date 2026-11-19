@@ -77,11 +77,16 @@ type slotTask struct {
 	later *Later
 }
 
-type slotQueue struct {
+type slotRun struct {
 	nonce string
 	next  sync.Locked[int]
 	tasks sync.Locked[[]slotTask]
 	errs  sync.Locked[[]error]
+}
+
+type slotQueue struct {
+	run   *slotRun
+	found []slotTask
 }
 
 func slotNonce() (string, error) {
@@ -94,35 +99,39 @@ func slotNonce() (string, error) {
 
 func (q *slotQueue) add(l *Later) string {
 	var seq int
-	q.next.WithLock(func(n *int) {
+	q.run.next.WithLock(func(n *int) {
 		seq = *n
 		*n++
 	})
-	id := fmt.Sprintf("s%s-%d", q.nonce, seq)
-	q.tasks.WithLock(func(ts *[]slotTask) {
-		*ts = append(*ts, slotTask{id: id, later: l})
-	})
+	id := fmt.Sprintf("s%s-%d", q.run.nonce, seq)
+	q.found = append(q.found, slotTask{id: id, later: l})
 	return id
 }
 
-func (q *slotQueue) drain() []slotTask {
+func (q *slotQueue) publish() {
+	q.run.tasks.WithLock(func(ts *[]slotTask) {
+		*ts = append(*ts, q.found...)
+	})
+}
+
+func (r *slotRun) drain() []slotTask {
 	var out []slotTask
-	q.tasks.WithLock(func(ts *[]slotTask) {
+	r.tasks.WithLock(func(ts *[]slotTask) {
 		out = append(out, *ts...)
 		*ts = nil
 	})
 	return out
 }
 
-func (q *slotQueue) fail(id string, err error) {
-	q.errs.WithLock(func(es *[]error) {
+func (r *slotRun) fail(id string, err error) {
+	r.errs.WithLock(func(es *[]error) {
 		*es = append(*es, fmt.Errorf("view: slot %s: %w", id, err))
 	})
 }
 
-func (q *slotQueue) joined() error {
+func (r *slotRun) joined() error {
 	var errs []error
-	q.errs.WithLock(func(es *[]error) {
+	r.errs.WithLock(func(es *[]error) {
 		errs = append(errs, *es...)
 	})
 	return errors.Join(errs...)
@@ -159,59 +168,63 @@ func Render(ctx context.Context, w io.Writer, n Node) error {
 	if err != nil {
 		return err
 	}
-	q := &slotQueue{nonce: nonce}
+	run := &slotRun{nonce: nonce}
+	q := &slotQueue{run: run}
 	if e, ok := n.(Element); ok && e.tag == "html" {
 		writeRaw(w, "<!doctype html>")?
 	}
 	if err := writeNode(w, n, q, ""); err != nil {
 		return err
 	}
+	q.publish()
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	return resolveSlots(ctx, q, w)
+	return resolveSlots(ctx, run, w)
 }
 
-func resolveSlots(ctx context.Context, q *slotQueue, w io.Writer) error {
+func resolveSlots(ctx context.Context, r *slotRun, w io.Writer) error {
 	lw := newLockedWriter(w)
 	for {
-		tasks := q.drain()
+		tasks := r.drain()
 		if len(tasks) == 0 {
-			return q.joined()
+			return r.joined()
 		}
-		q.runTasks(ctx, lw, tasks)?
+		r.runTasks(ctx, lw, tasks)?
 	}
 }
 
-func (q *slotQueue) runTasks(ctx context.Context, lw *lockedWriter, tasks []slotTask) error {
+func (r *slotRun) runTasks(ctx context.Context, lw *lockedWriter, tasks []slotTask) error {
 	go group (ctx, limit = 8) {
 		for _, task := range tasks {
 			go {
-				q.resolve(ctx, lw, task)
+				r.resolve(ctx, lw, task)
 			}
 		}
 	}
 	return nil
 }
 
-func (q *slotQueue) resolve(ctx context.Context, lw *lockedWriter, task slotTask) {
+func (r *slotRun) resolve(ctx context.Context, lw *lockedWriter, task slotTask) {
 	node, err := resolveNode(ctx, task.later)
 	if err != nil {
-		q.failSlot(lw, task.id, err)
+		r.failSlot(lw, task.id, err)
 		return
 	}
+	nested := &slotQueue{run: r}
 	var buf bytes.Buffer
-	if err := writeNode(&buf, node, q, ""); err != nil {
-		q.failSlot(lw, task.id, err)
+	if err := writeNode(&buf, node, nested, ""); err != nil {
+		r.failSlot(lw, task.id, err)
 		return
 	}
 	out := append([]byte(`<template data-spira-slot="`+task.id+`">`), buf.Bytes()...)
 	out = append(out, "</template>"...)
 	if err := lw.write(out); err != nil {
-		q.fail(task.id, err)
+		r.fail(task.id, err)
 		return
 	}
 	lw.flush()
+	nested.publish()
 }
 
 func resolveNode(ctx context.Context, l *Later) (node Node, err error) {
@@ -223,13 +236,13 @@ func resolveNode(ctx context.Context, l *Later) (node Node, err error) {
 	return l.Resolve(ctx)
 }
 
-func (q *slotQueue) failSlot(lw *lockedWriter, id string, err error) {
+func (r *slotRun) failSlot(lw *lockedWriter, id string, err error) {
 	bad := []byte(`<template data-spira-slot="` + id + `"><spira-error></spira-error></template>`)
 	if writeErr := lw.write(bad); writeErr != nil {
 		err = errors.Join(err, writeErr)
 	}
 	lw.flush()
-	q.fail(id, err)
+	r.fail(id, err)
 }
 
 func writeNode(w io.Writer, p Part, q *slotQueue, parent string) error {
@@ -384,7 +397,7 @@ func writeIslandOpen(w io.Writer, i *Island, props []byte) error {
 }
 
 func parentForbidsSlot(parent string) bool {
-	switch parent {
+	switch strings.ToLower(parent) {
 	case "table", "thead", "tbody", "tfoot", "tr", "colgroup", "select":
 		return true
 	}
@@ -393,7 +406,7 @@ func parentForbidsSlot(parent string) bool {
 
 func writeSlot(w io.Writer, l *Later, q *slotQueue, parent string) error {
 	if parentForbidsSlot(parent) {
-		return fmt.Errorf("view: Later inside <%s>: a browser moves a slot element out of this parent; defer the whole <%s>", parent, parent)
+		return laterInside(parent)
 	}
 	id := q.add(l)
 	if err := writeRaw(w, `<spira-slot id="`+id+`">`); err != nil {
@@ -403,4 +416,52 @@ func writeSlot(w io.Writer, l *Later, q *slotQueue, parent string) error {
 		return err
 	}
 	return writeRaw(w, "</spira-slot>")
+}
+
+func laterInside(parent string) error {
+	return fmt.Errorf("view: Later inside <%s>: a browser moves a slot element out of this parent; defer the whole <%s>", parent, parent)
+}
+
+func CheckSlots(n Node) error {
+	return slotPlacement(n, "")
+}
+
+func slotPlacement(p Part, parent string) error {
+	switch v := p.(type) {
+	case Element:
+		return elementSlots(v)
+	case Group:
+		return groupSlots(v, parent)
+	case *Island:
+		if fb := v.Fallback; fb != nil {
+			return slotPlacement(fb, "spira-island")
+		}
+	case *Later:
+		if parentForbidsSlot(parent) {
+			return laterInside(parent)
+		}
+		return slotPlacement(v.Fallback, parent)
+	case Text:
+	case Trusted:
+	case Attribute:
+	case nil:
+	}
+	return nil
+}
+
+func elementSlots(e Element) error {
+	if isVoid(e.tag) {
+		return nil
+	}
+	for _, p := range e.parts {
+		slotPlacement(p, e.tag)?
+	}
+	return nil
+}
+
+func groupSlots(g Group, parent string) error {
+	for _, n := range g.Nodes {
+		slotPlacement(n, parent)?
+	}
+	return nil
 }

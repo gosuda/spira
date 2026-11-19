@@ -94,6 +94,9 @@ func (r *Router) writePage(ctx *Context, p Page) error {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	htmx := ctx.Htmx()
 	if htmx.Request && !htmx.Boosted && !htmx.HistoryRestore {
+		if err := view.CheckSlots(p.Body); err != nil {
+			return fmt.Errorf("web: render page body: %w", err)
+		}
 		writeHead(ctx, pageStatus(p.Status))
 		return renderReply(ctx, w, p.Body, "web: render page body")
 	}
@@ -103,6 +106,9 @@ func (r *Router) writePage(ctx *Context, p Page) error {
 		return r.writeProblem(ctx, missing)
 	}
 	document := r.Layout(ctx, p)
+	if err := view.CheckSlots(document); err != nil {
+		return fmt.Errorf("web: render page layout: %w", err)
+	}
 	writeHead(ctx, pageStatus(p.Status))
 	return renderReply(ctx, w, document, "web: render page layout")
 }
@@ -129,6 +135,9 @@ func renderReply(ctx *Context, w http.ResponseWriter, n view.Node, what string) 
 }
 
 func (r *Router) writeFragment(ctx *Context, f Fragment) error {
+	if err := view.CheckSlots(f.Body); err != nil {
+		return fmt.Errorf("web: render fragment body: %w", err)
+	}
 	w := ctx.writer
 	w.Header().Add("Vary", "HX-Request")
 	setHtmxHeader(w, "HX-Retarget", f.Retarget)

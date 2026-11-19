@@ -2,12 +2,9 @@ package resilience
 
 import (
 	"context"
-	"errors"
 	"logos/sync"
 	"time"
 )
-
-var ErrOpen = errors.New("resilience: circuit open")
 
 type Breaker struct {
 	Window      int              = 20
@@ -73,7 +70,7 @@ func (b *Breaker) admit() (ticket, bool) {
 }
 
 func (b *Breaker) settle(ctx context.Context, tk ticket, err error) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || ignoredCause(err) != nil {
 		b.release(tk)
 		return
 	}

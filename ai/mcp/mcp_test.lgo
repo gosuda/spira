@@ -1,0 +1,337 @@
+package mcp_test
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"encoding/json/jsontext"
+
+	"net/http/httptest"
+
+	"github.com/gosuda/spira/ai/mcp"
+)
+
+const weatherText = "Current weather in New York:\nTemperature: 72°F\nConditions: Partly cloudy"
+
+func normalize(raw []byte) (string, error) {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", err
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func canon(t *testing.T, raw []byte) string {
+	t.Helper()
+	line, err := normalize(raw)
+	if err != nil {
+		t.Fatalf("normalize %s: %v", raw, err)
+		return ""
+	}
+	return line
+}
+
+func fixture(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+		return nil
+	}
+	return raw
+}
+
+func canonFixture(t *testing.T, name string) string {
+	t.Helper()
+	return canon(t, fixture(t, name))
+}
+
+func decodeFixture(t *testing.T, name string) mcp.Envelope {
+	t.Helper()
+	var env mcp.Envelope
+	if err := json.Unmarshal([]byte(canonFixture(t, name)), &env); err != nil {
+		t.Fatalf("decode fixture %s: %v", name, err)
+		return mcp.Envelope{}
+	}
+	return env
+}
+
+func mustNormalize(raw []byte) string {
+	line, err := normalize(raw)
+	if err != nil {
+		return "?"
+	}
+	return line
+}
+
+func mustNormalizeText(text string) string {
+	return mustNormalize([]byte(text))
+}
+
+type step struct {
+	method string
+	params string
+	reply  string
+	inject string
+	patch  func(env mcp.Envelope) mcp.Envelope
+}
+
+func (s step) respond(t *testing.T, req mcp.Envelope) (string, bool) {
+	t.Helper()
+	if s.reply == "" {
+		return "", false
+	}
+	env := decodeFixture(t, s.reply)
+	if s.patch != nil {
+		env = s.patch(env)
+	}
+	env.ID = req.ID
+	out, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal reply for %s: %v", s.method, err)
+		return "", false
+	}
+	return string(out), true
+}
+
+func runBoth(t *testing.T, steps func() []step, sse map[string]bool, run func(t *testing.T, c *mcp.Client)) {
+	t.Helper()
+	t.Run("stdio", func(t *testing.T) {
+		transport, shutdown := newStdioTransport(t, steps())
+		defer shutdown()
+		run(t, mcp.NewClient(transport))
+	})
+	t.Run("http", func(t *testing.T) {
+		spy := newHTTPSpy(t, steps(), sse)
+		server := httptest.NewServer(spy.handler(t))
+		defer server.Close()
+		run(t, mcp.NewClient(mcp.NewHTTP(server.URL, server.Client())))
+	})
+}
+
+func replaySteps() []step {
+	return []step{
+		{method: "initialize", reply: "lifecycle/initialize-response.json"},
+		{method: "tools/list", reply: "tools/tools-list-response.json"},
+		{method: "tools/list", params: `{"cursor":"next-page-cursor"}`, reply: "tools/tools-list-response-page2.json"},
+		{method: "tools/call", params: `{"name":"get_weather","arguments":{"location":"New York"}}`, reply: "tools/tools-call-response.json"},
+	}
+}
+
+func TestFixtureReplay(t *testing.T) {
+	runBoth(t, replaySteps, nil, func(t *testing.T, c *mcp.Client) {
+		if err := c.Initialize(context.Background()); err != nil {
+			t.Fatalf("initialize: %v", err)
+			return
+		}
+		tools, err := c.Tools(context.Background())
+		if err != nil {
+			t.Fatalf("tools: %v", err)
+			return
+		}
+		var names []string
+		for _, tool := range tools {
+			names = append(names, tool.Name)
+		}
+		want := []string{"get_weather", "calculate_sum", "get_current_time"}
+		if !slices.Equal(names, want) {
+			t.Fatalf("tool names %v, want %v", names, want)
+		}
+		if tools[0].Description != "Get current weather information for a location" {
+			t.Errorf("description %q", tools[0].Description)
+		}
+		assertWeatherSchema(t, tools[0].Schema)
+		text, err := tools[0].Call(context.Background(), `{"location":"New York"}`)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+			return
+		}
+		if text != weatherText {
+			t.Errorf("call text %q, want %q", text, weatherText)
+		}
+	})
+}
+
+func assertWeatherSchema(t *testing.T, schema string) {
+	t.Helper()
+	var page struct {
+		Result struct {
+			Tools []struct {
+				InputSchema jsontext.Value `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(canonFixture(t, "tools/tools-list-response.json")), &page); err != nil {
+		t.Fatalf("decode list response: %v", err)
+		return
+	}
+	if len(page.Result.Tools) != 1 {
+		t.Fatalf("fixture holds %d tools, want 1", len(page.Result.Tools))
+		return
+	}
+	if got, want := canon(t, []byte(schema)), canon(t, page.Result.Tools[0].InputSchema); got != want {
+		t.Errorf("schema %s, want %s", got, want)
+	}
+}
+
+func TestExecutionError(t *testing.T) {
+	steps := func() []step {
+		return []step{
+			{method: "initialize", reply: "lifecycle/initialize-response.json"},
+			{method: "tools/call", reply: "tools/tools-call-execution-error.json"},
+		}
+	}
+	runBoth(t, steps, nil, func(t *testing.T, c *mcp.Client) {
+		if err := c.Initialize(context.Background()); err != nil {
+			t.Fatalf("initialize: %v", err)
+			return
+		}
+		text, err := c.Call(context.Background(), "book_flight", "{}")
+		if err != nil {
+			t.Fatalf("execution error must reach the model as text: %v", err)
+			return
+		}
+		want := "Invalid departure date: must be in the future. Current date is 08/08/2025."
+		if text != want {
+			t.Errorf("text %q, want %q", text, want)
+		}
+	})
+}
+
+func TestProtocolError(t *testing.T) {
+	steps := func() []step {
+		return []step{
+			{method: "initialize", reply: "lifecycle/initialize-response.json"},
+			{method: "tools/call", reply: "tools/tools-call-protocol-error.json"},
+		}
+	}
+	runBoth(t, steps, nil, func(t *testing.T, c *mcp.Client) {
+		if err := c.Initialize(context.Background()); err != nil {
+			t.Fatalf("initialize: %v", err)
+			return
+		}
+		text, err := c.Call(context.Background(), "invalid_tool_name", "{}")
+		if err == nil {
+			t.Fatalf("call returned %q for a protocol error", text)
+			return
+		}
+		for _, part := range []string{"-32602", "Unknown tool: invalid_tool_name"} {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("error %q misses %q", err, part)
+			}
+		}
+	})
+}
+
+func TestInitializeError(t *testing.T) {
+	steps := func() []step {
+		return []step{{method: "initialize", reply: "lifecycle/initialize-error.json"}}
+	}
+	runBoth(t, steps, nil, func(t *testing.T, c *mcp.Client) {
+		err := c.Initialize(context.Background())
+		if err == nil {
+			t.Fatal("initialize accepted an error reply")
+		}
+		for _, part := range []string{"-32602", "Unsupported protocol version"} {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("error %q misses %q", err, part)
+			}
+		}
+	})
+}
+
+func TestInitializeVersion(t *testing.T) {
+	steps := func() []step {
+		return []step{{method: "initialize", reply: "lifecycle/initialize-response.json", patch: func(env mcp.Envelope) mcp.Envelope {
+			return withResultField(t, env, "protocolVersion", "2024-11-05")
+		}}}
+	}
+	runBoth(t, steps, nil, func(t *testing.T, c *mcp.Client) {
+		err := c.Initialize(context.Background())
+		if err == nil {
+			t.Fatal("initialize accepted an unsupported protocol version")
+		}
+		if !strings.Contains(err.Error(), "2024-11-05") {
+			t.Errorf("error %q names no protocol version", err)
+		}
+	})
+}
+
+func withResultField(t *testing.T, env mcp.Envelope, key string, value any) mcp.Envelope {
+	t.Helper()
+	var result map[string]any
+	if err := json.Unmarshal(env.Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	result[key] = value
+	out, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("encode result: %v", err)
+	}
+	env.Result = out
+	return env
+}
+
+func TestContentJoin(t *testing.T) {
+	steps := func() []step {
+		return []step{
+			{method: "initialize", reply: "lifecycle/initialize-response.json"},
+			{method: "tools/call", reply: "tools/tools-call-response.json", patch: func(env mcp.Envelope) mcp.Envelope {
+				return withContent(t, env,
+					fixture(t, "tools/content-image.json"),
+					fixture(t, "tools/content-text.json"),
+					fixture(t, "tools/content-audio.json"),
+					fixture(t, "tools/content-resource-link.json"),
+					fixture(t, "tools/content-text.json"))
+			}},
+		}
+	}
+	runBoth(t, steps, nil, func(t *testing.T, c *mcp.Client) {
+		if err := c.Initialize(context.Background()); err != nil {
+			t.Fatalf("initialize: %v", err)
+			return
+		}
+		text, err := c.Call(context.Background(), "get_weather", "{}")
+		if err != nil {
+			t.Fatalf("call: %v", err)
+			return
+		}
+		want := "Tool result text\nTool result text"
+		if text != want {
+			t.Errorf("text %q, want %q", text, want)
+		}
+	})
+}
+
+func withContent(t *testing.T, env mcp.Envelope, items ...[]byte) mcp.Envelope {
+	t.Helper()
+	var result map[string]any
+	if err := json.Unmarshal(env.Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	content := make([]any, len(items))
+	for i, item := range items {
+		var v any
+		if err := json.Unmarshal(item, &v); err != nil {
+			t.Fatalf("decode content item: %v", err)
+			return env
+		}
+		content[i] = v
+	}
+	result["content"] = content
+	out, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("encode result: %v", err)
+	}
+	env.Result = out
+	return env
+}

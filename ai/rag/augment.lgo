@@ -1,0 +1,127 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-rag/src/main/java/org/springframework/ai/rag/generation/augmentation/ContextualQueryAugmenter.java
+// and spring-ai-rag/src/main/java/org/springframework/ai/rag/retrieval/join/ConcatenationDocumentJoiner.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"iter"
+	"slices"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
+)
+
+func Augment(search func(ctx context.Context, q Search) ([]Document, error), base Search) ai.Layer {
+	return func(next ai.Model) ai.Model {
+		return augmenter{next: next, search: search, base: base}
+	}
+}
+
+type augmenter struct {
+	next   ai.Model
+	search func(ctx context.Context, q Search) ([]Document, error)
+	base   Search
+}
+
+func (a augmenter) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	changed := a.augment(ctx, req)?
+	reply := a.next.Chat(ctx, changed)?
+	return reply, nil
+}
+
+func (a augmenter) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	changed, err := a.augment(ctx, req)
+	if err != nil {
+		yield ai.Chunk{}, err
+		return
+	}
+	for chunk, err := range a.next.Stream(ctx, changed) {
+		yield chunk, err
+	}
+}
+
+func (a augmenter) augment(ctx context.Context, req ai.Request) (ai.Request, error) {
+	last := lastUser(req.Messages)
+	if last < 0 {
+		return req, nil
+	}
+	query := userText(req.Messages[last])
+	text, err := a.searchFor(ctx, query)
+	if err != nil {
+		return ai.Request{}, err
+	}
+	messages := slices.Clone(req.Messages)
+	messages[last] = ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: text}}}
+	req.Messages = messages
+	return req, nil
+}
+
+func (a augmenter) searchFor(ctx context.Context, query string) (string, error) {
+	q := a.base
+	q.Query = query
+	docs, err := a.search(ctx, q)
+	if err != nil {
+		if fault.Of(err) != nil {
+			return "", err
+		}
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: augment: %w", err))
+	}
+	return renderPrompt(query, joinDocuments(docs)), nil
+}
+
+func lastUser(messages []ai.Message) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == ai.RoleUser {
+			return i
+		}
+	}
+	return -1
+}
+
+func userText(m ai.Message) string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if t, ok := p.(ai.Text); ok {
+			b.WriteString(t.Text)
+		}
+	}
+	return b.String()
+}
+
+func joinDocuments(docs []Document) []Document {
+	seen := map[string]bool{}
+	var unique []Document
+	for _, d := range docs {
+		if seen[d.ID] ?? false {
+			continue
+		}
+		seen[d.ID] = true
+		unique = append(unique, d)
+	}
+	slices.SortFunc(unique, func(a Document, b Document) int {
+		return cmp.Or(cmp.Compare(scoreOf(b), scoreOf(a)), cmp.Compare(a.ID, b.ID))
+	})
+	return unique
+}
+
+func scoreOf(d Document) float64 {
+	return d.Score ?? 0
+}
+
+func renderPrompt(query string, docs []Document) string {
+	if len(docs) == 0 {
+		return "The user query is outside your knowledge base.\nPolitely inform the user that you can't answer it.\n"
+	}
+	texts := make([]string, len(docs))
+	for i, d := range docs {
+		texts[i] = d.Text
+	}
+	return "Context information is below.\n\n---------------------\n" + strings.Join(texts, "\n") + "\n---------------------\n\nGiven the context information and no prior knowledge, answer the query.\n\nFollow these rules:\n\n1. If the answer is not in the context, just say that you don't know.\n2. Avoid statements like \"Based on the context...\" or \"The provided information...\".\n\nQuery: " + query + "\n\nAnswer:\n"
+}

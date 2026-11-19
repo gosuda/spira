@@ -1,0 +1,443 @@
+package mcp_test
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai/mcp"
+)
+
+type captured struct {
+	method  string
+	params  string
+	accept  string
+	session string
+	version string
+}
+
+type httpSpy struct {
+	fake   *fakeServer
+	sse    map[string]bool
+	inbox  []captured
+	session string
+}
+
+func newHTTPSpy(t *testing.T, steps []step, sse map[string]bool) *httpSpy {
+	return &httpSpy{fake: &fakeServer{t: t, steps: steps}, sse: sse}
+}
+
+func (s *httpSpy) handler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		var msg mcp.Envelope
+		if err := json.Unmarshal(body, &msg); err != nil {
+			http.Error(w, "parse error", http.StatusBadRequest)
+			return
+		}
+		s.inbox = append(s.inbox, captured{
+			method:  msg.Method,
+			params:  mustNormalize(msg.Params),
+			accept:  r.Header.Get("Accept"),
+			session: r.Header.Get("MCP-Session-Id"),
+			version: r.Header.Get("MCP-Protocol-Version"),
+		})
+		s.serve(t, w, msg)
+	})
+}
+
+func (s *httpSpy) serve(t *testing.T, w http.ResponseWriter, msg mcp.Envelope) {
+	reply, ok := s.fake.handle(msg)
+	if strings.HasPrefix(msg.Method, "notifications/") {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	st := s.fake.steps[s.fake.next-1]
+	if s.sse[st.method] ?? false {
+		s.writeStream(w, st, reply)
+		return
+	}
+	if st.method == "initialize" {
+		s.session = "sess-1868a90c"
+		w.Header().Set("MCP-Session-Id", s.session)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := fmt.Fprint(w, reply); err != nil {
+		return
+	}
+}
+
+func (s *httpSpy) writeStream(w http.ResponseWriter, st step, reply string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	if st.inject != "" {
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", st.inject); err != nil {
+			return
+		}
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", reply); err != nil {
+		return
+	}
+	flusher.Flush()
+}
+
+func TestHTTPTransportNorms(t *testing.T) {
+	spy := newHTTPSpy(t, replaySteps(), nil)
+	server := httptest.NewServer(spy.handler(t))
+	defer server.Close()
+	c := mcp.NewClient(mcp.NewHTTP(server.URL, server.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	if err := c.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize: %v", err)
+		return
+	}
+	if _, err := c.Tools(context.Background()); err != nil {
+		t.Fatalf("tools: %v", err)
+		return
+	}
+	if len(spy.inbox) < 2 {
+		t.Fatalf("captured %d requests, want at least 2", len(spy.inbox))
+		return
+	}
+	if first := spy.inbox[0]; first.session != "" {
+		t.Errorf("initialize carried session %q before the server assigned one", first.session)
+	}
+	for i, got := range spy.inbox {
+		if !strings.Contains(got.accept, "application/json") || !strings.Contains(got.accept, "text/event-stream") {
+			t.Errorf("request %d Accept %q misses a required type", i, got.accept)
+		}
+		if got.version != "2025-11-25" {
+			t.Errorf("request %d MCP-Protocol-Version %q", i, got.version)
+		}
+	}
+	for _, got := range spy.inbox[1:] {
+		if got.session != "sess-1868a90c" {
+			t.Errorf("%s carried session %q, want the initialize value", got.method, got.session)
+		}
+	}
+}
+
+func TestHTTPStreamResponse(t *testing.T) {
+	steps := []step{
+		{method: "initialize", reply: "lifecycle/initialize-response.json"},
+		{method: "tools/list", reply: "tools/tools-list-response-page2.json", inject: canonFixture(t, "tools/tools-list-changed-notification.json")},
+	}
+	spy := newHTTPSpy(t, steps, map[string]bool{"tools/list": true})
+	server := httptest.NewServer(spy.handler(t))
+	defer server.Close()
+	c := mcp.NewClient(mcp.NewHTTP(server.URL, server.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	if err := c.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize: %v", err)
+		return
+	}
+	tools, err := c.Tools(context.Background())
+	if err != nil {
+		t.Fatalf("tools over a stream: %v", err)
+		return
+	}
+	var names []string
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	want := []string{"calculate_sum", "get_current_time"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("tool names %v, want %v", names, want)
+	}
+}
+
+func TestHTTPStreamReplyWhileOpen(t *testing.T) {
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		var msg mcp.Envelope
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		reply, err := json.Marshal(mcp.Envelope{JSONRPC: "2.0", ID: msg.ID, Result: jsontext.Value(`{"tools":[]}`)})
+		if err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", reply); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+    transport := mcp.NewHTTP(server.URL, server.Client())
+    defer func() {
+        if err := transport.Close(); err != nil {
+            t.Errorf("close transport: %v", err)
+        }
+    }()
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply, err := transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("7"), Method: "tools/list"})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("request over an open stream: %v", err)
+		return
+	}
+	if string(reply.ID) != "7" {
+		t.Errorf("reply id %s, want 7", reply.ID)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("request took %v with the stream still open, want the reply at once", elapsed)
+	}
+	close(release)
+	<-handlerDone
+}
+
+func TestHTTPReplyIDMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		var msg mcp.Envelope
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return
+		}
+		reply := mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("4"), Result: jsontext.Value(`{"tools":[]}`)}
+		if string(msg.ID) == "4" {
+			reply.ID = msg.ID
+		}
+		raw, err := json.Marshal(reply)
+		if err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write(raw); err != nil {
+			return
+		}
+	}))
+	defer server.Close()
+    transport := mcp.NewHTTP(server.URL, server.Client())
+    defer func() {
+        if err := transport.Close(); err != nil {
+            t.Errorf("close transport: %v", err)
+        }
+    }()
+    ctx := context.Background()
+	if _, err := transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("5"), Method: "tools/list"}); err == nil {
+		t.Fatal("accepted a reply numbered 4 for request 5")
+	} else if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("error %q does not name the id mismatch", err)
+	}
+	reply, err := transport.Request(ctx, mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("4"), Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("matching reply refused: %v", err)
+		return
+	}
+	if string(reply.ID) != "4" {
+		t.Errorf("reply id %s, want 4", reply.ID)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls int
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls++
+	return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestHTTPRequestKeepsTheStatusOfACutBody(t *testing.T) {
+	transport := &cutTransport{total: 100, cut: io.ErrUnexpectedEOF}
+	c := mcp.NewClient(mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: transport}))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	_, err := c.Call(context.Background(), "get_weather", "{}")
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("err = %v, want the 400 rejection", err)
+		return
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("err = %v, want the status with the read cause", err)
+		return
+	}
+	if transport.calls != 1 {
+		t.Fatalf("transport saw %d calls, want 1", transport.calls)
+	}
+}
+
+func TestHTTPNotifyKeepsTheStatusOfACutBody(t *testing.T) {
+	transport := &cutTransport{total: 100, cut: io.ErrUnexpectedEOF}
+	inner := mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: transport})
+	defer func() {
+		if err := inner.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	err := inner.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/initialized"})
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("err = %v, want the 400 rejection", err)
+		return
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("err = %v, want the status with the read cause", err)
+		return
+	}
+	if transport.calls != 1 {
+		t.Fatalf("transport saw %d calls, want 1", transport.calls)
+	}
+}
+
+type jsonCutReader struct {
+	data []byte
+	cut  error
+}
+
+func (r *jsonCutReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.cut
+	}
+	n := min(len(p), len(r.data))
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.cut
+	}
+	return n, nil
+}
+
+func (r *jsonCutReader) Close() error {
+	return nil
+}
+
+type jsonCutTransport struct {
+	calls int
+	body  string
+	cut   error
+}
+
+func (t *jsonCutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls++
+	return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: &jsonCutReader{data: []byte(t.body), cut: t.cut}}, nil
+}
+
+func checkCutJSONRPCError(t *testing.T, err error, calls int) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("err = nil, want the 400 cut reply")
+		return
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Fatalf("err = %v, want the HTTP 400 status", err)
+		return
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+		return
+	}
+	rpcErr := &mcp.RPCError{}
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("err = %v, want the RPC error", err)
+		return
+	}
+	if rpcErr.Code != -32600 {
+		t.Fatalf("code = %d, want -32600", rpcErr.Code)
+		return
+	}
+	if calls != 1 {
+		t.Fatalf("transport saw %d calls, want 1", calls)
+	}
+}
+
+func TestHTTPKeepsStatusOnCutJSONRPCError(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}`
+	requestTransport := &jsonCutTransport{body: body, cut: io.ErrUnexpectedEOF}
+	c := mcp.NewClient(mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: requestTransport}))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	_, err := c.Call(context.Background(), "get_weather", "{}")
+	if err == nil {
+		t.Fatalf("request err = nil, want the 400 cut reply")
+		return
+	}
+	checkCutJSONRPCError(t, err, requestTransport.calls)
+	notifyTransport := &jsonCutTransport{body: body, cut: io.ErrUnexpectedEOF}
+	inner := mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: notifyTransport})
+	defer func() {
+		if err := inner.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	notifyErr := inner.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/initialized"})
+	if notifyErr == nil {
+		t.Fatalf("notify err = nil, want the 400 cut reply")
+		return
+	}
+	checkCutJSONRPCError(t, notifyErr, notifyTransport.calls)
+}

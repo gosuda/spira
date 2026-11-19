@@ -1,0 +1,476 @@
+// Translated and changed by spira from Spring AI,
+// models/spring-ai-ollama/src/main/java/org/springframework/ai/ollama/api/OllamaApi.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package ollama
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/resilience"
+)
+
+type Client struct {
+	BaseURL string
+	Model   string
+	HTTP    *http.Client
+	Policy  resilience.Policy
+}
+
+func (c *Client) http() *http.Client {
+	if h := c.HTTP; h != nil {
+		return h
+	}
+	return http.DefaultClient
+}
+
+func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	req2, err := requestOf(req, false)
+	if err != nil {
+		return ai.Reply{}, ErrInvalidRequest.Wrap(err)
+	}
+	payload, err := json.Marshal(req2)
+	if err != nil {
+		return ai.Reply{}, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
+	}
+	out, err := send[chatResponse](ctx, c, exchange{path: "/api/chat", payload: payload, limit: replyLimit})
+	if err != nil {
+		return ai.Reply{}, err
+	}
+	if e := out.Error; e != "" {
+		return ai.Reply{}, ErrProviderError.Wrap(&statusDetail{status: http.StatusOK, length: len(e)})
+	}
+	if out.Message.Role != "" {
+		out.HasMessage = true
+	}
+	return replyOf(&out), nil
+}
+
+func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	req2, err := requestOf(req, true)
+	if err != nil {
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(err)
+		return
+	}
+	payload, err := json.Marshal(req2)
+	if err != nil {
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
+		return
+	}
+	status, body, err := c.do(ctx, "/api/chat", payload)
+	if err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() == context.Canceled {
+			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(ctx.Err())
+			return
+		}
+		yield ai.Chunk{}, ErrProviderError.Wrap(err)
+		return
+	}
+	defer closeBody(body)
+	if status < 200 || status > 299 {
+		yield ai.Chunk{}, failure(status, body)
+		return
+	}
+	for chunk, err := range streamLines(ctx, body) {
+		yield chunk, err
+	}
+}
+
+func closeBody(body io.Closer) {
+	if err := body.Close(); err != nil {
+		return
+	}
+}
+
+func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	input := make([]string, len(texts))
+	copy(input, texts)
+	payload, err := json.Marshal(embedRequest{Model: c.Model, Input: input, Truncate: true})
+	if err != nil {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
+	}
+	limit := replyLimit + int64(len(texts))*embedVectorLimit
+	out, err := send[embedResponse](ctx, c, exchange{path: "/api/embed", payload: payload, limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	return out.Embeddings, nil
+}
+
+const replyLimit = 1 << 20
+
+const embedVectorLimit = 128 << 10
+
+type exchange struct {
+	path    string
+	payload []byte
+	limit   int64
+}
+func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
+	var zero T
+	return resilience.Do[T](ctx, c.Policy, func(actx context.Context) (T, error) {
+		value, err := post[T](actx, c, x)
+		if err == nil {
+			return value, nil
+		}
+		if callerFault(err) || errors.Is(err, ErrProviderTooLarge) || errors.Is(err, ErrInvalidRequest) {
+			return zero, resilience.Ignored(err)
+		}
+		return zero, err
+	})
+}
+
+func callerFault(err error) bool {
+	return errors.Is(err, ErrProviderRejected)
+}
+
+func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
+	var zero T
+	status, body, err := c.do(ctx, x.path, x.payload)
+	if err != nil {
+		return zero, ErrProviderError.Wrap(err)
+	}
+	defer body.Close()?
+	if status < 200 || status > 299 {
+		return zero, failure(status, body)
+	}
+	data, err := io.ReadAll(io.LimitReader(body, x.limit+1))
+	if int64(len(data)) > x.limit {
+		return zero, ErrProviderTooLarge.Wrap(fmt.Errorf("response size %d exceeds the limit %d", len(data), x.limit))
+	}
+	if err != nil {
+		return zero, ErrProviderError.Wrap(fmt.Errorf("read response: %w", err))
+	}
+	var out T
+	if err := json.Unmarshal(data, &out); err != nil {
+		return zero, ErrProviderError.Wrap(fmt.Errorf("decode response: %w", err))
+	}
+	return out, nil
+}
+
+func failure(status int, body io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(body, replyLimit))
+	detail := statusDetailOf(status, data)
+	if err != nil {
+		return classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", detail, err))
+	}
+	return classifyStatus(status, detail)
+}
+
+func (c *Client) do(ctx context.Context, path string, payload []byte) (int, io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, fmt.Errorf("ai/ollama: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("ai/ollama: %s: %w", path, err)
+	}
+	return resp.StatusCode, resp.Body, nil
+}
+
+func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
+	reader := bufio.NewReader(body)
+	indexer := partIndexer{}
+	done := false
+	for {
+		line, err := reader.ReadString('\n')
+		if text := strings.TrimSpace(line); text != "" {
+			for chunk, cerr := range yieldLine(text, &indexer, &done) {
+				yield chunk, cerr
+			}
+		}
+		if done {
+			return
+		}
+		if ctx.Err() != nil {
+			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(ctx.Err())
+			return
+		}
+		if err != nil {
+			yield ai.Chunk{}, ErrProviderStreamCut.Err()
+			return
+		}
+	}
+}
+
+func yieldLine(text string, indexer *partIndexer, done *bool) iter.Seq2[ai.Chunk, error] {
+	for chunk, err := range handleLine(text, indexer, done) {
+		yield chunk, err
+		if err != nil {
+			return
+		}
+	}
+}
+
+func handleLine(text string, indexer *partIndexer, done *bool) iter.Seq2[ai.Chunk, error] {
+	var resp chatResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(fmt.Errorf("decode stream line: %w", err))
+		return
+	}
+	if e := resp.Error; e != "" {
+		*done = true
+		yield ai.Chunk{}, ErrProviderError.Wrap(&statusDetail{status: http.StatusOK, length: len(e)})
+		return
+	}
+	if resp.Message.Role != "" {
+		resp.HasMessage = true
+	}
+	if resp.Done {
+		*done = true
+	}
+	for chunk, err := range emitChunks(resp, indexer) {
+		yield chunk, err
+	}
+}
+
+func emitChunks(resp chatResponse, indexer *partIndexer) iter.Seq2[ai.Chunk, error] {
+	if resp.HasMessage {
+		for _, part := range resp.Message.parts() {
+			p, index, partial := indexer.stamp(part)
+			yield ai.Chunk{Part: p, Model: resp.Model, Partial: partial, Index: index}, nil
+		}
+	}
+	if !resp.Done {
+		return
+	}
+	yield doneChunk(resp), nil
+}
+
+func doneChunk(resp chatResponse) ai.Chunk {
+	chunk := ai.Chunk{Model: resp.Model}
+	if resp.DoneReason != "" {
+		f := ai.FinishOf(resp.DoneReason)
+		chunk.Finish = f
+	}
+	if resp.PromptEvalCount > 0 || resp.EvalCount > 0 {
+		chunk.Usage = usageOf(&resp)
+	}
+	return chunk
+}
+
+func (m *wireMessage) parts() []ai.Part {
+	var out []ai.Part
+	if m.Thinking != "" {
+		out = append(out, ai.Reasoning{Text: m.Thinking})
+	}
+	if m.Content != "" {
+		out = append(out, ai.Text{Text: m.Content})
+	}
+	for _, tc := range m.ToolCalls {
+		args, err := json.Marshal(tc.Function.Arguments)
+		if err != nil {
+			args = []byte("{}")
+		}
+		out = append(out, ai.ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: string(args)})
+	}
+	return out
+}
+
+func replyOf(resp *chatResponse) ai.Reply {
+	var parts []ai.Part
+	if resp.HasMessage {
+		parts = resp.Message.parts()
+	}
+	return ai.Reply{
+		Message: ai.Message{Role: ai.RoleAssistant, Parts: parts},
+		Finish:  ai.FinishOf(resp.DoneReason),
+		Usage:   usageOf(resp),
+		Model:   resp.Model,
+	}
+}
+
+func usageOf(resp *chatResponse) ai.Usage {
+	return ai.Usage{Input: int(resp.PromptEvalCount), Output: int(resp.EvalCount), Total: int(resp.PromptEvalCount + resp.EvalCount)}
+}
+
+func formatOf(format string) (jsontext.Value, error) {
+	switch format {
+	case "":
+		return nil, nil
+	case "json":
+		return jsontext.Value(`"json"`), nil
+	}
+	schema := jsontext.Value(format)
+	if schema.Kind() != jsontext.KindBeginObject || !schema.IsValid() {
+		return nil, errors.New("ai/ollama: format is not json and not a JSON object")
+	}
+	return schema, nil
+}
+
+func requestOf(req ai.Request, stream bool) (chatRequest, error) {
+	format, err := formatOf(req.Format ?? "")
+	if err != nil {
+		return chatRequest{}, err
+	}
+	out := chatRequest{Model: req.Model ?? "", Stream: stream, Format: format}
+	for _, m := range req.Messages {
+		wire, err := messageOf(m)
+		if err != nil {
+			return out, err
+		}
+		out.Messages = append(out.Messages, wire...)
+	}
+	tools, err := toolsOf(req.Tools)
+	if err != nil {
+		return out, err
+	}
+	out.Tools = tools
+	out.Options = optionsOf(req)
+	return out, nil
+}
+
+func messageOf(m ai.Message) ([]wireMessage, error) {
+	switch m.Role {
+	case ai.RoleSystem:
+		return []wireMessage{{Role: "system", Content: textOf(m.Parts)}}, nil
+	case ai.RoleUser:
+		return []wireMessage{{Role: "user", Content: textOf(m.Parts)}}, nil
+	case ai.RoleAssistant:
+		w, err := assistantOf(m)
+		if err != nil {
+			return nil, err
+		}
+		return []wireMessage{w}, nil
+	case ai.RoleTool:
+		var out []wireMessage
+		for _, p := range m.Parts {
+			if tr, ok := p.(ai.ToolResult); ok {
+				out = append(out, wireMessage{Role: "tool", Content: tr.Content, ToolName: tr.Name})
+			}
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+func assistantOf(m ai.Message) (wireMessage, error) {
+	w := wireMessage{Role: "assistant"}
+	var thinking []string
+	for _, p := range m.Parts {
+		switch v := p.(type) {
+		case ai.Text:
+			w.Content += v.Text
+		case ai.Reasoning:
+			thinking = append(thinking, v.Text)
+		case ai.ToolCall:
+			call, err := toolCallOf(v)
+			if err != nil {
+				return w, err
+			}
+			w.ToolCalls = append(w.ToolCalls, call)
+		}
+	}
+	w.Thinking = strings.Join(thinking, "\n")
+	return w, nil
+}
+
+func toolCallOf(call ai.ToolCall) (wireToolCall, error) {
+	args := map[string]any{}
+	if call.Arguments != "" {
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			return wireToolCall{}, fmt.Errorf("ai/ollama: tool call %s: arguments are not a JSON object: %w", call.Name, err)
+		}
+	}
+	return wireToolCall{ID: call.ID, Function: wireToolFunction{Name: call.Name, Arguments: args}}, nil
+}
+
+func textOf(parts []ai.Part) string {
+	var b strings.Builder
+	for _, p := range parts {
+		if t, ok := p.(ai.Text); ok {
+			b.WriteString(t.Text)
+		}
+	}
+	return b.String()
+}
+
+func toolsOf(tools []ai.Tool) ([]wireTool, error) {
+	if len(tools) == 0 {
+		return nil, nil
+	}
+	var out []wireTool
+	for _, t := range tools {
+		var params map[string]any
+		if t.Schema != "" {
+			if err := json.Unmarshal([]byte(t.Schema), &params); err != nil {
+				return nil, fmt.Errorf("ai/ollama: tool %q schema: %w", t.Name, err)
+			}
+		}
+		out = append(out, wireTool{Type: "function", Function: wireFunction{Name: t.Name, Description: t.Description, Parameters: params}})
+	}
+	return out, nil
+}
+
+func optionsOf(req ai.Request) map[string]any {
+	var out map[string]any
+	put := func(key string, v any) {
+		if out == nil {
+			out = map[string]any{}
+		}
+		out[key] = v
+	}
+	if v := req.Temperature; v != nil {
+		put("temperature", v)
+	}
+	if v := req.TopP; v != nil {
+		put("top_p", v)
+	}
+	if v := req.TopK; v != nil {
+		put("top_k", v)
+	}
+	if v := req.MaxTokens; v != nil {
+		put("num_predict", v)
+	}
+	if len(req.Stop) > 0 {
+		put("stop", req.Stop)
+	}
+	return out
+}
+
+type partIndexer struct {
+	index    int
+	runIndex int?
+	lastKind string
+}
+
+func (p *partIndexer) stamp(part ai.Part) (ai.Part, int?, bool) {
+	kind := ""
+	if _, ok := part.(ai.Reasoning); ok {
+		kind = "reasoning"
+	} else if t, ok := part.(ai.Text); ok {
+		if t.Text == "" {
+			return part, nil, false
+		}
+		kind = "text"
+	}
+	if kind != "" {
+		if kind != p.lastKind {
+			p.runIndex = p.next()
+		}
+		p.lastKind = kind
+		return part, p.runIndex, true
+	}
+	p.lastKind = ""
+	idx := p.next()
+	return part, idx, false
+}
+
+func (p *partIndexer) next() int {
+	p.index++
+	return p.index
+}

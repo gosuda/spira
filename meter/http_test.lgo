@@ -2,6 +2,7 @@ package meter_test
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -238,6 +239,30 @@ func TestRouteMissesAreCountedUnderOneRouteLabel(t *testing.T) {
 	}
 	if n := countRouteSeries(t, text); n != 1 {
 		t.Fatalf("route labels after three misses = %d, want 1", n)
+	}
+}
+
+func TestPanicAfterTheStatusIsCountedAsThatStatus(t *testing.T) {
+	reg := meter.NewRegistry()
+	r := web.NewRouter()
+	r.Use(web.Recover(), meter.HTTP(reg))
+	r.Handle("GET", "/stream", func(ctx *web.Context) (web.Reply, error) {
+		return web.Stream{ContentType: "text/plain", Write: func(w io.Writer) error {
+			if _, err := w.Write([]byte("first")); err != nil {
+				return err
+			}
+			panic("meter test: stream panic after the status")
+		}}, nil
+	})
+	if rec := meteredGet(r, "/stream"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /stream status = %d, want the committed 200", rec.Code)
+	}
+	samples := parseMetricLines(t, exposition(t, reg))
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /stream", "status": "2xx"}); !ok || s.value != "1" {
+		t.Fatalf("series after a panic behind a sent 200 = %+v, want one 2xx", s)
+	}
+	if s, ok := findMetric(samples, "http_requests_total", map[string]string{"method": "GET", "route": "GET /stream", "status": "5xx"}); ok {
+		t.Fatalf("series %+v counts a 5xx that the client never saw", s)
 	}
 }
 

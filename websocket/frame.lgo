@@ -1,0 +1,147 @@
+package websocket
+
+import (
+	"bufio"
+	"encoding/binary"
+	"errors"
+)
+
+var errReservedBits = errors.New("websocket: reserved bits set")
+var errUnknownOpcode = errors.New("websocket: unknown opcode")
+var errControlTooLarge = errors.New("websocket: control frame too large")
+var errFragmentedControl = errors.New("websocket: fragmented control frame")
+var errLengthTopBit = errors.New("websocket: length top bit set")
+var errNonMinimalLength = errors.New("websocket: non-minimal length")
+var errPayloadTooLarge = errors.New("websocket: payload too large")
+
+type header struct {
+	fin    bool
+	rsv1   bool
+	rsv2   bool
+	rsv3   bool
+	opcode uint8
+	masked bool
+	key    [4]byte
+	length int64
+}
+
+func readHeader(r *bufio.Reader, limit int64) (header, error) {
+	var h header
+	b0 := r.ReadByte()?
+	b1 := r.ReadByte()?
+	h.fin = b0&0x80 != 0
+	h.rsv1 = b0&0x40 != 0
+	h.rsv2 = b0&0x20 != 0
+	h.rsv3 = b0&0x10 != 0
+	if h.rsv1 || h.rsv2 || h.rsv3 {
+		return header{}, ErrProtocolError.Wrap(errReservedBits)
+	}
+	h.opcode = b0 & 0x0f
+	if h.opcode != 0x0 && h.opcode != 0x1 && h.opcode != 0x2 && h.opcode != 0x8 && h.opcode != 0x9 && h.opcode != 0xa {
+		return header{}, ErrProtocolError.Wrap(errUnknownOpcode)
+	}
+	h.masked = b1&0x80 != 0
+	length := readLength(r, b1&0x7f)?
+	h.length = int64(length)
+	if h.opcode >= 0x8 {
+		if !h.fin {
+			return header{}, ErrProtocolError.Wrap(errFragmentedControl)
+		}
+		if h.length > 125 {
+			return header{}, ErrProtocolError.Wrap(errControlTooLarge)
+		}
+	}
+	if h.length > limit {
+		return header{}, ErrTooLarge.Wrap(errPayloadTooLarge)
+	}
+	if h.masked {
+		for i := range 4 {
+			b := r.ReadByte()?
+			h.key[i] = b
+		}
+	}
+	return h, nil
+}
+
+func readLength(r *bufio.Reader, short uint8) (uint64, error) {
+	if short < 126 {
+		return uint64(short), nil
+	}
+	if short == 126 {
+		hi := r.ReadByte()?
+		lo := r.ReadByte()?
+		length := uint64(hi)<<8 | uint64(lo)
+		if length < 126 {
+			return 0, ErrProtocolError.Wrap(errNonMinimalLength)
+		}
+		return length, nil
+	}
+	length := uint64(0)
+	for range 8 {
+		b := r.ReadByte()?
+		length = length<<8 | uint64(b)
+	}
+	if length>>63 != 0 {
+		return 0, ErrProtocolError.Wrap(errLengthTopBit)
+	}
+	if length < 65536 {
+		return 0, ErrProtocolError.Wrap(errNonMinimalLength)
+	}
+	return length, nil
+}
+
+func appendHeader(dst []byte, h header) []byte {
+	b0 := h.opcode
+	if h.fin {
+		b0 |= 0x80
+	}
+	if h.rsv1 {
+		b0 |= 0x40
+	}
+	if h.rsv2 {
+		b0 |= 0x20
+	}
+	if h.rsv3 {
+		b0 |= 0x10
+	}
+	dst = append(dst, b0)
+	b1 := uint8(0)
+	if h.masked {
+		b1 = 0x80
+	}
+	if h.length < 126 {
+		dst = append(dst, b1|uint8(h.length))
+	} else if h.length < 65536 {
+		dst = append(dst, b1|126, byte(h.length>>8), byte(h.length))
+	} else {
+		v := uint64(h.length)
+		dst = append(dst, b1|127, byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	}
+	if h.masked {
+		dst = append(dst, h.key[0], h.key[1], h.key[2], h.key[3])
+	}
+	return dst
+}
+
+func mask(key [4]byte, offset int, data []byte) int {
+	n := len(data)
+	start := offset % 4
+	if start < 0 {
+		start += 4
+	}
+	var wide [8]byte
+	for i := range 8 {
+		wide[i] = key[(start+i)%4]
+	}
+	k := binary.LittleEndian.Uint64(wide[:])
+	for len(data) >= 8 {
+		v := binary.LittleEndian.Uint64(data)
+		binary.LittleEndian.PutUint64(data, v^k)
+		data = data[8:]
+	}
+	used := n - len(data)
+	for i := range data {
+		data[i] ^= key[(start+used+i)%4]
+	}
+	return (start + n) % 4
+}

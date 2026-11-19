@@ -1,0 +1,58 @@
+package ops_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/ops"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/ops.md", ops.Faults())
+}
+
+func TestCheckFailedThroughReady(t *testing.T) {
+	cause := errors.New("db: password=hunter2 connection refused")
+	checks := map[string]checkFunc{
+		"db": func(ctx context.Context) error { return cause },
+	}
+	r, _ := newOpsRouter(checks)
+	rec := opsGet(r, "/ops/ready", true)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /ops/ready status = %d, want 503", rec.Code)
+	}
+	var body reportBody
+	decodeBody(t, rec, &body)
+	found := false
+	for _, c := range body.Checks {
+		if c.Name == "db" {
+			found = true
+			if c.Status != "fail" || c.Error != "A health check failed." {
+				t.Fatalf("db check = %+v, want fail with the constant message", c)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("report names no db check: %+v", body.Checks)
+	}
+	if !errors.Is(ops.ErrCheckFailed.Wrap(cause), ops.ErrCheckFailed) {
+		t.Fatal("wrapped check failure does not match ops.ErrCheckFailed")
+	}
+	faulttest.RefuseLeak(t, []byte(rec.Body.String()), "hunter2", "connection refused")
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, ops.ErrCheckFailed.Wrap(cause)), "hunter2", "connection refused")
+}
+
+func TestCheckOutputHidesSecretsAndHostileInput(t *testing.T) {
+	planted := []string{"hunter2", "<script>alert(1)</script>", "'; DROP TABLE x; --", "/etc/passwd"}
+	cause := errors.New("db: password=hunter2 body=<script>alert(1)</script> q='; DROP TABLE x; --' key=/etc/passwd")
+	checks := map[string]checkFunc{
+		"db": func(ctx context.Context) error { return cause },
+	}
+	r, _ := newOpsRouter(checks)
+	rec := opsGet(r, "/ops/ready", true)
+	faulttest.RefuseLeak(t, []byte(rec.Body.String()), planted...)
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, ops.ErrCheckFailed.Wrap(cause)), planted...)
+}

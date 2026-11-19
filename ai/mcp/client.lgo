@@ -1,0 +1,141 @@
+package mcp
+
+import (
+	"context"
+	"fmt"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
+)
+
+type Client struct {
+	t       Transport
+	next    sync.Locked[int64]
+	Name    string = "spira"
+	Version string = "0.1.0"
+}
+
+func NewClient(t Transport) *Client {
+	return &Client{t: t}
+}
+
+func (c *Client) Initialize(ctx context.Context) error {
+	id := c.claimID()
+	msg, err := newRequest(id, "initialize", initializeParams{
+		ProtocolVersion: ProtocolVersion,
+		Capabilities:    clientCapabilities{},
+		ClientInfo:      Implementation{Name: c.Name, Version: c.Version},
+	})
+	if err != nil {
+		return err
+	}
+	reply, err := c.t.Request(ctx, msg)
+	if err != nil {
+		return err
+	}
+	result, err := resultOf[initializeResult](reply)
+	if err != nil {
+		return err
+	}
+	if result.ProtocolVersion != ProtocolVersion {
+		return ErrProtocolError.Wrap(fmt.Errorf("mcp: server answered protocol version %q, want %q", result.ProtocolVersion, ProtocolVersion))
+	}
+	return c.notifyInitialized(ctx)
+}
+
+func (c *Client) notifyInitialized(ctx context.Context) error {
+	msg, err := newNotification("notifications/initialized", nil)
+	if err != nil {
+		return err
+	}
+	if err := c.t.Notify(ctx, msg); err != nil {
+		if fault.Of(err) != nil {
+			return err
+		}
+		return ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: notifications/initialized: %w", err))
+	}
+	return nil
+}
+
+func (c *Client) Tools(ctx context.Context) ([]ai.Tool, error) {
+	var tools []ai.Tool
+	cursor := ""
+	for {
+		page, next, err := c.listPage(ctx, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for _, wire := range page {
+			tools = append(tools, c.exportTool(wire))
+		}
+		if next == "" {
+			return tools, nil
+		}
+		cursor = next
+	}
+}
+
+func (c *Client) listPage(ctx context.Context, cursor string) ([]wireTool, string, error) {
+	id := c.claimID()
+	msg, err := newRequest(id, "tools/list", listParams{Cursor: cursor})
+	if err != nil {
+		return nil, "", err
+	}
+	reply, err := c.t.Request(ctx, msg)
+	if err != nil {
+		return nil, "", err
+	}
+	result, err := resultOf[listResult](reply)
+	if err != nil {
+		return nil, "", err
+	}
+	return result.Tools, result.NextCursor, nil
+}
+
+func (c *Client) exportTool(wire wireTool) ai.Tool {
+	name := wire.Name
+	return ai.Tool{
+		Name:        wire.Name,
+		Description: wire.Description,
+		Schema:      string(wire.InputSchema),
+		Call: func(ctx context.Context, arguments string) (string, error) {
+			return c.Call(ctx, name, arguments)
+		},
+	}
+}
+
+func (c *Client) Call(ctx context.Context, name string, arguments string) (string, error) {
+	args, err := callArguments(name, arguments)
+	if err != nil {
+		return "", err
+	}
+	id := c.claimID()
+	msg, err := newRequest(id, "tools/call", callParams{Name: name, Arguments: args})
+	if err != nil {
+		return "", err
+	}
+	reply, err := c.t.Request(ctx, msg)
+	if err != nil {
+		return "", err
+	}
+	result, err := resultOf[callResult](reply)
+	if err != nil {
+		return "", err
+	}
+	return result.text(), nil
+}
+
+func (c *Client) Close() error {
+	return c.t.Close()
+}
+
+func (c *Client) claimID() int64 {
+	var id int64
+	c.next.WithLock(func(n *int64) {
+		*n = *n + 1
+		id = *n
+	})
+	return id
+}

@@ -1,0 +1,35 @@
+package rag_test
+
+import (
+	"testing"
+
+	"github.com/gosuda/spira/ai/rag"
+)
+
+func TestDropReleasesTheTextAndMetadataOfTheRemovedDocument(t *testing.T) {
+	vectors := map[string][]float32{
+		"text of a": {1, 0},
+		"text of b": {1, 0},
+		"text of c": {1, 0},
+	}
+	store := newStore(t, vectors)
+	add(t, store,
+		rag.Document{ID: "a", Text: "text of a", Metadata: map[string]rag.Value{"k": txt("a")}},
+		rag.Document{ID: "b", Text: "text of b", Metadata: map[string]rag.Value{"k": txt("b")}},
+		rag.Document{ID: "c", Text: "text of c", Metadata: map[string]rag.Value{"k": txt("c")}},
+	)
+
+	for _, id := range []string{"a", "c", "b"} {
+		if err := store.Delete(t.Context(), []string{id}); err != nil {
+			t.Fatalf("Delete %s: %v", id, err)
+		}
+	}
+
+	if n := rag.LiveDocuments(store); n != 0 {
+		t.Fatalf("the store holds %d documents after each one was deleted", n)
+		return
+	}
+	if at := rag.FirstHeldSlot(store); at >= 0 {
+		t.Errorf("backing slot %d still holds a removed document", at)
+	}
+}

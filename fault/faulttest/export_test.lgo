@@ -1,0 +1,23 @@
+package faulttest
+
+import (
+	"fmt"
+
+	"github.com/gosuda/spira/fault"
+)
+
+type Recorder struct {
+	Failed  bool
+	Message string
+}
+
+func (r *Recorder) Helper() {}
+
+func (r *Recorder) Fatalf(format string, args ...any) {
+	r.Failed = true
+	r.Message = fmt.Sprintf(format, args...)
+}
+
+func CheckTableRecorded(r *Recorder, specPath string, faults []*fault.Error) {
+	checkTable(r, specPath, faults)
+}

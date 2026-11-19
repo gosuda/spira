@@ -19,6 +19,26 @@ type Policy struct {
 	Breaker *Breaker?
 }
 
+type ignored struct {
+	cause error
+}
+
+func (i *ignored) Error() string {
+	return i.cause.Error()
+}
+
+func Ignored(err error) error {
+	return &ignored{cause: err}
+}
+
+func ignoredCause(err error) error? {
+	skipped := &ignored{}
+	if errors.As(err, &skipped) {
+		return skipped.cause
+	}
+	return nil
+}
+
 func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
 	var last error
@@ -30,8 +50,11 @@ func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T,
 		if err == nil {
 			return value, nil
 		}
+		if cause := ignoredCause(err); cause != nil {
+			return zero, halted(ctx, cause)
+		}
 		last = err
-		if errors.Is(err, ErrOpen) || ctx.Err() != nil {
+		if errors.Is(err, ErrCircuitOpen) || ctx.Err() != nil {
 			return zero, halted(ctx, last)
 		}
 	}
@@ -46,7 +69,7 @@ func attempt[T any](ctx context.Context, p Policy, call func(ctx context.Context
 		var ok bool
 		tk, ok = breaker.admit()
 		if !ok {
-			return zero, ErrOpen
+			return zero, ErrCircuitOpen.Err()
 		}
 	}
 	bounded, cancel := context.WithTimeout(ctx, p.Timeout)
@@ -57,13 +80,23 @@ func attempt[T any](ctx context.Context, p Policy, call func(ctx context.Context
 			b.record(tk, false)
 		}
 	}()
-	value, err := call(bounded)
+	value, callErr := call(bounded)
 	settled = true
-	if breaker != nil {
-		breaker.settle(ctx, tk, err)
+	if callErr != nil {
+		if ctx.Err() == nil && bounded.Err() != nil && errors.Is(callErr, context.DeadlineExceeded) {
+			timeout := ErrTimeout.Wrap(callErr)
+			if breaker != nil {
+				breaker.settle(ctx, tk, timeout)
+			}
+			return zero, timeout
+		}
+		if breaker != nil {
+			breaker.settle(ctx, tk, callErr)
+		}
+		return zero, callErr
 	}
-	if err != nil {
-		return zero, err
+	if breaker != nil {
+		breaker.settle(ctx, tk, nil)
 	}
 	return value, nil
 }

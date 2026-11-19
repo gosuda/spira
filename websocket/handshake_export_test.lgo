@@ -1,0 +1,55 @@
+package websocket
+
+import "net/http"
+
+func ExposedHandshakeAcceptKey(key string) string {
+	return acceptKey(key)
+}
+
+func ExposedHandshakeCheckUpgrade(r *http.Request) error {
+	return checkUpgrade(r)
+}
+
+func ExposedHandshakeUpgradeStatus(err error) int {
+	return upgradeStatus(err)
+}
+
+func ExposedHandshakeFailureHeaders(err error) http.Header {
+	return handshakeFailureHeaders(err)
+}
+
+func ExposedHandshakeUpgradeHeaders(key string, subprotocol string) (http.Header, error) {
+	return upgradeHeaders(key, subprotocol)
+}
+
+func ExposedHandshakePickSubprotocol(offered []string, supported []string) (string, error) {
+	return pickSubprotocol(offered, supported)
+}
+
+func ExposedHandshakeMethodError() error {
+	return errHandshakeMethod
+}
+
+func ExposedHandshakeProtocolError() error {
+	return errHandshakeProtocol
+}
+
+func ExposedHandshakeConnectionError() error {
+	return errHandshakeConnection
+}
+
+func ExposedHandshakeUpgradeError() error {
+	return errHandshakeUpgrade
+}
+
+func ExposedHandshakeVersionError() error {
+	return errHandshakeVersion
+}
+
+func ExposedHandshakeKeyError() error {
+	return errHandshakeKey
+}
+
+func ExposedHandshakeSubprotocolError() error {
+	return errHandshakeSubprotocol
+}

@@ -1,0 +1,50 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"io"
+	"testing"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func BenchmarkFrameEcho1KiB(b *testing.B) {
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	raw := []byte{0x82, 0xfe, 0x04, 0x00}
+	raw = append(raw, key[0], key[1], key[2], key[3])
+	for i := range payload {
+		raw = append(raw, payload[i]^key[i%4])
+	}
+	stream := bytes.NewReader(raw)
+	r := bufio.NewReader(stream)
+	scratch := make([]byte, len(payload))
+	var enc [14]byte
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := stream.Seek(0, io.SeekStart); err != nil {
+			b.Fatalf("seek: %v", err)
+		}
+		r.Reset(stream)
+		h, err := websocket.ExposedReadHeader(r, 1<<20)
+		if err != nil {
+			b.Fatalf("read: %v", err)
+			return
+		}
+		if _, err := io.ReadFull(r, scratch); err != nil {
+			b.Fatalf("payload: %v", err)
+			return
+		}
+		out := websocket.ExposedAppendHeader(enc[:0], h)
+		if !bytes.Equal(out, raw[:len(out)]) {
+			b.Fatalf("header round trip mismatch")
+		}
+		if !bytes.Equal(scratch, payload) {
+			b.Fatalf("payload mismatch")
+		}
+	}
+}

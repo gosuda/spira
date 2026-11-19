@@ -66,10 +66,29 @@ func (r *Registry) add(name string, help string, spec metricSpec, kind metricKin
 			if existing.name == name {
 				panic("meter: duplicate metric name " + name)
 			}
+			if shared := sharedSampleName(existing, m); shared != "" {
+				panic("meter: metric " + name + " collides with " + existing.name + " on the sample name " + shared)
+			}
 		}
 		*ms = append(*ms, m)
 	})
 	return m
+}
+
+func sharedSampleName(a *metric, b *metric) string {
+	for _, x := range sampleNames(a) {
+		if slices.Contains(sampleNames(b), x) {
+			return x
+		}
+	}
+	return ""
+}
+
+func sampleNames(m *metric) []string {
+	if m.kind != histogramKind {
+		return []string{m.name}
+	}
+	return []string{m.name, m.name + "_bucket", m.name + "_sum", m.name + "_count"}
 }
 
 func checkName(name string) {
@@ -95,6 +114,9 @@ func checkLabels(labels []string) {
 	for i, l := range labels {
 		if l == "" || !labelNameStart(l[0]) {
 			panic("meter: invalid label name " + strconv.Quote(l))
+		}
+		if len(l) > 1 && l[0] == '_' && l[1] == '_' {
+			panic("meter: label name " + strconv.Quote(l) + " is reserved")
 		}
 		for j := 1; j < len(l); j++ {
 			if !labelNameChar(l[j]) {

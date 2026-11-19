@@ -1,0 +1,304 @@
+package db_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/microsoft/go-mssqldb"
+)
+
+const engineCallTimeout = 15 * time.Second
+
+type engineRow struct {
+	N int64 `col:"n"`
+}
+
+func engineDSN(t *testing.T, name string) string {
+	t.Helper()
+	dsn := os.Getenv(name)
+	if dsn == "" {
+		t.Skipf("%s is not set; run `just engines`", name)
+	}
+	return dsn
+}
+
+type engineCase struct {
+	Driver string
+	DSNVar string
+	Table  string
+	Mark   string
+}
+
+func engineCreate(t *testing.T, ctx context.Context, pool *db.Pool, table string) {
+	t.Helper()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE "+table+" (n integer not null)"); err != nil {
+		panic(fmt.Sprintf("db_test: create %s: %v", table, err))
+	}
+}
+
+func engineRoundTrip(t *testing.T, ctx context.Context, pool *db.Pool, c engineCase) {
+	t.Helper()
+	table := c.Table
+	if _, err := db.Exec(ctx, pool, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(7)); err != nil {
+		panic(fmt.Sprintf("db_test: insert: %v", err))
+	}
+	rows, err := db.Query[engineRow](ctx, pool, "SELECT n FROM "+table)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query: %v", err))
+	}
+	if len(rows) != 1 || rows[0].N != 7 {
+		t.Fatalf("rows = %v, want one row with n = 7", rows)
+	}
+	one, err := db.One[engineRow](ctx, pool, "SELECT n FROM "+table)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: one: %v", err))
+	}
+	if one == nil {
+		t.Fatal("One returned no row")
+	}
+	row := one ?? engineRow{}
+	if row.N != 7 {
+		t.Fatalf("One = %v, want n = 7", row)
+	}
+}
+
+func engineTxRollback(t *testing.T, ctx context.Context, pool *db.Pool, c engineCase) {
+	t.Helper()
+	table := c.Table
+	want := errors.New("engine tx rollback")
+	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		if _, err := db.Exec(ctx, tx, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(9)); err != nil {
+			return struct{}{}, fmt.Errorf("tx insert: %w", err)
+		}
+		return struct{}{}, want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("InTx error = %v, want the sentinel", err)
+	}
+	rows, err := db.Query[engineRow](ctx, pool, "SELECT n FROM "+table)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: post-rollback query: %v", err))
+	}
+	for _, r := range rows {
+		if r.N == 9 {
+			t.Fatalf("row n = 9 is visible after rollback")
+		}
+	}
+}
+
+func engineTxCommit(t *testing.T, ctx context.Context, pool *db.Pool, c engineCase) {
+	t.Helper()
+	table := c.Table
+	n, err := db.InTx(ctx, pool, func(tx *db.Tx) (int64, error) {
+		if _, err := db.Exec(ctx, tx, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(11)); err != nil {
+			return 0, fmt.Errorf("tx insert: %w", err)
+		}
+		counted, err := db.One[int64](ctx, tx, "SELECT COUNT(*) FROM "+table)
+		if err != nil {
+			return 0, fmt.Errorf("tx count: %w", err)
+		}
+		if counted == nil {
+			return 0, fmt.Errorf("tx count is nil")
+		}
+		return counted ?? 0, nil
+	})
+	if err != nil {
+		panic(fmt.Sprintf("db_test: InTx: %v", err))
+	}
+	rows, err := db.Query[engineRow](ctx, pool, "SELECT n FROM "+table+" ORDER BY n")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: post-commit query: %v", err))
+	}
+	if n != 2 || len(rows) != 2 || rows[0].N != 7 || rows[1].N != 11 {
+		t.Fatalf("post-commit rows = %v (count %d), want 7 then 11", rows, n)
+	}
+}
+
+func enginePrepare(t *testing.T, ctx context.Context, pool *db.Pool, table string) {
+	t.Helper()
+	before := pool.Prepared()
+	text := "SELECT n FROM " + table + " WHERE n = 7"
+	if err := pool.Prepare(ctx, text); err != nil {
+		panic(fmt.Sprintf("db_test: Prepare: %v", err))
+	}
+	if got := pool.Prepared(); got != before+1 {
+		t.Fatalf("Prepared() = %d after Prepare, want %d", got, before+1)
+	}
+	rows, err := db.Query[engineRow](ctx, pool, text)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query through the prepared statement: %v", err))
+	}
+	if len(rows) == 0 || rows[0].N != 7 {
+		t.Fatalf("prepared rows = %v, want first n = 7", rows)
+	}
+}
+
+func runEngineSuite(t *testing.T, c engineCase) {
+	driver, dsnVar, table := c.Driver, c.DSNVar, c.Table
+	t.Helper()
+	dsn := engineDSN(t, dsnVar)
+	pool, err := db.Open(driver, dsn)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: db.Open(%s): %v", driver, err))
+	}
+	if pool == nil {
+		panic(fmt.Sprintf("db_test: db.Open(%s) returned no pool", driver))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), engineCallTimeout)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("pool.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("pool.Stop: %v", err)
+		}
+	})
+	engineCreate(t, ctx, pool, table)
+	engineRoundTrip(t, ctx, pool, c)
+	engineTxRollback(t, ctx, pool, c)
+	engineTxCommit(t, ctx, pool, c)
+	enginePrepare(t, ctx, pool, table)
+	if _, err := db.Exec(ctx, pool, "DROP TABLE "+table); err != nil {
+		panic(fmt.Sprintf("db_test: drop %s: %v", table, err))
+	}
+}
+
+func TestEnginePostgres(t *testing.T) {
+	runEngineSuite(t, engineCase{Driver: "pgx", DSNVar: "SPIRA_TEST_POSTGRES_DSN", Table: "engine_things_pg", Mark: "$1"})
+}
+
+func TestEngineMySQL(t *testing.T) {
+	runEngineSuite(t, engineCase{Driver: "mysql", DSNVar: "SPIRA_TEST_MYSQL_DSN", Table: "engine_things_my", Mark: "?"})
+}
+
+func TestEngineMSSQL(t *testing.T) {
+	runEngineSuite(t, engineCase{Driver: "sqlserver", DSNVar: "SPIRA_TEST_MSSQL_DSN", Table: "engine_things_ms", Mark: "@p1"})
+}
+
+func engineOpenPool(t *testing.T, c engineCase) (*db.Pool, context.Context, context.CancelFunc) {
+	t.Helper()
+	dsn := engineDSN(t, c.DSNVar)
+	pool, err := db.Open(c.Driver, dsn)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: db.Open(%s): %v", c.Driver, err))
+	}
+	if pool == nil {
+		panic(fmt.Sprintf("db_test: db.Open(%s) returned no pool", c.Driver))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), engineCallTimeout)
+	if serr := pool.Start(ctx); serr != nil {
+		cancel()
+		panic(fmt.Sprintf("db_test: pool.Start: %v", serr))
+	}
+	return pool, ctx, cancel
+}
+
+type constraintProbe struct {
+	table string
+	mark  string
+	check func(dupErr error)
+}
+
+func withConstraintProbe(t *testing.T, ctx context.Context, pool *db.Pool, p constraintProbe) {
+	t.Helper()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE "+p.table+" (n integer not null unique)"); err != nil {
+		t.Fatalf("create %s: %v", p.table, err)
+		return
+	}
+	defer func() {
+		if _, derr := db.Exec(context.Background(), pool, "DROP TABLE "+p.table); derr != nil {
+			t.Errorf("drop %s: %v", p.table, derr)
+		}
+	}()
+	if _, err := db.Exec(ctx, pool, "INSERT INTO "+p.table+" (n) VALUES ("+p.mark+")", int64(7)); err != nil {
+		t.Fatalf("seed %s: %v", p.table, err)
+		return
+	}
+	_, dupErr := db.Exec(ctx, pool, "INSERT INTO "+p.table+" (n) VALUES ("+p.mark+")", int64(7))
+	if dupErr == nil {
+		t.Fatalf("duplicate insert into %s succeeded", p.table)
+		return
+	}
+	p.check(dupErr)
+}
+
+func innermostText(err error) string {
+	text := err.Error()
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		text = current.Error()
+	}
+	return text
+}
+
+func checkEngineConstraint(t *testing.T, c engineCase, inner string, prefix bool) {
+	t.Helper()
+	pool, ctx, cancel := engineOpenPool(t, c)
+	defer cancel()
+	t.Cleanup(func() {
+		if serr := pool.Stop(context.Background()); serr != nil {
+			t.Errorf("pool.Stop: %v", serr)
+		}
+	})
+	withConstraintProbe(t, ctx, pool, constraintProbe{
+		table: c.Table + "_uniq",
+		mark:  c.Mark,
+		check: func(dupErr error) {
+			if !errors.Is(dupErr, db.ErrConstraintViolation) {
+				t.Fatalf("%s duplicate insert error = %v, want db.ErrConstraintViolation", c.Driver, dupErr)
+				return
+			}
+			innerText := innermostText(dupErr)
+			matched := strings.Contains(innerText, inner)
+			if prefix {
+				matched = strings.HasPrefix(innerText, inner)
+			}
+			if !matched {
+				t.Fatalf("%s innermost error = %q, want it to hold %q", c.Driver, innerText, inner)
+				return
+			}
+		},
+	})
+}
+
+func TestEnginePostgresConstraintViolation(t *testing.T) {
+	checkEngineConstraint(t, engineCase{Driver: "pgx", DSNVar: "SPIRA_TEST_POSTGRES_DSN", Table: "engine_things_pg", Mark: "$1"}, "(SQLSTATE 23505)", false)
+}
+
+func TestEngineMySQLConstraintViolation(t *testing.T) {
+	checkEngineConstraint(t, engineCase{Driver: "mysql", DSNVar: "SPIRA_TEST_MYSQL_DSN", Table: "engine_things_my", Mark: "?"}, "Error 1062", true)
+}
+
+func TestEngineMSSQLConstraintViolation(t *testing.T) {
+	checkEngineConstraint(t, engineCase{Driver: "sqlserver", DSNVar: "SPIRA_TEST_MSSQL_DSN", Table: "engine_things_ms", Mark: "@p1"}, "(2627)", false)
+}
+
+func TestEngineMySQLRefusedPort(t *testing.T) {
+	pool, err := db.Open("mysql", "spira:spira@tcp(127.0.0.1:1)/spira?parseTime=true&timeout=2s")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatal("Open returned no pool")
+		return
+	}
+	t.Cleanup(func() {
+		if serr := pool.Stop(context.Background()); serr != nil {
+			t.Errorf("Stop: %v", serr)
+		}
+	})
+	if serr := pool.Start(t.Context()); !errors.Is(serr, db.ErrUnavailable) {
+		t.Fatalf("Start error = %v, want db.ErrUnavailable", serr)
+		return
+	}
+}

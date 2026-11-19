@@ -15,10 +15,10 @@ import (
 func fingerprint(ctx context.Context, p *db.Pool) (string, error) {
 	rows, err := p.QueryContext(ctx, fingerprintQuery(p.Dialect()))
 	if err != nil {
-		return "", fmt.Errorf("migrate: fingerprint: %w", err)
+		return "", ErrUnavailable.Wrap(fmt.Errorf("migrate: fingerprint: %w", err))
 	}
 	if rows == nil {
-		return "", errors.New("migrate: fingerprint: no rows")
+		return "", ErrUnavailable.Wrap(errors.New("migrate: fingerprint: no rows"))
 	}
 	defer rows.Close()?
 	var parts []string
@@ -30,7 +30,7 @@ func fingerprint(ctx context.Context, p *db.Pool) (string, error) {
 		parts = append(parts, line)
 	}
 	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("migrate: fingerprint: %w", err)
+		return "", ErrUnavailable.Wrap(fmt.Errorf("migrate: fingerprint: %w", err))
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\n"), nil
@@ -39,7 +39,7 @@ func fingerprint(ctx context.Context, p *db.Pool) (string, error) {
 func scanFingerprintRow(rows *sql.Rows) (string, error) {
 	cols, err := rows.Columns()
 	if err != nil {
-		return "", fmt.Errorf("migrate: fingerprint columns: %w", err)
+		return "", ErrUnavailable.Wrap(fmt.Errorf("migrate: fingerprint columns: %w", err))
 	}
 	vals := make([]sql.NullString, len(cols))
 	ptrs := make([]any, len(cols))
@@ -47,7 +47,7 @@ func scanFingerprintRow(rows *sql.Rows) (string, error) {
 		ptrs[i] = &vals[i]
 	}
 	if err := rows.Scan(ptrs...); err != nil {
-		return "", fmt.Errorf("migrate: fingerprint scan: %w", err)
+		return "", ErrUnavailable.Wrap(fmt.Errorf("migrate: fingerprint scan: %w", err))
 	}
 	var b strings.Builder
 	for i, v := range vals {

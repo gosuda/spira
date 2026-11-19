@@ -1,10 +1,13 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 
 	"logos/sync"
 
@@ -30,13 +33,16 @@ type Router struct {
 	root        *Router?
 	stages      []Stage
 	routes      *routeList
+	unmatched   func(c *Context)
 	Layout      func(ctx *Context, p Page) view.Node
 	ProblemView func(p Problem) view.Node?
 	MaxBody     int64 = 1 << 20
 }
 
 func NewRouter() *Router {
-	return &Router{mux: http.NewServeMux(), routes: &routeList{}}
+	r := &Router{mux: http.NewServeMux(), routes: &routeList{}}
+	r.unmatched = chain(r, nil, delegateUnrouted)
+	return r
 }
 
 func (r *Router) rootRouter() *Router {
@@ -48,6 +54,9 @@ func (r *Router) rootRouter() *Router {
 
 func (r *Router) Use(stages ...Stage) {
 	r.stages = append(r.stages, stages...)
+	if r.root == nil {
+		r.unmatched = chain(r, r.stages, delegateUnrouted)
+	}
 }
 
 func (r *Router) Group(prefix string, build func(g *Router)) {
@@ -62,7 +71,8 @@ func (r *Router) Group(prefix string, build func(g *Router)) {
 }
 
 func (r *Router) Handle(method string, pattern string, h Handler) {
-	full := r.prefix + pattern
+	host := pattern[:max(strings.IndexByte(pattern, '/'), 0)]
+	full := host + r.prefix + pattern[len(host):]
 	r.record(method, full)
 	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
 }
@@ -83,15 +93,27 @@ func (r *Router) Routes() const []RouteInfo {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	unrouted, pattern := r.mux.Handler(req)
+	_, pattern := r.mux.Handler(req)
 	if pattern != "" {
 		r.mux.ServeHTTP(w, req)
 		return
 	}
 	root := r.rootRouter()
-	served(root, root.stages, func(_ *Context) (Reply, error) {
-		return Delegate{To: unrouted}, nil
-	}).ServeHTTP(w, req)
+	c := newContext(w, req, root)
+	unrouted, _ := root.mux.Handler(req)
+	c.fallback = unrouted
+	root.unmatched(c)
+}
+
+func delegateUnrouted(c *Context) (Reply, error) {
+	if c.Request.RequestURI == "*" {
+		return Delegate{To: c.root.mux}, nil
+	}
+	if c.fallback != nil {
+		return Delegate{To: c.fallback}, nil
+	}
+	unrouted, _ := c.root.mux.Handler(c.Request)
+	return Delegate{To: unrouted}, nil
 }
 
 func served(root *Router, stages []Stage, h Handler) http.HandlerFunc {
@@ -192,14 +214,15 @@ func Set[T any](ctx *Context, k *Key[T], v T) {
 }
 
 type Context struct {
-	Request *http.Request
-	writer  *statusWriter
-	root    *Router
-	vals    sync.Locked[map[any]any]
+	Request  *http.Request
+	writer   *statusWriter
+	root     *Router
+	vals     sync.Locked[map[any]any]
+	fallback http.Handler
 }
 
 func newContext(w http.ResponseWriter, req *http.Request, root *Router) *Context {
-	c := &Context{Request: req, writer: newStatusWriter(w), root: root}
+	c := &Context{Request: req, writer: newStatusWriter(w, req), root: root}
 	c.vals.WithLock(func(m *map[any]any) {
 		*m = map[any]any{}
 	})
@@ -240,12 +263,26 @@ type Htmx struct {
 
 type statusWriter struct {
 	inner  http.ResponseWriter
+	req    *http.Request
 	status int
 	wrote  bool
 }
 
-func newStatusWriter(inner http.ResponseWriter) *statusWriter {
-	return &statusWriter{inner: inner, status: http.StatusOK}
+func newStatusWriter(inner http.ResponseWriter, req *http.Request) *statusWriter {
+	return &statusWriter{inner: inner, req: req, status: http.StatusOK}
+}
+
+func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, buf, err := http.NewResponseController(s.inner).Hijack()
+	if err != nil {
+		return conn, buf, err
+	}
+	s.wrote = true
+	ups, served := s.req.Context().Value(upgradesKey{}).(*upgrades)
+	if !served {
+		return conn, buf, nil
+	}
+	return ups.adopt(conn, buf)
 }
 
 func (s *statusWriter) Header() http.Header {
@@ -275,6 +312,10 @@ func (s *statusWriter) Write(b []byte) (int, error) {
 
 func (s *statusWriter) Flush() {
 	if f, ok := s.inner.(http.Flusher); ok {
+		if !s.wrote {
+			s.status = http.StatusOK
+			s.wrote = true
+		}
 		f.Flush()
 	}
 }

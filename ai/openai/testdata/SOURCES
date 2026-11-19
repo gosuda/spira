@@ -1,0 +1,28 @@
+Ground truth for ai/openai. The wire bodies the tests replay come from
+the Spring AI test fixtures and the provider API reference pages
+below. This file carries the provenance a header comment would.
+
+Fetched 2026-11-19.
+
+Repository: spira/.references/spring-projects/spring-ai (Apache-2.0)
+
+  models/spring-ai-openai/src/test/java/org/springframework/ai/openai/chat/OpenAiChatModelTest.java
+  models/spring-ai-openai/src/test/java/org/springframework/ai/openai/embedding/OpenAiEmbeddingModelTests.java
+  models/spring-ai-openai/src/main/java/org/springframework/ai/openai/OpenAiChatModel.java
+  models/spring-ai-deepseek/src/main/java/org/springframework/ai/deepseek/api/DeepSeekApi.java
+  models/spring-ai-mistral-ai/src/main/java/org/springframework/ai/mistralai/api/MistralAiApi.java
+
+Provider API references (public documentation, request and response shapes):
+
+  https://platform.openai.com/docs/api-reference/chat/create   (chat completions)
+  https://platform.openai.com/docs/api-reference/embeddings    (embeddings)
+  https://api-docs.deepseek.com/api/create-chat-completion      (reasoning_content)
+  https://docs.mistral.ai/capabilities/chat_completion          (chunk-array content)
+
+The constants in openai_test.lgo name which body each test replays:
+completionBody and ssePlain from the chat completions reference,
+sseToolFragments in the delta.tool_calls shape of the same reference,
+deepseekBody with reasoning_content per the DeepSeek reference,
+mistralBody with content as a chunk array per the Mistral reference,
+and embeddingBody in the embeddings reference shape with its data
+rows deliberately out of index order.

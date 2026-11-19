@@ -1,0 +1,870 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/SimpleVectorStoreFilterExpressionEvaluatorTests.java
+// and spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/pgvector/PgVectorStoreTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"net/http/httptest"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/resilience"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+const pgTimeout = 15 * time.Second
+
+var _ rag.Store = (*rag.Memory)(nil)
+
+var _ rag.Store = (*rag.Pgvector)(nil)
+
+type countEmbed struct {
+	vector []float32
+	calls  int
+}
+
+func (e *countEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	e.calls++
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = e.vector
+	}
+	return out, nil
+}
+
+func pgEmbed(t *testing.T, vectors map[string][]float32) ai.Embedder {
+	t.Helper()
+	srv := httptest.NewServer(&provider{vectors: vectors})
+	t.Cleanup(srv.Close)
+	return &openai.Client{BaseURL: srv.URL, Model: "text-embedding-3-small", HTTP: srv.Client(), Policy: resilience.Policy{}}
+}
+
+func pgPool(t *testing.T, dsn string) *db.Pool {
+	t.Helper()
+	pool, err := db.Open("pgx", dsn)
+	if err != nil {
+		panic(fmt.Sprintf("pg_test: db.Open: %v", err))
+	}
+	if pool == nil {
+		panic("pg_test: db.Open returned no pool")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		panic(fmt.Sprintf("pg_test: pool.Start: %v", err))
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("pool.Stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func pgDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv("SPIRA_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skipf("SPIRA_TEST_POSTGRES_DSN is not set; run `just engines`")
+	}
+	return dsn
+}
+
+type pgConfig struct {
+	pool    *db.Pool
+	table   string
+	vectors map[string][]float32
+}
+
+func pgNew(t *testing.T, ctx context.Context, config pgConfig) *rag.Pgvector {
+	t.Helper()
+	store, err := rag.NewPgvector(config.pool, pgEmbed(t, config.vectors), config.table, 3)
+	if err != nil {
+		panic(fmt.Sprintf("pg_test: NewPgvector: %v", err))
+	}
+	if store == nil {
+		panic("pg_test: NewPgvector returned no store")
+	}
+	if err := store.Setup(ctx); err != nil {
+		panic(fmt.Sprintf("pg_test: Setup: %v", err))
+	}
+	return store
+}
+
+func mustPgParse(t *testing.T, text string) rag.Filter {
+	t.Helper()
+	out, err := rag.ParseFilter(text)
+	if err != nil {
+		t.Fatalf("ParseFilter(%q): %v", text, err)
+		return nil
+	}
+	return out
+}
+
+func TestPgvectorSharesTheStoreContract(t *testing.T) {
+	var store rag.Store = newStore(t, map[string][]float32{"q": {1, 0, 0}})
+	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "q"}}); err != nil {
+		t.Fatalf("Add through Store: %v", err)
+		return
+	}
+	docs, err := store.Search(t.Context(), rag.Search{Query: "q"})
+	if err != nil {
+		t.Fatalf("Search through Store: %v", err)
+		return
+	}
+	if got := ids(docs); !slices.Equal(got, []string{"d"}) {
+		t.Errorf("Store search = %v, want [d]", got)
+	}
+	if err := store.Delete(t.Context(), []string{"d"}); err != nil {
+		t.Fatalf("Delete through Store: %v", err)
+		return
+	}
+}
+
+func TestPgvectorRefusesBadTables(t *testing.T) {
+	pool, err := db.Open("pgx", "postgres://spira@localhost:5432/spira_test?sslmode=disable")
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatalf("db.Open returned no pool")
+		return
+	}
+	embed := &countEmbed{vector: []float32{1, 0, 0}}
+	for _, table := range []string{"", "X", "9lives", "has-hyphen", "has space", "pg;drop", "a.b", strings.Repeat("a", 64), "UPPER", "'; DROP TABLE x; --"} {
+		if _, err := rag.NewPgvector(pool, embed, table, 3); err == nil {
+			t.Errorf("NewPgvector(%q) succeeded, want a table-name error", table)
+		}
+	}
+	if _, err := rag.NewPgvector(pool, embed, "pg_ok", 3); err != nil {
+		t.Errorf("NewPgvector(pg_ok): %v, want no error", err)
+	}
+	if _, err := rag.NewPgvector(pool, embed, strings.Repeat("a", 63), 3); err != nil {
+		t.Errorf("NewPgvector(63 chars): %v, want no error", err)
+	}
+	if _, err := rag.NewPgvector(pool, embed, "pg_ok", 0); err == nil {
+		t.Errorf("NewPgvector with 0 dimensions succeeded, want an error")
+	}
+	if _, err := rag.NewPgvector(pool, nil, "pg_ok", 3); err == nil {
+		t.Errorf("NewPgvector with no embedder succeeded, want an error")
+	}
+}
+
+func TestPgvectorBlankIdSendsNoEmbedding(t *testing.T) {
+	pool, err := db.Open("pgx", "postgres://spira@localhost:5432/spira_test?sslmode=disable")
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatalf("db.Open returned no pool")
+		return
+	}
+	embed := &countEmbed{vector: []float32{1, 0, 0}}
+	store, err := rag.NewPgvector(pool, embed, "pg_blank", 3)
+	if err != nil {
+		t.Fatalf("NewPgvector: %v", err)
+		return
+	}
+	if store == nil {
+		t.Fatalf("NewPgvector returned no store")
+		return
+	}
+	if err := store.Add(t.Context(), []rag.Document{{ID: " ", Text: "q"}}); err == nil || !strings.Contains(err.Error(), "needs an id") {
+		t.Errorf("Add error = %v, want one that needs an id", err)
+	}
+	if embed.calls != 0 {
+		t.Errorf("the embedder received %d requests for a blank id, want 0", embed.calls)
+	}
+	if err := store.Add(t.Context(), nil); err == nil || !strings.Contains(err.Error(), "needs a document") {
+		t.Errorf("Add error = %v, want one that needs a document", err)
+	}
+}
+
+func TestPgvectorVectorTextFormatsBrackets(t *testing.T) {
+	cases := []struct {
+		vector []float32
+		want   string
+	}{
+		{[]float32{1, 2.5, -3}, "[1,2.5,-3]"},
+		{[]float32{0}, "[0]"},
+		{[]float32{}, "[]"},
+	}
+	for _, c := range cases {
+		if got := rag.ProbeVectorText(c.vector); got != c.want {
+			t.Errorf("vector text of %v = %q, want %q", c.vector, got, c.want)
+		}
+	}
+}
+
+func TestPgvectorMetadataTextRoundTrip(t *testing.T) {
+	text, err := rag.ProbeMetadataText(map[string]rag.Value{"s": txt("BG"), "n": num(2.5), "b": flag(true), "z": num(math.NaN())})
+	if err != nil {
+		t.Fatalf("ProbeMetadataText: %v", err)
+		return
+	}
+	if text != `{"b":true,"n":2.5,"s":"BG","z":null}` {
+		t.Errorf("metadata text = %s, want sorted keys with a null NaN", text)
+	}
+	back, err := rag.ProbeMetadataMap(text)
+	if err != nil {
+		t.Fatalf("ProbeMetadataMap: %v", err)
+		return
+	}
+	raw, ok := back["z"]
+	if !ok {
+		t.Fatalf("the decoded metadata holds no z")
+		return
+	}
+	held, ok := raw.(rag.Number)
+	if !ok {
+		t.Fatalf("the decoded z is %T, want a number", raw)
+		return
+	}
+	if !math.IsNaN(held.Number) {
+		t.Errorf("the decoded z = %v, want NaN", held.Number)
+	}
+	if _, err := rag.ProbeMetadataText(map[string]rag.Value{"k": num(math.Inf(1))}); err == nil || !strings.Contains(err.Error(), "not finite") {
+		t.Errorf("metadata with +Inf: error = %v, want one that says not finite", err)
+	}
+}
+
+func TestPgvectorFilterSQLBindsEveryValue(t *testing.T) {
+	hostile := "'; DROP TABLE x; --"
+	filter := mustPgParse(t, "genre == 'drama'")
+	frag, args, err := rag.ProbeFilterSQL(filter, 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL: %v", err)
+		return
+	}
+	if !strings.Contains(frag, "$4") || !strings.Contains(frag, "$5") {
+		t.Errorf("filter fragment = %q, want placeholders $4 and $5", frag)
+	}
+	if len(args) != 2 || args[0] != "genre" || args[1] != "drama" {
+		t.Errorf("filter args = %v, want [genre drama]", args)
+	}
+	if strings.Contains(frag, "drama") {
+		t.Errorf("filter fragment splices the value: %q", frag)
+	}
+	attack := rag.Expression{Type: rag.OpEq, Left: rag.Key{Name: "k"}, Right: rag.Filter(rag.Const{Text: hostile})}
+	frag, args, err = rag.ProbeFilterSQL(rag.Filter(attack), 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of the hostile filter: %v", err)
+		return
+	}
+	if strings.Contains(frag, hostile) {
+		t.Errorf("filter fragment splices the hostile value: %q", frag)
+	}
+	if len(args) != 2 || args[1] != hostile {
+		t.Errorf("hostile filter args = %v, want the value bound", args)
+	}
+}
+
+func TestPgvectorFilterSQLEmptyLists(t *testing.T) {
+	emptyIn := rag.Expression{Type: rag.OpIn, Left: rag.Key{Name: "genre"}, Right: rag.Filter(rag.Array{})}
+	frag, args, err := rag.ProbeFilterSQL(rag.Filter(emptyIn), 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of an empty IN: %v", err)
+		return
+	}
+	if frag != "FALSE" || len(args) != 0 {
+		t.Errorf("empty IN = (%q, %v), want (FALSE, [])", frag, args)
+	}
+	emptyNin := rag.Expression{Type: rag.OpNin, Left: rag.Key{Name: "genre"}, Right: rag.Filter(rag.Array{})}
+	frag, args, err = rag.ProbeFilterSQL(rag.Filter(emptyNin), 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of an empty NOT IN: %v", err)
+		return
+	}
+	if frag != "TRUE" || len(args) != 0 {
+		t.Errorf("empty NOT IN = (%q, %v), want (TRUE, [])", frag, args)
+	}
+}
+
+func TestPgvectorFilterSQLKinds(t *testing.T) {
+	integer := mustPgParse(t, "year == 2020")
+	_, args, err := rag.ProbeFilterSQL(integer, 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of an integer: %v", err)
+		return
+	}
+	if got, ok := args[1].(int64); !ok || got != 2020 {
+		t.Errorf("integer arg = %v (%T), want int64 2020", args[1], args[1])
+	}
+	decimal := mustPgParse(t, "year == 2019.5")
+	_, args, err = rag.ProbeFilterSQL(decimal, 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of a decimal: %v", err)
+		return
+	}
+	if got, ok := args[1].(float64); !ok || got != 2019.5 {
+		t.Errorf("decimal arg = %v (%T), want float64 2019.5", args[1], args[1])
+	}
+	boolean := mustPgParse(t, "open == true")
+	_, args, err = rag.ProbeFilterSQL(boolean, 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of a boolean: %v", err)
+		return
+	}
+	if got, ok := args[1].(bool); !ok || got != true {
+		t.Errorf("boolean arg = %v (%T), want true", args[1], args[1])
+	}
+	null := mustPgParse(t, "type is null")
+	frag, args, err := rag.ProbeFilterSQL(null, 4)
+	if err != nil {
+		t.Fatalf("ProbeFilterSQL of IS NULL: %v", err)
+		return
+	}
+	if !strings.Contains(frag, "jsonb_exists") || len(args) != 1 || args[0] != "type" {
+		t.Errorf("IS NULL = (%q, %v), want the key bound and no value", frag, args)
+	}
+}
+
+func pgUnitStore(t *testing.T, embed ai.Embedder) *rag.Pgvector {
+	t.Helper()
+	pool, err := db.Open("pgx", "postgres://spira@localhost:5432/spira_test?sslmode=disable")
+	if err != nil {
+		panic(fmt.Sprintf("pg_test: db.Open: %v", err))
+	}
+	if pool == nil {
+		panic("pg_test: db.Open returned no pool")
+	}
+	store, err := rag.NewPgvector(pool, embed, "pg_unit", 3)
+	if err != nil {
+		panic(fmt.Sprintf("pg_test: NewPgvector: %v", err))
+	}
+	if store == nil {
+		panic("pg_test: NewPgvector returned no store")
+	}
+	return store
+}
+
+type failEmbed struct {
+	err error
+}
+
+func (e *failEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	return nil, e.err
+}
+
+type shortEmbed struct{}
+
+func (shortEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	return [][]float32{}, nil
+}
+
+func TestPgvectorAddRefusesBadVectors(t *testing.T) {
+	cases := []struct {
+		name    string
+		vectors map[string][]float32
+		fixed   []float32
+		docs    []rag.Document
+		want    string
+	}{
+		{"empty embedding", map[string][]float32{"d": {}}, nil, []rag.Document{{ID: "d", Text: "d"}}, "has an empty embedding"},
+		{"mixed dimensions", map[string][]float32{"a": {1, 0, 0}, "b": {1, 0}}, nil, []rag.Document{{ID: "d1", Text: "a"}, {ID: "d2", Text: "b"}}, "dimensions"},
+		{"zero vector", map[string][]float32{"d": {0, 0, 0}}, nil, []rag.Document{{ID: "d", Text: "d"}}, "zero vector"},
+		{"non-finite vector", nil, []float32{float32(math.NaN()), 0, 0}, []rag.Document{{ID: "d", Text: "d"}}, "not finite"},
+		{"infinite vector", nil, []float32{float32(math.Inf(1)), 0, 0}, []rag.Document{{ID: "d", Text: "d"}}, "not finite"},
+	}
+	for _, c := range cases {
+		var embed ai.Embedder
+		if c.fixed != nil {
+			embed = &countEmbed{vector: c.fixed}
+		} else {
+			embed = pgEmbed(t, c.vectors)
+		}
+		store := pgUnitStore(t, embed)
+		if err := store.Add(t.Context(), c.docs); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Add error = %v, want one with %q", c.name, err, c.want)
+		}
+	}
+}
+
+func TestPgvectorSearchRefusesBadRequests(t *testing.T) {
+	store := pgUnitStore(t, &countEmbed{vector: []float32{1, 0, 0}})
+	cases := []struct {
+		query rag.Search
+		want  string
+	}{
+		{rag.Search{Query: "q", TopK: -1}, "topK"},
+		{rag.Search{Query: "q", Threshold: 1.5}, "threshold"},
+		{rag.Search{Query: "q", Threshold: -0.5}, "threshold"},
+	}
+	for _, c := range cases {
+		if _, err := store.Search(t.Context(), c.query); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("Search %+v error = %v, want one with %q", c.query, err, c.want)
+		}
+	}
+	zero := pgUnitStore(t, &countEmbed{vector: []float32{0, 0, 0}})
+	if _, err := zero.Search(t.Context(), rag.Search{Query: "q"}); err == nil || !strings.Contains(err.Error(), "zero vector") {
+		t.Errorf("Search of a zero query vector: error = %v, want a zero vector error", err)
+	}
+}
+
+func TestPgvectorSearchReportsEmbedFailures(t *testing.T) {
+	boom := pgUnitStore(t, &failEmbed{err: fmt.Errorf("pg_test: embed boom")})
+	if _, err := boom.Search(t.Context(), rag.Search{Query: "q"}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed query: pg_test: embed boom") {
+		t.Errorf("Search error = %v, want the embedder error wrapped", err)
+	}
+	short := pgUnitStore(t, shortEmbed{})
+	if _, err := short.Search(t.Context(), rag.Search{Query: "q"}); err == nil || !strings.Contains(err.Error(), "0 vectors for the query") {
+		t.Errorf("Search error = %v, want the vector count error", err)
+	}
+}
+
+func TestPgvectorFilterMismatchMapsToInvalidFilter(t *testing.T) {
+	marker := errors.New(`ERROR: ai/rag: filter type mismatch on "genre": string (SQLSTATE P0001)`)
+	if !rag.ProbeFilterMismatch(marker) {
+		t.Fatalf("ProbeFilterMismatch = false, want true for the mismatch marker")
+	}
+	if rag.ProbeFilterMismatch(errors.New("connection refused")) {
+		t.Fatalf("ProbeFilterMismatch = true, want false without the marker")
+	}
+	searchFault := fault.Of(rag.ProbeSearchError(marker))
+	if searchFault == nil {
+		t.Fatalf("search error carries no fault, want the outermost rag.invalid_filter fault")
+		return
+	}
+	if searchFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("search error = %v, want the outermost rag.invalid_filter fault", rag.ProbeSearchError(marker))
+	}
+	scanFault := fault.Of(rag.ProbeScanError(marker))
+	if scanFault == nil {
+		t.Fatalf("scan error carries no fault, want the outermost rag.invalid_filter fault")
+		return
+	}
+	if scanFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("scan error = %v, want the outermost rag.invalid_filter fault", rag.ProbeScanError(marker))
+	}
+	plain := errors.New("connection refused")
+	plainSearch := fault.Of(rag.ProbeSearchError(plain))
+	if plainSearch == nil {
+		t.Fatalf("search error carries no fault, want the outermost rag.store_failed fault")
+		return
+	}
+	if plainSearch.Code != rag.ErrStoreFailed.Code {
+		t.Errorf("search error = %v, want the outermost rag.store_failed fault", rag.ProbeSearchError(plain))
+	}
+	plainScan := fault.Of(rag.ProbeScanError(plain))
+	if plainScan == nil {
+		t.Fatalf("scan error carries no fault, want the outermost rag.store_failed fault")
+		return
+	}
+	if plainScan.Code != rag.ErrStoreFailed.Code {
+		t.Errorf("scan error = %v, want the outermost rag.store_failed fault", rag.ProbeScanError(plain))
+	}
+}
+
+func pgVectors() map[string][]float32 {
+	unit := []float32{1, 0, 0}
+	return map[string][]float32{
+		"q": unit, "alpha": unit, "delta": unit, "echo": unit,
+		"foxtrot": unit, "golf": unit, "hotel": unit, "india": unit,
+		"juliet": unit, "kilo": unit, "lima": unit, "mike": unit,
+		"november": unit, "oscar": unit, "papa": unit,
+		"bravo": {0, 1, 0}, "charlie": {0, 0, 1},
+		"one": {1, 0, 0}, "two": {1, 0},
+	}
+}
+
+type agreeCase struct {
+	name   string
+	filter string
+	built  rag.Filter
+	docs   []rag.Document
+	want   []string
+	fail   bool
+}
+
+func agreeDramaDocs() []rag.Document {
+	return []rag.Document{
+		{ID: "a", Text: "alpha", Metadata: map[string]rag.Value{"genre": txt("drama"), "year": num(2020)}},
+		{ID: "b", Text: "bravo", Metadata: map[string]rag.Value{"genre": txt("comedy"), "year": num(2019)}},
+		{ID: "c", Text: "charlie"},
+	}
+}
+
+func agreeEqCases(docs []rag.Document) []agreeCase {
+	return []agreeCase{
+		{name: "eq-text", filter: "genre == 'drama'", docs: docs, want: []string{"a"}},
+		{name: "ne-missing", filter: "genre != 'drama'", docs: docs, want: []string{"b", "c"}},
+		{name: "gte-int", filter: "year >= 2020", docs: docs, want: []string{"a"}},
+		{name: "lt-missing", filter: "year < 2020", docs: docs, want: []string{"b", "c"}},
+		{name: "gte-decimal", filter: "year >= 2019.5", docs: docs, want: []string{"a"}},
+		{name: "in-int", filter: "year in [2019, 2020, 2021]", docs: docs, want: []string{"a", "b"}},
+		{name: "nin-int", filter: "year nin [2019, 2021]", docs: docs, want: []string{"a", "c"}},
+	}
+}
+
+func agreeLogicCases(docs []rag.Document) []agreeCase {
+	return []agreeCase{
+		{name: "and", filter: "genre == 'drama' AND year >= 2020", docs: docs, want: []string{"a"}},
+		{name: "or", filter: "year >= 2020 OR genre == 'comedy'", docs: docs, want: []string{"a", "b"}},
+		{name: "not", filter: "NOT genre == 'drama'", docs: docs, want: []string{"b", "c"}},
+		{name: "nested", filter: "(year >= 2020 OR genre == 'comedy') AND genre != 'action'", docs: docs, want: []string{"a", "b"}},
+		{name: "in", filter: "genre in ['comedy', 'drama']", docs: docs, want: []string{"a", "b"}},
+		{name: "nin", filter: "genre nin ['comedy', 'drama']", docs: docs, want: []string{"c"}},
+		{name: "isnull", filter: "absent is null", docs: docs, want: []string{"a", "b", "c"}},
+		{name: "isnotnull", filter: "genre is not null", docs: docs, want: []string{"a", "b"}},
+	}
+}
+
+func agreeEmptyCases(docs []rag.Document) []agreeCase {
+	emptyIn := rag.Expression{Type: rag.OpIn, Left: rag.Key{Name: "genre"}, Right: rag.Filter(rag.Array{})}
+	emptyNin := rag.Expression{Type: rag.OpNin, Left: rag.Key{Name: "genre"}, Right: rag.Filter(rag.Array{})}
+	return []agreeCase{
+		{name: "empty-in", built: rag.Filter(emptyIn), docs: docs, want: nil},
+		{name: "empty-nin", built: rag.Filter(emptyNin), docs: docs, want: []string{"a", "b", "c"}},
+	}
+}
+
+func agreeNaNDocs() []rag.Document {
+	return []rag.Document{
+		{ID: "n1", Text: "hotel", Metadata: map[string]rag.Value{"n": num(math.NaN())}},
+		{ID: "n2", Text: "india", Metadata: map[string]rag.Value{"n": num(5)}},
+	}
+}
+
+func agreeNaNCases() []agreeCase {
+	docs := agreeNaNDocs()
+	return []agreeCase{
+		{name: "nan-eq", filter: "n == 5", docs: docs, want: []string{"n2"}},
+		{name: "nan-ne", filter: "n != 5", docs: docs, want: []string{"n1"}},
+		{name: "nan-in", filter: "n in [5, 6]", docs: docs, want: []string{"n2"}},
+		{name: "nan-nin", filter: "n nin [5, 6]", docs: docs, want: []string{"n1"}},
+		{name: "nan-lt", filter: "n < 5", docs: docs, want: nil},
+		{name: "nan-dec-eq", filter: "n == 5.5", docs: docs, want: nil},
+		{name: "nan-dec-ne", filter: "n != 5.5", docs: docs, want: []string{"n1"}},
+		{name: "nan-gt", filter: "n > 5", docs: docs, want: nil},
+		{name: "nan-gte", filter: "n >= 5", docs: docs, want: []string{"n2"}},
+		{name: "nan-lte", filter: "n <= 5", docs: docs, want: []string{"n2"}},
+	}
+}
+
+func agreeAbsentCases(docs []rag.Document) []agreeCase {
+	return []agreeCase{
+		{name: "absent-eq", filter: "absent == 'x'", docs: docs, want: nil},
+		{name: "absent-ne", filter: "absent != 'x'", docs: docs, want: []string{"a", "b", "c"}},
+		{name: "absent-gt", filter: "absent > 'x'", docs: docs, want: nil},
+		{name: "absent-gte", filter: "absent >= 'x'", docs: docs, want: nil},
+		{name: "absent-lt", filter: "absent < 'x'", docs: docs, want: []string{"a", "b", "c"}},
+		{name: "absent-lte", filter: "absent <= 'x'", docs: docs, want: []string{"a", "b", "c"}},
+	}
+}
+
+func agreeExactCases() []agreeCase {
+	exact := []rag.Document{{ID: "e1", Text: "mike", Metadata: map[string]rag.Value{"n": num(9007199254740992), "high": num(9223372036854775808)}}}
+	decimal := []rag.Document{{ID: "t1", Text: "november", Metadata: map[string]rag.Value{"t": num(-15.6)}}}
+	open := []rag.Document{{ID: "f1", Text: "golf", Metadata: map[string]rag.Value{"open": flag(true)}}}
+	quoted := []rag.Document{{ID: "k1", Text: "oscar", Metadata: map[string]rag.Value{"country 1 2 3": txt("BG")}}}
+	hostileKey := "'; DROP TABLE x; --"
+	hosted := []rag.Document{{ID: "h1", Text: "papa", Metadata: map[string]rag.Value{hostileKey: txt("v")}}}
+	hostileEq := rag.Expression{Type: rag.OpEq, Left: rag.Key{Name: hostileKey}, Right: rag.Filter(rag.Const{Text: "v"})}
+	mixed := []rag.Document{{ID: "m1", Text: "kilo", Metadata: map[string]rag.Value{"year": num(2020)}}}
+	withNaN := append(agreeNaNDocs(), rag.Document{ID: "n3", Text: "juliet", Metadata: map[string]rag.Value{"n": num(7)}})
+	return []agreeCase{
+		{name: "int-eq", filter: "n == 9007199254740992", docs: exact, want: []string{"e1"}},
+		{name: "int-ne", filter: "n == 9007199254740993", docs: exact, want: nil},
+		{name: "int-gt", filter: "high > 9223372036854775807", docs: exact, want: []string{"e1"}},
+		{name: "int-nin", filter: "n nin [9007199254740993]", docs: exact, want: []string{"e1"}},
+		{name: "dec-range", filter: "t >= -15.6 AND t <= 20.13", docs: decimal, want: []string{"t1"}},
+		{name: "flag-gt", filter: "open > false", docs: open, want: []string{"f1"}},
+		{name: "flag-eq-false", filter: "open == false", docs: open, want: nil},
+		{name: "quoted-space", filter: "'country 1 2 3' == 'BG'", docs: quoted, want: []string{"k1"}},
+		{name: "hostile-key", built: rag.Filter(hostileEq), docs: hosted, want: []string{"h1"}},
+		{name: "mixed-text-fail", filter: "year == '2020'", docs: mixed, fail: true},
+		{name: "mixed-list-fail", filter: "year in ['2020']", docs: mixed, fail: true},
+		{name: "nan-text-mixed-fail", filter: "n != 'x'", docs: withNaN, fail: true},
+		{name: "nan-text-alone", filter: "n != 'x'", docs: agreeNaNDocs()[:1], want: []string{"n1"}},
+	}
+}
+
+type agreeStores struct {
+	pg      *rag.Pgvector
+	vectors map[string][]float32
+}
+
+func runAgreement(t *testing.T, ctx context.Context, stores agreeStores, c agreeCase) {
+	t.Helper()
+	mem := newStore(t, stores.vectors)
+	if err := mem.Add(ctx, c.docs); err != nil {
+		t.Fatalf("memory add for %s: %v", c.name, err)
+		return
+	}
+	if err := stores.pg.Add(ctx, c.docs); err != nil {
+		t.Fatalf("pgvector add for %s: %v", c.name, err)
+		return
+	}
+	var filter rag.Filter
+	if c.filter == "" {
+		filter = c.built
+	} else {
+		filter = mustPgParse(t, c.filter)
+	}
+	memDocs, memErr := mem.Search(ctx, rag.Search{Query: "q", Filter: filter})
+	pgDocs, pgErr := stores.pg.Search(ctx, rag.Search{Query: "q", Filter: filter})
+	if c.fail {
+		checkAgreementFailure(t, c, memErr, pgErr)
+		return
+	}
+	if memErr != nil || pgErr != nil {
+		t.Errorf("%s: memory error = %v, pgvector error = %v", c.name, memErr, pgErr)
+		return
+	}
+	if got := ids(memDocs); !slices.Equal(got, c.want) {
+		t.Errorf("%s: memory ids = %v, want %v", c.name, got, c.want)
+	}
+	if got, want := ids(pgDocs), ids(memDocs); !slices.Equal(got, want) {
+		t.Errorf("%s: pgvector ids = %v, memory ids = %v", c.name, got, want)
+	}
+}
+
+func checkAgreementFailure(t *testing.T, c agreeCase, memErr error, pgErr error) {
+	t.Helper()
+	if memErr == nil || pgErr == nil {
+		t.Errorf("%s: memory error = %v, pgvector error = %v, want both to fail", c.name, memErr, pgErr)
+		return
+	}
+	memFault := fault.Of(memErr)
+	if memFault == nil {
+		t.Errorf("%s: memory error = %v, carries no fault", c.name, memErr)
+		return
+	}
+	pgFault := fault.Of(pgErr)
+	if pgFault == nil {
+		t.Errorf("%s: pgvector error = %v, carries no fault", c.name, pgErr)
+		return
+	}
+	if memFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("%s: memory fault = %v, want the outermost rag.invalid_filter fault", c.name, memErr)
+	}
+	if pgFault.Code != rag.ErrInvalidFilter.Code {
+		t.Errorf("%s: pgvector fault = %v, want the outermost rag.invalid_filter fault", c.name, pgErr)
+	}
+}
+
+func TestEnginePgvectorFilterAgreement(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	vectors := pgVectors()
+	pg := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_agree", vectors: vectors})
+	drama := agreeDramaDocs()
+	cases := agreeEqCases(drama)
+	cases = append(cases, agreeLogicCases(drama)...)
+	cases = append(cases, agreeEmptyCases(drama)...)
+	cases = append(cases, agreeAbsentCases(drama)...)
+	cases = append(cases, agreeExactCases()...)
+	sweep := []string{"a", "b", "c", "n1", "n2", "n3", "e1", "t1", "f1", "k1", "h1", "m1"}
+	for _, c := range cases {
+		runAgreement(t, ctx, agreeStores{pg: pg, vectors: vectors}, c)
+		if err := pg.Delete(ctx, sweep); err != nil {
+			t.Fatalf("cleanup after %s: %v", c.name, err)
+			return
+		}
+	}
+}
+
+func checkPgvectorOrder(t *testing.T, ctx context.Context, store *rag.Pgvector) {
+	t.Helper()
+	if err := store.Add(ctx, orderDocs); err != nil {
+		t.Fatalf("Add: %v", err)
+		return
+	}
+	docs, err := store.Search(ctx, rag.Search{Query: "q", TopK: 6})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+		return
+	}
+	if got, want := ids(docs), []string{"d-near", "a-tie", "z-tie", "d-mid", "b-zero", "c-zero"}; !slices.Equal(got, want) {
+		t.Errorf("order = %v, want %v", got, want)
+	}
+	if score := docs[0].Score ?? -1; score != 1 {
+		t.Errorf("the score of the equal vector is %v, want 1", score)
+	}
+}
+
+func TestEnginePgvectorSetupIsIdempotentAndRoundTrips(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store, err := rag.NewPgvector(pool, pgEmbed(t, orderVectors), "pg_roundtrip", 3)
+	if err != nil {
+		t.Fatalf("NewPgvector: %v", err)
+		return
+	}
+	if store == nil {
+		t.Fatalf("NewPgvector returned no store")
+		return
+	}
+	if err := store.Setup(ctx); err != nil {
+		t.Fatalf("Setup: %v", err)
+		return
+	}
+	if err := store.Setup(ctx); err != nil {
+		t.Fatalf("second Setup: %v", err)
+		return
+	}
+	empty, err := store.Search(ctx, rag.Search{Query: "q"})
+	if err != nil {
+		t.Fatalf("Search of an empty store: %v", err)
+		return
+	}
+	if len(empty) != 0 {
+		t.Fatalf("an empty store gave %v", ids(empty))
+		return
+	}
+	checkPgvectorOrder(t, ctx, store)
+	top, err := store.Search(ctx, rag.Search{Query: "q"})
+	if err != nil {
+		t.Fatalf("default TopK search: %v", err)
+		return
+	}
+	if got, want := ids(top), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
+		t.Errorf("default TopK = %v, want %v", got, want)
+	}
+	half, err := store.Search(ctx, rag.Search{Query: "q", TopK: 6, Threshold: 0.5})
+	if err != nil {
+		t.Fatalf("threshold search: %v", err)
+		return
+	}
+	if got, want := ids(half), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
+		t.Errorf("threshold 0.5 = %v, want %v", got, want)
+	}
+}
+
+func TestEnginePgvectorReplaceAndDelete(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_replace", vectors: pgVectors()})
+	first := rag.Document{ID: "m1", Text: "alpha", Metadata: map[string]rag.Value{"s": txt("BG"), "n": num(2.5), "b": flag(true)}}
+	if err := store.Add(ctx, []rag.Document{first}); err != nil {
+		t.Fatalf("Add: %v", err)
+		return
+	}
+	docs, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+		return
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Search gave %d documents, want 1", len(docs))
+		return
+	}
+	if got := docs[0].Text; got != "alpha" {
+		t.Errorf("text = %q, want alpha", got)
+	}
+	if got := fmt.Sprint(docs[0].Metadata); got != "map[b:{true} n:{2.5} s:{BG}]" {
+		t.Errorf("metadata = %s, want the stored values", got)
+	}
+	second := rag.Document{ID: "m1", Text: "delta", Metadata: map[string]rag.Value{"s": txt("NL")}}
+	if err := store.Add(ctx, []rag.Document{second}); err != nil {
+		t.Fatalf("Add of a stored id: %v", err)
+		return
+	}
+	var via rag.Store = store
+	after, err := via.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search through Store: %v", err)
+		return
+	}
+	if len(after) != 1 || after[0].Text != "delta" {
+		t.Fatalf("after a replaced id: %v, want the new text", ids(after))
+		return
+	}
+	if err := store.Delete(ctx, []string{"m1", "missing"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+		return
+	}
+	gone, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search after Delete: %v", err)
+		return
+	}
+	if len(gone) != 0 {
+		t.Errorf("after Delete: %v, want no document", ids(gone))
+	}
+}
+
+func TestEnginePgvectorHostileValueLeavesTheTable(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_hostile", vectors: pgVectors()})
+	hostile := "'; DROP TABLE x; --"
+	docs := []rag.Document{
+		{ID: "h1", Text: "alpha", Metadata: map[string]rag.Value{"k": txt("safe")}},
+		{ID: "h2", Text: "bravo", Metadata: map[string]rag.Value{"k": txt("other")}},
+		{ID: "h3", Text: "charlie", Metadata: map[string]rag.Value{hostile: txt("v")}},
+	}
+	if err := store.Add(ctx, docs); err != nil {
+		t.Fatalf("Add: %v", err)
+		return
+	}
+	attack := rag.Expression{Type: rag.OpEq, Left: rag.Key{Name: "k"}, Right: rag.Filter(rag.Const{Text: hostile})}
+	none, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10, Filter: rag.Filter(attack)})
+	if err != nil {
+		t.Fatalf("Search of the hostile value: %v", err)
+		return
+	}
+	if len(none) != 0 {
+		t.Errorf("the hostile value matched %v, want no row", ids(none))
+	}
+	keyed := rag.Expression{Type: rag.OpEq, Left: rag.Key{Name: hostile}, Right: rag.Filter(rag.Const{Text: "v"})}
+	found, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10, Filter: rag.Filter(keyed)})
+	if err != nil {
+		t.Fatalf("Search of the hostile key: %v", err)
+		return
+	}
+	if got := ids(found); !slices.Equal(got, []string{"h3"}) {
+		t.Errorf("the hostile key matched %v, want [h3]", got)
+	}
+	kept, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search after the hostile filters: %v", err)
+		return
+	}
+	if got, want := ids(kept), []string{"h1", "h2", "h3"}; !slices.Equal(got, want) {
+		t.Errorf("after the hostile filters: %v, want %v", got, want)
+	}
+}
+
+func TestEnginePgvectorRefusesDimensionMismatch(t *testing.T) {
+	pool := pgPool(t, pgDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	store := pgNew(t, ctx, pgConfig{pool: pool, table: "pg_dims", vectors: pgVectors()})
+	if err := store.Add(ctx, []rag.Document{{ID: "d", Text: "two"}}); err == nil || !strings.Contains(err.Error(), "the store holds 3") {
+		t.Errorf("Add error = %v, want the dimensions of the store", err)
+	}
+	kept, err := store.Search(ctx, rag.Search{Query: "q", TopK: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+		return
+	}
+	if len(kept) != 0 {
+		t.Errorf("the refused batch left %v", ids(kept))
+	}
+	if _, err := store.Search(ctx, rag.Search{Query: "two"}); err == nil || !strings.Contains(err.Error(), "the store holds 3") {
+		t.Errorf("Search error = %v, want the dimensions of the store", err)
+	}
+}

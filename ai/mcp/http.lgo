@@ -1,0 +1,237 @@
+package mcp
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+)
+
+type HTTP struct {
+	endpoint string
+	client   *http.Client
+	session  string
+}
+
+func NewHTTP(endpoint string, client *http.Client) *HTTP {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &HTTP{endpoint: endpoint, client: client}
+}
+
+func (h *HTTP) Notify(ctx context.Context, msg Envelope) error {
+	reply, err := h.post(ctx, msg)
+	if err != nil {
+		return err
+	}
+	if !okStatus(reply.status) {
+		return failureOf(reply)
+	}
+	return closeBody(reply.body)
+}
+
+func (h *HTTP) Request(ctx context.Context, msg Envelope) (Envelope, error) {
+	reply, err := h.post(ctx, msg)
+	if err != nil {
+		return Envelope{}, err
+	}
+	if !okStatus(reply.status) {
+		return Envelope{}, failureOf(reply)
+	}
+	media, _, err := mime.ParseMediaType(reply.media)
+	if err != nil {
+		return Envelope{}, ErrUpstreamFailed.Wrap(joinClose(reply.body, fmt.Errorf("mcp: http content type: %w", err)))
+	}
+	return decodeReply(ctx, msg, media, reply.body)
+}
+
+func failureOf(reply httpReply) error {
+	if reply.body == nil {
+		return ErrUpstreamFailed.Wrap(statusCause(reply.status, nil))
+	}
+	payload, readErr := io.ReadAll(reply.body)
+	if readErr != nil {
+		joined := cutCause(reply.status, payload, readErr)
+		if closeErr := closeBody(reply.body); closeErr != nil {
+			return ErrUpstreamFailed.Wrap(errors.Join(joined, closeErr))
+		}
+		return ErrUpstreamFailed.Wrap(joined)
+	}
+	if closeErr := closeBody(reply.body); closeErr != nil {
+		return ErrUpstreamFailed.Wrap(errors.Join(statusCause(reply.status, payload), closeErr))
+	}
+	return ErrUpstreamFailed.Wrap(statusCause(reply.status, payload))
+}
+
+func cutCause(status int, payload []byte, readErr error) error {
+	if rpc := rpcErrorOf(payload); rpc != nil {
+		base := fmt.Errorf("mcp: http status %d: %w", status, rpc)
+		return fmt.Errorf("%w: body read ended early: %w", base, readErr)
+	}
+	base := fmt.Errorf("mcp: http status %d", status)
+	return fmt.Errorf("%w: body read ended early: %w", base, readErr)
+}
+
+func statusCause(status int, payload []byte) error {
+	if rpc := rpcErrorOf(payload); rpc != nil {
+		return fmt.Errorf("mcp: http status %d: %w", status, rpc)
+	}
+	return fmt.Errorf("mcp: http status %d", status)
+}
+
+func rpcErrorOf(payload []byte) error {
+	reply, err := decodeEnvelope(payload)
+	if err != nil {
+		return nil
+	}
+	if e := reply.Error; e != nil {
+		return e
+	}
+	return nil
+}
+
+func decodeReply(ctx context.Context, msg Envelope, media string, body io.ReadCloser) (Envelope, error) {
+	switch media {
+	case "application/json":
+		payload, err := readBody(body)
+		if err != nil {
+			return Envelope{}, err
+		}
+		decoded, err := decodeEnvelope(payload)
+		if err != nil {
+			return Envelope{}, err
+		}
+		return matchReply(msg, decoded)
+	case "text/event-stream":
+		streamed, streamErr := streamReply(ctx, msg, body)
+		closeErr := closeBody(body)
+		if streamErr != nil || closeErr != nil {
+			return Envelope{}, errors.Join(streamErr, closeErr)
+		}
+		return streamed, nil
+	}
+	return Envelope{}, ErrUpstreamFailed.Wrap(joinClose(body, fmt.Errorf("mcp: http content type %q", media)))
+}
+
+func joinClose(body io.Closer, err error) error {
+	closeErr := closeBody(body)
+	if closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	return err
+}
+
+type httpReply struct {
+	status int
+	media  string
+	body   io.ReadCloser
+}
+
+func (h *HTTP) post(ctx context.Context, msg Envelope) (httpReply, error) {
+	body, err := encodeEnvelope(msg)
+	if err != nil {
+		return httpReply{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return httpReply{}, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http request: %w", err))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", ProtocolVersion)
+	if h.session != "" {
+		req.Header.Set("MCP-Session-Id", h.session)
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return httpReply{}, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http post: %w", err))
+	}
+	if sid := resp.Header.Get("MCP-Session-Id"); sid != "" {
+		h.session = sid
+	}
+	return httpReply{status: resp.StatusCode, media: resp.Header.Get("Content-Type"), body: resp.Body}, nil
+}
+
+func readBody(body io.ReadCloser) ([]byte, error) {
+	if body == nil {
+		return nil, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http reply holds no body"))
+	}
+	payload, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil {
+		return nil, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http read body: %w", readErr))
+	}
+	if closeErr != nil {
+		return nil, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http close body: %w", closeErr))
+	}
+	return payload, nil
+}
+
+func closeBody(body io.Closer) error {
+	if body == nil {
+		return nil
+	}
+	if err := body.Close(); err != nil {
+		return ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http close body: %w", err))
+	}
+	return nil
+}
+
+func (h *HTTP) Close() error {
+	h.client.CloseIdleConnections()
+	return nil
+}
+
+func okStatus(status int) bool {
+	return status >= 200 && status < 300
+}
+
+func streamReply(ctx context.Context, sent Envelope, body io.Reader) (Envelope, error) {
+	want := idKey(sent.ID)
+	reader := bufio.NewReader(body)
+	for {
+		if err := ctx.Err(); err != nil {
+			return Envelope{}, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http stream: %w", err))
+		}
+		event, err := nextEvent(reader)
+		if err != nil {
+			return Envelope{}, ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: http stream: %w", err))
+		}
+		if event == "" {
+			continue
+		}
+		reply, err := decodeEnvelope([]byte(event))
+		if err != nil {
+			continue
+		}
+		if isResponse(reply) && idKey(reply.ID) == want {
+			return reply, nil
+		}
+	}
+}
+
+func nextEvent(reader *bufio.Reader) (string, error) {
+	var data []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		switch {
+		case line == "":
+			if len(data) > 0 {
+				return strings.Join(data, "\n"), nil
+			}
+		case strings.HasPrefix(line, ":"):
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+}

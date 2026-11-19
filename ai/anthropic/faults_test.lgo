@@ -1,0 +1,97 @@
+package anthropic_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/anthropic"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../../docs/specs/ai-anthropic.md", anthropic.Faults())
+}
+
+func assertHidesSecrets(t *testing.T, err error, secrets []string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected the provider error")
+	}
+	public := faulttest.PublicJSON(t, err)
+	faulttest.RefuseLeak(t, public, secrets...)
+	for _, secret := range secrets {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error exposes %q in %v", secret, err)
+		}
+	}
+}
+
+func TestAdversarialSecretsStayOutOfPublicView(t *testing.T) {
+	key := "sk-ant-test-secret-4d2c8e6a0b"
+	hostile := "<script>alert('x')</script>"
+	injection := "'; DROP TABLE sessions; --"
+	secretPath := "/etc/shadow"
+	body := `{"type":"error","error":{"type":"authentication_error","message":"key rejected for ` + hostile + ` at ` + secretPath + `"}}`
+	rec := &recorder{want: key}
+	srv := rec.serve(t, http.StatusUnauthorized, "application/json", body)
+	c := testClient(srv)
+	c.Key = key
+	prompt := hostile + " " + injection + " " + secretPath + " " + key
+	req := ai.Request{Model: "claude-opus-5-5", MaxTokens: 1024, Messages: []ai.Message{userTurn(prompt)}}
+	secrets := []string{key, hostile, injection, secretPath}
+	_, chatErr := c.Chat(context.Background(), req)
+	if !errors.Is(chatErr, anthropic.ErrProviderRejected) {
+		t.Fatalf("chat err = %v, want the provider rejection", chatErr)
+	}
+	assertHidesSecrets(t, chatErr, secrets)
+	_, streamErr := gather(c.Stream(context.Background(), req))
+	assertHidesSecrets(t, streamErr, secrets)
+	if !errors.Is(streamErr, anthropic.ErrProviderRejected) {
+		t.Fatalf("stream err = %v, want the provider rejection", streamErr)
+	}
+}
+
+func TestBadToolSchemaIsAnInvalidRequest(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+		Tools:     []ai.Tool{{Name: "broken", Description: "broken", Schema: `{"type":`}},
+	})
+	if err == nil || !errors.Is(err, anthropic.ErrInvalidRequest) {
+		t.Fatalf("err = %v, want the invalid request fault", err)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("a bad tool schema reached the provider: %d requests", rec.count())
+	}
+}
+
+func TestTooManyRedirectsEndAsUnavailable(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Redirect(w, r, "/v1/messages", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil || !errors.Is(err, anthropic.ErrTooManyRedirects) {
+		t.Fatalf("err = %v, want the too many redirects fault", err)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("no request reached the redirecting server")
+	}
+}

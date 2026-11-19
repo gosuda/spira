@@ -1,0 +1,1895 @@
+// Test cases translated and changed by spira from Spring AI,
+// models/spring-ai-anthropic/src/test/java/org/springframework/ai/anthropic/AnthropicChatModelTests.java
+// and models/spring-ai-anthropic/src/test/java/org/springframework/ai/anthropic/AnthropicChatModelStreamingHttpTests.java,
+// replayed against the wire bodies recorded in testdata/SOURCES.
+// Revision 4cce4caa9653092624b20ae1113633b3ad97d256.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package anthropic_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/anthropic"
+	"github.com/gosuda/spira/resilience"
+)
+
+func fixture(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile("testdata/" + name)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return string(data)
+}
+
+func testClient(srv *httptest.Server) *anthropic.Client {
+	return &anthropic.Client{
+		BaseURL: srv.URL,
+		Key:     "test-key",
+		HTTP:    srv.Client(),
+		Policy:  resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}},
+	}
+}
+
+type recorder struct {
+	mu sync.Mutex
+	bodies []string
+	keys []string
+	vers []string
+	paths []string
+	want string
+}
+
+func (r *recorder) add(req *http.Request, body string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bodies = append(r.bodies, body)
+	r.keys = append(r.keys, req.Header.Get("x-api-key"))
+	r.vers = append(r.vers, req.Header.Get("anthropic-version"))
+	r.paths = append(r.paths, req.URL.Path)
+}
+func (r *recorder) admit(req *http.Request, body string) (int, bool) {
+	key := req.Header.Get("x-api-key")
+	want := r.want
+	if want == "" {
+		want = "test-key"
+	}
+	if key != want {
+		return 0, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bodies = append(r.bodies, body)
+	r.keys = append(r.keys, key)
+	r.vers = append(r.vers, req.Header.Get("anthropic-version"))
+	r.paths = append(r.paths, req.URL.Path)
+	return len(r.bodies), true
+}
+
+func (r *recorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.bodies)
+}
+
+func (r *recorder) body(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bodies[i]
+}
+
+func (r *recorder) key(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.keys[i]
+}
+
+func (r *recorder) version(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.vers[i]
+}
+
+func (rec *recorder) serve(t *testing.T, status int, contentType string, body string) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func canonical(t *testing.T, raw string) string {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	out, err := json.Marshal(v, json.Deterministic(true))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return string(out)
+}
+
+func gather(seq iter.Seq2[ai.Chunk, error]) ([]ai.Chunk, error) {
+	var out []ai.Chunk
+	var first error
+	for chunk, err := range seq {
+		if err != nil && first == nil {
+			first = err
+		}
+		out = append(out, chunk)
+	}
+	return out, first
+}
+
+func userTurn(text string) ai.Message {
+	return ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: text}}}
+}
+
+func TestChatReplies(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Hi, what is your name?")},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" || reply.Model != "claude-opus-5-5" {
+		t.Fatalf("reply identity: %+v", reply)
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if reply.Usage != (ai.Usage{Input: 6197, Output: 503, Total: 6700}) {
+		t.Fatalf("usage: %+v", reply.Usage)
+	}
+	if len(reply.Message.Parts) != 1 {
+		t.Fatalf("parts: %+v", reply.Message.Parts)
+	}
+	if text, ok := reply.Message.Parts[0].(ai.Text); !ok || text.Text != "Hi! My name is Claude." {
+		t.Fatalf("text part: %+v", reply.Message.Parts[0])
+	}
+	if rec.paths[0] != "/v1/messages" {
+		t.Fatalf("path: %s", rec.paths[0])
+	}
+	if rec.key(0) != "test-key" || rec.version(0) != "2026-10-21" {
+		t.Fatalf("headers: key=%q version=%q", rec.key(0), rec.version(0))
+	}
+}
+
+func TestChatRequestWithToolIsTheReferenceOracle(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	tool := ai.Tool{
+		Name:        "get_weather",
+		Description: "Get the weather of a city",
+		Schema:      `{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`,
+	}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: "You are a helpful assistant."}}},
+			userTurn("What is the weather in Seoul?"),
+		},
+		Tools: []ai.Tool{tool},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	want := canonical(t, `{
+	  "model": "claude-opus-5-5",
+	  "max_tokens": 1024,
+	  "system": "You are a helpful assistant.",
+	  "messages": [{"role":"user","content":[{"type":"text","text":"What is the weather in Seoul?"}]}],
+	  "stream": false,
+	  "tools": [{"name":"get_weather","description":"Get the weather of a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]
+	}`)
+	if got := canonical(t, rec.body(0)); got != want {
+		t.Fatalf("request body:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestChatRequestTurnsToolResultsIntoUserBlocks(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			{Role: ai.RoleAssistant, Parts: []ai.Part{
+				ai.ToolCall{ID: "toolu_01", Name: "get_weather", Arguments: `{"city":"Seoul"}`},
+			}},
+			{Role: ai.RoleTool, Parts: []ai.Part{
+				ai.ToolResult{ID: "toolu_01", Name: "get_weather", Content: "sunny, 20C"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	want := canonical(t, `{
+	  "model": "claude-opus-5-5",
+	  "max_tokens": 1024,
+	  "messages": [
+	    {"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Seoul"}}]},
+	    {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"sunny, 20C"}]}
+	  ],
+	  "stream": false
+	}`)
+	if got := canonical(t, rec.body(0)); got != want {
+		t.Fatalf("request body:\n got %s\nwant %s", got, want)
+	}
+}
+
+func sentMaxTokens(t *testing.T, c *anthropic.Client, rec *recorder) int32 {
+	t.Helper()
+	before := rec.count()
+	if _, err := c.Chat(context.Background(), ai.Request{
+		Model:    "claude-opus-5-5",
+		Messages: []ai.Message{userTurn("hi")},
+	}); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	var body struct {
+		MaxTokens int32 `json:"max_tokens"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(before)), &body); err != nil {
+		t.Fatalf("request body: %v", err)
+	}
+	return body.MaxTokens
+}
+
+func TestDefaultMaxTokensIsSent(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	c := testClient(srv)
+	if got := sentMaxTokens(t, c, rec); got != 4096 {
+		t.Fatalf("max_tokens = %d, want the documented default 4096", got)
+	}
+	c.MaxTokens = 512
+	if got := sentMaxTokens(t, c, rec); got != 512 {
+		t.Fatalf("max_tokens = %d, want the 512 of the client", got)
+	}
+}
+
+func TestSystemMessagesJoinIntoTheSystemField(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	system := func(text string) ai.Message {
+		return ai.Message{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: text}}}
+	}
+	if _, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:    "claude-opus-5-5",
+		Messages: []ai.Message{system("Answer in one word."), system("  "), userTurn("hi"), system("Use English.")},
+	}); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	var body struct {
+		System   string `json:"system"`
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &body); err != nil {
+		t.Fatalf("request body: %v", err)
+	}
+	if body.System != "Answer in one word.\n\nUse English." || len(body.Messages) != 1 || body.Messages[0].Role != "user" {
+		t.Fatalf("system = %q with %d messages, want the two texts joined by a blank line and the user turn only", body.System, len(body.Messages))
+	}
+}
+
+func TestStreamCollectsTheReferenceReply(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", fixture(t, "stream-plain.txt"))
+	c := testClient(srv)
+	reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	var text strings.Builder
+	for _, p := range reply.Message.Parts {
+		if t, ok := p.(ai.Text); ok {
+			text.WriteString(t.Text)
+		}
+	}
+	if text.String() != "Hello!" {
+		t.Fatalf("stream text: %q", text.String())
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if reply.Usage != (ai.Usage{Input: 25, Output: 15, Total: 40}) {
+		t.Fatalf("usage: %+v", reply.Usage)
+	}
+	if reply.ID != "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY" || reply.Model != "claude-opus-5-5" {
+		t.Fatalf("reply identity: %+v", reply)
+	}
+	if rec.paths[0] != "/v1/messages" {
+		t.Fatalf("path: %s", rec.paths[0])
+	}
+	var sent struct {
+		Stream bool `json:"stream"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &sent); err != nil || !sent.Stream {
+		t.Fatalf("stream flag: %s err=%v", rec.body(0), err)
+	}
+}
+
+func TestStreamToolCallAssemblesFragments(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", fixture(t, "stream-tool.txt"))
+	c := testClient(srv)
+	reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			userTurn("What is the weather in San Francisco, CA?"),
+		},
+		Tools: []ai.Tool{{
+			Name:        "get_weather",
+			Description: "Get the weather of a city",
+			Schema:      `{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}`,
+		}},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	call := calls[0]
+	if call.ID != "toolu_01T1x1fJ34qAmk2tNTrN7Up6" || call.Name != "get_weather" {
+		t.Fatalf("assembled call: %+v", call)
+	}
+	var args map[string]any
+	err = json.Unmarshal([]byte(call.Arguments), &args)
+	if err != nil {
+		t.Fatalf("arguments %q: %v", call.Arguments, err)
+		return
+	}
+	value, found := args["location"]
+	if !found || value != "San Francisco, CA" {
+		t.Fatalf("arguments %q: location %v", call.Arguments, value)
+	}
+}
+
+func TestStreamEndsAtMessageStopWhileTheBodyStaysOpen(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, fixture(t, "stream-plain.txt")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply, err := ai.Collect(c.Stream(ctx, ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if waited := time.Since(start); waited > 30*time.Second {
+		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	}
+}
+
+func TestCutStreamYieldsErrorChunkAndNoReply(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", `event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}
+
+`)
+	c := testClient(srv)
+	_, err := gather(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err == nil {
+		t.Fatal("expected an error chunk")
+	}
+	if !errors.Is(err, anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error: %v", err)
+	}
+	if _, cerr := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	})); cerr == nil {
+		t.Fatal("collect over a cut stream returned no error")
+	}
+}
+
+func TestStreamErrorEvent(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", "event: error\ndata: "+strings.TrimSpace(fixture(t, "message-error.json"))+"\n\n")
+	c := testClient(srv)
+	var errs []error
+	chunks := 0
+	for _, err := range c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	}) {
+		chunks++
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) != 1 || chunks != 1 {
+		t.Fatalf("the stream gave %d chunks and the errors %v, want the one error chunk of the event", chunks, errs)
+	}
+	if !errors.Is(errs[0], anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error = %v, want the stream cut fault for the error event", errs[0])
+	}
+	if status, errType, length, ok := anthropic.FaultDetail(errs[0]); !ok || status != 200 || errType != "overloaded_error" || length != len("Overloaded") {
+		t.Fatalf("detail = %d %q %d, want the parsed error type and the message length", status, errType, length)
+	}
+}
+
+func TestBadRequestIsFinal(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusBadRequest, "application/json", `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: Field required"}}`)
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:    "claude-opus-5-5",
+		Messages: []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("400 was retried: %d requests", rec.count())
+	}
+}
+
+func TestServerErrorIsRetried(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"internal"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat after retry: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d", rec.count())
+	}
+}
+
+func TestRateLimitedIsRetried(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat after retry: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d", rec.count())
+	}
+}
+
+func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
+	statuses := []int{http.StatusInternalServerError, http.StatusInternalServerError, http.StatusBadRequest}
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n <= len(statuses) {
+			w.WriteHeader(statuses[n-1])
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"refused"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second, Breaker: &resilience.Breaker{Window: 3, FailureRate: 0.5, OpenFor: time.Hour}}
+	req := ai.Request{Model: "claude-opus-5-5", MaxTokens: 1024, Messages: []ai.Message{userTurn("hi")}}
+	for range statuses {
+		if _, err := c.Chat(context.Background(), req); err == nil {
+			t.Fatal("err=nil, want the failing answer")
+		}
+	}
+	reply, err := c.Chat(context.Background(), req)
+	if err != nil {
+		t.Fatalf("err = %v, want a reply: two 500 answers and a 400 must not fill a window of three", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 4 {
+		t.Fatalf("server saw %d calls, want 4: two 500 answers and a 400 must not fill a window of three", rec.count())
+	}
+}
+
+func TestBodyOverTheLimitIsFinal(t *testing.T) {
+	body := `{"id":"msg_big","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"` + strings.Repeat("x", (1<<20)+64) + `"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Logf("server write ended when the client stopped at its limit: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil || !errors.Is(err, anthropic.ErrProviderTooLarge) {
+		t.Fatalf("error: %v, want the size limit fault", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("oversize body was retried: %d requests", rec.count())
+	}
+}
+
+func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
+	body := strings.Repeat("x", (1<<20)+8)
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 30 * time.Second, Retry: resilience.Retry{Attempts: 2}}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("err=nil, want a failing status")
+		return
+	}
+	if !errors.Is(err, anthropic.ErrProviderError) {
+		t.Fatalf("error: %v, want the provider error for a 500 answer", err)
+	}
+	if status, _, length, ok := anthropic.FaultDetail(err); !ok || status != 500 || length != 1<<20 {
+		t.Fatalf("detail = %d %d, want status 500 with the body cut at one mebibyte", status, length)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("server saw %d calls, want 2: the 500 is retried, not a caller fault", rec.count())
+	}
+}
+
+func TestKeyNeverAppearsInError(t *testing.T) {
+	rec := &recorder{want: "sk-ant-super-secret-value"}
+	srv := rec.serve(t, http.StatusUnauthorized, "application/json", `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+	c := testClient(srv)
+	c.Key = "sk-ant-super-secret-value"
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "sk-ant-super-secret-value") {
+		t.Fatalf("error leaks the key: %v", err)
+	}
+	if rec.key(0) != "sk-ant-super-secret-value" {
+		t.Fatalf("x-api-key header: %s", rec.key(0))
+	}
+}
+
+func partTexts(parts []ai.Part) (reasoning string, text string) {
+	for _, p := range parts {
+		switch v := p.(type) {
+		case ai.Reasoning:
+			reasoning += v.Text
+		case ai.Text:
+			text += v.Text
+		}
+	}
+	return reasoning, text
+}
+
+func TestThinkingBlockBecomesAReasoningPartAndIsNotSentBack(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", `{"id":"msg_think","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"thinking","thinking":"Two and two.","signature":"c2ln"},{"type":"text","text":"4"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":7}}`)
+	reply, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			userTurn("2+2?"),
+			{Role: ai.RoleAssistant, Parts: []ai.Part{ai.Reasoning{Text: "An earlier thought."}, ai.Text{Text: "Let me see."}}},
+			userTurn("Go on."),
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reasoning, text := partTexts(reply.Message.Parts); reasoning != "Two and two." || text != "4" || len(reply.Message.Parts) != 2 {
+		t.Fatalf("parts = %+v, want one reasoning part and one text part", reply.Message.Parts)
+	}
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &sent); err != nil {
+		t.Fatalf("request body: %v", err)
+		return
+	}
+	if len(sent.Messages) != 3 || len(sent.Messages[1].Content) != 1 || sent.Messages[1].Content[0].Type != "text" || sent.Messages[1].Content[0].Text != "Let me see." {
+		t.Fatalf("request messages = %+v, want the assistant turn with its text block only", sent.Messages)
+	}
+}
+
+const thinkingStream = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_think","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"usage":{"input_tokens":9,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Two and "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"two."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"4"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+func TestStreamThinkingDeltasBecomeOneReasoningPart(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", thinkingStream)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("2+2?")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reasoning, text := partTexts(reply.Message.Parts); reasoning != "Two and two." || text != "4" {
+		t.Fatalf("parts = %+v, want the reasoning text and the answer", reply.Message.Parts)
+	}
+	if reply.Finish != ai.FinishCompleted || reply.Usage != (ai.Usage{Input: 9, Output: 7, Total: 16}) {
+		t.Fatalf("finish %v usage %+v", reply.Finish, reply.Usage)
+	}
+}
+
+func TestStreamRecordThatIsNotJSONIsAnError(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\n\nevent: message_stop\n")
+	var errs []error
+	chunks := 0
+	for _, err := range testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}) {
+		chunks++
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) != 1 || !errors.Is(errs[0], anthropic.ErrProviderStreamCut) {
+		t.Fatalf("errors = %v, want the one decode error of the stream record", errs)
+	}
+	if chunks != 1 {
+		t.Fatalf("the stream gave %d chunks, want only the error chunk: nothing follows a record that is not JSON", chunks)
+	}
+}
+
+func TestStreamEndsAtAMessageStopRecordWithoutEventLines(t *testing.T) {
+	body := `data: {"type":"message_start","message":{"id":"msg_plain","model":"claude-opus-5-5","usage":{"input_tokens":3,"output_tokens":1}}}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}` + "\n\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	reply, err := ai.Collect(testClient(srv).Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishTruncated || reply.Usage != (ai.Usage{Input: 3, Output: 5, Total: 8}) {
+		t.Fatalf("finish %v usage %+v, want truncated and 3 + 5", reply.Finish, reply.Usage)
+	}
+	if waited := time.Since(start); waited > 30*time.Second {
+		t.Fatalf("Collect returned after %v: the stream waited for the body to close", waited)
+	}
+}
+
+func truncatedFailingHandler(t *testing.T, rec *recorder) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n > 1 {
+			if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := io.WriteString(w, `{"type":"error","error":{"type":"inval`); err != nil {
+			t.Logf("server write ended early: %v", err)
+		}
+	}
+}
+
+func TestTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(truncatedFailingHandler(t, rec))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}, Breaker: &resilience.Breaker{Window: 1, FailureRate: 0.5, OpenFor: time.Hour}}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("truncated 400 was retried: %d requests", rec.count())
+	}
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat after a truncated 400: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("server saw %d calls, want 2: the truncated 400 must add no breaker sample", rec.count())
+	}
+}
+
+func TestRedirectToAnotherOriginDropsTheKey(t *testing.T) {
+	landed := &recorder{}
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		landed.add(r, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(target.Close)
+	seen := &recorder{}
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := seen.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		http.Redirect(w, r, target.URL+"/land", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(front.Close)
+	c := testClient(front)
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if seen.key(0) != "test-key" {
+		t.Fatalf("first request lost the key: %q", seen.key(0))
+	}
+	if landed.key(0) != "" {
+		t.Fatalf("redirected request carries %q, want no key on another origin", landed.key(0))
+	}
+}
+
+func TestRedirectOnTheSameOriginKeepsTheKey(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/v1/messages" {
+			http.Redirect(w, r, "/land", http.StatusTemporaryRedirect)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	reply, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d, want the first request and its same-origin redirect", rec.count())
+	}
+	if rec.key(1) != "test-key" {
+		t.Fatalf("redirected request lost the key: %q", rec.key(1))
+	}
+}
+
+func TestRetryAfterHoldsTheNextAttempt(t *testing.T) {
+	rec := &recorder{}
+	log := &arrivalLog{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		log.add(r)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, werr := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
+			if werr != nil {
+				t.Errorf("server write: %v", werr)
+			}
+			log.done(n, werr)
+			return
+		}
+		_, werr := io.WriteString(w, fixture(t, "message-response.json"))
+		if werr != nil {
+			t.Errorf("server write: %v", werr)
+		}
+		log.done(n, werr)
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 30 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 3 * time.Second}}
+	reply, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if got := rec.count(); got != 2 {
+		t.Fatalf("requests: %d, want 2: the second attempt must wait out the advertised second\n%s", got, log.dump())
+		return
+	}
+	gap := log.gap(1)
+	if gap < time.Second {
+		t.Fatalf("second attempt %v after the first answer, want at least the advertised second", gap)
+	}
+	if gap > 30*time.Second {
+		t.Fatalf("second attempt %v after the first answer, past the 30s backstop", gap)
+	}
+}
+
+type arrival struct {
+	offset time.Duration
+	method string
+	path   string
+	remote string
+	proto  string
+	closed bool
+	length int64
+	idem   string
+	xidem  string
+	sretry string
+	conn   string
+	ua     string
+	wrote  bool
+	werr   string
+}
+
+
+type arrivalLog struct {
+	mu       sync.Mutex
+	first    time.Time
+	at       []time.Time
+	answered []time.Time
+	rows     []arrival
+}
+
+func (l *arrivalLog) add(r *http.Request) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if l.first.IsZero() {
+		l.first = now
+	}
+	l.at = append(l.at, now)
+	l.rows = append(l.rows, arrival{
+		offset: now.Sub(l.first),
+		method: r.Method,
+		path:   r.URL.Path,
+		remote: r.RemoteAddr,
+		proto:  r.Proto,
+		closed: r.Close,
+		length: r.ContentLength,
+		idem:   r.Header.Get("Idempotency-Key"),
+		xidem:  r.Header.Get("X-Idempotency-Key"),
+		sretry: r.Header.Get("X-Stainless-Retry-Count"),
+		conn:   r.Header.Get("Connection"),
+		ua:     r.Header.Get("User-Agent"),
+	})
+	return len(l.at)
+}
+
+
+func (l *arrivalLog) done(n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for len(l.answered) < n {
+		l.answered = append(l.answered, time.Now())
+	}
+	if n-1 < len(l.rows) {
+		l.rows[n-1].wrote = true
+		if err != nil {
+			l.rows[n-1].werr = err.Error()
+		}
+	}
+}
+
+func (l *arrivalLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.at)
+}
+
+func (l *arrivalLog) gap(n int) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n >= len(l.at) || n-1 >= len(l.answered) {
+		return 0
+	}
+	return l.at[n].Sub(l.answered[n-1])
+}
+
+func (l *arrivalLog) dump() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var b strings.Builder
+	for i, row := range l.rows {
+		fmt.Fprintf(&b, "#%d off=%v %s %s %s %s closed=%v len=%d idem=%q xidem=%q sretry=%q conn=%q ua=%q wrote=%v werr=%q\n",
+			i+1, row.offset, row.method, row.path, row.remote, row.proto, row.closed, row.length,
+			row.idem, row.xidem, row.sretry, row.conn, row.ua, row.wrote, row.werr)
+	}
+	return b.String()
+}
+
+
+func TestEchoedKeyNeverAppearsInError(t *testing.T) {
+	rec := &recorder{want: "sk-ant-super-secret-value"}
+	srv := rec.serve(t, http.StatusUnauthorized, "application/json", `{"type":"error","error":{"type":"authentication_error","message":"key sk-ant-super-secret-value is unknown"}}`)
+	c := testClient(srv)
+	c.Key = "sk-ant-super-secret-value"
+	c.Policy = resilience.Policy{Timeout: 2 * time.Second}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "sk-ant-super-secret-value") {
+		t.Fatalf("error leaks the key: %v", err)
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+func TestStreamErrorEventHidesTheKey(t *testing.T) {
+	rec := &recorder{want: "sk-ant-super-secret-value"}
+	body := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"key sk-ant-super-secret-value overloaded\"}}\n\n"
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
+	c := testClient(srv)
+	c.Key = "sk-ant-super-secret-value"
+	var errs []error
+	for _, err := range c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	}) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) != 1 {
+		t.Fatalf("errors = %v, want the one redacted error of the event", errs)
+	}
+	if strings.Contains(errs[0].Error(), "sk-ant-super-secret-value") {
+		t.Fatalf("stream error leaks the key: %v", errs[0])
+	}
+	if !errors.Is(errs[0], anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error: %v", errs[0])
+	}
+}
+
+const bareToolStream = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_bare","model":"claude-opus-5-5","usage":{"input_tokens":9,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bare","name":"get_time","input":{}}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+func TestStreamBareToolCallUsesTheStartInput(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", bareToolStream)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("time?")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	if calls[0].Arguments != "{}" {
+		t.Fatalf("arguments %q, want the empty object", calls[0].Arguments)
+	}
+}
+
+func TestStreamDeltaKeepsEarlierCacheCounts(t *testing.T) {
+	body := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_cache","model":"claude-opus-5-5","usage":{"input_tokens":20,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":25}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Usage != (ai.Usage{Input: 135, Output: 1, Total: 136}) {
+		t.Fatalf("usage %+v, want 25 uncached plus the held 100 read and 10 created", reply.Usage)
+	}
+}
+
+func TestStreamCacheOnlyDeltaKeepsUncachedCounts(t *testing.T) {
+	body := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_cache","model":"claude-opus-5-5","usage":{"input_tokens":20,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_read_input_tokens":150}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Usage != (ai.Usage{Input: 180, Output: 1, Total: 181}) {
+		t.Fatalf("usage %+v, want the held 20 uncached plus 150 read and 10 created", reply.Usage)
+	}
+}
+
+func outputConfig(t *testing.T, rec *recorder, i int) string {
+	t.Helper()
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(rec.body(i)), &sent); err != nil {
+		t.Fatalf("request body: %v", err)
+		return ""
+	}
+	config, ok := sent["output_config"]
+	if !ok {
+		t.Fatalf("request body has no output_config:\n%s", rec.body(i))
+		return ""
+	}
+	out, err := json.Marshal(config, json.Deterministic(true))
+	if err != nil {
+		t.Fatalf("output_config: %v", err)
+		return ""
+	}
+	return string(out)
+}
+
+func TestFormatGoesOutAsOutputConfig(t *testing.T) {
+	format := `{"type":"object","properties":{"email":{"type":"string"},"limit":{"default":9007199254740993}},"required":["email"]}`
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	_, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+		Format:    format,
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	want := canonical(t, `{"format":{"schema":{"properties":{"email":{"type":"string"},"limit":{"default":9007199254740993}},"required":["email"],"type":"object"},"type":"json_schema"}}`)
+	if got := outputConfig(t, rec, 0); got != want {
+		t.Fatalf("output_config:\n got %s\nwant %s", got, want)
+	}
+	if !strings.Contains(rec.body(0), "9007199254740993") {
+		t.Fatalf("request body rounds the large integer:\n%s", rec.body(0))
+	}
+}
+
+func TestFormatGoesOutOnTheStreamToo(t *testing.T) {
+	format := `{"type":"object","properties":{"email":{"type":"string"}},"required":["email"]}`
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", fixture(t, "stream-plain.txt"))
+	_, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+		Format:    format,
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	want := canonical(t, `{"format":{"schema":{"properties":{"email":{"type":"string"}},"required":["email"],"type":"object"},"type":"json_schema"}}`)
+	if got := outputConfig(t, rec, 0); got != want {
+		t.Fatalf("output_config:\n got %s\nwant %s", got, want)
+	}
+	var sent struct {
+		Stream bool `json:"stream"`
+	}
+	if err := json.Unmarshal([]byte(rec.body(0)), &sent); err != nil || !sent.Stream {
+		t.Fatalf("stream flag: %s err=%v", rec.body(0), err)
+	}
+}
+
+func TestFormatThatIsNotAnObjectIsAnError(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	_, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+		Format:    `["email"]`,
+	})
+	if err == nil || !errors.Is(err, anthropic.ErrInvalidRequest) {
+		t.Fatalf("error: %v, want the invalid request fault", err)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("invalid format reached the provider: %d requests", rec.count())
+	}
+}
+
+func TestToolReplayKeepsLargeIntegersExact(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", fixture(t, "message-response.json"))
+	_, err := testClient(srv).Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages: []ai.Message{
+			{Role: ai.RoleAssistant, Parts: []ai.Part{
+				ai.ToolCall{ID: "toolu_01", Name: "lookup", Arguments: `{"order_id":9007199254740993}`},
+			}},
+			{Role: ai.RoleTool, Parts: []ai.Part{
+				ai.ToolResult{ID: "toolu_01", Name: "lookup", Content: "shipped"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if !strings.Contains(rec.body(0), `"order_id":9007199254740993`) {
+		t.Fatalf("request body:\n%s", rec.body(0))
+	}
+	if strings.Contains(rec.body(0), "9007199254740992") {
+		t.Fatalf("request body rounds the integer:\n%s", rec.body(0))
+	}
+}
+
+func TestStreamCarriesTheStartInputOfABareTool(t *testing.T) {
+	body := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_seed","model":"claude-opus-5-5","usage":{"input_tokens":9,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_seed","name":"lookup","input":{"a":1}}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	if calls[0].Arguments != `{"a":1}` {
+		t.Fatalf("arguments %q, want the start input of the block", calls[0].Arguments)
+	}
+}
+
+func TestStreamReplacesANonObjectStartInput(t *testing.T) {
+	body := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_array","model":"claude-opus-5-5","usage":{"input_tokens":9,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_array","name":"lookup","input":[]}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
+	reply, err := ai.Collect(testClient(srv).Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok && call.Arguments != "{}" {
+			t.Fatalf("arguments %q, want the empty object for a start input that is not an object", call.Arguments)
+		}
+	}
+}
+
+func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
+	start := time.Now()
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.Header().Set("Retry-After", "9223372036854775807")
+			w.WriteHeader(http.StatusTooManyRequests)
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 60 * time.Second, Retry: resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 20 * time.Millisecond}}
+	call, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	reply, err := c.Chat(call, ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if waited := time.Since(start); waited > 30*time.Second {
+		t.Fatalf("the wait took %v: an advertisement past the retry maximum must be capped at it", waited)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d, want the rejected attempt and its retry", rec.count())
+	}
+}
+
+func TestRetryAfterLeavesACallerFaultFinal(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("a 400 with Retry-After was retried: %d requests", rec.count())
+	}
+}
+
+func TestKeyStraddlingTheCutIsRedacted(t *testing.T) {
+	key := strings.Repeat("k", 64)
+	body := strings.Repeat("x", (1<<20)-10) + key + "yyyyyyyy"
+	rec := &recorder{want: key}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Key = key
+	c.Policy = resilience.Policy{Timeout: 30 * time.Second}
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+		return
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v, want the provider rejection", err)
+	}
+	if status, _, length, ok := anthropic.FaultDetail(err); !ok || status != 401 || length != 1<<20 {
+		t.Fatalf("detail = %d %d, want status 401 with the body cut at one mebibyte", status, length)
+	}
+	if strings.Contains(err.Error(), key[:10]) {
+		t.Fatalf("error holds the key prefix at the cut")
+	}
+}
+
+func TestPlainStreamFixtureEndsWithItsDataLine(t *testing.T) {
+	lines := strings.Split(strings.TrimSpace(fixture(t, "stream-plain.txt")), "\n")
+	last := lines[len(lines)-1]
+	if !strings.HasPrefix(last, "data:") {
+		t.Fatalf("the fixture ends with %q, want the data record of the last event", last)
+	}
+	if !strings.Contains(last, `"message_stop"`) {
+		t.Fatalf("the last data record is %q, want the message_stop record", last)
+	}
+}
+
+func TestStreamMakesOneAttemptOnAFailingStatus(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusBadRequest, "application/json", `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 5 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	_, err := gather(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	}))
+	if err == nil {
+		t.Fatal("expected the failing status as an error")
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("Stream saw %d requests, want one: a caller fault makes one attempt", rec.count())
+	}
+}
+
+func TestStreamRetriesARateLimitedAnswerBeforeAnyEvent(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, fixture(t, "stream-plain.txt")); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 5 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 20 * time.Millisecond}}
+	reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.ID != "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY" {
+		t.Fatalf("reply: %+v", reply)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("Stream saw %d requests, want two: a 429 before any event is retried", rec.count())
+	}
+}
+
+func TestStreamDoesNotRetryAfterOneEvent(t *testing.T) {
+	rec := &recorder{}
+	body := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mid\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
+	_, err := gather(cWithRetry(srv).Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	}))
+	if err == nil {
+		t.Fatal("expected the cut stream as an error")
+	}
+	if !errors.Is(err, anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("Stream saw %d requests, want one: no retry after one event", rec.count())
+	}
+}
+
+func TestStreamTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := io.WriteString(w, `{"type":"error","error":{"type":"inval`); err != nil {
+			t.Logf("server write ended early: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 5 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	_, err := gather(c.Stream(context.Background(), ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("hi")},
+	}))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("truncated 400 was retried: %d requests", rec.count())
+	}
+}
+
+func cWithRetry(srv *httptest.Server) *anthropic.Client {
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 5 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	return c
+}
+
+func TestStreamCancelKeepsThePrefixAndTheCause(t *testing.T) {
+	rec := &recorder{}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 5 * time.Second}
+	var got error
+	for _, err := range c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}) {
+		if err == nil {
+			cancel()
+			continue
+		}
+		got = err
+		break
+	}
+	cancel()
+	if got == nil {
+		t.Fatal("expected the cancel error from the stream")
+	}
+	if !errors.Is(got, anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error %v does not carry the stream cut fault", got)
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("errors.Is(err, context.Canceled) = false for %w", got)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls *atomic.Int64
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestChatBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	transport := &cutTransport{calls: &calls, total: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}
+	c := &anthropic.Client{BaseURL: "http://anthropic.invalid", Key: "test-key", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
+	_, err := c.Chat(context.Background(), ai.Request{Model: "claude-opus-5-5"})
+	if err == nil || !errors.Is(err, anthropic.ErrProviderTooLarge) {
+		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
+	}
+}

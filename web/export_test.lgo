@@ -1,0 +1,37 @@
+package web
+
+import (
+	"net"
+)
+
+func (s *Server) UpgradedConnections() int {
+	var held *serverRun?
+	s.state.WithLock(func(st *serverState) {
+		held = st.run
+	})
+	run := held
+	if run == nil {
+		return 0
+	}
+	open := 0
+	run.upgrades.state.WithLock(func(u *upgradeState) {
+		open = len(u.open)
+	})
+	return open
+}
+
+func WrapConnForTest(conn net.Conn) net.Conn {
+	return &upgradedConn{Conn: conn, owner: newUpgrades()}
+}
+
+func (s *Server) BoundAddrForTest() string {
+	var held *serverRun?
+	s.state.WithLock(func(st *serverState) {
+		held = st.run
+	})
+	run := held
+	if run == nil {
+		return ""
+	}
+	return run.listener.Addr().String()
+}

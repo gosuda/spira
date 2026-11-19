@@ -1,0 +1,665 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/SimpleVectorStoreTests.java,
+// SimpleVectorStoreFilterExpressionEvaluatorTests.java and
+// SimpleVectorStoreSimilarityTests.java. The cosine oracle is written in this file.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"cmp"
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/resilience"
+)
+
+type embedInput struct {
+	Input []string `json:"input"`
+}
+
+type embedRow struct {
+	Index     int64     `json:"index"`
+	Embedding []float32 `json:"embedding"`
+}
+
+type embedOutput struct {
+	Data []embedRow `json:"data"`
+}
+
+type provider struct {
+	vectors map[string][]float32
+	omitted int
+	calls   atomic.Int64
+}
+
+func (p *provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.calls.Add(1)
+	var in embedInput
+	if err := json.UnmarshalRead(r.Body, &in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out := embedOutput{Data: make([]embedRow, 0, len(in.Input))}
+	for i, text := range in.Input[:len(in.Input)-p.omitted] {
+		vector, ok := p.vectors[text]
+		if !ok {
+			http.Error(w, "no vector for "+text, http.StatusBadRequest)
+			return
+		}
+		out.Data = append(out.Data, embedRow{Index: int64(i), Embedding: vector})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.MarshalWrite(w, &out); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func serve(t *testing.T, p *provider) *rag.Memory {
+	t.Helper()
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	return &rag.Memory{Embed: &openai.Client{BaseURL: srv.URL, Model: "text-embedding-3-small", HTTP: srv.Client(), Policy: resilience.Policy{}}}
+}
+
+func newStore(t *testing.T, vectors map[string][]float32) *rag.Memory {
+	t.Helper()
+	return serve(t, &provider{vectors: vectors})
+}
+
+type fixedEmbed struct {
+	vector []float32
+}
+
+func (e fixedEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = e.vector
+	}
+	return out, nil
+}
+
+func add(t *testing.T, store *rag.Memory, docs ...rag.Document) {
+	t.Helper()
+	if err := store.Add(t.Context(), docs); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+}
+
+func search(t *testing.T, store *rag.Memory, q rag.Search) []rag.Document {
+	t.Helper()
+	docs, err := store.Search(t.Context(), q)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+		return nil
+	}
+	return docs
+}
+
+func txt(v string) rag.Value {
+	return rag.Text{Text: v}
+}
+
+func num(v float64) rag.Value {
+	return rag.Number{Number: v}
+}
+
+func flag(b bool) rag.Value {
+	return rag.Flag{Flag: b}
+}
+
+func ids(docs []rag.Document) []string {
+	out := make([]string, len(docs))
+	for i, d := range docs {
+		out[i] = d.ID
+	}
+	return out
+}
+
+var orderVectors = map[string][]float32{
+	"q":     {1, 0, 0},
+	"near":  {1, 0, 0},
+	"tie":   {1, 1, 0},
+	"mid":   {3, 4, 0},
+	"zero":  {0, 0, 5},
+	"zero2": {0, 0, 7},
+}
+
+var orderDocs = []rag.Document{
+	{ID: "d-near", Text: "near"},
+	{ID: "z-tie", Text: "tie"},
+	{ID: "a-tie", Text: "tie"},
+	{ID: "d-mid", Text: "mid"},
+	{ID: "c-zero", Text: "zero2"},
+	{ID: "b-zero", Text: "zero"},
+}
+
+type bruteHit struct {
+	id    string
+	score float64
+}
+
+func bruteCosine(a []float32, b []float32) float64 {
+	var product, aa, bb float64
+	for i := range a {
+		product += float64(a[i]) * float64(b[i])
+		aa += float64(a[i]) * float64(a[i])
+		bb += float64(b[i]) * float64(b[i])
+	}
+	return product / (math.Sqrt(aa) * math.Sqrt(bb))
+}
+
+func bruteOrder(query []float32, docs []rag.Document, vectors map[string][]float32) []bruteHit {
+	hits := []bruteHit{}
+	for _, d := range docs {
+		hits = append(hits, bruteHit{id: d.ID, score: bruteCosine(query, vectors[d.Text] ?? []float32{})})
+	}
+	slices.SortFunc(hits, func(x bruteHit, y bruteHit) int {
+		return cmp.Or(cmp.Compare(y.score, x.score), cmp.Compare(x.id, y.id))
+	})
+	return hits
+}
+
+func TestMemorySearchOrderEqualsABruteForceComputation(t *testing.T) {
+	store := newStore(t, orderVectors)
+	add(t, store, orderDocs...)
+
+	docs := search(t, store, rag.Search{Query: "q", TopK: 6})
+
+	want := bruteOrder([]float32{1, 0, 0}, orderDocs, orderVectors)
+	if len(docs) != len(want) {
+		t.Fatalf("Search gave %d documents, the oracle gives %d", len(docs), len(want))
+	}
+	for i, hit := range want {
+		score := docs[i].Score ?? math.Inf(1)
+		if docs[i].ID != hit.id || score != hit.score {
+			t.Errorf("rank %d: got (%s, %v), the oracle gives (%s, %v)", i, docs[i].ID, score, hit.id, hit.score)
+		}
+	}
+	if got, tiesByID := ids(docs), []string{"d-near", "a-tie", "z-tie", "d-mid", "b-zero", "c-zero"}; !slices.Equal(got, tiesByID) {
+		t.Errorf("order = %v, want equal scores in id order %v", got, tiesByID)
+	}
+}
+
+func TestMemoryDefaultIsFourDocumentsAndNoThreshold(t *testing.T) {
+	store := newStore(t, orderVectors)
+	add(t, store, orderDocs...)
+
+	if got, want := ids(search(t, store, rag.Search{Query: "q"})), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
+		t.Errorf("default search = %v, want the first four %v", got, want)
+	}
+	if got := search(t, store, rag.Search{Query: "q", TopK: 6}); len(got) != 6 {
+		t.Errorf("the default threshold dropped documents: %v", ids(got))
+	}
+}
+
+func TestMemoryThresholdIsInclusive(t *testing.T) {
+	store := newStore(t, orderVectors)
+	add(t, store, orderDocs...)
+
+	if got, want := ids(search(t, store, rag.Search{Query: "q", TopK: 6, Threshold: 0.6})), []string{"d-near", "a-tie", "z-tie", "d-mid"}; !slices.Equal(got, want) {
+		t.Errorf("threshold 0.6 = %v, want %v with the score 0.6 of d-mid", got, want)
+	}
+	if got, want := ids(search(t, store, rag.Search{Query: "q", TopK: 6, Threshold: 0.61})), []string{"d-near", "a-tie", "z-tie"}; !slices.Equal(got, want) {
+		t.Errorf("threshold 0.61 = %v, want %v", got, want)
+	}
+}
+
+func TestMemoryThresholdOneKeepsAnEqualVector(t *testing.T) {
+	for _, vector := range [][]float32{{1, 1}, {0.1, 0.2, 0.3}, {3, 5, 7, 11}} {
+		other := slices.Clone(vector)
+		other[0] += 0.5
+		store := newStore(t, map[string][]float32{"q": vector, "same": vector, "other": other})
+		add(t, store, rag.Document{ID: "same", Text: "same"}, rag.Document{ID: "other", Text: "other"})
+
+		docs := search(t, store, rag.Search{Query: "q", Threshold: 1})
+
+		if got := ids(docs); !slices.Equal(got, []string{"same"}) {
+			t.Errorf("vector %v at threshold 1: %v, want the equal vector alone", vector, got)
+			continue
+		}
+		if score := docs[0].Score ?? -1; score != 1 {
+			t.Errorf("vector %v: the score of the equal vector is %v, want 1", vector, score)
+		}
+	}
+}
+
+func TestMemoryTopKZeroGivesNoDocument(t *testing.T) {
+	store := newStore(t, orderVectors)
+	add(t, store, orderDocs...)
+
+	if docs := search(t, store, rag.Search{Query: "q", TopK: 0}); len(docs) != 0 {
+		t.Errorf("TopK 0 gave %v", ids(docs))
+	}
+}
+
+func TestMemorySearchOfAnEmptyStoreGivesNoDocument(t *testing.T) {
+	store := newStore(t, orderVectors)
+
+	if docs := search(t, store, rag.Search{Query: "q"}); len(docs) != 0 {
+		t.Errorf("an empty store gave %v", ids(docs))
+	}
+}
+
+func TestMemoryAddRefusesBadDocuments(t *testing.T) {
+	vectors := map[string][]float32{
+		"good":  {1, 0, 0},
+		"two":   {1, 0},
+		"zero":  {0, 0, 0},
+		"empty": {},
+	}
+	cases := []struct {
+		name string
+		docs []rag.Document
+		want string
+	}{
+		{"no document", []rag.Document{}, "needs a document"},
+		{"blank id", []rag.Document{{ID: " ", Text: "good"}}, "needs an id"},
+		{"empty embedding", []rag.Document{{ID: "d1", Text: "empty"}}, "empty embedding"},
+		{"zero vector", []rag.Document{{ID: "d1", Text: "zero"}}, "zero vector"},
+		{"mixed dimensions", []rag.Document{{ID: "d1", Text: "good"}, {ID: "d2", Text: "two"}}, "dimensions"},
+	}
+	for _, c := range cases {
+		err := newStore(t, vectors).Add(t.Context(), c.docs)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Add error = %v, want one with %q", c.name, err, c.want)
+		}
+	}
+}
+
+func TestMemoryAddRefusesAVectorThatIsNotFinite(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		store := &rag.Memory{Embed: fixedEmbed{vector: []float32{float32(value), 0, 0}}}
+
+		err := store.Add(t.Context(), []rag.Document{{ID: "d1", Text: "t"}})
+
+		if err == nil || !strings.Contains(err.Error(), "not finite") {
+			t.Errorf("value %v: Add error = %v, want one with \"not finite\"", value, err)
+		}
+	}
+}
+
+func TestMemoryAddSendsNoTextOfABatchWithABlankId(t *testing.T) {
+	p := &provider{vectors: map[string][]float32{"good": {1, 0, 0}}}
+	store := serve(t, p)
+
+	err := store.Add(t.Context(), []rag.Document{{ID: "d1", Text: "good"}, {ID: " ", Text: "good"}})
+
+	if err == nil || !strings.Contains(err.Error(), "needs an id") {
+		t.Errorf("Add error = %v, want one with \"needs an id\"", err)
+	}
+	if calls := p.calls.Load(); calls != 0 {
+		t.Errorf("the embedder received %d requests for a batch with a blank id, want 0", calls)
+	}
+}
+
+func TestMemoryAddStoresNoDocumentOfARefusedBatch(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "good": {1, 0, 0}})
+
+	err := store.Add(t.Context(), []rag.Document{{ID: "good", Text: "good"}, {ID: "", Text: "good"}})
+
+	if err == nil {
+		t.Fatal("Add took a batch with a blank id")
+	}
+	if docs := search(t, store, rag.Search{Query: "q"}); len(docs) != 0 {
+		t.Errorf("the refused batch left %v", ids(docs))
+	}
+}
+
+func TestMemoryAddRefusesAChangeOfDimensions(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "v3": {1, 0, 0}, "v2": {1, 0}})
+	add(t, store, rag.Document{ID: "d1", Text: "v3"})
+
+	err := store.Add(t.Context(), []rag.Document{{ID: "d2", Text: "v2"}})
+
+	if err == nil || !strings.Contains(err.Error(), "the store holds 3") {
+		t.Errorf("Add error = %v, want the dimensions of the store", err)
+	}
+	if got := ids(search(t, store, rag.Search{Query: "q"})); !slices.Equal(got, []string{"d1"}) {
+		t.Errorf("the refused document changed the store: %v", got)
+	}
+}
+
+func TestMemoryGivesTheErrorOfTheEmbedder(t *testing.T) {
+	store := newStore(t, map[string][]float32{})
+
+	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "t"}}); err == nil || !errors.Is(err, openai.ErrProviderRejected) {
+		t.Errorf("Add error = %v, want the openai provider fault", err)
+	}
+	if _, err := store.Search(t.Context(), rag.Search{Query: "t"}); err == nil || !errors.Is(err, openai.ErrProviderRejected) {
+		t.Errorf("Search error = %v, want the openai provider fault", err)
+	}
+}
+
+func TestMemoryRefusesAnEmbedderThatGivesTooFewVectors(t *testing.T) {
+	store := serve(t, &provider{vectors: map[string][]float32{"a": {1, 0}, "b": {0, 1}}, omitted: 1})
+
+	err := store.Add(t.Context(), []rag.Document{{ID: "d1", Text: "a"}, {ID: "d2", Text: "b"}})
+
+	if err == nil || !strings.Contains(err.Error(), "1 vectors for 2 documents") {
+		t.Errorf("Add error = %v", err)
+	}
+	if _, err := store.Search(t.Context(), rag.Search{Query: "a"}); err == nil || !strings.Contains(err.Error(), "0 vectors for the query") {
+		t.Errorf("Search error = %v", err)
+	}
+}
+
+func TestMemoryNeedsAnEmbedder(t *testing.T) {
+	store := &rag.Memory{}
+
+	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "t"}}); err == nil || !strings.Contains(err.Error(), "needs an embedder") {
+		t.Errorf("Add error = %v", err)
+	}
+	if _, err := store.Search(t.Context(), rag.Search{Query: "t"}); err == nil || !strings.Contains(err.Error(), "needs an embedder") {
+		t.Errorf("Search error = %v", err)
+	}
+}
+
+func TestMemorySearchRefusesBadRequests(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "qzero": {0, 0, 0}, "q2": {1, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d"})
+	cases := []struct {
+		name string
+		q    rag.Search
+		want string
+	}{
+		{"negative topK", rag.Search{Query: "q", TopK: -1}, "topK"},
+		{"threshold above one", rag.Search{Query: "q", Threshold: 1.5}, "threshold"},
+		{"negative threshold", rag.Search{Query: "q", Threshold: -0.5}, "threshold"},
+		{"zero query vector", rag.Search{Query: "qzero"}, "zero vector"},
+		{"query dimensions", rag.Search{Query: "q2"}, "the store holds 3"},
+	}
+	for _, c := range cases {
+		_, err := store.Search(t.Context(), c.q)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Search error = %v, want one with %q", c.name, err, c.want)
+		}
+	}
+}
+
+func TestMemoryAddOfAStoredIdReplacesTheDocument(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "old": {0, 1, 0}, "new": {2, 0, 0}})
+	add(t, store, rag.Document{ID: "1", Text: "old", Metadata: map[string]rag.Value{"version": txt("1")}})
+	add(t, store, rag.Document{ID: "1", Text: "new", Metadata: map[string]rag.Value{"version": txt("2")}})
+
+	docs := search(t, store, rag.Search{Query: "q"})
+
+	if len(docs) != 1 {
+		t.Fatalf("a replaced id gave %d documents", len(docs))
+	}
+	score := docs[0].Score ?? -1
+	if got := fmt.Sprintf("%s %v %v", docs[0].Text, docs[0].Metadata, score); got != "new map[version:{2}] 1" {
+		t.Errorf("the replaced document is %s, want the new text, metadata and vector", got)
+	}
+}
+
+func TestMemoryDeleteKeepsTheOtherDocumentsWhole(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "a": {1, 0, 0}, "b": {3, 4, 0}, "c": {0, 1, 0}, "c2": {1, 1, 0}})
+	add(t, store, rag.Document{ID: "a", Text: "a"}, rag.Document{ID: "b", Text: "b"}, rag.Document{ID: "c", Text: "c"})
+
+	if err := store.Delete(t.Context(), []string{"a", "missing"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	add(t, store, rag.Document{ID: "c", Text: "c2", Metadata: map[string]rag.Value{"moved": flag(true)}})
+
+	docs := search(t, store, rag.Search{Query: "q", TopK: 5})
+	spelled := make([]string, len(docs))
+	for i, d := range docs {
+		spelled[i] = fmt.Sprintf("%s %s %.4f %v", d.ID, d.Text, d.Score ?? -1, d.Metadata)
+	}
+	want := []string{"c c2 0.7071 map[moved:{true}]", "b b 0.6000 map[]"}
+	if !slices.Equal(spelled, want) {
+		t.Errorf("after the delete of a and the replacement of c:\n got %q\nwant %q", spelled, want)
+	}
+	if err := store.Delete(t.Context(), []string{"c"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := ids(search(t, store, rag.Search{Query: "q", TopK: 5})); !slices.Equal(got, []string{"b"}) {
+		t.Errorf("after the delete of c: %v, want b alone", got)
+	}
+	add(t, store, rag.Document{ID: "a", Text: "a"})
+	if got := ids(search(t, store, rag.Search{Query: "q", TopK: 5})); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("after a deleted id was added again: %v, want a and b", got)
+	}
+}
+
+func TestMemoryCopiesMetadataInAndOut(t *testing.T) {
+	original := map[string]rag.Value{"key": txt("original")}
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "text": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "text", Metadata: original})
+
+	original["key"] = txt("changed by the caller")
+	original["new"] = txt("value")
+	docs := search(t, store, rag.Search{Query: "q"})
+	if got := fmt.Sprint(docs[0].Metadata); got != "map[key:{original}]" {
+		t.Errorf("the stored metadata followed the map of the caller: %s", got)
+	}
+
+	docs[0].Metadata["key"] = txt("changed in the result")
+	if got := fmt.Sprint(search(t, store, rag.Search{Query: "q"})[0].Metadata); got != "map[key:{original}]" {
+		t.Errorf("the stored metadata followed the map of a result: %s", got)
+	}
+}
+
+func TestMemoryKeepsEachKindOfMetadataValue(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "text": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "text", Metadata: map[string]rag.Value{"s": txt("BG"), "n": num(2.5), "b": flag(true)}})
+
+	docs := search(t, store, rag.Search{Query: "q"})
+
+	if got := fmt.Sprint(docs[0].Metadata); got != "map[b:{true} n:{2.5} s:{BG}]" {
+		t.Errorf("metadata = %s", got)
+	}
+}
+
+var evaluated = []struct {
+	filter string
+	meta   map[string]rag.Value
+	want   bool
+}{
+	{"country == 'BG'", map[string]rag.Value{"country": txt("BG")}, true},
+	{"country == 'BG'", map[string]rag.Value{"country": txt("NL")}, false},
+	{"country != 'BG'", map[string]rag.Value{"country": txt("NL")}, true},
+	{"country != 'BG'", map[string]rag.Value{"country": txt("BG")}, false},
+	{"year > 2020", map[string]rag.Value{"year": num(2021)}, true},
+	{"year > 2020", map[string]rag.Value{"year": num(2020)}, false},
+	{"year >= 2020", map[string]rag.Value{"year": num(2020)}, true},
+	{"year >= 2020", map[string]rag.Value{"year": num(2019)}, false},
+	{"year < 2020", map[string]rag.Value{"year": num(2019)}, true},
+	{"year < 2020", map[string]rag.Value{"year": num(2020)}, false},
+	{"year <= 2020", map[string]rag.Value{"year": num(2020)}, true},
+	{"year <= 2020", map[string]rag.Value{"year": num(2021)}, false},
+	{"genre == 'drama' AND year >= 2020", map[string]rag.Value{"genre": txt("drama"), "year": num(2020)}, true},
+	{"genre == 'drama' AND year >= 2020", map[string]rag.Value{"genre": txt("comedy"), "year": num(2020)}, false},
+	{"genre == 'drama' AND year >= 2020", map[string]rag.Value{"genre": txt("drama"), "year": num(2019)}, false},
+	{"year >= 2020 OR country == 'BG' AND city != 'Sofia'", map[string]rag.Value{"city": txt("Seoul"), "year": num(2020), "country": txt("NL")}, true},
+	{"year >= 2020 OR country == 'BG' AND city != 'Sofia'", map[string]rag.Value{"city": txt("Seoul"), "year": num(2019), "country": txt("BG")}, true},
+	{"year >= 2020 OR country == 'BG' AND city != 'Sofia'", map[string]rag.Value{"city": txt("Sofia"), "year": num(2019), "country": txt("BG")}, false},
+	{"not(country == 'BG')", map[string]rag.Value{"country": txt("NL")}, true},
+	{"not(country == 'BG')", map[string]rag.Value{"country": txt("BG")}, false},
+	{"genre in ['comedy', 'documentary', 'drama']", map[string]rag.Value{"genre": txt("drama")}, true},
+	{"genre in ['comedy', 'documentary', 'drama']", map[string]rag.Value{"genre": txt("action")}, false},
+	{"city nin ['Sofia', 'Plovdiv']", map[string]rag.Value{"city": txt("Seoul")}, true},
+	{"city nin ['Sofia', 'Plovdiv']", map[string]rag.Value{"city": txt("Sofia")}, false},
+	{"(year >= 2020 OR country == 'BG') AND city nin ['Sofia', 'Plovdiv']", map[string]rag.Value{"city": txt("Seoul"), "year": num(2019), "country": txt("BG")}, true},
+	{"(year >= 2020 OR country == 'BG') AND city nin ['Sofia', 'Plovdiv']", map[string]rag.Value{"city": txt("Sofia"), "year": num(2020), "country": txt("BG")}, false},
+	{"isOpen == true AND year >= 2020 AND country in ['BG', 'NL', 'US']", map[string]rag.Value{"isOpen": flag(true), "year": num(2020), "country": txt("NL")}, true},
+	{"isOpen == true AND year >= 2020 AND country in ['BG', 'NL', 'US']", map[string]rag.Value{"isOpen": flag(false), "year": num(2020), "country": txt("NL")}, false},
+	{"isOpen == true AND year >= 2020 AND country in ['BG', 'NL', 'US']", map[string]rag.Value{"isOpen": flag(true), "year": num(2020), "country": txt("KR")}, false},
+	{"temperature >= -15.6 AND temperature <= 20.13", map[string]rag.Value{"temperature": num(-15.6)}, true},
+	{"temperature >= -15.6 AND temperature <= 20.13", map[string]rag.Value{"temperature": num(20.13)}, true},
+	{"temperature >= -15.6 AND temperature <= 20.13", map[string]rag.Value{"temperature": num(-16.0)}, false},
+	{"temperature >= -15.6 AND temperature <= 20.13", map[string]rag.Value{"temperature": num(21.0)}, false},
+	{"year >= 2019.5", map[string]rag.Value{"year": num(2020)}, true},
+	{"year in [2019, 2020, 2021]", map[string]rag.Value{"year": num(2020)}, true},
+	{"score in [3.5, 3.9]", map[string]rag.Value{"score": num(4)}, false},
+	{"year nin [2019, 2021]", map[string]rag.Value{"year": num(2020)}, true},
+	{"open == false", map[string]rag.Value{"open": flag(false)}, true},
+	{"open > false", map[string]rag.Value{"open": flag(true)}, true},
+	{"'country 1 2 3' == 'BG'", map[string]rag.Value{"country 1 2 3": txt("BG")}, true},
+	{"a == 1 AND NOT b == 2 OR c == 3", map[string]rag.Value{"a": num(1), "b": num(0), "c": num(0)}, true},
+	{"a == 1 AND NOT b == 2 OR c == 3", map[string]rag.Value{"a": num(1), "b": num(0), "c": num(3)}, false},
+	{"type is null", map[string]rag.Value{}, true},
+	{"type is null", map[string]rag.Value{"type": txt("x")}, false},
+	{"type is not null", map[string]rag.Value{"type": txt("x")}, true},
+	{"type is not null", map[string]rag.Value{}, false},
+	{"type in ['x']", map[string]rag.Value{}, false},
+	{"type nin ['x']", map[string]rag.Value{}, true},
+	{"type == 'x'", map[string]rag.Value{}, false},
+	{"type != 'x'", map[string]rag.Value{}, true},
+	{"type > 'x'", map[string]rag.Value{}, false},
+	{"type < 'x'", map[string]rag.Value{}, true},
+}
+
+func TestMemoryFilterKeepsWhatTheReferenceEvaluatorKeeps(t *testing.T) {
+	vectors := map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}}
+	for _, c := range evaluated {
+		store := newStore(t, vectors)
+		add(t, store, rag.Document{ID: "d", Text: "d", Metadata: c.meta})
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q on %v kept the document = %v, want %v", c.filter, c.meta, got, c.want)
+		}
+	}
+}
+
+func TestMemoryFilterComparesAnIntegerConstantExactly(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{
+		"n":    num(9007199254740992),
+		"high": num(9223372036854775808),
+		"low":  num(-9223372036854775808),
+		"half": num(2.5),
+	}})
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{"n == 9007199254740992", true},
+		{"n == 9007199254740993", false},
+		{"n != 9007199254740993", true},
+		{"n < 9007199254740993", true},
+		{"n >= 9007199254740993", false},
+		{"n > 9007199254740991", true},
+		{"n in [9007199254740993, 9007199254740991]", false},
+		{"n nin [9007199254740993]", true},
+		{"high == 9223372036854775807", false},
+		{"high > 9223372036854775807", true},
+		{"low == -9223372036854775808", true},
+		{"low < -9223372036854775807", true},
+		{"low == -9223372036854775807", false},
+		{"half > 2", true},
+		{"half < 3", true},
+		{"half == 2", false},
+	}
+	for _, c := range cases {
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q kept the document = %v, want %v", c.filter, got, c.want)
+		}
+	}
+}
+
+func TestMemoryFilterOfDifferentTypesIsAnError(t *testing.T) {
+	cases := []struct {
+		filter string
+		meta   map[string]rag.Value
+	}{
+		{"year > 2019", map[string]rag.Value{"year": txt("2020")}},
+		{"open > 0", map[string]rag.Value{"open": flag(true)}},
+		{"name == true", map[string]rag.Value{"name": txt("true")}},
+		{"year in ['2020']", map[string]rag.Value{"year": num(2020)}},
+	}
+	vectors := map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}}
+	for _, c := range cases {
+		store := newStore(t, vectors)
+		add(t, store, rag.Document{ID: "d", Text: "d", Metadata: c.meta})
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		_, err = store.Search(t.Context(), rag.Search{Query: "q", Filter: filter})
+		if err == nil || !strings.Contains(err.Error(), "ai/rag: filter: key") {
+			t.Errorf("filter %q on %v: the error is %v, want a filter error that names the key", c.filter, c.meta, err)
+		}
+	}
+}
+
+func TestMemoryFilterOfAHandBuiltTreeWithoutAKeyIsAnError(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d"})
+	keyless := rag.Expression{Type: rag.OpEq, Left: rag.Const{Text: "x"}, Right: rag.Filter(rag.Const{Text: "x"})}
+
+	_, err := store.Search(t.Context(), rag.Search{Query: "q", Filter: rag.Filter(keyless)})
+
+	if err == nil || !strings.Contains(err.Error(), "needs a key on the left") {
+		t.Errorf("Search error = %v, want one that asks for a key", err)
+	}
+}
+
+func TestMemoryAddAndSearchAtTheSameTime(t *testing.T) {
+	vectors := map[string][]float32{"q": {1, 0, 0}}
+	want := make([]string, 0, 10)
+	for i := range 10 {
+		id := fmt.Sprintf("v%d", i)
+		vectors[id] = []float32{1, 0, 0}
+		want = append(want, id)
+	}
+	store := newStore(t, vectors)
+
+	if err := addWhileSearching(t.Context(), store, want); err != nil {
+		t.Fatalf("add beside search: %v", err)
+	}
+
+	got := ids(search(t, store, rag.Search{Query: "q", TopK: 10}))
+	if !slices.Equal(got, want) {
+		t.Errorf("after the adds: %v, want %v", got, want)
+	}
+}
+
+func addWhileSearching(ctx context.Context, store *rag.Memory, texts []string) error {
+	go group (ctx) {
+		go { addEach(ctx, store, texts)? }
+		go { searchRepeatedly(ctx, store)? }
+	}
+	return nil
+}
+
+func addEach(ctx context.Context, store *rag.Memory, texts []string) error {
+	for _, text := range texts {
+		if err := store.Add(ctx, []rag.Document{{ID: text, Text: text}}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func searchRepeatedly(ctx context.Context, store *rag.Memory) error {
+	for range 50 {
+		if _, err := store.Search(ctx, rag.Search{Query: "q"}); err != nil {
+			return err
+		}
+	}
+	return nil
+}

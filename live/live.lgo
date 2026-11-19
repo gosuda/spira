@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -20,7 +21,7 @@ type Event struct {
 
 func NewEvent(name string, body view.Node) (Event, error) {
 	if badName(name) {
-		return Event{}, fmt.Errorf("live: event name %q contains a line break", name)
+		return Event{}, ErrInvalidEventName.Wrap(errors.New("live: event name holds a line break"))
 	}
 	return Event{Name: name, Body: body}, nil
 }
@@ -39,8 +40,9 @@ func writeEvents(ctx context.Context, w io.Writer, events <-chan Event) error {
 	}
 	ticker := time.NewTicker(heartbeatEvery)
 	defer ticker.Stop()
+	s := stream{w: w, beats: ticker.C}
 	for {
-		keep, err := oneRound(ctx, w, events, ticker.C)
+		keep, err := s.oneRound(ctx, events)
 		if err != nil {
 			return err
 		}
@@ -50,17 +52,22 @@ func writeEvents(ctx context.Context, w io.Writer, events <-chan Event) error {
 	}
 }
 
-func oneRound(ctx context.Context, w io.Writer, events <-chan Event, beats <-chan time.Time) (bool, error) {
+type stream struct {
+	w     io.Writer
+	beats <-chan time.Time
+}
+
+func (s stream) oneRound(ctx context.Context, events <-chan Event) (bool, error) {
 	select {
 	case <-ctx.Done():
 		return false, nil
-	case <-beats:
-		if err := beat(ctx, w); err != nil {
+	case <-s.beats:
+		if err := beat(ctx, s.w); err != nil {
 			return false, err
 		}
 		return true, nil
 	case ev, ok := <-events:
-		if stop, serr := relay(ctx, w, ok, ev); serr != nil {
+		if stop, serr := s.relay(ctx, ok, ev); serr != nil {
 			return false, serr
 		} else if stop {
 			return false, nil
@@ -69,11 +76,11 @@ func oneRound(ctx context.Context, w io.Writer, events <-chan Event, beats <-cha
 	}
 }
 
-func relay(ctx context.Context, w io.Writer, open bool, ev Event) (bool, error) {
+func (s stream) relay(ctx context.Context, open bool, ev Event) (bool, error) {
 	if !open {
 		return true, nil
 	}
-	if err := writeMessage(ctx, w, ev); err != nil {
+	if err := s.writeMessage(ctx, ev); err != nil {
 		return true, endIfDone(ctx, err)
 	}
 	return false, nil
@@ -81,7 +88,7 @@ func relay(ctx context.Context, w io.Writer, open bool, ev Event) (bool, error) 
 
 func beat(ctx context.Context, w io.Writer) error {
 	if err := writeHeartbeat(w); err != nil {
-		return endIfDone(ctx, fmt.Errorf("live: heartbeat: %w", err))
+		return endIfDone(ctx, ErrWriteFailed.Wrap(fmt.Errorf("live: heartbeat: %w", err)))
 	}
 	return nil
 }
@@ -93,13 +100,13 @@ func writeHeartbeat(w io.Writer) error {
 	return nil
 }
 
-func writeMessage(ctx context.Context, w io.Writer, ev Event) error {
+func (s stream) writeMessage(ctx context.Context, ev Event) error {
 	if badName(ev.Name) {
-		return fmt.Errorf("live: event name %q contains a line break", ev.Name)
+		return ErrInvalidEventName.Wrap(errors.New("live: event name holds a line break"))
 	}
 	var body strings.Builder
-	if err := view.Render(ctx, &body, ev.Body); err != nil {
-		return fmt.Errorf("live: render event %q: %w", ev.Name, err)
+	if err := s.render(ctx, &body, ev); err != nil {
+		return err
 	}
 	var msg strings.Builder
 	msg.WriteString($"event: {ev.Name}\n")
@@ -107,10 +114,42 @@ func writeMessage(ctx context.Context, w io.Writer, ev Event) error {
 		msg.WriteString($"data: {line}\n")
 	}
 	msg.WriteString("\n")
-	if _, err := io.WriteString(w, msg.String()); err != nil {
-		return fmt.Errorf("live: write event %q: %w", ev.Name, err)
+	if _, err := io.WriteString(s.w, msg.String()); err != nil {
+		return ErrWriteFailed.Wrap(fmt.Errorf("live: write event: %w", err))
 	}
 	return nil
+}
+
+func (s stream) render(ctx context.Context, body *strings.Builder, ev Event) error {
+	rendered := make(chan struct{})
+	go group (ctx) {
+		go renderBody(ctx, body, ev, rendered)
+		go s.beatUntil(ctx, rendered)
+	}
+	return nil
+}
+
+func renderBody(ctx context.Context, body *strings.Builder, ev Event, rendered chan<- struct{}) error {
+	defer close(rendered)
+	if err := view.Render(ctx, body, ev.Body); err != nil {
+		return ErrRenderFailed.Wrap(fmt.Errorf("live: render event: %w", err))
+	}
+	return nil
+}
+
+func (s stream) beatUntil(ctx context.Context, rendered <-chan struct{}) error {
+	for {
+		select {
+		case <-rendered:
+			return nil
+		case <-ctx.Done():
+			return nil
+		case <-s.beats:
+			if err := beat(ctx, s.w); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func newlines(s string) string {

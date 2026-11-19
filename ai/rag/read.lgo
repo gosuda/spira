@@ -1,0 +1,131 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-commons/src/main/java/org/springframework/ai/reader/TextReader.java
+// and spring-ai-commons/src/main/java/org/springframework/ai/reader/JsonReader.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"strings"
+)
+
+const readLimit = 1 << 20
+
+func ReadText(r io.Reader, source string) ([]Document, error) {
+	data, err := readBounded(r)
+	if err != nil {
+		return nil, err
+	}
+	text := string(data)
+	return []Document{{
+		ID:   textID(text),
+		Text: text,
+		Metadata: map[string]Value{
+			"source":  Text{Text: source},
+			"charset": Text{Text: "UTF-8"},
+		},
+	}}, nil
+}
+
+func ReadJSON(r io.Reader, keys ...string) ([]Document, error) {
+	data, err := readBounded(r)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: decode JSON: empty input"))
+	}
+	var elements []jsontext.Value
+	switch trimmed[0] {
+	case '[':
+		var items []jsontext.Value
+		if err := json.Unmarshal(data, &items); err != nil {
+			return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: decode JSON: %w", err))
+		}
+		elements = items
+	case '{':
+		var one jsontext.Value
+		if err := json.Unmarshal(data, &one); err != nil {
+			return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: decode JSON: %w", err))
+		}
+		elements = []jsontext.Value{one}
+	default:
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: JSON root must be an object or an array"))
+	}
+	docs := make([]Document, len(elements))
+	for i, el := range elements {
+		doc, derr := jsonDoc(el, keys, i)
+		if derr != nil {
+			return nil, derr
+		}
+		docs[i] = doc
+	}
+	return docs, nil
+}
+
+func jsonDoc(el jsontext.Value, keys const []string, at int) (Document, error) {
+	var fields map[string]jsontext.Value
+	if err := json.Unmarshal(el, &fields); err != nil {
+		return Document{}, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: element %d is not a JSON object: %w", at, err))
+	}
+	text := jsonText(el, fields, keys)
+	return Document{
+		ID:       textID(text),
+		Text:     text,
+		Metadata: map[string]Value{},
+	}, nil
+}
+
+func jsonText(el jsontext.Value, fields map[string]jsontext.Value, keys const []string) string {
+	if len(keys) == 0 {
+		return string(el)
+	}
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		raw, ok := fields[key]
+		if !ok {
+			continue
+		}
+		lines = append(lines, key+": "+jsonScalar(raw)+"\n")
+	}
+	if len(lines) == 0 {
+		return string(el)
+	}
+	return strings.Join(lines, "")
+}
+
+func jsonScalar(raw jsontext.Value) string {
+	if raw.Kind() == jsontext.KindNull {
+		return "null"
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return string(raw)
+}
+
+func readBounded(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, readLimit+1))
+	if len(data) > readLimit {
+		return nil, ErrTooLarge.Wrap(fmt.Errorf("ai/rag: input exceeds the size limit of %d bytes", readLimit))
+	}
+	if err != nil {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: read input: %w", err))
+	}
+	return data, nil
+}
+
+func textID(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}

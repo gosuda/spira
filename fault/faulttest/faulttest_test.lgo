@@ -1,0 +1,90 @@
+package faulttest_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+const specHead = "# x\n\n### Code table\n\n| Code | Kind | Message |\n|---|---|---|\n"
+
+func writeSpec(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fault.md")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+		return ""
+	}
+	return path
+}
+
+func expectFailure(t *testing.T, path string, faults []*fault.Error, want string) {
+	t.Helper()
+	r := &faulttest.Recorder{}
+	faulttest.CheckTableRecorded(r, path, faults)
+	if !r.Failed {
+		t.Fatalf("defect passed, want failure with %q", want)
+		return
+	}
+	if !strings.Contains(r.Message, want) {
+		t.Fatalf("failure = %q, want %q", r.Message, want)
+		return
+	}
+}
+
+func TestCheckTableAcceptsMatchingSet(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | invalid | bad input |\n")
+	r := &faulttest.Recorder{}
+	faulttest.CheckTableRecorded(r, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+	})
+	if r.Failed {
+		t.Fatalf("matching set failed: %s", r.Message)
+		return
+	}
+}
+
+func TestCheckTableFailsDuplicateDeclaredCode(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | invalid | bad input |\n")
+	expectFailure(t, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+		fault.New("a.b", fault.Invalid, "bad input"),
+	}, "duplicate")
+}
+
+func TestCheckTableFailsDeclaredMissingFromTable(t *testing.T) {
+	path := writeSpec(t, specHead)
+	expectFailure(t, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+	}, "missing from the spec")
+}
+
+func TestCheckTableFailsTableCodeWithoutFault(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | invalid | bad input |\n")
+	expectFailure(t, path, []*fault.Error{}, "no declared fault")
+}
+
+func TestCheckTableFailsDuplicateSpecRow(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | invalid | bad input |\n| `a.b` | not_found | bad input |\n")
+	expectFailure(t, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+	}, "in the spec table")
+}
+
+func TestCheckTableFailsKindMismatch(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | not_found | bad input |\n")
+	expectFailure(t, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+	}, "kind")
+}
+
+func TestCheckTableFailsMessageMismatch(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | invalid | another text |\n")
+	expectFailure(t, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+	}, "message")
+}

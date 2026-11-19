@@ -1,0 +1,697 @@
+// Translated and changed by spira from Spring AI,
+// session-repositories/spring-ai-session-jdbc/src/main/java/org/springframework/ai/session/jdbc/JdbcSessionRepository.java,
+// JdbcSessionRepositoryDialect.java, PostgresJdbcSessionRepositoryDialect.java,
+// MysqlJdbcSessionRepositoryDialect.java, SqlServerJdbcSessionRepositoryDialect.java,
+// H2JdbcSessionRepositoryDialect.java and src/main/resources/org/springframework/ai/session/jdbc/schema-postgresql.sql,
+// schema-mysql.sql, schema-sqlserver.sql, schema-h2.sql.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package session
+
+import (
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/db"
+)
+
+type Store interface {
+	Ensure(id string) (*Session?, error)
+	Find(id string) *Session?
+	Events(ctx context.Context, id string) ([]Event, error)
+	Active(ctx context.Context, id string) ([]ai.Message, error)
+	LastN(ctx context.Context, id string, n int) ([]Event, error)
+	Append(ctx context.Context, id string, version int64, events ...Event) (bool, error)
+	Version(ctx context.Context, id string) (int64, error)
+	Compact(ctx context.Context, id string, version int64, boundary Boundary) (bool, error)
+	Delete(ctx context.Context, id string) error
+}
+
+var _ Store = (*Service)(nil)
+
+var _ Store = (*SQLStore)(nil)
+
+func (s *Service) Delete(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if tooLongID(id) {
+		return nil
+	}
+	s.store.WithLock(func(m *memory) {
+		delete(m.logs, id)
+	})
+	return nil
+}
+
+const sqlOpTimeout = 5 * time.Second
+
+type SQLStore struct {
+	Pool *db.Pool
+	TTL  time.Duration
+	Now  (func() time.Time)?
+}
+
+func (s *SQLStore) now() time.Time {
+	return (s.Now ?? time.Now)()
+}
+
+func (s *SQLStore) ttl() time.Duration {
+	if s.TTL <= 0 {
+		return 24 * time.Hour
+	}
+	return s.TTL
+}
+
+type sessionRow struct {
+	ID      string `col:"id"`
+	Created int64  `col:"created_at"`
+	Expires int64  `col:"expires_at"`
+	Version int64  `col:"version"`
+}
+
+type eventRow struct {
+	ID        string `col:"id"`
+	SessionID string `col:"session_id"`
+	AtNanos   int64  `col:"at_nanos"`
+	EventType string `col:"event_type"`
+	Role      string `col:"msg_role"`
+	Parts     string `col:"parts"`
+}
+
+type boundaryRow struct {
+	Seq   int64  `col:"seq"`
+	Parts string `col:"parts"`
+}
+
+type storedPart struct {
+	Kind      string `json:"kind"`
+	Text      string `json:"text,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"args,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Skipped   bool   `json:"skipped,omitempty"`
+}
+
+type storedMessage struct {
+	Role  string       `json:"role"`
+	Parts []storedPart `json:"parts"`
+}
+
+type storedRow struct {
+	id        string
+	session   string
+	at        int64
+	eventType string
+	role      string
+	parts     string
+}
+
+type sessionStmts struct {
+	createSessions string
+	createEvents   string
+	createIdx      string
+	binaryKeys     bool
+	insertNew      string
+	claim          string
+	selectSession  string
+	bump           string
+	insert         string
+	selectEvents   string
+	countEvents    string
+	newestBoundary string
+	selectAfter    string
+	deleteEvents   string
+	retireSession  string
+}
+func sqliteSessionStmts() sessionStmts {
+	return sessionStmts{
+		createSessions: "CREATE TABLE IF NOT EXISTS spira_sessions (id VARCHAR(255) NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
+		createEvents:   "CREATE TABLE IF NOT EXISTS spira_session_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id VARCHAR(255) NOT NULL, session_id VARCHAR(255) NOT NULL REFERENCES spira_sessions (id) ON DELETE CASCADE, at_nanos BIGINT NOT NULL, event_type VARCHAR(64) NOT NULL, msg_role VARCHAR(20) NOT NULL DEFAULT '', parts TEXT NOT NULL)",
+		createIdx:      "CREATE INDEX IF NOT EXISTS idx_spira_session_events_session_seq ON spira_session_events (session_id, seq)",
+		insertNew:      "INSERT INTO spira_sessions (id, created_at, expires_at, version) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+		claim:          "UPDATE spira_sessions SET version = ?, created_at = ?, expires_at = ? WHERE id = ? AND version = ? AND expires_at = ?",
+		selectSession:  "SELECT id, created_at, expires_at, version FROM spira_sessions WHERE id = ?",
+		bump:           "UPDATE spira_sessions SET version = ? WHERE id = ? AND version = ? AND expires_at >= ?",
+		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)",
+		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? ORDER BY seq",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = ?",
+		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = ? AND event_type = ? ORDER BY seq DESC LIMIT ?",
+		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? AND seq > ? ORDER BY seq",
+		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = ?",
+		retireSession:  "UPDATE spira_sessions SET expires_at = ? WHERE id = ?",
+	}
+}
+func postgresSessionStmts() sessionStmts {
+	return sessionStmts{
+		createSessions: "CREATE TABLE IF NOT EXISTS spira_sessions (id VARCHAR(255) NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
+		createEvents:   "CREATE TABLE IF NOT EXISTS spira_session_events (seq BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, id VARCHAR(255) NOT NULL, session_id VARCHAR(255) NOT NULL REFERENCES spira_sessions (id) ON DELETE CASCADE, at_nanos BIGINT NOT NULL, event_type VARCHAR(64) NOT NULL, msg_role VARCHAR(20) NOT NULL DEFAULT '', parts TEXT NOT NULL, CONSTRAINT fk_spira_session_events_session FOREIGN KEY (session_id) REFERENCES spira_sessions (id) ON DELETE CASCADE)",
+		createIdx:      "CREATE INDEX IF NOT EXISTS idx_spira_session_events_session_seq ON spira_session_events (session_id, seq)",
+		insertNew:      "INSERT INTO spira_sessions (id, created_at, expires_at, version) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
+		claim:          "UPDATE spira_sessions SET version = $1, created_at = $2, expires_at = $3 WHERE id = $4 AND version = $5 AND expires_at = $6",
+		selectSession:  "SELECT id, created_at, expires_at, version FROM spira_sessions WHERE id = $1",
+		bump:           "UPDATE spira_sessions SET version = $1 WHERE id = $2 AND version = $3 AND expires_at >= $4",
+		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES ($1, $2, $3, $4, $5, $6)",
+		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = $1 ORDER BY seq",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = $1",
+		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = $1 AND event_type = $2 ORDER BY seq DESC LIMIT $3",
+		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = $1 AND seq > $2 ORDER BY seq",
+		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = $1",
+		retireSession:  "UPDATE spira_sessions SET expires_at = $1 WHERE id = $2",
+	}
+}
+func mysqlSessionStmts() sessionStmts {
+	return sessionStmts{
+		createSessions: "CREATE TABLE IF NOT EXISTS spira_sessions (id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
+		createEvents:   "CREATE TABLE IF NOT EXISTS spira_session_events (seq BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, session_id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL, at_nanos BIGINT NOT NULL, event_type VARCHAR(64) NOT NULL, msg_role VARCHAR(20) CHARACTER SET utf8mb4 NOT NULL DEFAULT '', parts LONGTEXT CHARACTER SET utf8mb4 NOT NULL, INDEX idx_spira_session_events_session_seq (session_id, seq), CONSTRAINT fk_spira_session_events_session FOREIGN KEY (session_id) REFERENCES spira_sessions (id) ON DELETE CASCADE)",
+		createIdx:      "",
+		insertNew:      "INSERT INTO spira_sessions (id, created_at, expires_at, version) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE id = id",
+		claim:          "UPDATE spira_sessions SET version = ?, created_at = ?, expires_at = ? WHERE id = ? AND version = ? AND expires_at = ?",
+		selectSession:  "SELECT id, created_at, expires_at, version FROM spira_sessions WHERE id = ?",
+		bump:           "UPDATE spira_sessions SET version = ? WHERE id = ? AND version = ? AND expires_at >= ?",
+		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)",
+		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? ORDER BY seq",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = ?",
+		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = ? AND event_type = ? ORDER BY seq DESC LIMIT ?",
+		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? AND seq > ? ORDER BY seq",
+		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = ?",
+		retireSession:  "UPDATE spira_sessions SET expires_at = ? WHERE id = ?",
+	}
+}
+func mssqlSessionStmts() sessionStmts {
+	return sessionStmts{
+		createSessions: "IF OBJECT_ID('spira_sessions', 'U') IS NULL CREATE TABLE spira_sessions (id VARBINARY(255) NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
+		createEvents:   "IF OBJECT_ID('spira_session_events', 'U') IS NULL CREATE TABLE spira_session_events (seq BIGINT IDENTITY(1, 1) NOT NULL PRIMARY KEY, id NVARCHAR(255) COLLATE Latin1_General_100_BIN2 NOT NULL, session_id VARBINARY(255) NOT NULL, at_nanos BIGINT NOT NULL, event_type NVARCHAR(64) NOT NULL, msg_role NVARCHAR(20) NOT NULL DEFAULT '', parts NVARCHAR(MAX) NOT NULL, INDEX idx_spira_session_events_session_seq (session_id, seq), CONSTRAINT fk_spira_session_events_session FOREIGN KEY (session_id) REFERENCES spira_sessions (id) ON DELETE CASCADE)",
+		binaryKeys:     true,
+		createIdx:      "",
+		insertNew:      "MERGE INTO spira_sessions WITH (HOLDLOCK) AS t USING (SELECT @p1 AS id, @p2 AS created_at, @p3 AS expires_at, @p4 AS version) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, created_at, expires_at, version) VALUES (s.id, s.created_at, s.expires_at, s.version);",
+		claim:          "UPDATE spira_sessions SET version = @p1, created_at = @p2, expires_at = @p3 WHERE id = @p4 AND version = @p5 AND expires_at = @p6",
+		selectSession:  "SELECT id, created_at, expires_at, version FROM spira_sessions WHERE id = @p1",
+		bump:           "UPDATE spira_sessions SET version = @p1 WHERE id = @p2 AND version = @p3 AND expires_at >= @p4",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = @p1",
+		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (@p1, @p2, @p3, @p4, @p5, @p6)",
+		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = @p1 ORDER BY seq",
+		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = @p1 AND event_type = @p2 ORDER BY seq DESC OFFSET 0 ROWS FETCH NEXT @p3 ROWS ONLY",
+		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = @p1 AND seq > @p2 ORDER BY seq",
+		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = @p1",
+		retireSession:  "UPDATE spira_sessions SET expires_at = @p1 WHERE id = @p2",
+	}
+}
+
+func stmtsFor(d db.Dialect) sessionStmts {
+	return switch d.(type) {
+	case db.SQLite => sqliteSessionStmts()
+	case db.Postgres => postgresSessionStmts()
+	case db.MySQL => mysqlSessionStmts()
+	case db.MSSQL => mssqlSessionStmts()
+	default => panicNilDialect[sessionStmts]()
+	}
+}
+
+func panicNilDialect[T any]() T {
+	panic("ai/session: nil dialect")
+}
+
+func (s *SQLStore) Prepare(ctx context.Context) error {
+	stmts := stmtsFor(s.Pool.Dialect())
+	if _, err := db.Exec(ctx, s.Pool, stmts.createSessions); err != nil {
+		return fmt.Errorf("ai/session: prepare sessions: %w", err)
+	}
+	if _, err := db.Exec(ctx, s.Pool, stmts.createEvents); err != nil {
+		return fmt.Errorf("ai/session: prepare events: %w", err)
+	}
+	if stmts.createIdx != "" {
+		if _, err := db.Exec(ctx, s.Pool, stmts.createIdx); err != nil {
+			return fmt.Errorf("ai/session: prepare events index: %w", err)
+		}
+	}
+	return nil
+}
+
+const maxEnsureAttempts = 8
+
+func lockConflict(err error) bool {
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "locked") || strings.Contains(text, "busy") || strings.Contains(text, "deadlock") || strings.Contains(text, "serialization")
+}
+
+type ensureResult struct {
+	sess  *Session?
+	retry bool
+}
+
+func (s *SQLStore) Ensure(id string) (*Session?, error) {
+	if err := checkSessionID(id); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqlOpTimeout)
+	defer cancel()
+	stmts := stmtsFor(s.Pool.Dialect())
+	at := s.now()
+	created := at.UnixNano()
+	expires := at.Add(s.ttl()).UnixNano()
+	attempts := 0
+	for {
+		res, err := db.InTx[ensureResult](ctx, s.Pool, func(tx *db.Tx) (ensureResult, error) {
+			w := sessionTx{ctx: ctx, tx: tx, stmts: stmts, id: id}
+			return w.claimGeneration(created, expires, at.UnixNano())
+		})
+		if err != nil && !lockConflict(err) {
+			return nil, fmt.Errorf("ai/session: ensure: %w", err)
+		}
+		if err == nil && !res.retry {
+			return res.sess, nil
+		}
+		attempts++
+		if attempts >= maxEnsureAttempts {
+			return nil, ErrContention.Err()
+		}
+	}
+}
+
+type sessionTx struct {
+	ctx   context.Context
+	tx    *db.Tx
+	stmts sessionStmts
+	id    string
+}
+
+func keyArg(stmts sessionStmts, id string) any {
+	if stmts.binaryKeys {
+		return []byte(id)
+	}
+	return id
+}
+
+func sessionOf(row sessionRow) *Session {
+	return &Session{ID: row.ID, CreatedAt: time.Unix(0, row.Created).UTC(), ExpiresAt: time.Unix(0, row.Expires).UTC()}
+}
+
+func (w sessionTx) claimGeneration(created int64, expires int64, now int64) (ensureResult, error) {
+	res, err := db.Exec(w.ctx, w.tx, w.stmts.insertNew, keyArg(w.stmts, w.id), created, expires, 1)
+	if err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: insert: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: insert: %w", err)
+	}
+	if n == 1 {
+		return ensureResult{sess: &Session{ID: w.id, CreatedAt: time.Unix(0, created).UTC(), ExpiresAt: time.Unix(0, expires).UTC()}}, nil
+	}
+	return w.existingSession(created, expires, now)
+}
+
+func (w sessionTx) existingSession(created int64, expires int64, now int64) (ensureResult, error) {
+	row, err := db.One[sessionRow](w.ctx, w.tx, w.stmts.selectSession, keyArg(w.stmts, w.id))
+	if err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: %w", err)
+	}
+	if row == nil {
+		return ensureResult{retry: true}, nil
+	}
+	live := row ?? sessionRow{}
+	if live.Expires >= now {
+		return ensureResult{sess: sessionOf(live)}, nil
+	}
+	return w.claimStale(created, expires, live)
+}
+
+func (w sessionTx) claimStale(created int64, expires int64, old sessionRow) (ensureResult, error) {
+	next := old.Version + 1
+	res, err := db.Exec(w.ctx, w.tx, w.stmts.claim, next, created, expires, keyArg(w.stmts, w.id), old.Version, old.Expires)
+	if err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: claim: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: claim: %w", err)
+	}
+	if n != 1 {
+		return ensureResult{retry: true}, nil
+	}
+	if _, err := db.Exec(w.ctx, w.tx, w.stmts.deleteEvents, keyArg(w.stmts, w.id)); err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: clear events: %w", err)
+	}
+	return ensureResult{sess: &Session{ID: w.id, CreatedAt: time.Unix(0, created).UTC(), ExpiresAt: time.Unix(0, expires).UTC()}}, nil
+}
+
+func (s *SQLStore) Find(id string) *Session? {
+	ctx, cancel := context.WithTimeout(context.Background(), sqlOpTimeout)
+	defer cancel()
+	if tooLongID(id) {
+		return nil
+	}
+	stmts := stmtsFor(s.Pool.Dialect())
+	row, err := db.One[sessionRow](ctx, s.Pool, stmts.selectSession, keyArg(stmts, id))
+	if err != nil {
+		return nil
+	}
+	if row == nil {
+		return nil
+	}
+	found := row ?? sessionRow{}
+	if found.Expires < s.now().UnixNano() {
+		return nil
+	}
+	return &Session{ID: found.ID, CreatedAt: time.Unix(0, found.Created).UTC(), ExpiresAt: time.Unix(0, found.Expires).UTC()}
+}
+
+func (s *SQLStore) Events(ctx context.Context, id string) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if tooLongID(id) {
+		return nil, nil
+	}
+	stmts := stmtsFor(s.Pool.Dialect())
+	live, err := s.liveSession(ctx, stmts, id, s.now().UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("ai/session: events: %w", err)
+	}
+	if live == nil {
+		return nil, nil
+	}
+	rows, err := db.Query[eventRow](ctx, s.Pool, stmts.selectEvents, keyArg(stmts, id))
+	if err != nil {
+		return nil, fmt.Errorf("ai/session: events: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return decodeEvents(rows)
+}
+
+func (s *SQLStore) liveSession(ctx context.Context, stmts sessionStmts, id string, now int64) (sessionRow?, error) {
+	row, err := db.One[sessionRow](ctx, s.Pool, stmts.selectSession, keyArg(stmts, id))
+	if err != nil {
+		return nil, err
+	}
+	if row == nil {
+		return nil, nil
+	}
+	found := row ?? sessionRow{}
+	if found.Expires < now {
+		return nil, nil
+	}
+	return found, nil
+}
+
+func decodeEvents(rows []eventRow) ([]Event, error) {
+	out := make([]Event, 0, len(rows))
+	for _, r := range rows {
+		e, err := decodeEvent(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func decodeEvent(r eventRow) (Event, error) {
+	message, err := decodeMessage(r.Role, r.Parts)
+	if err != nil {
+		return Event{}, err
+	}
+	return Event{ID: r.ID, Session: r.SessionID, At: time.Unix(0, r.AtNanos).UTC(), Type: EventType(r.EventType), Message: message}, nil
+}
+
+func (s *SQLStore) Active(ctx context.Context, id string) ([]ai.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if tooLongID(id) {
+		return nil, nil
+	}
+	stmts := stmtsFor(s.Pool.Dialect())
+	live, err := s.liveSession(ctx, stmts, id, s.now().UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("ai/session: active: %w", err)
+	}
+	if live == nil {
+		return nil, nil
+	}
+	bound, err := db.One[boundaryRow](ctx, s.Pool, stmts.newestBoundary, keyArg(stmts, id), string(EventCompaction), 1)
+	if err != nil {
+		return nil, fmt.Errorf("ai/session: active: %w", err)
+	}
+	var after int64
+	if bound != nil {
+		after = (bound ?? boundaryRow{}).Seq
+	}
+	rows, err := db.Query[eventRow](ctx, s.Pool, stmts.selectAfter, keyArg(stmts, id), after)
+	if err != nil {
+		return nil, fmt.Errorf("ai/session: active: %w", err)
+	}
+	return activeRows(rows)
+}
+
+func activeRows(rows []eventRow) ([]ai.Message, error) {
+	var out []ai.Message
+	for _, r := range rows {
+		if r.EventType != string(EventMessage) {
+			continue
+		}
+		message, err := decodeMessage(r.Role, r.Parts)
+		if err != nil {
+			return nil, err
+		}
+		if message != nil {
+			out = append(out, message)
+		}
+	}
+	return out, nil
+}
+
+func (s *SQLStore) LastN(ctx context.Context, id string, n int) ([]Event, error) {
+	if n <= 0 {
+		return nil, ErrInvalidCount.Err()
+	}
+	events, err := s.Events(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return window(events, n), nil
+}
+
+func (s *SQLStore) Append(ctx context.Context, id string, version int64, events ...Event) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if tooLongID(id) {
+		return false, overlongIDError(id, "session id")
+	}
+	if len(events) == 0 {
+		return false, ErrEmptyBatch.Err()
+	}
+	if err := checkEventIDs(events); err != nil {
+		return false, err
+	}
+	for _, e := range events {
+		if m := e.Message; m != nil && m.Role == ai.RoleSystem {
+			return false, ErrSystemMessage.Err()
+		}
+		if e.Session != id {
+			return false, ErrForeignEvent.Wrap(fmt.Errorf("event belongs to session %q, not %q", e.Session, id))
+		}
+	}
+	stmts := stmtsFor(s.Pool.Dialect())
+	batch, err := encodeEvents(id, events)
+	if err != nil {
+		return false, err
+	}
+	now := s.now().UnixNano()
+	return db.InTx[bool](ctx, s.Pool, func(tx *db.Tx) (bool, error) {
+		w := sessionTx{ctx: ctx, tx: tx, stmts: stmts, id: id}
+		return w.appendBatch(version, now, batch)
+	})
+}
+
+func (w sessionTx) appendBatch(version int64, now int64, batch []storedRow) (bool, error) {
+	claimed, err := w.claimVersion(version, now)
+	if err != nil {
+		return false, err
+	}
+	if !claimed {
+		return false, nil
+	}
+	for _, r := range batch {
+		if _, err := db.Exec(w.ctx, w.tx, w.stmts.insert, r.id, keyArg(w.stmts, r.session), r.at, r.eventType, r.role, r.parts); err != nil {
+			return false, fmt.Errorf("ai/session: append: insert: %w", err)
+		}
+	}
+	return true, nil
+}
+
+func (w sessionTx) claimVersion(version int64, now int64) (bool, error) {
+	res, err := db.Exec(w.ctx, w.tx, w.stmts.bump, version+1, keyArg(w.stmts, w.id), version, now)
+	if err != nil {
+		return false, fmt.Errorf("ai/session: append: claim: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("ai/session: append: claim: %w", err)
+	}
+	return n == 1, nil
+}
+
+func (s *SQLStore) Version(ctx context.Context, id string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if tooLongID(id) {
+		return 0, nil
+	}
+	stmts := stmtsFor(s.Pool.Dialect())
+	row, err := db.One[sessionRow](ctx, s.Pool, stmts.selectSession, keyArg(stmts, id))
+	if err != nil {
+		return 0, fmt.Errorf("ai/session: version: %w", err)
+	}
+	if row == nil {
+		return 0, nil
+	}
+	found := row ?? sessionRow{}
+	if found.Expires < s.now().UnixNano() {
+		return 0, nil
+	}
+	return found.Version, nil
+}
+
+func (s *SQLStore) Compact(ctx context.Context, id string, version int64, boundary Boundary) (bool, error) {
+	events, err := s.Events(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if len(activeMessages(events)) == 0 {
+		return false, nil
+	}
+	at := s.now()
+	batch := make([]Event, 0, 1+len(boundary.Summary))
+	batch = append(batch, Event{ID: newID(), Session: id, At: at, Type: EventCompaction})
+	for _, m := range boundary.Summary {
+		batch = append(batch, Event{ID: newID(), Session: id, At: at, Type: EventMessage, Message: m})
+	}
+	return s.Append(ctx, id, version, batch...)
+}
+
+func (s *SQLStore) Delete(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if tooLongID(id) {
+		return nil
+	}
+	stmts := stmtsFor(s.Pool.Dialect())
+	_, err := db.InTx[int](ctx, s.Pool, func(tx *db.Tx) (int, error) {
+		if _, err := db.Exec(ctx, tx, stmts.retireSession, 0, keyArg(stmts, id)); err != nil {
+			return 0, fmt.Errorf("ai/session: delete: retire session: %w", err)
+		}
+		if _, err := db.Exec(ctx, tx, stmts.deleteEvents, keyArg(stmts, id)); err != nil {
+			return 0, fmt.Errorf("ai/session: delete: clear events: %w", err)
+		}
+		return 0, nil
+	})
+	return err
+}
+
+func encodeEvents(id string, events []Event) ([]storedRow, error) {
+	batch := make([]storedRow, 0, len(events))
+	for _, e := range events {
+		r, err := encodeEvent(id, e)
+		if err != nil {
+			return nil, err
+		}
+		batch = append(batch, r)
+	}
+	return batch, nil
+}
+
+func encodeEvent(id string, e Event) (storedRow, error) {
+	var role string
+	parts := "[]"
+	if m := e.Message; m != nil {
+		role = string(m.Role)
+		raw, err := encodeMessage(m)
+		if err != nil {
+			return storedRow{}, err
+		}
+		parts = raw
+	}
+	return storedRow{id: e.ID, session: id, at: e.At.UnixNano(), eventType: string(e.Type), role: role, parts: parts}, nil
+}
+
+func encodeMessage(m ai.Message) (string, error) {
+	var parts []storedPart
+	if m.Parts != nil {
+		parts = make([]storedPart, 0, len(m.Parts))
+		for _, p := range m.Parts {
+			part, err := encodePart(p)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, part)
+		}
+	}
+	raw, err := json.Marshal(storedMessage{Role: string(m.Role), Parts: parts})
+	if err != nil {
+		return "", ErrStoredMessage.Wrap(err)
+	}
+	return string(raw), nil
+}
+
+func encodePart(p ai.Part) (storedPart, error) {
+	switch v := p.(type) {
+	case ai.Text:
+		return storedPart{Kind: "text", Text: v.Text}, nil
+	case ai.Reasoning:
+		return storedPart{Kind: "reasoning", Text: v.Text}, nil
+	case ai.ToolCall:
+		return storedPart{Kind: "call", ID: v.ID, Name: v.Name, Arguments: v.Arguments}, nil
+	case ai.ToolResult:
+		return storedPart{Kind: "result", ID: v.ID, Name: v.Name, Content: v.Content, Skipped: v.Skipped}, nil
+	}
+	return storedPart{}, ErrStoredMessage.Err()
+}
+
+func decodeMessage(role string, raw string) (ai.Message?, error) {
+	if role == "" {
+		return nil, nil
+	}
+	var stored storedMessage
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		return nil, ErrStoredMessage.Wrap(err)
+	}
+	var parts []ai.Part
+	if stored.Parts != nil {
+		parts = make([]ai.Part, 0, len(stored.Parts))
+		for _, p := range stored.Parts {
+			part, err := decodePart(p)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, part)
+		}
+	}
+	return ai.Message{Role: ai.Role(role), Parts: parts}, nil
+}
+
+func decodePart(p storedPart) (ai.Part, error) {
+	switch p.Kind {
+	case "text":
+		return ai.Text{Text: p.Text}, nil
+	case "reasoning":
+		return ai.Reasoning{Text: p.Text}, nil
+	case "call":
+		return ai.ToolCall{ID: p.ID, Name: p.Name, Arguments: p.Arguments}, nil
+	case "result":
+		return ai.ToolResult{ID: p.ID, Name: p.Name, Content: p.Content, Skipped: p.Skipped}, nil
+	}
+	return nil, ErrStoredMessage.Wrap(fmt.Errorf("unknown part %q", p.Kind))
+}

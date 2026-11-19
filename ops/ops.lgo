@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"slices"
 	"time"
 
+	"github.com/gosuda/spira/fault"
 	"github.com/gosuda/spira/meter"
 	"github.com/gosuda/spira/web"
 )
@@ -64,8 +66,14 @@ func checksResponse(ctx *web.Context, o Options) web.Reply {
 func runCheck(parent context.Context, name string, check func(ctx context.Context) error, timeout time.Duration) checkStatus {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	if err := guardedCheck(ctx, check); err != nil {
-		return checkStatus{Name: name, Status: "fail", Error: err.Error()}
+	err := guardedCheck(ctx, check)
+	if err == nil && ctx.Err() != nil {
+		err = fmt.Errorf("ops: check outlived its context: %w", ctx.Err())
+	}
+	if err != nil {
+		wrapped := ErrCheckFailed.Wrap(err)
+		slog.Error("ops: check failed", "check", name, "error", wrapped)
+		return checkStatus{Name: name, Status: "fail", Error: fault.Public(wrapped).Message}
 	}
 	return checkStatus{Name: name, Status: "ok"}
 }
@@ -101,11 +109,16 @@ func metricsResponse(ctx *web.Context, reg *meter.Registry) web.Reply {
 
 func routesResponse(r *web.Router) web.Reply {
 	src := r.Routes()
-	out := make([]web.RouteInfo, 0, len(src))
-	for _, route := range src {
-		out = append(out, route)
+	out := make([]routeEntry, 0, len(src))
+	for i := range src {
+		out = append(out, routeEntry{Method: src[i].Method, Pattern: src[i].Pattern})
 	}
 	return web.Data{Value: out}
+}
+
+type routeEntry struct {
+	Method  string `json:"Method"`
+	Pattern string `json:"Pattern"`
 }
 
 type statusReport struct {

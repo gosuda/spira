@@ -1,0 +1,134 @@
+package websocket_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/websocket"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/websocket.md", websocket.Faults())
+}
+
+func TestFaultHandshakeFailedInvalidMethod(t *testing.T) {
+	srv, out := serveUpgradeCase(t, websocket.Config{})
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, r := dialRaw(t, addr)
+	req := "POST /chat HTTP/1.1\r\nHost: " + addr + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write handshake: %v", err)
+		return
+	}
+	code, _ := readResponse(t, r)
+	if code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", code)
+		return
+	}
+	u, ok := awaitUpgrade(t, out)
+	if !ok {
+		return
+	}
+	if !errors.Is(u.err, websocket.ErrHandshakeFailed) {
+		t.Fatalf("Upgrade error = %v, want ErrHandshakeFailed", u.err)
+		return
+	}
+	found := fault.Of(u.err)
+	if found == nil {
+		t.Fatalf("Upgrade error holds no fault")
+		return
+	}
+	if got := string(found.Code); got != "websocket.handshake_failed" {
+		t.Fatalf("fault code = %q, want websocket.handshake_failed", got)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("peer close: %v", err)
+		return
+	}
+}
+func TestFaultForbiddenOriginRejected(t *testing.T) {
+	srv, out := serveUpgradeCase(t, websocket.Config{})
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, r := dialRaw(t, addr)
+	sendHandshake(t, conn, addr, "Origin: https://evil.example\r\nX-Api-Key: sk-secret-abc123\r\n")
+	code, _ := readResponse(t, r)
+	if code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", code)
+		return
+	}
+	u, ok := awaitUpgrade(t, out)
+	if !ok {
+		return
+	}
+	if !errors.Is(u.err, websocket.ErrForbiddenOrigin) {
+		t.Fatalf("Upgrade error = %v, want ErrForbiddenOrigin", u.err)
+		return
+	}
+	raw := faulttest.PublicJSON(t, u.err)
+	faulttest.RefuseLeak(t, raw, "sk-secret-abc123", "evil.example", "<script>", "'; DROP TABLE x; --")
+	if got := string(fault.Public(u.err).Code); got != "websocket.forbidden_origin" {
+		t.Fatalf("public code = %q, want websocket.forbidden_origin", got)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("peer close: %v", err)
+		return
+	}
+}
+
+func TestFaultPublicHidesFrameBytes(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	payload := []byte("<script>alert(1)</script> Bearer sk-secret-xyz '; DROP TABLE x; --")
+	if err := writeClientBytes(peer, 0xc1, payload); err != nil {
+		t.Fatalf("write hostile frame: %v", err)
+		return
+	}
+	_, _, err := c.Next(ctx)
+	if err == nil {
+		t.Fatalf("Next over reserved bits: want error, got nil")
+		return
+	}
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("Next error = %v, want ErrProtocolError", err)
+		return
+	}
+	raw := faulttest.PublicJSON(t, err)
+	faulttest.RefuseLeak(t, raw, "<script>", "sk-secret-xyz", "DROP TABLE")
+	if cerr := expectCloseCode(peer, 1002, ""); cerr != nil {
+		t.Fatalf("peer close: %v", cerr)
+		return
+	}
+	closePipe(t, c, peer)
+}
+
+func TestFaultClosedAfterClose(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+		return
+	}
+	_, _, err := c.Next(t.Context())
+	if !errors.Is(err, websocket.ErrClosed) {
+		t.Fatalf("Next after close = %v, want ErrClosed", err)
+		return
+	}
+	view := fault.Public(err)
+	if got := string(view.Code); got != "websocket.closed" {
+		t.Fatalf("public code = %q, want websocket.closed", got)
+		return
+	}
+	if view.Message != "The connection is closed." {
+		t.Fatalf("public message = %q, want the constant text", view.Message)
+		return
+	}
+	closePipe(t, c, peer)
+}

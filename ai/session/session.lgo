@@ -1,0 +1,580 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-session/src/main/java/org/springframework/ai/session/Session.java,
+// SessionEvent.java, DefaultSessionService.java, InMemorySessionRepository.java,
+// EventFilter.java, EventType.java, MessageFilter.java and
+// compaction/CompactionBoundary.java, and
+// advisors/spring-ai-session-advisor/src/main/java/org/springframework/ai/session/advisor/PromptHistory.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package session
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type EventType string
+
+const (
+	EventMessage    EventType = "MESSAGE"
+	EventCompaction EventType = "COMPACTION"
+)
+
+type Event struct {
+	ID      string
+	Session string
+	At      time.Time
+	Type    EventType
+	Message ai.Message?
+}
+
+type Session struct {
+	ID        string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+type Boundary struct {
+	Summary []ai.Message
+}
+
+type Service struct {
+	TTL time.Duration
+	Now (func() time.Time)?
+
+	store sync.Locked[memory]
+}
+
+type memory struct {
+	logs    map[string]*sessionLog
+	sweepAt time.Time
+	next    int64
+}
+
+type sessionLog struct {
+	head    Session
+	events  []Event
+	version int64
+}
+
+func (s *Service) now() time.Time {
+	return (s.Now ?? time.Now)()
+}
+
+func (s *Service) ttl() time.Duration {
+	if s.TTL <= 0 {
+		return 24 * time.Hour
+	}
+	return s.TTL
+}
+
+func (m *memory) live(id string, now time.Time) *sessionLog? {
+	if log := m.logs[id]; log != nil {
+		if !log.head.ExpiresAt.Before(now) {
+			return log
+		}
+	}
+	return nil
+}
+
+func (m *memory) open(id string, now time.Time, ttl time.Duration) Session {
+	if m.logs == nil {
+		m.logs = map[string]*sessionLog{}
+	}
+	if !now.Before(m.sweepAt) {
+		for stored, log := range m.logs {
+			if log.head.ExpiresAt.Before(now) {
+				delete(m.logs, stored)
+			}
+		}
+		m.sweepAt = now.Add(ttl)
+	}
+	head := Session{ID: id, CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	m.logs[id] = &sessionLog{head: head, version: m.next}
+	m.next++
+	return head
+}
+
+func (s *Service) Find(id string) *Session? {
+	if tooLongID(id) {
+		return nil
+	}
+	var found *Session?
+	s.store.WithLock(func(m *memory) {
+		if log := m.live(id, s.now()); log != nil {
+			head := log.head
+			found = &head
+		}
+	})
+	return found
+
+}
+func checkSessionID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return ErrBlankID.Err()
+	}
+	if tooLongID(id) {
+		return overlongIDError(id, "session id")
+	}
+	return nil
+}
+
+const maxSessionIDBytes = 255
+
+func tooLongID(id string) bool {
+	return len(id) > maxSessionIDBytes
+}
+
+func overlongIDError(id string, noun string) error {
+	return ErrIDTooLarge.Wrap(fmt.Errorf("%s is %d bytes, the limit is %d", noun, len(id), maxSessionIDBytes))
+}
+
+func checkEventIDs(events []Event) error {
+	for _, e := range events {
+		if tooLongID(e.ID) {
+			return overlongIDError(e.ID, "event id")
+		}
+	}
+	return nil
+}
+
+func (s *Service) Ensure(id string) (*Session?, error) {
+	if err := checkSessionID(id); err != nil {
+		return nil, err
+	}
+	now := s.now()
+	var head Session
+	s.store.WithLock(func(m *memory) {
+		if log := m.live(id, now); log != nil {
+			head = log.head
+			return
+		}
+		head = m.open(id, now, s.ttl())
+	})
+	return &head, nil
+}
+
+func (s *Service) Events(ctx context.Context, id string) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if tooLongID(id) {
+		return nil, nil
+	}
+	var out []Event
+	s.store.WithLock(func(m *memory) {
+		if log := m.live(id, s.now()); log != nil {
+			out = make([]Event, len(log.events))
+			for i, e := range log.events {
+				out[i] = copyEvent(e)
+			}
+		}
+	})
+	return out, nil
+}
+
+func (s *Service) Active(ctx context.Context, id string) ([]ai.Message, error) {
+	events, err := s.Events(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return activeMessages(events), nil
+}
+
+func (s *Service) LastN(ctx context.Context, id string, n int) ([]Event, error) {
+	if n <= 0 {
+		return nil, ErrInvalidCount.Err()
+	}
+	events, err := s.Events(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return window(events, n), nil
+}
+
+func (s *Service) Append(ctx context.Context, id string, version int64, events ...Event) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if tooLongID(id) {
+		return false, overlongIDError(id, "session id")
+	}
+	if len(events) == 0 {
+		return false, ErrEmptyBatch.Err()
+	}
+	if err := checkEventIDs(events); err != nil {
+		return false, err
+	}
+	for _, e := range events {
+		if m := e.Message; m != nil && m.Role == ai.RoleSystem {
+			return false, ErrSystemMessage.Err()
+		}
+		if e.Session != id {
+			return false, ErrForeignEvent.Wrap(fmt.Errorf("event belongs to session %q, not %q", e.Session, id))
+		}
+	}
+	now := s.now()
+	ok := false
+	stored := make([]Event, len(events))
+	for i, e := range events {
+		stored[i] = copyEvent(e)
+	}
+	s.store.WithLock(func(m *memory) {
+		log := m.live(id, now)
+		if log == nil {
+			return
+		}
+		if log.version != version {
+			return
+		}
+		log.events = append(log.events, stored...)
+		log.version = m.next
+		m.next++
+		ok = true
+	})
+	return ok, nil
+}
+
+func (s *Service) Version(ctx context.Context, id string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if tooLongID(id) {
+		return 0, nil
+	}
+	var v int64
+	s.store.WithLock(func(m *memory) {
+		if log := m.live(id, s.now()); log != nil {
+			v = log.version
+		}
+	})
+	return v, nil
+}
+
+func (s *Service) Compact(ctx context.Context, id string, version int64, boundary Boundary) (bool, error) {
+	events, err := s.Events(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if len(activeMessages(events)) == 0 {
+		return false, nil
+	}
+	now := s.now()
+	batch := make([]Event, 0, 1+len(boundary.Summary))
+	batch = append(batch, Event{ID: newID(), Session: id, At: now, Type: EventCompaction})
+	for _, m := range boundary.Summary {
+		batch = append(batch, Event{ID: newID(), Session: id, At: now, Type: EventMessage, Message: m})
+	}
+	return s.Append(ctx, id, version, batch...)
+}
+
+func newID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("ai/session: event id entropy: %v", err))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func copyEvent(e Event) Event {
+	if m := e.Message; m != nil {
+		parts := slices.Clone(m.Parts)
+		msg := m
+		msg.Parts = parts
+		e.Message = msg
+	}
+	return e
+}
+
+func activeMessages(log []Event) []ai.Message {
+	boundary := -1
+	for i := len(log) - 1; i >= 0; i-- {
+		if log[i].Type == EventCompaction {
+			boundary = i
+			break
+		}
+	}
+	from := 0
+	if boundary >= 0 {
+		from = boundary + 1
+	}
+	var out []ai.Message
+	for _, e := range log[from:] {
+		if e.Type == EventMessage {
+			if m := e.Message; m != nil {
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
+func window(events []Event, n int) []Event {
+	if len(events) <= n {
+		return slices.Clone(events)
+	}
+	from := len(events) - n
+	turnStart := -1
+	for i := from; i >= 0; i-- {
+		if isTurnStart(events[i]) {
+			turnStart = i
+			break
+		}
+	}
+	if turnStart >= 0 {
+		from = turnStart
+	}
+	return slices.Clone(events[from:])
+}
+
+func isTurnStart(e Event) bool {
+	m := e.Message ?? ai.Message{}
+	return m.Role == ai.RoleUser
+}
+
+func History(stored []ai.Message, request []ai.Message) []ai.Message {
+	var system, conversation []ai.Message
+	for _, m := range stored {
+		if m.Role == ai.RoleSystem {
+			system = append(system, m)
+		} else {
+			conversation = append(conversation, m)
+		}
+	}
+	var requestConversation []ai.Message
+	for _, m := range request {
+		if m.Role != ai.RoleSystem {
+			requestConversation = append(requestConversation, m)
+		}
+	}
+	overlapCount := overlap(conversation, requestConversation)
+	missing := conversation[:len(conversation)-overlapCount]
+	prompt := make([]ai.Message, 0, len(system)+len(missing)+len(request))
+	prompt = append(prompt, system...)
+	prompt = append(prompt, dropOrphans(missing, requestConversation)...)
+	prompt = append(prompt, request...)
+	seen := map[string]bool{}
+	var systems []ai.Message
+	var rest []ai.Message
+	for _, m := range prompt {
+		if m.Role == ai.RoleSystem {
+			text := textOf(m)
+			if strings.TrimSpace(text) != "" && !(seen[text] ?? false) {
+				seen[text] = true
+				systems = append(systems, m)
+			}
+			continue
+		}
+		rest = append(rest, m)
+	}
+	return append(systems, rest...)
+}
+
+func textOf(m ai.Message) string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if t, ok := p.(ai.Text); ok {
+			b.WriteString(t.Text)
+		}
+	}
+	return b.String()
+}
+
+func overlap(history []ai.Message, request []ai.Message) int {
+	if len(request) < 2 {
+		return 0
+	}
+	for k := min(len(history), len(request)); k > 0; k-- {
+		offset := len(history) - k
+		i := 0
+		for i < k && sameContent(history[offset+i], request[i]) {
+			i++
+		}
+		if i == k {
+			return k
+		}
+	}
+	return 0
+}
+
+func sameContent(a ai.Message, b ai.Message) bool {
+	if a.Role != b.Role || textOf(a) != textOf(b) {
+		return false
+	}
+	if callsOf(a) != callsOf(b) {
+		return false
+	}
+	return resultsOf(a) == resultsOf(b)
+}
+
+func callsOf(m ai.Message) string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if c, ok := p.(ai.ToolCall); ok {
+			b.WriteString(c.ID)
+			b.WriteByte(0)
+			b.WriteString(c.Name)
+			b.WriteByte(0)
+			b.WriteString(c.Arguments)
+			b.WriteByte(1)
+		}
+	}
+	return b.String()
+}
+
+func resultsOf(m ai.Message) string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if r, ok := p.(ai.ToolResult); ok {
+			b.WriteString(r.ID)
+			b.WriteByte(0)
+			b.WriteString(r.Name)
+			b.WriteByte(0)
+			b.WriteString(r.Content)
+			b.WriteByte(1)
+		}
+	}
+	return b.String()
+}
+
+func dropOrphans(history []ai.Message, following []ai.Message) []ai.Message {
+	if !hasAnyTool(history) {
+		return history
+	}
+	all := append(append([]ai.Message(nil), history...), following...)
+	keep := make([]bool, len(history))
+	for i := range keep {
+		keep[i] = true
+	}
+	markOrphans(history, all, keep)
+	var out []ai.Message
+	for i, m := range history {
+		if !keep[i] {
+			continue
+		}
+		if m.Role == ai.RoleTool {
+			if kept := filterOrphanResults(history, keep, i, m); len(kept.Parts) > 0 {
+				out = append(out, kept)
+			}
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func filterOrphanResults(history []ai.Message, keep []bool, i int, m ai.Message) ai.Message {
+	ids := keptCallIDs(history, keep, i)
+	out := m
+	out.Parts = slices.Clone(m.Parts)
+	out.Parts = slices.DeleteFunc(out.Parts, func(p ai.Part) bool {
+		r, ok := p.(ai.ToolResult)
+		return ok && !(ids[r.ID] ?? false)
+	})
+	return out
+}
+
+func keptCallIDs(history []ai.Message, keep []bool, i int) map[string]bool {
+	out := map[string]bool{}
+	for j := 0; j < i; j++ {
+		if !keep[j] || !hasCalls(history[j]) {
+			continue
+		}
+		for id := range callIDs(history[j]) {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func hasAnyTool(history []ai.Message) bool {
+	for _, m := range history {
+		if m.Role == ai.RoleTool || hasCalls(m) {
+			return true
+		}
+	}
+	return false
+}
+
+func markOrphans(history []ai.Message, all []ai.Message, keep []bool) {
+	for i, m := range history {
+		if hasCalls(m) {
+			keep[i] = answersAllCalls(all, i, m)
+		} else if m.Role == ai.RoleTool {
+			keep[i] = answersKnownCall(history, keep, i, m)
+		}
+	}
+}
+
+func answersAllCalls(all []ai.Message, i int, m ai.Message) bool {
+	unanswered := callIDs(m)
+	for j := i + 1; j < len(all) && len(unanswered) > 0; j++ {
+		if all[j].Role != ai.RoleTool {
+			continue
+		}
+		for _, id := range resultIDs(all[j]) {
+			delete(unanswered, id)
+		}
+	}
+	return len(unanswered) == 0
+}
+
+func answersKnownCall(history []ai.Message, keep []bool, i int, m ai.Message) bool {
+	ids := keptCallIDs(history, keep, i)
+	for _, p := range m.Parts {
+		if r, ok := p.(ai.ToolResult); ok {
+			if ids[r.ID] ?? false {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasCalls(m ai.Message) bool {
+	for _, p := range m.Parts {
+		if _, ok := p.(ai.ToolCall); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func callIDs(m ai.Message) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range m.Parts {
+		if c, ok := p.(ai.ToolCall); ok {
+			out[c.ID] = true
+		}
+	}
+	return out
+}
+
+func resultIDs(m ai.Message) []string {
+	var out []string
+	for _, p := range m.Parts {
+		if r, ok := p.(ai.ToolResult); ok {
+			out = append(out, r.ID)
+		}
+	}
+	return out
+}
+
+func LastUserOrTool(messages []ai.Message) ai.Message? {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == ai.RoleUser || messages[i].Role == ai.RoleTool {
+			return messages[i]
+		}
+	}
+	return nil
+}

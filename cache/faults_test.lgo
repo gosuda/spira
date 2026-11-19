@@ -1,0 +1,84 @@
+package cache_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/cache"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/cache.md", cache.Faults())
+}
+
+func TestLoadFailedThroughPanickingLoad(t *testing.T) {
+	planted := []string{"hunter2", "<script>alert(1)</script>", "'; DROP TABLE x; --", "/etc/passwd"}
+	c := cache.NewMemory[string, int](4, time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	load := func(lctx context.Context) (int, error) {
+		close(entered)
+		<-release
+		panic("cache test: load exploded password=hunter2 <script>alert(1)</script> '; DROP TABLE x; --' /etc/passwd")
+	}
+	leaderErrs := make([]error, 1)
+	waiterErrs := make([]error, 1)
+	var panicked atomic.Int64
+	saw := make(chan string, 1)
+	run := func() error {
+		go group (ctx) {
+			go {
+				defer recordPanic(saw, &panicked)
+				_, leaderErrs[0] = cache.Load(ctx, c, "k", load)
+			}
+			go {
+				<-entered
+				_, waiterErrs[0] = cache.Load(ctx, c, "k", load)
+			}
+			go {
+				<-entered
+				releaseWhenJoined(c, 1, release)?
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	if panicked.Load() != 1 {
+		t.Fatalf("panicking leaders = %d, want exactly 1", panicked.Load())
+	}
+	if leaderErrs[0] != nil {
+		t.Fatalf("leader error = %v, want the panic re-raised, not returned", leaderErrs[0])
+	}
+	if !errors.Is(waiterErrs[0], cache.ErrLoadFailed) {
+		t.Fatalf("waiter error = %v, want cache.load_failed", waiterErrs[0])
+	}
+	if got := waiterErrs[0].Error(); !strings.HasPrefix(got, "cache.load_failed: The cache load failed.") {
+		t.Fatalf("waiter error text = %q, want the load-failed form", got)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, waiterErrs[0]), planted...)
+}
+
+func TestLoadErrorPassesThroughUnchanged(t *testing.T) {
+	c := cache.NewMemory[string, int](4, time.Minute)
+	boom := errors.New("boom password=hunter2")
+	_, err := cache.Load(t.Context(), c, "k", func(ctx context.Context) (int, error) {
+		return 0, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("Load error = %v, want the loader error itself", err)
+	}
+	if fault.Of(err) != nil {
+		t.Fatalf("Load error %v carries a fault, want none", err)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "hunter2")
+}

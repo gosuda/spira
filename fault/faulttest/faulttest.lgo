@@ -1,0 +1,145 @@
+package faulttest
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/fault"
+)
+
+type failer interface {
+	Helper()
+	Fatalf(format string, args ...any)
+}
+
+func CheckTable(t *testing.T, specPath string, faults []*fault.Error) {
+	t.Helper()
+	checkTable(t, specPath, faults)
+}
+
+func checkTable(f failer, specPath string, faults []*fault.Error) {
+	f.Helper()
+	table, ok := readTable(f, specPath)
+	if !ok {
+		return
+	}
+	seen := map[string]bool{}
+	for _, e := range faults {
+		code := string(e.Code)
+		if seen[code] ?? false {
+			f.Fatalf("duplicate fault code %q", code)
+			return
+		}
+		seen[code] = true
+		checkOne(f, table, e)
+	}
+	for _, r := range table {
+		if !(seen[r[0]] ?? false) {
+			f.Fatalf("spec table code %q has no declared fault", r[0])
+			return
+		}
+	}
+}
+
+func checkOne(f failer, table [][3]string, e *fault.Error) {
+	f.Helper()
+	code := string(e.Code)
+	i := findRowIndex(table, code)
+	if i < 0 {
+		f.Fatalf("fault code %q missing from the spec code table", code)
+		return
+	}
+	if table[i][1] != e.Kind.String() {
+		f.Fatalf("fault %q kind = %q, want table kind %q", code, e.Kind.String(), table[i][1])
+		return
+	}
+	if table[i][2] != e.Message {
+		f.Fatalf("fault %q message = %q, want table message %q", code, e.Message, table[i][2])
+		return
+	}
+}
+
+func findRowIndex(table [][3]string, code string) int {
+	for i, r := range table {
+		if r[0] == code {
+			return i
+		}
+	}
+	return -1
+}
+
+func readTable(f failer, specPath string) ([][3]string, bool) {
+	f.Helper()
+	raw, err := os.ReadFile(specPath)
+	if err != nil {
+		f.Fatalf("read spec table: %v", err)
+		return nil, false
+	}
+	var table [][3]string
+	seenCodes := map[string]bool{}
+	inTable := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "### Code table") {
+			inTable = true
+			continue
+		}
+		if !inTable {
+			continue
+		}
+		if strings.HasPrefix(line, "## ") {
+			break
+		}
+		row, ok := parseRow(line)
+		if !ok {
+			continue
+		}
+		if seenCodes[row[0]] ?? false {
+			f.Fatalf("duplicate fault code %q in the spec table", row[0])
+			return nil, false
+		}
+		seenCodes[row[0]] = true
+		table = append(table, row)
+	}
+	return table, true
+}
+
+func parseRow(line string) ([3]string, bool) {
+	var row [3]string
+	if !strings.HasPrefix(line, "|") {
+		return row, false
+	}
+	cells := strings.Split(line, "|")
+	if len(cells) < 5 {
+		return row, false
+	}
+	code := strings.Trim(strings.TrimSpace(cells[1]), "`")
+	if code == "" || code == "Code" || code == "code" || strings.Trim(code, "-") == "" {
+		return row, false
+	}
+	row[0] = code
+	row[1] = strings.TrimSpace(cells[2])
+	row[2] = strings.Trim(strings.TrimSpace(cells[3]), "\"")
+	return row, true
+}
+
+func PublicJSON(t *testing.T, err error) []byte {
+	t.Helper()
+	bs, merr := json.Marshal(fault.Public(err))
+	if merr != nil {
+		t.Fatalf("marshal public view: %v", merr)
+		return nil
+	}
+	return bs
+}
+
+func RefuseLeak(t *testing.T, public []byte, planted ...string) {
+	t.Helper()
+	for _, v := range planted {
+		if strings.Contains(string(public), v) {
+			t.Fatalf("client-visible output holds %q: %s", v, public)
+			return
+		}
+	}
+}

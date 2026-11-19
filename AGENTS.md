@@ -7,12 +7,12 @@ spira is a behavioral rewrite of the Spring ecosystem in LoGOs (`.lgo` files). I
 - This module holds only `.lgo` packages. Tests are `_test.lgo` files in an external test package (`package x_test`; `package main_test` for a command, which imports its own `main` package). The one in-package file a package may add is `export_test.lgo`: it holds no test and only exposes internal state that an external test must observe. [David Parnas]
 - Build with `logos`. Plain `go` ignores `.lgo` files. [John Carmack]
 - `logos.toml` sits next to `go.mod`. Unknown tables or keys are errors. Add a `[capabilities]` allowlist entry only when `logos build` reports a capability diagnostic, and name the exact module path it reports. [Tony Hoare]
-- Strictly no cgo (human-supplied). `logos.toml` keeps `[build] cgo = "forbid"`; never change it, never set `CGO_ENABLED=1`, and never add a dependency that needs cgo. The race detector needs cgo, so the gate runs tests without `-race`. [Tony Hoare]
+- Strictly no cgo (human-supplied). `logos.toml` keeps `[build] cgo = "forbid"`; never change it, never set `CGO_ENABLED=1`, and never add a dependency that needs cgo. The gate runs the tests with `-race`: under this policy the toolchain links only the race runtime through `runtime/cgo`, and a package with `import "C"` still fails. `-race` needs a C compiler or `zig` in `PATH`. [Tony Hoare]
 - Before you write, build, test, lint, review, or eject `.lgo` code, load every skill under `/home/alpha/repos-devtool/LoGOs/plugins/logos/skills/` that fits the task (`logos` always, `logos-concurrency` for `go group` and shared state, `logos-review` before a commit) and follow it. `logos-doc/SPEC.md` in the toolchain tree settles what the skills leave open. [Richard Feynman]
 
 ## Toolchain environment
 
-The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113, #114, #116, #117, #118, #119 and #123 applied. The comptime packages need #102, `just eject` needs #103 and #118, `resilience` needs #109, and an interpolated string whose text holds a quote, a backquote or `//` needs #119. #116 rejects an exported comptime generic that names an unexported identifier of its package, so such a generic calls only exported names. #123 lets `just eject` accept an anonymous struct with field tags as the type argument of a comptime generic. Every command needs:
+The toolchain is a LoGOs worktree, not the system Go: upstream `release-branch.go1.27` with the fixes of gosuda/LoGOs#102, #103, #109, #110, #111, #113, #114, #116, #117, #118, #119 and #123 applied. The comptime packages need #102, `just eject` needs #103 and #118, `resilience` needs #109, and an interpolated string whose text holds a quote, a backquote or `//` needs #119. #116 rejects an exported comptime generic that names an unexported identifier of its package, so such a generic calls only exported names. #123 lets `just eject` accept an anonymous struct with field tags as the type argument of a comptime generic. The worktree also holds two fixes that upstream has not merged. gosuda/LoGOs#135 applies the JSON options of the caller to static structs; `cmd/sqlc-gen-spira` needs it to reject an unknown option key. gosuda/LoGOs#136 runs the race detector under the cgo ban; `just test` needs it. Every command needs:
 
 ```sh
 export GOROOT=/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip PATH="$GOROOT/bin:$PATH" GOTOOLCHAIN=local
@@ -63,7 +63,7 @@ Follow these steps in order before a new exported name lands. [Christopher Alexa
 
 ## Wire contract
 
-The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A change to one side changes the other side and the corpus in the same commit. [Claude Shannon]
+The server packages (`view`, `web`, `live`) and `frontend/` share these rules. A change to one side changes the other side and the corpus in the same commit. The full contract is [docs/specs/wire-contract.md](docs/specs/wire-contract.md); [docs/specs/README.md](docs/specs/README.md) lists the specification of every package. [Claude Shannon]
 
 - Slot id: `s<16 hex digits>-<n>`. The 16 digits are random for each `Render` call; `n` counts slots from 0 in that call. [Claude Shannon]
 - Slot match: the client compares the `id` attribute byte for byte. It MUST NOT build a selector from an id. [Tony Hoare]

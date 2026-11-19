@@ -3,12 +3,14 @@ package config_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -762,5 +764,98 @@ func TestFileSourceRefusesKeysThatCollide(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("%s: error = %v, want it to hold %q", tc.name, err, tc.want)
 		}
+	}
+}
+
+func TestLoaderErrPrefersParseOverMissing(t *testing.T) {
+	loader := config.NewLoader([]config.Source{config.Map(map[string]string{"BAD": "x"})})
+	var bad int
+	var miss string
+	loader.Set(&bad, "BAD", false)
+	loader.Set(&miss, "MISS", true)
+	err := loader.Err()
+	if err == nil {
+		t.Fatal("Loader.Err = nil, want the parse failure")
+		return
+	}
+	if strings.Contains(err.Error(), "missing keys") {
+		t.Fatalf("error = %v, want the parse failure and not the missing-key report", err)
+		return
+	}
+	if !strings.Contains(err.Error(), "BAD") {
+		t.Fatalf("error = %v, want it to name BAD", err)
+	}
+}
+
+func TestFileSourceRejectsNullDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "null.json")
+	if err := os.WriteFile(path, []byte(`null`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+		return
+	}
+	_, err := config.File(path)
+	if err == nil || !strings.Contains(err.Error(), "document is not a JSON object") {
+		t.Fatalf("File(null) error = %v, want document is not a JSON object", err)
+	}
+}
+
+func TestRemoteSourceRejectsNullDocument(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeBody(w, `null`)
+	}))
+	defer srv.Close()
+	_, err := config.Remote(t.Context(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "document is not a JSON object") {
+		t.Fatalf("Remote(null) error = %v, want document is not a JSON object", err)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls *atomic.Int64
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestRemoteSourceOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	transport := &cutTransport{calls: &calls, total: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}
+	prior := http.DefaultClient.Transport
+	http.DefaultClient.Transport = transport
+	defer func() { http.DefaultClient.Transport = prior }()
+	_, err := config.Remote(t.Context(), "http://config.invalid/remote.json")
+	if err == nil || !strings.Contains(err.Error(), "body exceeds 1048576 bytes") {
+		t.Fatalf("err = %v, want the body size limit of 1 MiB", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("transport saw %d calls, want 1", calls.Load())
 	}
 }

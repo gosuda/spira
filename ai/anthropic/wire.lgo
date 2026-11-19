@@ -1,0 +1,286 @@
+// Translated and changed by spira from Spring AI,
+// models/spring-ai-anthropic/src/main/java/org/springframework/ai/anthropic/AnthropicChatModel.java
+// (prompt assembly, block mapping and stop reasons).
+// Revision 4cce4caa9653092624b20ae1113633b3ad97d256.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package anthropic
+
+import (
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type chatRequest struct {
+	Model        string         `json:"model"`
+	MaxTokens    int32          `json:"max_tokens"`
+	Messages     []blockMessage `json:"messages"`
+	System       string         `json:"system,omitempty"`
+	Tools        []toolWire     `json:"tools,omitempty"`
+	Stop         []string       `json:"stop_sequences,omitempty"`
+	Stream       bool           `json:"stream"`
+	OutputConfig map[string]any `json:"output_config,omitempty"`
+}
+
+type blockMessage struct {
+	Role    string `json:"role"`
+	Content []any  `json:"content"`
+}
+
+type toolWire struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	InputSchema jsontext.Value `json:"input_schema"`
+}
+
+type textBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type toolUseBlock struct {
+	Type  string         `json:"type"`
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
+	Input jsontext.Value `json:"input"`
+}
+
+type toolResultBlock struct {
+	Type      string `json:"type"`
+	ToolUseID string `json:"tool_use_id"`
+	Content   string `json:"content"`
+}
+
+type chatResponse struct {
+	ID         string      `json:"id"`
+	Content    []wireBlock `json:"content"`
+	Model      string      `json:"model"`
+	StopReason string      `json:"stop_reason"`
+	Usage      wireUsage   `json:"usage"`
+}
+
+type wireBlock struct {
+	Type     string         `json:"type"`
+	Text     string         `json:"text"`
+	Thinking string         `json:"thinking"`
+	ID       string         `json:"id"`
+	Name     string         `json:"name"`
+	Input    jsontext.Value `json:"input"`
+}
+
+type wireUsage struct {
+	InputTokens              int32 `json:"input_tokens"`
+	OutputTokens             int32 `json:"output_tokens"`
+	CacheReadInputTokens     int32 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int32 `json:"cache_creation_input_tokens"`
+}
+
+type wireDeltaUsage struct {
+	input   int32
+	output  int32
+	read    int32
+	created int32
+	seenIn  bool
+	seenOut bool
+	seenRd  bool
+	seenMk  bool
+}
+
+func (u *wireDeltaUsage) UnmarshalJSON(data []byte) error {
+	var raw map[string]jsontext.Value
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var err error
+	u.input, u.seenIn, err = optInt(raw, "input_tokens")
+	if err != nil {
+		return err
+	}
+	u.output, u.seenOut, err = optInt(raw, "output_tokens")
+	if err != nil {
+		return err
+	}
+	u.read, u.seenRd, err = optInt(raw, "cache_read_input_tokens")
+	if err != nil {
+		return err
+	}
+	u.created, u.seenMk, err = optInt(raw, "cache_creation_input_tokens")
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func optInt(raw map[string]jsontext.Value, name string) (int32, bool, error) {
+	value, ok := raw[name]
+	if !ok {
+		return 0, false, nil
+	}
+	var parsed int32
+	if err := json.Unmarshal(value, &parsed); err != nil {
+		return 0, false, err
+	}
+	return parsed, true, nil
+}
+
+type wireEvent struct {
+	Type         string    `json:"type"`
+	Index        int32     `json:"index"`
+	Message      wireHead  `json:"message"`
+	ContentBlock wireBlock `json:"content_block"`
+	Delta        wireDelta `json:"delta"`
+	Usage        wireDeltaUsage `json:"usage"`
+	Error        wireErr   `json:"error"`
+}
+
+type wireHead struct {
+	ID    string    `json:"id"`
+	Model string    `json:"model"`
+	Usage wireUsage `json:"usage"`
+}
+
+type wireDelta struct {
+	Type        string `json:"type"`
+	Text        string `json:"text"`
+	Thinking    string `json:"thinking"`
+	PartialJSON string `json:"partial_json"`
+	StopReason  string `json:"stop_reason"`
+}
+
+type wireErr struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+func encodeChat(req ai.Request, fallbackMaxTokens int, stream bool) (chatRequest, error) {
+	out := chatRequest{
+		Model:     req.Model ?? "",
+		MaxTokens: int32(req.MaxTokens ?? fallbackMaxTokens),
+		Messages:  []blockMessage{},
+		Stop:      req.Stop,
+		Stream:    stream,
+	}
+	var system []string
+	for _, m := range req.Messages {
+		if m.Role == ai.RoleSystem {
+			system = append(system, systemTexts(m)...)
+			continue
+		}
+		content, err := blocksOf(m)
+		if err != nil {
+			return chatRequest{}, err
+		}
+		if len(content) == 0 {
+			continue
+		}
+		out.Messages = append(out.Messages, blockMessage{Role: roleOf(m.Role), Content: content})
+	}
+	out.System = strings.Join(system, "\n\n")
+	for _, tool := range req.Tools {
+		schema, err := rawJSON(tool.Schema, `{"type": "object"}`)
+		if err != nil {
+			return chatRequest{}, fmt.Errorf("ai/anthropic: tool %s: schema: %w", tool.Name, err)
+		}
+		out.Tools = append(out.Tools, toolWire{Name: tool.Name, Description: tool.Description, InputSchema: schema})
+	}
+	format, err := formatOf(req.Format ?? "")
+	if err != nil {
+		return chatRequest{}, err
+	}
+	if format != nil {
+		out.OutputConfig = format
+	}
+	return out, nil
+}
+
+func roleOf(role ai.Role) string {
+	if role == ai.RoleTool {
+		return "user"
+	}
+	return string(role)
+}
+
+func systemTexts(m ai.Message) []string {
+	var out []string
+	for _, p := range m.Parts {
+		if t, isText := p.(ai.Text); isText && strings.TrimSpace(t.Text) != "" {
+			out = append(out, t.Text)
+		}
+	}
+	return out
+}
+
+func blocksOf(m ai.Message) ([]any, error) {
+	var out []any
+	for _, p := range m.Parts {
+		switch v := p.(type) {
+		case ai.Text:
+			if v.Text != "" {
+				out = append(out, textBlock{Type: "text", Text: v.Text})
+			}
+		case ai.ToolCall:
+			input, err := rawJSON(v.Arguments, `{}`)
+			if err != nil {
+				return nil, fmt.Errorf("ai/anthropic: tool call %s: arguments: %w", v.ID, err)
+			}
+			out = append(out, toolUseBlock{Type: "tool_use", ID: v.ID, Name: v.Name, Input: input})
+		case ai.ToolResult:
+			out = append(out, toolResultBlock{Type: "tool_result", ToolUseID: v.ID, Content: v.Content})
+		}
+	}
+	return out, nil
+}
+
+func rawJSON(text string, fallback string) (jsontext.Value, error) {
+	raw := strings.TrimSpace(text)
+	if raw == "" {
+		raw = fallback
+	}
+	var probe map[string]any
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		return jsontext.Value(""), err
+	}
+	if probe == nil {
+		return jsontext.Value(""), fmt.Errorf("not a JSON object")
+	}
+	return jsontext.Value(raw), nil
+}
+
+func formatOf(format string) (map[string]any, error) {
+	if strings.TrimSpace(format) == "" {
+		return nil, nil
+	}
+	schema, err := rawJSON(format, "")
+	if err != nil {
+		return nil, fmt.Errorf("ai/anthropic: format is not a JSON schema: %w", err)
+	}
+	return map[string]any{"format": map[string]any{"type": "json_schema", "schema": schema}}, nil
+}
+
+func replyOf(raw *chatResponse) ai.Reply {
+	var parts []ai.Part
+	for _, b := range raw.Content {
+		switch b.Type {
+		case "text":
+			parts = append(parts, ai.Text{Text: b.Text})
+		case "thinking":
+			parts = append(parts, ai.Reasoning{Text: b.Thinking})
+		case "tool_use":
+			parts = append(parts, ai.ToolCall{ID: b.ID, Name: b.Name, Arguments: string(b.Input)})
+		}
+	}
+	input := int(inputTokens(raw.Usage))
+	output := int(raw.Usage.OutputTokens)
+	return ai.Reply{
+		Message: ai.Message{Role: ai.RoleAssistant, Parts: parts},
+		Finish:  ai.FinishOf(raw.StopReason),
+		Usage:   ai.Usage{Input: input, Output: output, Total: input + output},
+		ID:      raw.ID,
+		Model:   raw.Model,
+	}
+}

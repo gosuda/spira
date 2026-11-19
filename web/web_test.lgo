@@ -192,6 +192,22 @@ func TestStageAfterGroupSkipsInnerRoutes(t *testing.T) {
 	}
 }
 
+func TestGroupPrefixFollowsTheHostOfAPattern(t *testing.T) {
+	r := web.NewRouter()
+	r.Group("/edge", func(g *web.Router) {
+		g.Handle("GET", "shop.example/x", okReply)
+	})
+	if rec := call(t, r, httptest.NewRequest(http.MethodGet, "http://shop.example/edge/x", nil)); rec.Code != http.StatusNoContent {
+		t.Fatalf("host route inside a group status %d want 204", rec.Code)
+	}
+	if rec := call(t, r, httptest.NewRequest(http.MethodGet, "http://other.example/edge/x", nil)); rec.Code != http.StatusNotFound {
+		t.Fatalf("other host status %d want 404", rec.Code)
+	}
+	if got := r.Routes()[0].Pattern; got != "shop.example/edge/x" {
+		t.Fatalf("recorded pattern %q want shop.example/edge/x", got)
+	}
+}
+
 func TestRedirectUnderHtmxAndPlain(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/go", func(ctx *web.Context) (web.Reply, error) {
@@ -226,6 +242,90 @@ func TestFailWritesProblemMembers(t *testing.T) {
 	}
 	if len(doc.Errors) != 1 || doc.Errors[0].Field != "id" || doc.Errors[0].Rule != "present" {
 		t.Fatalf("errors %+v wrong", doc.Errors)
+	}
+}
+
+func abortCutStream(ctx *web.Context) (web.Reply, error) {
+	return web.Stream{ContentType: "text/plain", Write: func(w io.Writer) error {
+		if _, err := w.Write([]byte("chunk-one")); err != nil {
+			return err
+		}
+		panic(http.ErrAbortHandler)
+	}}, nil
+}
+
+func TestErrAbortHandlerAbortsACutStream(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(web.Recover())
+	r.Handle("GET", "/cut", abortCutStream)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/cut")
+	if err != nil {
+		t.Fatalf("get cut stream: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("body close: %v", cerr)
+		}
+	}()
+	body, rerr := io.ReadAll(resp.Body)
+	if rerr == nil {
+		t.Fatalf("client read %q without an error, want a body read error", string(body))
+	}
+}
+
+type signalWriter struct {
+	text sync.Locked[string]
+	got  chan struct{}
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	w.text.WithLock(func(s *string) {
+		*s += string(p)
+		if strings.Contains(*s, "\n") {
+			select {
+			case w.got <- struct{}{}:
+			default:
+			}
+		}
+	})
+	return len(p), nil
+}
+
+func TestAccessLogRecordsAnAbortedStream(t *testing.T) {
+	w := &signalWriter{text: sync.Locked[string]{}, got: make(chan struct{}, 1)}
+	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{}))
+	r := web.NewRouter()
+	r.Use(web.Recover(), web.AccessLog(logger))
+	r.Handle("GET", "/cut", abortCutStream)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/cut")
+	if err != nil {
+		t.Fatalf("get cut stream: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("body close: %v", cerr)
+		}
+	}()
+	if _, rerr := io.ReadAll(resp.Body); rerr == nil {
+		t.Fatal("client read the cut stream without an error, want a body read error")
+		return
+	}
+	select {
+	case <-w.got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("access log did not record the aborted request")
+		return
+	}
+	var n int
+	w.text.WithLock(func(s *string) { n = strings.Count(*s, "web: request") })
+	if n != 1 {
+		t.Fatalf("access log holds %d records for the aborted request, want 1", n)
 	}
 }
 
@@ -339,9 +439,7 @@ func TestSetAndGetIsolatedPerRequest(t *testing.T) {
 		return web.Data{Value: v}, nil
 	})
 	srv := httptest.NewServer(r)
-	defer func() {
-		srv.Close()
-	}()
+	t.Cleanup(srv.Close)
 	res := &markResult{}
 	res.bodies.WithLock(func(m *map[string]string) { *m = map[string]string{} })
 	if err := runMarkConcurrently(context.Background(), srv.URL, res); err != nil {
@@ -626,6 +724,156 @@ func TestStageSetsResponseHeaderOnEveryReply(t *testing.T) {
 	}
 }
 
+func TestWroteTurnsTrueWhenTheStatusIsWritten(t *testing.T) {
+	var before, after bool
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			before = ctx.Wrote()
+			reply, err := next(ctx)
+			after = ctx.Wrote()
+			return reply, err
+		}
+	})
+	r.Handle("GET", "/x", okReply)
+	call(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if before || !after {
+		t.Fatalf("Wrote before next = %v and after next = %v, want false and true", before, after)
+	}
+}
+
+type noFlushWriter struct {
+	header http.Header
+	code   int
+}
+
+func (w *noFlushWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *noFlushWriter) Write(b []byte) (int, error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	return len(b), nil
+}
+
+func (w *noFlushWriter) WriteHeader(code int) {
+	w.code = code
+}
+
+func TestWroteStaysFalseWhenTheWriterLacksFlush(t *testing.T) {
+	var after bool
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			reply, err := next(ctx)
+			after = ctx.Wrote()
+			return reply, err
+		}
+	})
+	flusher := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.(http.Flusher).Flush()
+	})
+	r.Handle("GET", "/events", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: flusher}, nil
+	})
+	w := &noFlushWriter{header: http.Header{}}
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/events", nil))
+	if after {
+		t.Fatal("Wrote after Flush on a writer without Flush = true, want false")
+	}
+}
+
+func TestWroteTurnsTrueAfterADelegatedFlush(t *testing.T) {
+	var after bool
+	var status int
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			reply, err := next(ctx)
+			after = ctx.Wrote()
+			status = ctx.Status()
+			return reply, err
+		}
+	})
+	flusher := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+	})
+	r.Handle("GET", "/events", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: flusher}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/events", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delegated flush status %d want 200", rec.Code)
+		return
+	}
+	if !after {
+		t.Fatal("Wrote after a delegated Flush = false, want true")
+		return
+	}
+	if status != http.StatusOK {
+		t.Fatalf("Status after a delegated Flush = %d, want 200", status)
+	}
+}
+
+func TestWroteTurnsTrueAfterADelegatedHijack(t *testing.T) {
+	wroteCh := make(chan bool, 1)
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			reply, err := next(ctx)
+			select {
+			case wroteCh <- ctx.Wrote():
+			case <-ctx.Ctx().Done():
+			}
+			return reply, err
+		}
+	})
+	upgrader := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			http.Error(w, "hijack unavailable: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+				t.Errorf("hijacked close: %v", cerr)
+			}
+		}()
+		if _, err := buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n\r\nhello-ws"); err != nil {
+			return
+		}
+		if err := buf.Flush(); err != nil {
+			return
+		}
+	})
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: upgrader}, nil
+	})
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	conn, reader := dialUpgraded(t, strings.TrimPrefix(srv.URL, "http://"))
+	if _, err := io.ReadAll(reader); err != nil {
+		t.Fatalf("read upgrade close: %v", err)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+		return
+	}
+	select {
+	case wrote := <-wroteCh:
+		if !wrote {
+			t.Fatal("Wrote after a delegated Hijack = false, want true")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stage did not report Wrote after a delegated Hijack")
+	}
+}
+
 func TestStageReadsTheWrittenStatus(t *testing.T) {
 	seen := map[string]int{}
 	record := func(next web.Handler) web.Handler {
@@ -810,6 +1058,36 @@ func TestLayoutPanicUnderRecoverIsProblem(t *testing.T) {
 	}
 }
 
+func TestBannedSlotAnswersProblemBeforeAnyPageByte(t *testing.T) {
+	later := &view.Later{Fallback: view.T("loading"), Resolve: func(ctx context.Context) (view.Node, error) {
+		return view.Tr(view.Td(view.T("row"))), nil
+	}}
+	body := view.Div(view.T("before-table"), view.Table(view.Tbody(later)))
+	r := web.NewRouter()
+	r.Layout = func(ctx *web.Context, p web.Page) view.Node {
+		return view.Html(view.Body(p.Body, view.P(view.T("footer"))))
+	}
+	r.Handle("GET", "/page", func(ctx *web.Context) (web.Reply, error) {
+		return web.Page{Body: body}, nil
+	})
+	r.Handle("GET", "/fragment", func(ctx *web.Context) (web.Reply, error) {
+		return web.Fragment{Body: body}, nil
+	})
+	for name, req := range map[string]*http.Request{
+		"page layout": httptest.NewRequest(http.MethodGet, "/page", nil),
+		"page body":   reqWithHeaders("/page", http.Header{"HX-Request": []string{"true"}}),
+		"fragment":    httptest.NewRequest(http.MethodGet, "/fragment", nil),
+	} {
+		rec := call(t, r, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s: status %d want 500", name, rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "before-table") {
+			t.Errorf("%s: page bytes %q came before the problem", name, rec.Body.String())
+		}
+	}
+}
+
 func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
 	withView := web.NewRouter()
 	withView.ProblemView = func(p web.Problem) view.Node? {
@@ -892,9 +1170,7 @@ func TestDelegateHijackUpgrade(t *testing.T) {
 		return web.Delegate{To: upgrader}, nil
 	})
 	srv := httptest.NewServer(r)
-	defer func() {
-		srv.Close()
-	}()
+	t.Cleanup(srv.Close)
 	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -924,6 +1200,95 @@ func TestDelegateHijackUpgrade(t *testing.T) {
 	}
 	if !strings.Contains(string(rest), "hello-ws") {
 		t.Fatalf("payload %q lacks the upgraded frame", string(rest))
+	}
+}
+
+func TestAsteriskTargetIsRejectedWithoutARedirect(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Root-Stage", "ran")
+			return next(ctx)
+		}
+	})
+	r.Handle("GET", "/users", okReply)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RequestURI = "*"
+	req.URL.Path = "*"
+	rec := call(t, r, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("asterisk target status %d want 400", rec.Code)
+		return
+	}
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Fatalf("asterisk target got a redirect to %q", loc)
+		return
+	}
+	if rec.Header().Get("X-Root-Stage") != "ran" {
+		t.Fatal("root stage did not run for the asterisk target")
+	}
+}
+
+func TestUnmatchedRequestKeepsTheHandlerChosenBeforeStages(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if ctx.Request.URL.Path == "/missing" {
+				ctx.Request.URL.Path = "/users"
+			}
+			return next(ctx)
+		}
+	})
+	r.Handle("GET", "/users", okReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("rewritten unmatched path status %d want 404", rec.Code)
+	}
+}
+
+func TestAsteriskRequestURIUsesTheLiveMuxAnswer(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.Request.RequestURI = "*"
+			return next(ctx)
+		}
+	})
+	r.Handle("GET", "/users", okReply)
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("mutated asterisk status %d want 400", rec.Code)
+	}
+}
+
+func TestUnmatchedChainWrapsAStageOnlyAtUse(t *testing.T) {
+	wraps := 0
+	runs := 0
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		wraps++
+		return func(ctx *web.Context) (web.Reply, error) {
+			runs++
+			return next(ctx)
+		}
+	})
+	registered := wraps
+	for range 3 {
+		if miss := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil)); miss.Code != http.StatusNotFound {
+			t.Fatalf("unmatched path status %d want 404", miss.Code)
+		}
+	}
+	if wraps != registered || runs != 3 {
+		t.Fatalf("three unmatched requests wrapped the stage %d more times and ran it %d times, want 0 and 3", wraps-registered, runs)
+	}
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Late-Stage", "ran")
+			return next(ctx)
+		}
+	})
+	if late := call(t, r, httptest.NewRequest(http.MethodGet, "/missing", nil)); late.Header().Get("X-Late-Stage") != "ran" {
+		t.Fatal("a stage added after the first unmatched request did not run")
 	}
 }
 

@@ -1,0 +1,185 @@
+package mcp
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+)
+
+type Stdio struct {
+	source  io.Reader
+	sink    io.Writer
+	reader  *bufio.Reader
+	pending []byte
+	broken  bool
+}
+
+func NewStdio(r io.Reader, w io.Writer) *Stdio {
+	return &Stdio{source: r, sink: w, reader: bufio.NewReader(r)}
+}
+
+func (s *Stdio) Notify(ctx context.Context, msg Envelope) error {
+	return s.send(ctx, msg)
+}
+
+func (s *Stdio) Request(ctx context.Context, msg Envelope) (Envelope, error) {
+	if err := s.armRead(ctx); err != nil {
+		return Envelope{}, err
+	}
+	if err := s.send(ctx, msg); err != nil {
+		return Envelope{}, err
+	}
+	want := idKey(msg.ID)
+	for {
+		if err := ctx.Err(); err != nil {
+			return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", err))
+		}
+		reply, err := s.nextMessage(ctx)
+		if err != nil {
+			return Envelope{}, err
+		}
+		if isResponse(reply) && idKey(reply.ID) == want {
+			return reply, nil
+		}
+	}
+}
+
+func (s *Stdio) send(ctx context.Context, msg Envelope) error {
+	if s.broken {
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: transport is unusable after a partial write"))
+	}
+	if err := ctx.Err(); err != nil {
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", err))
+	}
+	if err := s.armWrite(ctx); err != nil {
+		return err
+	}
+	line, err := encodeEnvelope(msg)
+	if err != nil {
+		return err
+	}
+	frame := append(line, '\n')
+	n, err := s.sink.Write(frame)
+	if n > 0 && n < len(frame) {
+		s.broken = true
+		if err == nil {
+			return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: short write of a message line"))
+		}
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", ctxErr))
+		}
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio write: %w", err))
+	}
+	return nil
+}
+
+func (s *Stdio) nextMessage(ctx context.Context) (Envelope, error) {
+	for {
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return s.readError(ctx, s.pending, line, err)
+		}
+		if len(s.pending) > 0 {
+			line = string(s.pending) + line
+			s.pending = nil
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return decodeEnvelope([]byte(line))
+	}
+}
+
+func (s *Stdio) readError(ctx context.Context, pending []byte, line string, err error) (Envelope, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		s.keep(line)
+		return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", ctxErr))
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		s.keep(line)
+		return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", context.DeadlineExceeded))
+	}
+	if int64(len(pending)+len(line)) > maxMessage {
+		s.pending = nil
+		s.broken = true
+		return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio line exceeds the size limit of %d bytes: %w", maxMessage, err))
+	}
+	return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio read: %w", err))
+}
+
+func (s *Stdio) keep(prefix string) {
+	if prefix == "" {
+		return
+	}
+	if len(s.pending)+len(prefix) > maxMessage {
+		s.pending = nil
+		s.broken = true
+		return
+	}
+	s.pending = append(s.pending, prefix...)
+}
+
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+type writeDeadliner interface {
+	SetWriteDeadline(time.Time) error
+}
+
+func (s *Stdio) armRead(ctx context.Context) error {
+	setter, ok := s.source.(readDeadliner)
+	if !ok {
+		return nil
+	}
+	deadline, _ := ctx.Deadline()
+	if err := setter.SetReadDeadline(deadline); err != nil {
+		if errors.Is(err, os.ErrNoDeadline) {
+			return nil
+		}
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio read deadline: %w", err))
+	}
+	return nil
+}
+
+func (s *Stdio) armWrite(ctx context.Context) error {
+	setter, ok := s.sink.(writeDeadliner)
+	if !ok {
+		return nil
+	}
+	deadline, _ := ctx.Deadline()
+	if err := setter.SetWriteDeadline(deadline); err != nil {
+		if errors.Is(err, os.ErrNoDeadline) {
+			return nil
+		}
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio write deadline: %w", err))
+	}
+	return nil
+}
+
+func (s *Stdio) Close() error {
+	var errs []error
+	if closer, ok := s.sink.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("mcp: stdio close write: %w", err))
+		}
+	}
+	if closer, ok := s.source.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("mcp: stdio close read: %w", err))
+		}
+	}
+	joined := errors.Join(errs...)
+	if joined == nil {
+		return nil
+	}
+	return ErrTransportFailed.Wrap(joined)
+}

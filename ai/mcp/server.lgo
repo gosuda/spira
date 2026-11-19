@@ -1,0 +1,168 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/web"
+)
+
+const maxMessage = 4 << 20
+
+func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage) {
+	if guard == nil {
+		panic("mcp: Mount requires a guard stage")
+	}
+	serve := func(ctx *web.Context) (web.Reply, error) {
+		return handlePost(ctx, tools)
+	}
+	r.Group("", func(g *web.Router) {
+		g.Use(guard)
+		g.Handle("POST", path, serve)
+	})
+}
+
+func handlePost(ctx *web.Context, tools []ai.Tool) (web.Reply, error) {
+	req := ctx.Request
+	if !originAllowed(req) {
+		return fail(nil, http.StatusForbidden, rpcFailure{code: -32000, message: "forbidden origin", fault: ErrForbiddenOrigin})
+	}
+	if v := req.Header.Get("MCP-Protocol-Version"); v != "" && v != ProtocolVersion {
+		return fail(nil, http.StatusBadRequest, rpcFailure{code: -32600, message: "unsupported protocol version", fault: ErrUnsupportedVersion})
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxMessage))
+	if err != nil {
+		return nil, ErrTransportFailed.Wrap(fmt.Errorf("mcp: read request body: %w", err))
+	}
+	msg, err := decodeEnvelope(body)
+	if err != nil {
+		return fail(nil, http.StatusBadRequest, rpcFailure{code: -32700, message: "parse error", fault: ErrParseError})
+	}
+	if len(msg.ID) == 0 || msg.Method == "" {
+		return web.Empty{Status: http.StatusAccepted}, nil
+	}
+	return dispatch(ctx.Ctx(), tools, msg)
+}
+
+func originAllowed(req *http.Request) bool {
+	origin := req.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return strings.EqualFold(u.Host, req.Host)
+}
+
+func dispatch(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, error) {
+	switch msg.Method {
+	case "initialize":
+		return respond(msg.ID, initializeResult{
+			ProtocolVersion: ProtocolVersion,
+			Capabilities:    serverCapabilities{Tools: toolsCapability{ListChanged: false}},
+			ServerInfo:      Implementation{Name: "spira", Version: "0.1.0"},
+		})
+	case "tools/list":
+		return respond(msg.ID, listTools(tools))
+	case "tools/call":
+		return callTool(ctx, tools, msg)
+	}
+	return fail(msg.ID, http.StatusOK, rpcFailure{code: -32601, message: "Method not found", fault: ErrMethodNotFound})
+}
+
+func listTools(tools []ai.Tool) listResult {
+	result := listResult{Tools: make([]wireTool, 0, len(tools))}
+	for _, tool := range tools {
+		schema := tool.Schema
+		if schema == "" {
+			schema = `{"type":"object"}`
+		}
+		result.Tools = append(result.Tools, wireTool{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: jsontext.Value(schema),
+		})
+	}
+	return result
+}
+
+func callTool(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, error) {
+	var params callParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil || params.Name == "" {
+		return fail(msg.ID, http.StatusOK, rpcFailure{code: -32602, message: "Invalid params", fault: ErrInvalidParams})
+	}
+	for i := range tools {
+		if tools[i].Name != params.Name {
+			continue
+		}
+		if !argumentsObject(params.Arguments) {
+			return fail(msg.ID, http.StatusOK, rpcFailure{code: -32602, message: "Invalid params", fault: ErrInvalidParams})
+		}
+		arguments := string(params.Arguments)
+		if strings.TrimSpace(arguments) == "" {
+			arguments = "{}"
+		}
+		content, err := tools[i].Call(ctx, arguments)
+		if err != nil {
+			return toolErrReply(msg.ID, tools[i].Name, err)
+		}
+		return respond(msg.ID, callResult{
+			Content: []contentItem{{Type: "text", Text: content}},
+		})
+	}
+	return fail(msg.ID, http.StatusOK, rpcFailure{code: -32602, message: "Unknown tool", fault: ErrUnknownTool})
+}
+
+func toolErrReply(id jsontext.Value, name string, err error) (web.Reply, error) {
+	wrapped := ErrToolFailed.Wrap(err)
+	slog.Error("mcp: tool failed", "tool", name, "error", wrapped)
+	return respond(id, callResult{
+		Content: []contentItem{{Type: "text", Text: ErrToolFailed.Message}},
+		IsError: true,
+	})
+}
+
+func respond(id jsontext.Value, result any) (web.Reply, error) {
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, ErrTransportFailed.Wrap(fmt.Errorf("mcp: encode result: %w", err))
+	}
+	return web.Data{Value: Envelope{JSONRPC: "2.0", ID: id, Result: raw}}, nil
+}
+
+type rpcFailure struct {
+	code    int32
+	message string
+	fault   *fault.Error
+}
+
+func fail(id jsontext.Value, status int, e rpcFailure) (web.Reply, error) {
+	return web.Data{
+		Value:  Envelope{JSONRPC: "2.0", ID: id, Error: &RPCError{Code: e.code, Message: e.message, Data: faultCode(e.fault)}},
+		Status: status,
+	}, nil
+}
+
+func faultCode(f *fault.Error) jsontext.Value {
+	raw, err := json.Marshal(struct {
+		Code fault.Code `json:"code"`
+	}{Code: f.Code})
+	if err != nil {
+		return nil
+	}
+	return jsontext.Value(raw)
+}

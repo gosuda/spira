@@ -1,0 +1,245 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-vector-store/src/test/java/org/springframework/ai/vectorstore/filter/FilterExpressionTextParserTests.java,
+// and from the Filters.g4 grammar for the inputs that the reference tests do not hold.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/rag"
+)
+
+func spell(f rag.Filter) string {
+	switch node := f.(type) {
+	case rag.Expression:
+		right := node.Right
+		if right == nil {
+			return fmt.Sprintf("(%s %s)", node.Type, spell(node.Left))
+		}
+		return fmt.Sprintf("(%s %s %s)", node.Type, spell(node.Left), spell(right))
+	case rag.Group:
+		return "group(" + spell(node.Inner) + ")"
+	case rag.Key:
+		return "[" + node.Name + "]"
+	case rag.Const:
+		return spellConst(node)
+	case rag.Array:
+		items := make([]string, len(node.Items))
+		for i, item := range node.Items {
+			items[i] = spellConst(item)
+		}
+		return "list(" + strings.Join(items, " ") + ")"
+	}
+	return "unknown"
+}
+
+func spellConst(c rag.Const) string {
+	if text := c.Text; text != nil {
+		return fmt.Sprintf("%q", text)
+	}
+	if integer := c.Integer; integer != nil {
+		return fmt.Sprintf("%d", integer)
+	}
+	if decimal := c.Decimal; decimal != nil {
+		return fmt.Sprintf("%vd", decimal)
+	}
+	if flag := c.Flag; flag != nil {
+		return fmt.Sprintf("%v", flag)
+	}
+	return "empty"
+}
+
+const openSince2020 = `(AND (EQ [isOpen] true) (GTE [year] 2020))`
+
+const threeCountries = `list("BG" "NL" "US")`
+
+var accepted = []struct {
+	input string
+	want  string
+}{
+	{"country == 'BG'", `(EQ [country] "BG")`},
+	{"(country == 'BG')", `(EQ [country] "BG")`},
+	{"genre == 'drama' && year >= 2020", `(AND (EQ [genre] "drama") (GTE [year] 2020))`},
+	{"genre in ['comedy', 'documentary', 'drama']", `(IN [genre] list("comedy" "documentary" "drama"))`},
+	{`year >= 2020 OR country == "BG" AND city != "Sofia"`, `(OR (GTE [year] 2020) (AND (EQ [country] "BG") (NE [city] "Sofia")))`},
+	{`(year >= 2020 OR country == "BG") AND city NIN ["Sofia", "Plovdiv"]`, `(AND group((OR (GTE [year] 2020) (EQ [country] "BG"))) (NIN [city] list("Sofia" "Plovdiv")))`},
+	{`isOpen == true AND year >= 2020 AND country IN ["BG", "NL", "US"]`, `(AND ` + openSince2020 + ` (IN [country] ` + threeCountries + `))`},
+	{`not(isOpen == true AND year >= 2020 AND country IN ["BG", "NL", "US"])`, `(NOT group((AND ` + openSince2020 + ` (IN [country] ` + threeCountries + `))))`},
+	{`not(country NOT IN ["BG", "NL", "US"])`, `(NOT group((NIN [country] ` + threeCountries + `)))`},
+	{`NOT country NOT IN ["BG", "NL", "US"]`, `(NOT (NIN [country] ` + threeCountries + `))`},
+	{`not(isOpen == true AND year >= 2020 AND NOT(country IN ["BG", "NL", "US"]))`, `(NOT group((AND ` + openSince2020 + ` (NOT group((IN [country] ` + threeCountries + `))))))`},
+	{"temperature >= -15.6 && temperature <= +20.13", `(AND (GTE [temperature] -15.6d) (LTE [temperature] 20.13d))`},
+	{"biz_id == 3L", `(EQ [biz_id] 3)`},
+	{"biz_id == -5L", `(EQ [biz_id] -5)`},
+	{"timestamp == 2147483647", `(EQ [timestamp] 2147483647)`},
+	{"timestamp == 9223372036854775807", `(EQ [timestamp] 9223372036854775807)`},
+	{"timestamp == -9223372036854775808", `(EQ [timestamp] -9223372036854775808)`},
+	{"timestamp == 9223372036854775807L", `(EQ [timestamp] 9223372036854775807)`},
+	{"id in [9223372036854775807, 1]", `(IN [id] list(9223372036854775807 1))`},
+	{"'country.1' == 'BG'", `(EQ [country.1] "BG")`},
+	{"'country_1_2_3' == 'BG'", `(EQ [country_1_2_3] "BG")`},
+	{`"country 1 2 3" == 'BG'`, `(EQ [country 1 2 3] "BG")`},
+	{`"country \"1 2 3" == 'BG'`, `(EQ [country "1 2 3] "BG")`},
+	{"file_name == 'medicaid-wa-faqs.pdf'", `(EQ [file_name] "medicaid-wa-faqs.pdf")`},
+	{`stuff == "he'd say \"hello\", I'd say 'hi'"`, `(EQ [stuff] "he'd say \"hello\", I'd say 'hi'")`},
+	{`stuff == 'he\'d say "hello", I\'d say \'hi\''`, `(EQ [stuff] "he'd say \"hello\", I'd say 'hi'")`},
+	{`stuff == 'This is a single backslash: \\'`, `(EQ [stuff] "This is a single backslash: \\")`},
+
+	{"meta.country == 'BG'", `(EQ [meta.country] "BG")`},
+	{"where country == 'BG'", `(EQ [country] "BG")`},
+	{"WHERE country == 'BG'", `(EQ [country] "BG")`},
+	{"And == 'BG'", `(EQ [And] "BG")`},
+	{"a == 1 AND NOT b == 2 OR c == 3", `(AND (EQ [a] 1) (NOT (OR (EQ [b] 2) (EQ [c] 3))))`},
+	{"NOT a == 1 AND b == 2", `(NOT (AND (EQ [a] 1) (EQ [b] 2)))`},
+	{"a < 1 or b > 2 || c <= 3", `(OR (OR (LT [a] 1) (GT [b] 2)) (LTE [c] 3))`},
+	{"country IS NULL", `(ISNULL [country])`},
+	{"country is not null", `(ISNOTNULL [country])`},
+	{"open == FALSE", `(EQ [open] false)`},
+	{"year == - 5", `(EQ [year] -5)`},
+	{"temperature == .5", `(EQ [temperature] 0.5d)`},
+	{"temperature == -.5", `(EQ [temperature] -0.5d)`},
+	{"temperature == 5.", `(EQ [temperature] 5d)`},
+	{"year == 3 L", `(EQ [year] 3)`},
+	{"year == 3l", `(EQ [year] 3)`},
+	{"year == 3L AND open == true", `(AND (EQ [year] 3) (EQ [open] true))`},
+	{"id in [3L, 4 l]", `(IN [id] list(3 4))`},
+	{"Lima == 1", `(EQ [Lima] 1)`},
+	{"'L' == 1", `(EQ [L] 1)`},
+	{"'l' == 1", `(EQ [l] 1)`},
+}
+
+var rejected = []string{
+	"",
+	"   ",
+	"country",
+	"country ==",
+	"(country == 'BG'",
+	"country == 'BG')",
+	"country == 'BG",
+	"country == 'BG' extra",
+	"country == 'BG' &&",
+	"country = 'BG'",
+	"country & 'BG'",
+	"country IN 'BG'",
+	"country == [1, 2]",
+	"country ~ 'BG'",
+	"country in []",
+	"country in ['a',]",
+	"country In ['BG']",
+	"Not(country == 'BG')",
+	"country NOT",
+	"country NOT NULL",
+	"country && 'BG'",
+	"country is",
+	"country is not",
+	"country is 5",
+	"WHERE == 'BG'",
+	"is == 'BG'",
+	"NULL == 1",
+	"meta. == 'BG'",
+	"year == -",
+	"year == .",
+	"year == 5 6",
+	"year == 9223372036854775808",
+	"year == 3LAND open == true",
+	"year == 3LL",
+	"year == 3.5L",
+	"year == L",
+	"L == 1",
+	"l == 1",
+}
+
+func TestParseFilterGivesTheTreeOfTheReference(t *testing.T) {
+	for _, c := range accepted {
+		got, err := rag.ParseFilter(c.input)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.input, err)
+			continue
+		}
+		if spelled := spell(got); spelled != c.want {
+			t.Errorf("ParseFilter(%q)\n got %s\nwant %s", c.input, spelled, c.want)
+		}
+	}
+}
+
+func TestParseFilterRefusesWhatTheGrammarRefuses(t *testing.T) {
+	for _, input := range rejected {
+		got, err := rag.ParseFilter(input)
+		if err == nil {
+			t.Errorf("ParseFilter(%q) = %s, want an error", input, spell(got))
+		}
+	}
+}
+
+func TestParseFilterReportsTheOperatorPosition(t *testing.T) {
+	_, err := rag.ParseFilter("country = 'BG'")
+	if err == nil || !errors.Is(err, rag.ErrInvalidFilter) || !strings.Contains(err.Error(), "position 8:") {
+		t.Errorf("ParseFilter(%q) error = %v, want the invalid_filter fault at position 8", "country = 'BG'", err)
+	}
+}
+
+func TestMemoryFilterWithNaNMetadataMatchesOnlyInequality(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{"n": num(math.NaN())}})
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{"n == 5", false},
+		{"n != 5", true},
+		{"n < 5", false},
+		{"n <= 5", false},
+		{"n > 5", false},
+		{"n >= 5", false},
+		{"n in [5, 6]", false},
+		{"n nin [5, 6]", true},
+		{"n == 5.5", false},
+		{"n != 5.5", true},
+		{"n < 5.5", false},
+		{"n <= 5.5", false},
+		{"n > 5.5", false},
+		{"n >= 5.5", false},
+		{"n in [5.5, 6.5]", false},
+		{"n nin [5.5, 6.5]", true},
+	}
+	for _, c := range cases {
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q on a NaN value kept the document = %v, want %v", c.filter, got, c.want)
+		}
+	}
+}
+
+func TestMemoryFilterWithAQuotedLKeyMatchesTheDocument(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{"L": num(1), "l": num(2)}})
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{"'L' == 1", true},
+		{"'l' == 2", true},
+		{"'L' == 2", false},
+	}
+	for _, c := range cases {
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q kept the document = %v, want %v", c.filter, got, c.want)
+		}
+	}
+}

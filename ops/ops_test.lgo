@@ -92,8 +92,8 @@ func TestReadyNamesFailingCheck(t *testing.T) {
 		byName[c.Name] = c
 	}
 	dbCheck, ok := byName["db"]
-	if !ok || dbCheck.Status != "fail" || !strings.Contains(dbCheck.Error, "connection refused") {
-		t.Fatalf("db check = %+v, want fail naming the error", dbCheck)
+	if !ok || dbCheck.Status != "fail" || dbCheck.Error != "A health check failed." {
+		t.Fatalf("db check = %+v, want fail with the constant check-failed message", dbCheck)
 	}
 	diskCheck, ok := byName["disk"]
 	if !ok || diskCheck.Status != "ok" {
@@ -214,8 +214,11 @@ func TestPanickingCheckFails(t *testing.T) {
 		t.Fatalf("GET /ops/ready status = %d, want 503", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "flaky") || !strings.Contains(body, "check exploded") {
-		t.Fatalf("body must name the panicking check and its panic value: %s", body)
+	if !strings.Contains(body, "flaky") || !strings.Contains(body, "A health check failed.") {
+		t.Fatalf("body must name the panicking check with the constant message: %s", body)
+	}
+	if strings.Contains(body, "check exploded") {
+		t.Fatalf("body must not echo the panic value: %s", body)
 	}
 }
 
@@ -237,8 +240,11 @@ func TestTimedOutCheckFails(t *testing.T) {
 		t.Fatalf("check ended after %v; the 50ms check timeout did not bound it", elapsed)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "slow") || !strings.Contains(body, "context deadline exceeded") {
-		t.Fatalf("body must name the timed-out check and the deadline: %s", body)
+	if !strings.Contains(body, "slow") || !strings.Contains(body, "A health check failed.") {
+		t.Fatalf("body must name the timed-out check with the constant message: %s", body)
+	}
+	if strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("body must not echo the check error text: %s", body)
 	}
 }
 
@@ -249,4 +255,25 @@ func TestMountRefusesNonPositiveCheckTimeout(t *testing.T) {
 		}
 	}()
 	ops.Mount(web.NewRouter(), tokenGuard(), ops.Options{Registry: meter.NewRegistry(), CheckTimeout: 0})
+}
+
+func TestExpiredCheckReturningNilFails(t *testing.T) {
+	checks := map[string]checkFunc{
+		"late": func(ctx context.Context) error {
+			<-ctx.Done()
+			return nil
+		},
+	}
+	r, _ := newOpsRouter(checks)
+	rec := opsGet(r, "/ops/ready", true)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /ops/ready status = %d, want 503 when the check returns nil after its timeout", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "late") || !strings.Contains(body, "A health check failed.") {
+		t.Fatalf("body must name the expired check with the constant message: %s", body)
+	}
+	if strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("body must not echo the check error text: %s", body)
+	}
 }

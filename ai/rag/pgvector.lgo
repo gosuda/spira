@@ -1,0 +1,782 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-pgvector-store/src/main/java/org/springframework/ai/vectorstore/pgvector/PgVectorStore.java,
+// PgVectorFilterExpressionConverter.java and PgVectorSchemaValidator.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/db"
+)
+
+type Store interface {
+	Add(ctx context.Context, docs []Document) error
+	Delete(ctx context.Context, ids const []string) error
+	Search(ctx context.Context, q Search) ([]Document, error)
+}
+
+var _ Store = (*Memory)(nil)
+
+var _ Store = (*Pgvector)(nil)
+
+type Pgvector struct {
+	pool  *db.Pool
+	embed ai.Embedder
+	table string
+	dims  int
+}
+
+func NewPgvector(pool *db.Pool, embed ai.Embedder, table string, dims int) (*Pgvector?, error) {
+	if embed == nil {
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: pgvector needs an embedder"))
+	}
+	if !validTable(table) {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: pgvector table %q must match ^[a-z_][a-z0-9_]{0,62}$", table))
+	}
+	if dims <= 0 {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: pgvector needs dimensions above 0, got %d", dims))
+	}
+	return &Pgvector{pool: pool, embed: embed, table: table, dims: dims}, nil
+}
+
+func validTable(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	if len(name) > 63 {
+		return false
+	}
+	if !validHead(name[0]) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !validTail(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func validHead(c byte) bool {
+	if c == '_' {
+		return true
+	}
+	return inLower(c)
+}
+
+func inLower(c byte) bool {
+	if c < 'a' {
+		return false
+	}
+	return c <= 'z'
+}
+
+func validTail(c byte) bool {
+	if validHead(c) {
+		return true
+	}
+	return inDigit(c)
+}
+
+func inDigit(c byte) bool {
+	if c < '0' {
+		return false
+	}
+	return c <= '9'
+}
+
+func (p *Pgvector) Setup(ctx context.Context) error {
+	if err := p.execSetup(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+		return err
+	}
+	create := "CREATE TABLE IF NOT EXISTS " + p.table + " (id text primary key, content text not null, metadata jsonb not null, embedding vector(" + strconv.Itoa(p.dims) + "))"
+	if err := p.execSetup(ctx, create); err != nil {
+		return err
+	}
+	index := "CREATE INDEX IF NOT EXISTS " + p.table + "_embedding_idx ON " + p.table + " USING hnsw (embedding vector_cosine_ops)"
+	return p.execSetup(ctx, index)
+}
+
+func (p *Pgvector) execSetup(ctx context.Context, query string) error {
+	if _, err := p.pool.ExecContext(ctx, query); err != nil {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector setup: %w", err))
+	}
+	return nil
+}
+
+func (p *Pgvector) Add(ctx context.Context, docs []Document) error {
+	if p.embed == nil {
+		return ErrInvalidRequest.Wrap(errors.New("ai/rag: pgvector needs an embedder"))
+	}
+	texts, err := addTexts(docs)
+	if err != nil {
+		return err
+	}
+	vectors, err := p.embed.Embed(ctx, texts)
+	if err != nil {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed documents: %w", err))
+	}
+	if len(vectors) != len(docs) {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for %d documents", len(vectors), len(docs)))
+	}
+	if err := checkAddVectors(docs, vectors, p.dims); err != nil {
+		return ErrInvalidRequest.Wrap(err)
+	}
+	rows, err := addRows(docs, vectors)
+	if err != nil {
+		return ErrStoreFailed.Wrap(err)
+	}
+	return p.insertRows(ctx, rows)
+}
+
+type addRow struct {
+	id     string
+	text   string
+	meta   string
+	vector string
+}
+
+func addTexts(docs []Document) ([]string, error) {
+	if len(docs) == 0 {
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: add needs a document"))
+	}
+	texts := make([]string, len(docs))
+	for i, d := range docs {
+		if strings.TrimSpace(d.ID) == "" {
+			return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: document needs an id"))
+		}
+		texts[i] = d.Text
+	}
+	return texts, nil
+}
+
+func checkAddVectors(docs []Document, vectors [][]float32, dims int) error {
+	if _, err := squaredLengths(docs, vectors); err != nil {
+		return err
+	}
+	if len(vectors[0]) != dims {
+		return fmt.Errorf("ai/rag: document %s has %d dimensions, the store holds %d", docs[0].ID, len(vectors[0]), dims)
+	}
+	return nil
+}
+
+func addRows(docs []Document, vectors [][]float32) ([]addRow, error) {
+	rows := make([]addRow, len(docs))
+	for i, d := range docs {
+		meta, err := metadataText(d.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("ai/rag: document %s: %w", d.ID, err)
+		}
+		rows[i] = addRow{id: d.ID, text: d.Text, meta: meta, vector: vectorText(vectors[i])}
+	}
+	return rows, nil
+}
+
+func (p *Pgvector) insertRows(ctx context.Context, rows const []addRow) error {
+	query := "INSERT INTO " + p.table + " (id, content, metadata, embedding) VALUES ($1, $2, $3::jsonb, $4::vector) ON CONFLICT (id) DO UPDATE SET content = $2, metadata = $3::jsonb, embedding = $4::vector"
+	for _, r := range rows {
+		if _, err := p.pool.ExecContext(ctx, query, r.id, r.text, r.meta, r.vector); err != nil {
+			return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector add: %w", err))
+		}
+	}
+	return nil
+}
+
+func vectorText(vector const []float32) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, v := range vector {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatFloat(float64(v), 'g', -1, 32))
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+type metaPair struct {
+	key   string
+	value any
+}
+
+func metadataText(meta map[string]Value) (string, error) {
+	pairs, err := metadataPairs(meta)
+	if err != nil {
+		return "", err
+	}
+	slices.SortFunc(pairs, func(a metaPair, b metaPair) int {
+		return strings.Compare(a.key, b.key)
+	})
+	return metadataJoin(pairs)
+}
+
+func metadataPairs(meta map[string]Value) ([]metaPair, error) {
+	pairs := make([]metaPair, 0, len(meta))
+	for k, v := range meta {
+		one, err := metadataValue(k, v)
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, metaPair{key: k, value: one})
+	}
+	return pairs, nil
+}
+
+func metadataJoin(pairs []metaPair) (string, error) {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, p := range pairs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		kb, err := json.Marshal(p.key)
+		if err != nil {
+			return "", fmt.Errorf("ai/rag: encode metadata: %w", err)
+		}
+		vb, err := json.Marshal(p.value)
+		if err != nil {
+			return "", fmt.Errorf("ai/rag: encode metadata: %w", err)
+		}
+		b.WriteString(string(kb))
+		b.WriteByte(':')
+		b.WriteString(string(vb))
+	}
+	b.WriteByte('}')
+	return b.String(), nil
+}
+
+func metadataValue(key string, v Value) (any, error) {
+	switch held := v.(type) {
+	case Text:
+		return held.Text, nil
+	case Number:
+		return metadataNumber(key, held.Number)
+	case Flag:
+		return held.Flag, nil
+	case nil:
+		return nil, fmt.Errorf("metadata key %q holds no value", key)
+	}
+	return nil, fmt.Errorf("metadata key %q holds no value", key)
+}
+
+func metadataNumber(key string, n float64) (any, error) {
+	if math.IsNaN(n) {
+		return nil, nil
+	}
+	if math.IsInf(n, 0) {
+		return nil, fmt.Errorf("metadata key %q is not finite", key)
+	}
+	return n, nil
+}
+
+func (p *Pgvector) Delete(ctx context.Context, ids const []string) error {
+	if err := ctx.Err(); err != nil {
+		return ErrStoreFailed.Wrap(err)
+	}
+	for _, id := range ids {
+		if _, err := p.pool.ExecContext(ctx, "DELETE FROM "+p.table+" WHERE id = $1", id); err != nil {
+			return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector delete: %w", err))
+		}
+	}
+	return nil
+}
+
+func (p *Pgvector) Search(ctx context.Context, q Search) ([]Document, error) {
+	if err := checkSearch(q); err != nil {
+		return nil, ErrInvalidRequest.Wrap(err)
+	}
+	if p.embed == nil {
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: pgvector needs an embedder"))
+	}
+	vector, err := queryVector(ctx, p.embed, q.Query, p.dims)
+	if err != nil {
+		return nil, err
+	}
+	where, args, err := filterWhere(q.Filter, 4)
+	if err != nil {
+		return nil, err
+	}
+	plan := searchPlan{vector: vector, bound: 1 - q.Threshold, top: q.TopK, where: where, args: args}
+	return p.searchRows(ctx, plan)
+}
+
+type searchPlan struct {
+	vector string
+	bound  float64
+	top    int
+	where  string
+	args   []any
+}
+
+func checkSearch(q Search) error {
+	if q.TopK < 0 {
+		return fmt.Errorf("ai/rag: topK must not be negative, got %d", q.TopK)
+	}
+	if q.Threshold < 0 || q.Threshold > 1 {
+		return fmt.Errorf("ai/rag: similarity threshold must be in [0, 1], got %v", q.Threshold)
+	}
+	return nil
+}
+
+func queryVector(ctx context.Context, embed ai.Embedder, query string, dims int) (string, error) {
+	vectors, err := embed.Embed(ctx, []string{query})
+	if err != nil {
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed query: %w", err))
+	}
+	if len(vectors) != 1 {
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for the query", len(vectors)))
+	}
+	if _, err := squaredLength(vectors[0]); err != nil {
+		return "", ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query: %w", err))
+	}
+	if len(vectors[0]) != dims {
+		return "", ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query vector has %d dimensions, the store holds %d", len(vectors[0]), dims))
+	}
+	return vectorText(vectors[0]), nil
+}
+
+func filterWhere(f Filter?, start int) (string, []any, error) {
+	if f == nil {
+		return "", nil, nil
+	}
+	b := &filterArgs{args: []any{}, next: start}
+	fragment, err := translate(f, b)
+	if err != nil {
+		return "", nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: filter: %w", err))
+	}
+	return " AND (" + fragment + ")", b.args, nil
+}
+
+const filterMismatchMark = "ai/rag: filter type mismatch"
+
+func filterMismatch(err error) bool {
+	return err != nil && strings.Contains(err.Error(), filterMismatchMark)
+}
+
+func searchError(err error) error {
+	if filterMismatch(err) {
+		return ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: pgvector search: %w", err))
+	}
+	return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector search: %w", err))
+}
+
+func scanError(err error) error {
+	if filterMismatch(err) {
+		return ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
+	}
+	return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
+}
+
+func (p *Pgvector) searchRows(ctx context.Context, plan searchPlan) ([]Document, error) {
+	query := "SELECT id, content, metadata, (embedding <=> $1::vector) AS distance FROM " + p.table + " WHERE (embedding <=> $1::vector) <= $2" + plan.where + " ORDER BY distance ASC, id ASC LIMIT $3"
+	full := make([]any, 0, len(plan.args)+3)
+	full = append(full, plan.vector, plan.bound, plan.top)
+	full = append(full, plan.args...)
+	rows, err := p.pool.QueryContext(ctx, query, full...)
+	if err != nil {
+		return nil, searchError(err)
+	}
+	if rows == nil {
+		return nil, ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector search returned no rows handle"))
+	}
+	defer rows.Close()?
+	return scanDocuments(rows)
+}
+
+func scanDocuments(rows *sql.Rows) ([]Document, error) {
+	var out []Document
+	for rows.Next() {
+		var vid, vcontent, vmeta, vdist any
+		if err := rows.Scan(&vid, &vcontent, &vmeta, &vdist); err != nil {
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
+		}
+		doc, err := scannedDocument(vid, vcontent, vmeta, vdist)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, doc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, scanError(err)
+	}
+	if out == nil {
+		return []Document{}, nil
+	}
+	return out, nil
+}
+
+func scannedDocument(vid any, vcontent any, vmeta any, vdist any) (Document, error) {
+	id, err := scannedText(vid)
+	if err != nil {
+		return Document{}, err
+	}
+	text, err := scannedText(vcontent)
+	if err != nil {
+		return Document{}, err
+	}
+	raw, err := scannedText(vmeta)
+	if err != nil {
+		return Document{}, err
+	}
+	meta, err := decodeMetadata(raw, id)
+	if err != nil {
+		return Document{}, err
+	}
+	distance, err := scannedNumber(vdist)
+	if err != nil {
+		return Document{}, err
+	}
+	return Document{ID: id, Text: text, Metadata: meta, Score: 1 - distance}, nil
+}
+
+func scannedText(v any) (string, error) {
+	switch held := v.(type) {
+	case string:
+		return held, nil
+	case []byte:
+		return string(held), nil
+	default:
+		return "", ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector scan holds an unsupported text value"))
+	}
+}
+
+func scannedNumber(v any) (float64, error) {
+	switch held := v.(type) {
+	case float64:
+		return held, nil
+	case float32:
+		return float64(held), nil
+	case int64:
+		return float64(held), nil
+	default:
+		return scannedTextNumber(v)
+	}
+}
+
+func scannedTextNumber(v any) (float64, error) {
+	switch held := v.(type) {
+	case []byte:
+		return parseScannedNumber(string(held))
+	case string:
+		return parseScannedNumber(held)
+	default:
+		return 0, ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector scan holds an unsupported numeric value"))
+	}
+}
+
+func parseScannedNumber(text string) (float64, error) {
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan holds a distance that is not a number: %w", err))
+	}
+	return f, nil
+}
+
+func decodeMetadata(raw string, id string) (map[string]Value, error) {
+	var body map[string]any
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: decode metadata of %q: %w", id, err))
+	}
+	out := map[string]Value{}
+	for k, v := range body {
+		held, err := decodedValue(k, v)
+		if err != nil {
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: decode metadata of %q: %w", id, err))
+		}
+		out[k] = held
+	}
+	return out, nil
+}
+
+func decodedValue(key string, v any) (Value, error) {
+	switch held := v.(type) {
+	case nil:
+		return Number{Number: math.NaN()}, nil
+	case string:
+		return Text{Text: held}, nil
+	case bool:
+		return Flag{Flag: held}, nil
+	case float64:
+		return Number{Number: held}, nil
+	default:
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("key %q holds an unsupported value", key))
+	}
+}
+
+type filterArgs struct {
+	args []any
+	next int
+}
+
+func (b *filterArgs) param(value any) string {
+	b.args = append(b.args, value)
+	mark := "$" + strconv.Itoa(b.next)
+	b.next++
+	return mark
+}
+
+func translate(f Filter, b *filterArgs) (string, error) {
+	if e, ok := f.(Expression); ok {
+		return translateExpression(e, b)
+	}
+	if g, ok := f.(Group); ok {
+		inner, err := translate(g.Inner, b)
+		if err != nil {
+			return "", err
+		}
+		return "(" + inner + ")", nil
+	}
+	if f == nil {
+		return "", errors.New("a missing filter stands where a condition must stand")
+	}
+	return "", errors.New("a key, a constant or a list stands where a condition must stand")
+}
+
+func translateExpression(e Expression, b *filterArgs) (string, error) {
+	if e.Type == OpAnd || e.Type == OpOr {
+		return translateJunction(e, b, e.Type == OpAnd)
+	}
+	if e.Type == OpNot {
+		return translateNegation(e, b)
+	}
+	if e.Type == OpIn || e.Type == OpNin {
+		return translateIn(e, b, e.Type == OpNin)
+	}
+	if e.Type == OpIsNull || e.Type == OpIsNotNull {
+		return translateNull(e, b)
+	}
+	if isCompareOp(e.Type) {
+		return translateCompare(e, b)
+	}
+	return "", fmt.Errorf("unknown operator %q", e.Type)
+}
+
+func isCompareOp(op Op) bool {
+	switch op {
+	case OpEq, OpNe, OpGt, OpGte, OpLt, OpLte:
+		return true
+	default:
+		return false
+	}
+}
+
+func translateJunction(e Expression, b *filterArgs, both bool) (string, error) {
+	right := e.Right
+	if right == nil {
+		return "", fmt.Errorf("%s needs a right operand", e.Type)
+	}
+	left, err := translate(e.Left, b)
+	if err != nil {
+		return "", err
+	}
+	other, err := translate(right, b)
+	if err != nil {
+		return "", err
+	}
+	if both {
+		return "(" + left + " AND " + other + ")", nil
+	}
+	return "(" + left + " OR " + other + ")", nil
+}
+
+func translateNegation(e Expression, b *filterArgs) (string, error) {
+	inner, err := translate(e.Left, b)
+	if err != nil {
+		return "", err
+	}
+	return "(NOT (" + inner + "))", nil
+}
+
+func translateNull(e Expression, b *filterArgs) (string, error) {
+	key, ok := e.Left.(Key)
+	if !ok {
+		return "", fmt.Errorf("%s needs a key on the left", e.Type)
+	}
+	mark := b.param(key.Name)
+	if e.Type == OpIsNull {
+		return "(NOT jsonb_exists(metadata, " + mark + "))", nil
+	}
+	return "(jsonb_exists(metadata, " + mark + "))", nil
+}
+
+func translateCompare(e Expression, b *filterArgs) (string, error) {
+	key, right, err := compareOperands(e)
+	if err != nil {
+		return "", err
+	}
+	mark := b.param(key.Name)
+	if text := right.Text; text != nil {
+		return textFragment(mark, text, e.Type, b)
+	}
+	if integer := right.Integer; integer != nil {
+		return integerFragment(mark, integer, e.Type, b)
+	}
+	if decimal := right.Decimal; decimal != nil {
+		return decimalFragment(mark, decimal, e.Type, b)
+	}
+	if flag := right.Flag; flag != nil {
+		return flagFragment(mark, flag, e.Type, b)
+	}
+	return "", fmt.Errorf("key %q holds an empty constant", key.Name)
+}
+
+func compareOperands(e Expression) (Key, Const, error) {
+	key, ok := e.Left.(Key)
+	if !ok {
+		return Key{}, Const{}, fmt.Errorf("%s needs a key on the left", e.Type)
+	}
+	right := e.Right
+	if right == nil {
+		return Key{}, Const{}, fmt.Errorf("%s needs a right operand", e.Type)
+	}
+	made, ok := right.(Const)
+	if !ok {
+		return Key{}, Const{}, fmt.Errorf("%s needs a constant on the right", e.Type)
+	}
+	return key, made, nil
+}
+
+func listOperands(e Expression) (Key, Array, error) {
+	key, ok := e.Left.(Key)
+	if !ok {
+		return Key{}, Array{}, fmt.Errorf("%s needs a key on the left", e.Type)
+	}
+	right := e.Right
+	if right == nil {
+		return Key{}, Array{}, fmt.Errorf("%s needs a right operand", e.Type)
+	}
+	list, ok := right.(Array)
+	if !ok {
+		return Key{}, Array{}, fmt.Errorf("%s needs a list on the right", e.Type)
+	}
+	return key, list, nil
+}
+
+func textFragment(mark string, want string, op Op, b *filterArgs) (string, error) {
+	value := b.param(want)
+	compare := "(((metadata ->> " + mark + ") COLLATE \"C\") " + sqlOp(op) + " " + value + ")"
+	return casedCompare(mark, "'string'", compare, op), nil
+}
+
+func integerFragment(mark string, want int64, op Op, b *filterArgs) (string, error) {
+	value := b.param(want)
+	compare := "((metadata ->> " + mark + ")::numeric " + sqlOp(op) + " " + value + "::numeric)"
+	return casedCompare(mark, "'number'", compare, op), nil
+}
+
+func decimalFragment(mark string, want float64, op Op, b *filterArgs) (string, error) {
+	value := b.param(want)
+	compare := "((metadata ->> " + mark + ")::double precision " + sqlOp(op) + " " + value + "::double precision)"
+	return casedCompare(mark, "'number'", compare, op), nil
+}
+
+func flagFragment(mark string, want bool, op Op, b *filterArgs) (string, error) {
+	value := b.param(want)
+	left := "(CASE (metadata ->> " + mark + ")::boolean WHEN true THEN 1 ELSE 0 END)"
+	right := "(CASE " + value + "::boolean WHEN true THEN 1 ELSE 0 END)"
+	compare := "(" + left + " " + sqlOp(op) + " " + right + ")"
+	return casedCompare(mark, "'boolean'", compare, op), nil
+}
+
+func casedCompare(mark string, expected string, compare string, op Op) string {
+	absent := "FALSE"
+	if op == OpNe || op == OpLt || op == OpLte {
+		absent = "TRUE"
+	}
+	present := "FALSE"
+	if op == OpNe {
+		present = "TRUE"
+	}
+	raise := "(CAST(('" + filterMismatchMark + " on ' || " + mark + " || ': ' || jsonb_typeof(metadata -> " + mark + ")) AS integer) = 0)"
+	return "(CASE WHEN NOT jsonb_exists(metadata, " + mark + ") THEN " + absent + " WHEN (jsonb_typeof(metadata -> " + mark + ") = 'null') THEN " + present + " WHEN (jsonb_typeof(metadata -> " + mark + ") IS DISTINCT FROM " + expected + ") THEN " + raise + " ELSE " + compare + " END)"
+}
+
+func sqlOp(op Op) string {
+	if op == OpEq {
+		return "="
+	}
+	if op == OpNe {
+		return "<>"
+	}
+	if op == OpGt {
+		return ">"
+	}
+	if op == OpGte {
+		return ">="
+	}
+	if op == OpLt {
+		return "<"
+	}
+	return "<="
+}
+
+func translateIn(e Expression, b *filterArgs, negated bool) (string, error) {
+	key, list, err := listOperands(e)
+	if err != nil {
+		return "", err
+	}
+	if len(list.Items) == 0 {
+		if negated {
+			return "TRUE", nil
+		}
+		return "FALSE", nil
+	}
+	parts := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		one, err := inclusionPart(key, item, b)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, wrapNegation(one, negated))
+	}
+	join := " OR "
+	if negated {
+		join = " AND "
+	}
+	return "(" + strings.Join(parts, join) + ")", nil
+}
+
+func wrapNegation(one string, negated bool) string {
+	if negated {
+		return "(NOT (" + one + "))"
+	}
+	return one
+}
+
+func inclusionPart(key Key, item Const, b *filterArgs) (string, error) {
+	mark := b.param(key.Name)
+	if text := item.Text; text != nil {
+		value := b.param(text)
+		compare := "(((metadata ->> " + mark + ") COLLATE \"C\") = " + value + ")"
+		return casedCompare(mark, "'string'", compare, OpEq), nil
+	}
+	if integer := item.Integer; integer != nil {
+		value := b.param(integer)
+		compare := "((metadata ->> " + mark + ")::numeric = " + value + "::numeric)"
+		return casedCompare(mark, "'number'", compare, OpEq), nil
+	}
+	if decimal := item.Decimal; decimal != nil {
+		value := b.param(decimal)
+		compare := "((metadata ->> " + mark + ")::double precision = " + value + "::double precision)"
+		return casedCompare(mark, "'number'", compare, OpEq), nil
+	}
+	if flag := item.Flag; flag != nil {
+		value := b.param(flag)
+		compare := "((metadata ->> " + mark + ")::boolean = " + value + "::boolean)"
+		return casedCompare(mark, "'boolean'", compare, OpEq), nil
+	}
+	return "", fmt.Errorf("key %q holds an empty constant", key.Name)
+}

@@ -1,0 +1,1396 @@
+package session_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/session"
+	"github.com/gosuda/spira/db"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/microsoft/go-mssqldb"
+	_ "modernc.org/sqlite"
+)
+
+func sqlBaseTime() time.Time {
+	return time.Date(2026, time.November, 18, 12, 0, 0, 0, time.UTC)
+}
+
+func sqlFixedStore(pool *db.Pool) *session.SQLStore {
+	at := sqlBaseTime()
+	return &session.SQLStore{Pool: pool, Now: func() time.Time { return at }}
+}
+
+func sqlMemoryStore() session.Store {
+	at := sqlBaseTime()
+	return &session.Service{Now: func() time.Time { return at }}
+}
+
+func sqlOpen(t *testing.T, driver string, dsn string) *db.Pool {
+	t.Helper()
+	pool, err := db.Open(driver, dsn)
+	if err != nil {
+		panic(fmt.Sprintf("sql_test: db.Open(%s): %v", driver, err))
+	}
+	if pool == nil {
+		panic(fmt.Sprintf("sql_test: db.Open(%s) returned no pool", driver))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		panic(fmt.Sprintf("sql_test: start %s: %v", driver, err))
+	}
+	return pool
+}
+
+func sqlPrepare(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	store := sqlFixedStore(pool)
+	if err := store.Prepare(t.Context()); err != nil {
+		panic(fmt.Sprintf("sql_test: prepare: %v", err))
+	}
+	if err := store.Prepare(t.Context()); err != nil {
+		panic(fmt.Sprintf("sql_test: second prepare: %v", err))
+	}
+}
+
+func sqlStop(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("pool.Stop: %v", err)
+		}
+	})
+}
+
+func sqlSQLitePool(t *testing.T) *db.Pool {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", ")", " ", "_").Replace(t.Name())
+	pool := sqlOpen(t, "sqlite", fmt.Sprintf("file:spira_session_%s?mode=memory&cache=shared", key))
+	sqlPrepare(t, pool)
+	sqlStop(t, pool)
+	return pool
+}
+
+func sqlDSN(t *testing.T, name string) string {
+	t.Helper()
+	dsn := os.Getenv(name)
+	if dsn == "" {
+		t.Skipf("%s is not set; run `just engines`", name)
+	}
+	return dsn
+}
+
+func sqlEnginePool(t *testing.T, driver string, dsnVar string) *db.Pool {
+	t.Helper()
+	pool := sqlOpen(t, driver, sqlDSN(t, dsnVar))
+	sqlPrepare(t, pool)
+	sqlStop(t, pool)
+	return pool
+}
+
+func TestEngineSessionContractSQLite(t *testing.T) {
+	pool := sqlSQLitePool(t)
+	runSessionContract(t, func(t *testing.T) session.Store {
+		t.Helper()
+		return sqlFixedStore(pool)
+	})
+}
+
+func TestEngineSessionContractMemory(t *testing.T) {
+	runSessionContract(t, func(t *testing.T) session.Store {
+		t.Helper()
+		return sqlMemoryStore()
+	})
+}
+
+func TestEngineSessionContractPostgres(t *testing.T) {
+	pool := sqlEnginePool(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")
+	runSessionContract(t, func(t *testing.T) session.Store {
+		t.Helper()
+		return sqlFixedStore(pool)
+	})
+}
+
+func TestEngineSessionContractMySQL(t *testing.T) {
+	pool := sqlEnginePool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
+	runSessionContract(t, func(t *testing.T) session.Store {
+		t.Helper()
+		return sqlFixedStore(pool)
+	})
+}
+
+func TestEngineSessionContractMSSQL(t *testing.T) {
+	pool := sqlEnginePool(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")
+	runSessionContract(t, func(t *testing.T) session.Store {
+		t.Helper()
+		return sqlFixedStore(pool)
+	})
+}
+
+type sessionContractCase struct {
+	name string
+	run  func(t *testing.T, b session.Store)
+}
+
+func sessionContractCases() []sessionContractCase {
+	return []sessionContractCase{
+		{"append orders by sequence", contractAppendOrdersBySequence},
+		{"last n extends to turn start", contractLastNExtendsToTurnStart},
+		{"conversations stay isolated", contractConversationsStayIsolated},
+		{"delete frees one conversation", contractDeleteFreesOneConversation},
+		{"every part kind round trips", contractEveryPartKindRoundTrips},
+		{"quotes and unicode survive", contractQuotesAndUnicodeSurvive},
+		{"hostile id stays data", contractHostileIDStaysData},
+		{"cancelled save writes nothing", contractCancelledSaveWritesNothing},
+		{"stale version loses", contractStaleVersionLoses},
+		{"compact shapes the active view", contractCompactShapesTheActiveView},
+		{"blank id is rejected", contractBlankIDIsRejected},
+		{"append validations reject bad batches", contractAppendValidationsRejectBadBatches},
+		{"last n must be positive", contractLastNMustBePositive},
+		{"compact stale version loses", contractCompactStaleVersionLoses},
+		{"find returns the live session", contractFindReturnsTheLiveSession},
+		{"ensure live session keeps version", contractEnsureLiveSessionKeepsVersion},
+		{"delete missing session succeeds", contractDeleteMissingSessionSucceeds},
+		{"input edit leaves stored parts alone", contractInputEditLeavesStoredPartsAlone},
+		{"read edit leaves returned parts alone", contractReadEditLeavesReturnedPartsAlone},
+		{"expiry starts a new generation", contractExpiryStartsANewGeneration},
+		{"default ttl covers a day", contractDefaultTTLCoversADay},
+		{"custom ttl covers a minute", contractCustomTTLCoversAMinute},
+		{"delete then recreate refuses the old version", contractDeleteThenRecreateRefusesTheOldVersion},
+		{"trailing space ids stay isolated", contractTrailingSpaceIDsStayIsolated},
+		{"overlong id is refused", contractOverlongIDIsRefused},
+	}
+}
+
+func runSessionContract(t *testing.T, fresh func(t *testing.T) session.Store) {
+	t.Helper()
+	for _, c := range sessionContractCases() {
+		t.Run(c.name, func(t *testing.T) {
+			c.run(t, fresh(t))
+		})
+	}
+}
+
+func sqlUser(s string) ai.Message {
+	return ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: s}}}
+}
+
+func sqlEnsure(t *testing.T, b session.Store, id string) {
+	t.Helper()
+	sess, err := b.Ensure(id)
+	if err != nil {
+		t.Fatalf("Ensure(%s): %v", id, err)
+		return
+	}
+	if sess == nil {
+		t.Fatalf("Ensure(%s) returned nil", id)
+	}
+}
+
+func sqlAssistant(s string) ai.Message {
+	return ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{ai.Text{Text: s}}}
+}
+
+func sqlRichCall() ai.Message {
+	return ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{
+		ai.Text{Text: "let me check"},
+		ai.Reasoning{Text: "the user needs a forecast"},
+		ai.ToolCall{ID: "call_1", Name: "weather", Arguments: "{\"city\":\"Oslo\"}"},
+	}}
+}
+
+func sqlRichResults() ai.Message {
+	return ai.Message{Role: ai.RoleTool, Parts: []ai.Part{
+		ai.ToolResult{ID: "call_1", Name: "weather", Content: "rain", Skipped: false},
+		ai.ToolResult{ID: "call_9", Name: "weather", Content: "stale", Skipped: true},
+	}}
+}
+
+func sqlVersion(t *testing.T, b session.Store, id string) int64 {
+	t.Helper()
+	v, err := b.Version(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Version(%s): %v", id, err)
+		return 0
+	}
+	return v
+}
+
+func sqlAppend(t *testing.T, b session.Store, e session.Event) {
+	t.Helper()
+	ok, err := b.Append(t.Context(), e.Session, sqlVersion(t, b, e.Session), e)
+	if err != nil {
+		t.Fatalf("Append(%s): %v", e.Session, err)
+		return
+	}
+	if !ok {
+		t.Fatalf("Append(%s) returned false", e.Session)
+	}
+}
+
+func sqlEvents(t *testing.T, b session.Store, id string) []session.Event {
+	t.Helper()
+	events, err := b.Events(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Events(%s): %v", id, err)
+		return nil
+	}
+	return events
+}
+
+func sqlActive(t *testing.T, b session.Store, id string) []ai.Message {
+	t.Helper()
+	messages, err := b.Active(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Active(%s): %v", id, err)
+		return nil
+	}
+	return messages
+}
+
+func sqlAdvance(t *testing.T, b session.Store, to time.Time) {
+	t.Helper()
+	switch s := b.(type) {
+	case *session.Service:
+		s.Now = func() time.Time { return to }
+	case *session.SQLStore:
+		s.Now = func() time.Time { return to }
+	}
+}
+
+func sqlWithTTL(t *testing.T, b session.Store, ttl time.Duration, now func() time.Time) session.Store {
+	t.Helper()
+	switch s := b.(type) {
+	case *session.Service:
+		return &session.Service{TTL: ttl, Now: now}
+	case *session.SQLStore:
+		return &session.SQLStore{Pool: s.Pool, TTL: ttl, Now: now}
+	}
+	t.Fatalf("unknown store type")
+	return nil
+}
+
+func sqlTextOf(m ai.Message) string {
+	for _, p := range m.Parts {
+		if text, ok := p.(ai.Text); ok {
+			return text.Text
+		}
+	}
+	return ""
+}
+
+func sqlMessageEqual(a ai.Message, b ai.Message) bool {
+	if a.Role != b.Role || len(a.Parts) != len(b.Parts) {
+		return false
+	}
+	for i := range a.Parts {
+		if !sqlPartEqual(a.Parts[i], b.Parts[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sqlPartEqual(a ai.Part, b ai.Part) bool {
+	switch x := a.(type) {
+	case ai.Text:
+		y, ok := b.(ai.Text)
+		return ok && x.Text == y.Text
+	case ai.Reasoning:
+		y, ok := b.(ai.Reasoning)
+		return ok && x.Text == y.Text
+	case ai.ToolCall:
+		y, ok := b.(ai.ToolCall)
+		return ok && x.ID == y.ID && x.Name == y.Name && x.Arguments == y.Arguments
+	case ai.ToolResult:
+		y, ok := b.(ai.ToolResult)
+		return ok && x.ID == y.ID && x.Name == y.Name && x.Content == y.Content && x.Skipped == y.Skipped
+	}
+	return false
+}
+
+func sqlEventEqual(a session.Event, b session.Event) bool {
+	if a.ID != b.ID || a.Session != b.Session || a.Type != b.Type {
+		return false
+	}
+	if a.At.UnixNano() != b.At.UnixNano() {
+		return false
+	}
+	if a.Message == nil || b.Message == nil {
+		return a.Message == nil && b.Message == nil
+	}
+	return sqlMessageEqual(a.Message ?? ai.Message{}, b.Message ?? ai.Message{})
+}
+
+func sqlRequireEvents(t *testing.T, got []session.Event, want []session.Event) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("events = %d, want %d", len(got), len(want))
+		return
+	}
+	for i := range got {
+		if !sqlEventEqual(got[i], want[i]) {
+			t.Fatalf("event %d = %+v, want %+v", i, got[i], want[i])
+			return
+		}
+	}
+}
+
+func sqlMessageOf(eid string, id string, m ai.Message) session.Event {
+	return session.Event{ID: eid, Session: id, At: sqlBaseTime(), Type: session.EventMessage, Message: m}
+}
+
+func contractAppendOrdersBySequence(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	first := sqlUser("first")
+	second := sqlAssistant("second")
+	third := sqlUser("third")
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, first))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, second))
+	sqlAppend(t, b, sqlMessageOf(a+"/e3", a, third))
+	sqlRequireEvents(t, sqlEvents(t, b, a), []session.Event{
+		sqlMessageOf(a+"/e1", a, first),
+		sqlMessageOf(a+"/e2", a, second),
+		sqlMessageOf(a+"/e3", a, third),
+	})
+	if got := sqlEvents(t, b, c); len(got) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(got))
+	}
+}
+
+func contractLastNExtendsToTurnStart(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("u1")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlAssistant("a1")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e3", a, sqlUser("u2")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e4", a, sqlAssistant("a2")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e5", a, sqlUser("u3")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e6", a, sqlAssistant("a3")))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	last, err := b.LastN(t.Context(), a, 1)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(last) != 2 || sqlTextOf(last[0].Message ?? ai.Message{}) != "u3" {
+		t.Fatalf("LastN 1 holds %d events, want 2 starting at u3", len(last))
+		return
+	}
+	if _, err := b.LastN(t.Context(), a, 0); err == nil {
+		t.Fatalf("LastN 0 reported no error")
+	}
+	all, err := b.LastN(t.Context(), a, 10)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(all) != 6 {
+		t.Fatalf("LastN 10 holds %d events, want 6", len(all))
+	}
+	if got := sqlEvents(t, b, c); len(got) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(got))
+	}
+}
+
+func contractConversationsStayIsolated(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	one := sqlUser("one")
+	two := sqlUser("two")
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, one))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, two))
+	sqlRequireEvents(t, sqlEvents(t, b, a), []session.Event{sqlMessageOf(a+"/e1", a, one)})
+	sqlRequireEvents(t, sqlEvents(t, b, c), []session.Event{sqlMessageOf(c+"/e1", c, two)})
+}
+
+func contractDeleteFreesOneConversation(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("one")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlAssistant("two")))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	if err := b.Delete(t.Context(), a); err != nil {
+		t.Fatalf("Delete: %v", err)
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 0 {
+		t.Fatalf("conversation a holds %d events after delete, want 0", len(got))
+	}
+	if found := b.Find(a); found != nil {
+		t.Fatalf("Find(a) is not nil after delete")
+	}
+	if v := sqlVersion(t, b, a); v != 0 {
+		t.Fatalf("version after delete = %d, want 0", v)
+	}
+	if got := sqlEvents(t, b, c); len(got) != 1 {
+		t.Fatalf("conversation c holds %d events after deleting a, want 1", len(got))
+	}
+	sqlEnsure(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e9", a, sqlUser("again")))
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("recreated conversation a holds %d events, want 1", len(got))
+	}
+}
+
+func contractEveryPartKindRoundTrips(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	call := sqlRichCall()
+	results := sqlRichResults()
+	plain := ai.Message{Role: ai.RoleUser}
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, call))
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, results))
+	sqlAppend(t, b, sqlMessageOf(a+"/e3", a, plain))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	got := sqlActive(t, b, a)
+	if len(got) != 3 || !sqlMessageEqual(got[0], call) || !sqlMessageEqual(got[1], results) || !sqlMessageEqual(got[2], plain) {
+		t.Fatalf("active messages = %+v, want the call, the results and the bare message", got)
+	}
+	if events := sqlEvents(t, b, a); len(events) != 3 {
+		t.Fatalf("conversation a holds %d events, want 3", len(events))
+	}
+	if decoy := sqlEvents(t, b, c); len(decoy) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(decoy))
+	}
+}
+
+func contractQuotesAndUnicodeSurvive(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	tricky := "it's \"quoted\" with \\ and emoji \U0001F600 plus CJK"
+	want := sqlUser(tricky)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, want))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	got := sqlEvents(t, b, a)
+	if len(got) != 1 || !sqlMessageEqual(got[0].Message ?? ai.Message{}, want) {
+		t.Fatalf("tricky text came back as %+v, want %+v", got, want)
+	}
+	if decoy := sqlEvents(t, b, c); len(decoy) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(decoy))
+	}
+}
+
+func contractHostileIDStaysData(t *testing.T, b session.Store) {
+	t.Helper()
+	hostile := "'; DROP TABLE x; --"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, hostile)
+	sqlEnsure(t, b, c)
+	sqlAppend(t, b, sqlMessageOf(hostile+"/e1", hostile, sqlUser("hidden")))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	got := sqlEvents(t, b, hostile)
+	if len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "hidden" {
+		t.Fatalf("hostile conversation holds %d events, want 1 saying hidden", len(got))
+	}
+	if err := b.Delete(t.Context(), hostile); err != nil {
+		t.Fatalf("Delete(hostile): %v", err)
+		return
+	}
+	if left := sqlEvents(t, b, hostile); len(left) != 0 {
+		t.Fatalf("hostile conversation holds %d events after delete, want 0", len(left))
+	}
+	sqlEnsure(t, b, t.Name()+"/after")
+	sqlAppend(t, b, sqlMessageOf(t.Name()+"/e1", t.Name()+"/after", sqlUser("the table is intact")))
+	if kept := sqlEvents(t, b, c); len(kept) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(kept))
+	}
+}
+
+func contractCancelledSaveWritesNothing(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	v := sqlVersion(t, b, a)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := b.Append(ctx, a, v, session.Event{ID: a + "/e1", Session: a, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("lost")}); err == nil {
+		t.Fatalf("Append with a cancelled context reported no error")
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 0 {
+		t.Fatalf("cancelled save left %d events, want 0", len(got))
+	}
+	if kept := sqlVersion(t, b, a); kept != v {
+		t.Fatalf("version moved to %d, want %d", kept, v)
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlUser("after")))
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("conversation a holds %d events, want 1", len(got))
+	}
+}
+
+func contractStaleVersionLoses(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	v := sqlVersion(t, b, a)
+	ok, err := b.Append(t.Context(), a, v+7, session.Event{ID: a + "/e1", Session: a, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("stale")})
+	if err != nil {
+		t.Fatalf("stale Append: %v", err)
+		return
+	}
+	if ok {
+		t.Fatalf("stale Append returned true, want false")
+	}
+	if got := sqlEvents(t, b, a); len(got) != 0 {
+		t.Fatalf("stale save left %d events, want 0", len(got))
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlUser("fresh")))
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("conversation a holds %d events, want 1", len(got))
+	}
+	if kept := sqlEvents(t, b, c); len(kept) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(kept))
+	}
+}
+
+func contractCompactShapesTheActiveView(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("m1")))
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlAssistant("m2")))
+	sqlAppend(t, b, sqlMessageOf(c+"/e1", c, sqlUser("decoy")))
+	summary := sqlAssistant("summary")
+	ok, err := b.Compact(t.Context(), a, sqlVersion(t, b, a), session.Boundary{Summary: []ai.Message{summary}})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+		return
+	}
+	if !ok {
+		t.Fatalf("Compact returned false")
+	}
+	third := sqlUser("m3")
+	sqlAppend(t, b, sqlMessageOf(a+"/e9", a, third))
+	got := sqlActive(t, b, a)
+	if len(got) != 2 || !sqlMessageEqual(got[0], summary) || !sqlMessageEqual(got[1], third) {
+		t.Fatalf("active view = %+v, want the summary and m3", got)
+	}
+	if events := sqlEvents(t, b, a); len(events) != 5 {
+		t.Fatalf("conversation a holds %d events, want 5", len(events))
+	}
+	if kept := sqlEvents(t, b, c); len(kept) != 1 {
+		t.Fatalf("conversation c holds %d events, want 1", len(kept))
+	}
+}
+
+func contractBlankIDIsRejected(t *testing.T, b session.Store) {
+	t.Helper()
+	_, err := b.Ensure("")
+	if err == nil {
+		t.Fatalf("Ensure blank id reported no error")
+		return
+	}
+	if !errors.Is(err, session.ErrBlankID) {
+		t.Fatalf("Ensure blank id error = %q, want the blank id fault", err.Error())
+		return
+	}
+	_, blerr := b.Ensure("   ")
+	if blerr == nil {
+		t.Fatalf("Ensure blank id reported no error")
+		return
+	}
+	if !errors.Is(blerr, session.ErrBlankID) {
+		t.Fatalf("Ensure blank id error = %q, want the blank id fault", blerr.Error())
+		return
+	}
+}
+
+func contractAppendValidationsRejectBadBatches(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	c := t.Name() + "/c"
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, c)
+	stale := sqlVersion(t, b, a) + 7
+	system := session.Event{ID: a + "/e1", Session: a, At: sqlBaseTime(), Type: session.EventMessage, Message: ai.Message{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: "s"}}}}
+	_, syserr := b.Append(t.Context(), a, stale, system)
+	if syserr == nil {
+		t.Fatalf("system Append reported no error")
+		return
+	}
+	if !errors.Is(syserr, session.ErrSystemMessage) {
+		t.Fatalf("system Append error = %q, want the system message fault", syserr.Error())
+		return
+	}
+	_, emptyerr := b.Append(t.Context(), a, stale)
+	if emptyerr == nil {
+		t.Fatalf("empty Append reported no error")
+		return
+	}
+	if !errors.Is(emptyerr, session.ErrEmptyBatch) {
+		t.Fatalf("empty Append error = %q, want the empty batch fault", emptyerr.Error())
+		return
+	}
+	foreign := session.Event{ID: c + "/e1", Session: c, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("x")}
+	_, forerr := b.Append(t.Context(), a, stale, foreign)
+	if forerr == nil {
+		t.Fatalf("foreign Append reported no error")
+		return
+	}
+	if !errors.Is(forerr, session.ErrForeignEvent) {
+		t.Fatalf("foreign Append error = %v, want the foreign event fault", forerr)
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 0 {
+		t.Fatalf("rejected batches left %d events, want 0", len(got))
+		return
+	}
+	if kept := sqlEvents(t, b, c); len(kept) != 0 {
+		t.Fatalf("rejected batches left %d events in c, want 0", len(kept))
+	}
+}
+
+func contractLastNMustBePositive(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	if _, err := b.LastN(t.Context(), a, 0); err == nil {
+		t.Fatalf("LastN 0 reported no error")
+		return
+	}
+	_, negerr := b.LastN(t.Context(), a, -3)
+	if negerr == nil {
+		t.Fatalf("LastN -3 reported no error")
+		return
+	}
+	if !errors.Is(negerr, session.ErrInvalidCount) {
+		t.Fatalf("LastN -3 error = %q, want the count fault", negerr.Error())
+	}
+}
+
+func contractCompactStaleVersionLoses(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("m1")))
+	ok, err := b.Compact(t.Context(), a, sqlVersion(t, b, a)+7, session.Boundary{Summary: []ai.Message{sqlAssistant("s")}})
+	if err != nil {
+		t.Fatalf("stale Compact: %v", err)
+		return
+	}
+	if ok {
+		t.Fatalf("stale Compact returned true, want false")
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("stale Compact left %d events, want 1", len(got))
+	}
+}
+
+func contractFindReturnsTheLiveSession(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sess, err := b.Ensure(a)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+		return
+	}
+	if sess == nil {
+		t.Fatalf("Ensure returned nil")
+		return
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("hi")))
+	found := b.Find(a)
+	if found == nil {
+		t.Fatalf("Find(a) is nil for a live session")
+		return
+	}
+	if found.ID != a {
+		t.Fatalf("Find(a) id = %q, want %q", found.ID, a)
+		return
+	}
+	if found.CreatedAt.UnixNano() != sess.CreatedAt.UnixNano() {
+		t.Fatalf("Find(a) created at %v, want %v", found.CreatedAt, sess.CreatedAt)
+		return
+	}
+	if found.ExpiresAt.UnixNano() != sess.ExpiresAt.UnixNano() {
+		t.Fatalf("Find(a) expires at %v, want %v", found.ExpiresAt, sess.ExpiresAt)
+		return
+	}
+}
+
+func contractEnsureLiveSessionKeepsVersion(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	first, err := b.Ensure(a)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+		return
+	}
+	if first == nil {
+		t.Fatalf("Ensure returned nil")
+		return
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("hi")))
+	kept := sqlVersion(t, b, a)
+	second, err := b.Ensure(a)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+		return
+	}
+	if second == nil {
+		t.Fatalf("Ensure returned nil")
+		return
+	}
+	if second.ID != a || second.CreatedAt.UnixNano() != first.CreatedAt.UnixNano() {
+		t.Fatalf("live Ensure changed the session: %+v, want %+v", second, first)
+		return
+	}
+	if moved := sqlVersion(t, b, a); moved != kept {
+		t.Fatalf("live Ensure moved the version to %d, want %d", moved, kept)
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("live Ensure left %d events, want 1", len(got))
+	}
+}
+
+func contractDeleteMissingSessionSucceeds(t *testing.T, b session.Store) {
+	t.Helper()
+	if err := b.Delete(t.Context(), t.Name()+"/missing"); err != nil {
+		t.Fatalf("Delete missing: %v", err)
+		return
+	}
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("hi")))
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("conversation a holds %d events, want 1", len(got))
+	}
+}
+
+func contractInputEditLeavesStoredPartsAlone(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	want := sqlRichCall()
+	m := sqlRichCall()
+	ok, err := b.Append(t.Context(), a, sqlVersion(t, b, a), sqlMessageOf(a+"/e1", a, m))
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+		return
+	}
+	if !ok {
+		t.Fatalf("Append returned false")
+		return
+	}
+	m.Parts[0] = ai.Text{Text: "changed"}
+	m.Parts = append(m.Parts, ai.Text{Text: "extra"})
+	got := sqlEvents(t, b, a)
+	if len(got) != 1 || !sqlMessageEqual(got[0].Message ?? ai.Message{}, want) {
+		t.Fatalf("stored parts changed to %+v, want %+v", got, want)
+		return
+	}
+}
+
+func contractReadEditLeavesReturnedPartsAlone(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	want := sqlRichCall()
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, want))
+	got := sqlEvents(t, b, a)
+	if len(got) != 1 {
+		t.Fatalf("conversation a holds %d events, want 1", len(got))
+		return
+	}
+	m := got[0].Message ?? ai.Message{}
+	m.Parts[0] = ai.Text{Text: "changed"}
+	got[0].Message = m
+	again := sqlEvents(t, b, a)
+	if len(again) != 1 || !sqlMessageEqual(again[0].Message ?? ai.Message{}, want) {
+		t.Fatalf("a read edit reached the next read: %+v", again)
+	}
+}
+
+func contractExpiryStartsANewGeneration(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("first")))
+	v0 := sqlVersion(t, b, a)
+	sqlAdvance(t, b, sqlBaseTime().Add(12*time.Hour))
+	if found := b.Find(a); found == nil {
+		t.Fatalf("Find(a) is nil before expiry")
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("conversation a holds %d events before expiry, want 1", len(got))
+		return
+	}
+	if kept := sqlVersion(t, b, a); kept != v0 {
+		t.Fatalf("version moved to %d before expiry, want %d", kept, v0)
+		return
+	}
+	sqlAdvance(t, b, sqlBaseTime().Add(25*time.Hour))
+	if found := b.Find(a); found != nil {
+		t.Fatalf("Find(a) is not nil after expiry")
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 0 {
+		t.Fatalf("conversation a holds %d events after expiry, want 0", len(got))
+		return
+	}
+	if kept := sqlVersion(t, b, a); kept != 0 {
+		t.Fatalf("version is %d after expiry, want 0", kept)
+		return
+	}
+	if live := sqlActive(t, b, a); len(live) != 0 {
+		t.Fatalf("active holds %d messages after expiry, want 0", len(live))
+		return
+	}
+	sqlEnsure(t, b, a)
+	if v1 := sqlVersion(t, b, a); v1 == v0 {
+		t.Fatalf("the new generation keeps version %d", v1)
+		return
+	}
+	old, olderr := b.Append(t.Context(), a, v0, session.Event{ID: a + "/old", Session: a, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("old")})
+	if olderr != nil {
+		t.Fatalf("old version Append: %v", olderr)
+		return
+	}
+	if old {
+		t.Fatalf("the old version appended to the new generation")
+		return
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlUser("second")))
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("the new generation holds %d events, want 1", len(got))
+	}
+}
+
+func contractDefaultTTLCoversADay(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("hi")))
+	edge := sqlBaseTime().Add(24 * time.Hour)
+	sqlAdvance(t, b, edge.Add(-time.Second))
+	if found := b.Find(a); found == nil {
+		t.Fatalf("Find(a) is nil just inside the TTL")
+		return
+	}
+	if v := sqlVersion(t, b, a); v == 0 {
+		t.Fatalf("version is zero just inside the TTL")
+		return
+	}
+	sqlAdvance(t, b, edge.Add(time.Second))
+	if found := b.Find(a); found != nil {
+		t.Fatalf("Find(a) is not nil just outside the TTL")
+		return
+	}
+	if v := sqlVersion(t, b, a); v != 0 {
+		t.Fatalf("version is %d just outside the TTL, want 0", v)
+	}
+}
+
+func contractCustomTTLCoversAMinute(t *testing.T, b session.Store) {
+	t.Helper()
+	at := sqlBaseTime()
+	timed := sqlWithTTL(t, b, time.Minute, func() time.Time { return at })
+	if timed == nil {
+		t.Fatalf("custom TTL store is nil")
+		return
+	}
+	a := t.Name() + "/a"
+	sqlEnsure(t, timed, a)
+	sqlAppend(t, timed, sqlMessageOf(a+"/e1", a, sqlUser("hi")))
+	at = at.Add(59 * time.Second)
+	if found := timed.Find(a); found == nil {
+		t.Fatalf("Find(a) is nil just inside the minute")
+		return
+	}
+	if v := sqlVersion(t, timed, a); v == 0 {
+		t.Fatalf("version is zero just inside the minute")
+		return
+	}
+	at = at.Add(2 * time.Second)
+	if found := timed.Find(a); found != nil {
+		t.Fatalf("Find(a) is not nil just outside the minute")
+		return
+	}
+	if got := sqlEvents(t, timed, a); len(got) != 0 {
+		t.Fatalf("conversation a holds %d events just outside the minute, want 0", len(got))
+		return
+	}
+	if v := sqlVersion(t, timed, a); v != 0 {
+		t.Fatalf("version is %d just outside the minute, want 0", v)
+	}
+
+}
+
+func contractDeleteThenRecreateRefusesTheOldVersion(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	sqlEnsure(t, b, a)
+	first := sqlVersion(t, b, a)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("first")))
+	last := sqlVersion(t, b, a)
+	if err := b.Delete(t.Context(), a); err != nil {
+		t.Fatalf("Delete: %v", err)
+		return
+	}
+	sqlEnsure(t, b, a)
+	for _, stale := range []int64{first, last} {
+		ok, err := b.Append(t.Context(), a, stale, session.Event{ID: a + "/old", Session: a, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("old")})
+		if err != nil {
+			t.Fatalf("stale version %d Append: %v", stale, err)
+			return
+		}
+		if ok {
+			t.Fatalf("version %d from the deleted session appended to the recreated session", stale)
+			return
+		}
+	}
+	sqlAppend(t, b, sqlMessageOf(a+"/e2", a, sqlUser("second")))
+	got := sqlEvents(t, b, a)
+	if len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "second" {
+		t.Fatalf("the recreated conversation holds %d events, want only the second turn", len(got))
+	}
+}
+
+func contractTrailingSpaceIDsStayIsolated(t *testing.T, b session.Store) {
+	t.Helper()
+	a := t.Name() + "/a"
+	spaced := t.Name() + "/a "
+	sqlEnsure(t, b, a)
+	sqlEnsure(t, b, spaced)
+	sqlAppend(t, b, sqlMessageOf(a+"/e1", a, sqlUser("plain")))
+	sqlAppend(t, b, sqlMessageOf(spaced+"/e1", spaced, sqlUser("spaced")))
+	if got := sqlEvents(t, b, a); len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "plain" {
+		t.Fatalf("conversation a holds %d events, want only the plain turn", len(got))
+		return
+	}
+	if got := sqlEvents(t, b, spaced); len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "spaced" {
+		t.Fatalf("the spaced conversation holds %d events, want only the spaced turn", len(got))
+		return
+	}
+	if err := b.Delete(t.Context(), spaced); err != nil {
+		t.Fatalf("Delete(spaced): %v", err)
+		return
+	}
+	if got := sqlEvents(t, b, a); len(got) != 1 {
+		t.Fatalf("deleting the spaced conversation left %d events in a, want 1", len(got))
+	}
+}
+
+func contractOverlongIDIsRefused(t *testing.T, b session.Store) {
+	t.Helper()
+	long := strings.Repeat("k", 256)
+	_, err := b.Ensure(long)
+	if err == nil {
+		t.Fatalf("Ensure of a %d byte id reported no error", len(long))
+		return
+	}
+	if !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("overlong id error = %v, want the id limit fault", err)
+		return
+	}
+	edge := strings.Repeat("k", 255)
+	sqlEnsure(t, b, edge)
+	sqlAppend(t, b, sqlMessageOf("e1", edge, sqlUser("at the limit")))
+	got := sqlEvents(t, b, edge)
+	if len(got) != 1 || sqlTextOf(got[0].Message ?? ai.Message{}) != "at the limit" {
+		t.Fatalf("the %d byte id holds %d events, want the one turn", len(edge), len(got))
+		return
+	}
+	longEvent := session.Event{ID: long + "/e1", Session: edge, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("lost")}
+	if _, err := b.Append(t.Context(), edge, sqlVersion(t, b, edge), longEvent); !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("overlong event id Append error = %v, want the id limit fault", err)
+		return
+	}
+	if kept := sqlEvents(t, b, edge); len(kept) != 1 {
+		t.Fatalf("the %d byte id holds %d events after the overlong event, want 1", len(edge), len(kept))
+		return
+	}
+	overlong := session.Event{ID: long + "/e1", Session: long, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("lost")}
+	if _, err := b.Append(t.Context(), long, 0, overlong); !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("overlong Append error = %v, want the id limit fault", err)
+		return
+	}
+	if found := b.Find(long); found != nil {
+		t.Fatalf("Find of an overlong id returned a session")
+		return
+	}
+	if events := sqlEvents(t, b, long); len(events) != 0 {
+		t.Fatalf("Events of an overlong id holds %d events, want 0", len(events))
+		return
+	}
+	if active := sqlActive(t, b, long); len(active) != 0 {
+		t.Fatalf("Active of an overlong id holds %d messages, want 0", len(active))
+		return
+	}
+	if v := sqlVersion(t, b, long); v != 0 {
+		t.Fatalf("version of an overlong id is %d, want 0", v)
+		return
+	}
+	if err := b.Delete(t.Context(), long); err != nil {
+		t.Fatalf("Delete of an overlong id: %v", err)
+		return
+	}
+	if kept := sqlEvents(t, b, edge); len(kept) != 1 {
+		t.Fatalf("the %d byte id holds %d events after the overlong delete, want 1", len(edge), len(kept))
+	}
+}
+
+func TestStoredPartsRoundTrip(t *testing.T) {
+	call := sqlRichCall()
+	results := sqlRichResults()
+	plain := ai.Message{Role: ai.RoleUser}
+	empty := ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{}}
+	for _, m := range []ai.Message{call, results, plain, empty, sqlUser("hi")} {
+		raw, err := session.EncodeStoredMessage(m)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+			return
+		}
+		back, err := session.DecodeStoredMessage(string(m.Role), raw)
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+			return
+		}
+		if back == nil {
+			t.Fatalf("round trip of %+v came back nil", m)
+			return
+		}
+		if !sqlMessageEqual(back, m) {
+			t.Fatalf("round trip of %+v came back as %+v", m, back)
+			return
+		}
+	}
+	if _, err := session.DecodeStoredMessage("assistant", "{\"role\":\"assistant\",\"parts\":[{\"kind\":\"smoke\"}]}"); err == nil {
+		t.Fatalf("an unknown part decoded without an error")
+	}
+	if _, err := session.DecodeStoredMessage("user", "{oops"); err == nil {
+		t.Fatalf("broken JSON decoded without an error")
+	}
+	back, err := session.DecodeStoredMessage("", "[]")
+	if err != nil {
+		t.Fatalf("Decode empty role: %v", err)
+		return
+	}
+	if back != nil {
+		t.Fatalf("empty role decoded to %+v, want nil", back)
+		return
+	}
+}
+
+func sessionInsertMarks(t *testing.T, d db.Dialect, mark string) {
+	t.Helper()
+	s := session.SessionInsert(d)
+	if !strings.Contains(s, mark) {
+		t.Fatalf("insert = %q, want %s marks", s, mark)
+		return
+	}
+	for _, other := range []string{"?", "$", "@p"} {
+		if other != mark && strings.Contains(s, other) {
+			t.Fatalf("insert = %q, want %s marks only", s, mark)
+			return
+		}
+	}
+}
+
+func sessionClaimMarks(t *testing.T, d db.Dialect, mark string) {
+	t.Helper()
+	s := session.SessionClaim(d)
+	if !strings.Contains(s, mark) {
+		t.Fatalf("claim = %q, want %s marks", s, mark)
+		return
+	}
+	for _, other := range []string{"?", "$", "@p"} {
+		if other != mark && strings.Contains(s, other) {
+			t.Fatalf("claim = %q, want %s marks only", s, mark)
+			return
+		}
+	}
+}
+
+func TestSessionStatementsUsePlaceholders(t *testing.T) {
+	sessionInsertMarks(t, db.SQLite{}, "?")
+	sessionClaimMarks(t, db.SQLite{}, "?")
+	sessionInsertMarks(t, db.Postgres{}, "$")
+	sessionClaimMarks(t, db.Postgres{}, "$")
+	sessionInsertMarks(t, db.MySQL{}, "?")
+	sessionClaimMarks(t, db.MySQL{}, "?")
+	sessionInsertMarks(t, db.MSSQL{}, "@p")
+	sessionClaimMarks(t, db.MSSQL{}, "@p")
+	if s := session.SessionInsert(db.MSSQL{}); !strings.Contains(s, "MERGE") {
+		t.Fatalf("mssql insert = %q, want a merge", s)
+	}
+	if s := session.SessionNewestBoundary(db.MSSQL{}); !strings.Contains(s, "FETCH") || strings.Contains(s, "LIMIT") {
+		t.Fatalf("mssql boundary = %q, want fetch and no limit", s)
+	}
+	sessions, events := session.SessionTables(db.MySQL{})
+	if !strings.Contains(sessions, "utf8mb4_0900_bin") || !strings.Contains(events, "utf8mb4_0900_bin") {
+		t.Fatalf("mysql tables = %q %q, want the NO PAD collation on session keys", sessions, events)
+	}
+	sessions, events = session.SessionTables(db.MSSQL{})
+	if !strings.Contains(sessions, "VARBINARY") || !strings.Contains(events, "VARBINARY") {
+		t.Fatalf("mssql tables = %q %q, want binary session keys", sessions, events)
+	}
+	for _, d := range []db.Dialect{db.SQLite{}, db.Postgres{}, db.MySQL{}} {
+		if s := session.SessionNewestBoundary(d); !strings.Contains(s, "LIMIT") {
+			t.Fatalf("boundary = %q, want limit", s)
+		}
+	}
+}
+
+func TestEngineSessionClaimAdmitsOneWinner(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlSQLitePool(t)) })
+	t.Run("postgres", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")) })
+	t.Run("mysql", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")) })
+	t.Run("mssql", func(t *testing.T) { sessionClaimAdmitsOneWinner(t, sqlEnginePool(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")) })
+}
+
+func sessionClaimAdmitsOneWinner(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	store := sqlFixedStore(pool)
+	a := t.Name() + "/a"
+	sess, err := store.Ensure(a)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+		return
+	}
+	if sess == nil {
+		t.Fatalf("Ensure returned nil")
+		return
+	}
+	expires := sess.ExpiresAt.UnixNano()
+	sqlAppend(t, store, sqlMessageOf(a+"/e1", a, sqlUser("first")))
+	old := sqlVersion(t, store, a)
+	sqlAdvance(t, store, sqlBaseTime().Add(25*time.Hour))
+	won, err := session.ClaimStale(store, a, old, expires)
+	if err != nil {
+		t.Fatalf("ClaimStale winner: %v", err)
+		return
+	}
+	if !won {
+		t.Fatalf("ClaimStale winner returned false, want true")
+		return
+	}
+	lost, err := session.ClaimStale(store, a, old, expires)
+	if err != nil {
+		t.Fatalf("ClaimStale loser: %v", err)
+		return
+	}
+	if lost {
+		t.Fatalf("ClaimStale loser returned true, want false")
+		return
+	}
+	if got := sqlEvents(t, store, a); len(got) != 0 {
+		t.Fatalf("a losing claim left %d events, want 0", len(got))
+		return
+	}
+	if v := sqlVersion(t, store, a); v != old+1 {
+		t.Fatalf("version is %d, want %d", v, old+1)
+		return
+	}
+	sqlEnsure(t, store, a)
+	sqlAppend(t, store, sqlMessageOf(a+"/e2", a, sqlUser("second")))
+	if got := sqlEvents(t, store, a); len(got) != 1 {
+		t.Fatalf("the claimed conversation holds %d events, want 1", len(got))
+	}
+}
+
+func TestEngineDeleteClearsAConcurrentAppend(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) {
+		first, second := sqlSQLitePair(t)
+		sessionDeleteBesideAppend(t, first, second)
+	})
+	t.Run("postgres", func(t *testing.T) {
+		first, second := sqlEnginePair(t, "pgx", "SPIRA_TEST_POSTGRES_DSN")
+		sessionDeleteBesideAppend(t, first, second)
+	})
+	t.Run("mysql", func(t *testing.T) {
+		first, second := sqlEnginePair(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
+		sessionDeleteBesideAppend(t, first, second)
+	})
+	t.Run("mssql", func(t *testing.T) {
+		first, second := sqlEnginePair(t, "sqlserver", "SPIRA_TEST_MSSQL_DSN")
+		sessionDeleteBesideAppend(t, first, second)
+	})
+}
+
+func sessionDeleteBesideAppend(t *testing.T, first *db.Pool, second *db.Pool) {
+	t.Helper()
+	writer := sqlFixedStore(first)
+	deleter := sqlFixedStore(second)
+	a := t.Name() + "/a"
+	sqlEnsure(t, writer, a)
+	version := sqlVersion(t, writer, a)
+	inserted := make(chan struct{})
+	release := make(chan struct{})
+	appended := make(chan error, 1)
+	appendDone := make(chan struct{})
+	deleted := make(chan error, 1)
+	ctx := t.Context()
+	if err := func() error {
+		go group (ctx) {
+			go {
+				defer close(appendDone)
+				appended <- session.AppendHeld(ctx, session.HeldAppend{Store: writer, ID: a, Version: version, Events: []session.Event{sqlMessageOf(a+"/e1", a, sqlUser("racing"))}, Inserted: inserted, Release: release})
+			}
+			go {
+				select {
+				case <-inserted:
+					close(release)
+				case <-appendDone:
+				}
+			}
+			go { deleted <- deleter.Delete(ctx, a) }
+		}
+		return nil
+	}(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	appendErr := <-appended
+	deleteErr := <-deleted
+	if deleteErr != nil {
+		t.Fatalf("concurrent Delete: %v", deleteErr)
+		return
+	}
+	if appendErr != nil && appendErr != session.ErrHeldStale {
+		t.Fatalf("held append: %v", appendErr)
+		return
+	}
+	if found := deleter.Find(a); found != nil {
+		t.Fatalf("Delete left the session behind")
+		return
+	}
+	left, err := session.EventCount(ctx, writer, a)
+	if err != nil {
+		t.Fatalf("EventCount: %v", err)
+		return
+	}
+	if left != 0 {
+		t.Fatalf("Delete left %d event rows of a concurrent append, want 0", left)
+	}
+}
+
+func TestEngineSQLiteConcurrentEnsureOpensOneSession(t *testing.T) {
+	first, second := sqlSQLitePair(t)
+	a := t.Name() + "/a"
+	start := make(chan struct{})
+	type opened struct {
+		sess *session.Session?
+		err  error
+	}
+	ready := make(chan struct{}, 2)
+	one := make(chan opened, 2)
+	two := make(chan opened, 2)
+	ctx := t.Context()
+	if err := func() error {
+		go group (ctx) {
+			go {
+				ready <- struct{}{}
+				<-start
+				sess, err := sqlFixedStore(first).Ensure(a)
+				if err != nil {
+					one <- opened{err: err}
+				} else {
+					one <- opened{sess: sess}
+				}
+			}
+			go {
+				ready <- struct{}{}
+				<-start
+				sess, err := sqlFixedStore(second).Ensure(a)
+				if err != nil {
+					two <- opened{err: err}
+				} else {
+					two <- opened{sess: sess}
+				}
+			}
+			go {
+				<-ready
+				<-ready
+				close(start)
+			}
+		}
+		return nil
+	}(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	for i, got := range []opened{<-one, <-two} {
+		if got.err != nil {
+			t.Fatalf("Ensure %d: %v", i, got.err)
+			return
+		}
+		s := got.sess
+		if s == nil {
+			t.Fatalf("Ensure %d returned nil", i)
+			return
+		}
+		if s.ID != a {
+			t.Fatalf("Ensure %d opened %q, want %q", i, s.ID, a)
+		}
+	}
+}
+
+func sqlSQLitePair(t *testing.T) (*db.Pool, *db.Pool) {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", ")", " ", "_").Replace(t.Name())
+	dsn := fmt.Sprintf("file:spira_session_%s?mode=memory&cache=shared", key)
+	first := sqlOpen(t, "sqlite", dsn)
+	second := sqlOpen(t, "sqlite", dsn)
+	sqlPrepare(t, first)
+	sqlStop(t, first)
+	sqlStop(t, second)
+	return first, second
+}
+
+func sqlEnginePair(t *testing.T, driver string, dsnVar string) (*db.Pool, *db.Pool) {
+	t.Helper()
+	dsn := sqlDSN(t, dsnVar)
+	first := sqlPrepareOn(t, driver, sqlOpen(t, driver, dsn))
+	second := sqlPrepareOn(t, driver, sqlOpen(t, driver, dsn))
+	sqlStop(t, first)
+	sqlStop(t, second)
+	return first, second
+}
+
+func sqlPrepareOn(t *testing.T, driver string, pool *db.Pool) *db.Pool {
+	t.Helper()
+	if err := sqlFixedStore(pool).Prepare(t.Context()); err != nil {
+		t.Fatalf("prepare %s: %v", driver, err)
+		return pool
+	}
+	return pool
+}

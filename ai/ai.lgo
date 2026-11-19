@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"iter"
+	"strings"
 )
 
 type Role string
@@ -34,6 +35,7 @@ type ToolResult struct {
 	ID      string
 	Name    string
 	Content string
+	Skipped bool
 }
 
 type Message struct {
@@ -61,6 +63,7 @@ type Request struct {
 	Stop        []string
 	Format      string?
 	Decisions   []Decision
+	Resume      *Reply?
 }
 
 type Finish string
@@ -74,14 +77,14 @@ const (
 )
 
 func FinishOf(raw string) Finish {
-	switch raw {
-	case "stop", "end_turn", "STOP", "stop_sequence":
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "stop", "end_turn", "stop_sequence":
 		return FinishCompleted
-	case "length", "max_tokens", "MAX_TOKENS", "context_window_exceeded":
+	case "length", "max_tokens", "context_window_exceeded", "model_context_window_exceeded":
 		return FinishTruncated
-	case "tool_calls", "tool_call", "tool_use", "TOOL_CALLS":
+	case "tool_calls", "tool_call", "tool_use":
 		return FinishToolCall
-	case "content_filter", "SAFETY", "RECITATION", "refusal", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST":
+	case "content_filter", "safety", "recitation", "prohibited_content", "spii", "blocklist", "refusal", "guardrailrefusal":
 		return FinishFiltered
 	}
 	return FinishOther

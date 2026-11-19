@@ -1,0 +1,1487 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-session/src/test/java/org/springframework/ai/session/SessionMemoryTests.java,
+// EventFilterTests.java, PromptHistoryTests.java and
+// advisors/spring-ai-session-advisor/src/test/java/org/springframework/ai/session/advisor/SessionMemoryAdvisorTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package session_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"logos/sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/ai/session"
+	"github.com/gosuda/spira/resilience"
+)
+
+func text(s string) ai.Message {
+	return ai.Message{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: s}}}
+}
+
+func assistant(s string) ai.Message {
+	return ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{ai.Text{Text: s}}}
+}
+
+func system(s string) ai.Message {
+	return ai.Message{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: s}}}
+}
+
+func toolCall(id string) ai.Message {
+	return ai.Message{Role: ai.RoleAssistant, Parts: []ai.Part{ai.ToolCall{ID: id, Name: "weather", Arguments: "{}"}}}
+}
+
+func toolResult(id string) ai.Message {
+	return ai.Message{Role: ai.RoleTool, Parts: []ai.Part{ai.ToolResult{ID: id, Name: "weather", Content: "sunny"}}}
+}
+
+func msgText(m ai.Message) string {
+	for _, p := range m.Parts {
+		if t, ok := p.(ai.Text); ok {
+			return t.Text
+		}
+	}
+	return ""
+}
+
+func describe(messages []ai.Message) []string {
+	var out []string
+	for _, m := range messages {
+		if m.Role == ai.RoleAssistant && len(m.Parts) > 0 {
+			if tc, ok := m.Parts[0].(ai.ToolCall); ok {
+				out = append(out, "call:"+tc.ID)
+				continue
+			}
+		}
+		if m.Role == ai.RoleTool && len(m.Parts) > 0 {
+			if tr, ok := m.Parts[0].(ai.ToolResult); ok {
+				out = append(out, "result:"+tr.ID)
+				continue
+			}
+		}
+		out = append(out, msgText(m))
+	}
+	return out
+}
+
+func appendMsg(t *testing.T, s *session.Service, id string, m ai.Message) {
+	t.Helper()
+	v, err := s.Version(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Version: %v", err)
+		return
+	}
+	e := session.Event{ID: fmt.Sprintf("e%d", v), Session: id, Type: session.EventMessage, Message: m}
+	ok, err := s.Append(t.Context(), id, v, e)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+		return
+	}
+	if !ok {
+		t.Fatalf("Append returned false")
+	}
+}
+
+func ensureSession(t *testing.T, s *session.Service, id string) {
+	t.Helper()
+	_, err := s.Ensure(id)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+}
+
+func eventsOf(t *testing.T, s *session.Service, id string) []session.Event {
+	t.Helper()
+	events, err := s.Events(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+		return nil
+	}
+	return events
+}
+
+func versionOf(t *testing.T, s *session.Service, id string) int64 {
+	t.Helper()
+	v, err := s.Version(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Version: %v", err)
+		return 0
+	}
+	return v
+}
+
+func TestEnsureCreatesSessionWithTTL(t *testing.T) {
+	s := &session.Service{TTL: time.Hour}
+	sess, err := s.Ensure("s1")
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+		return
+	}
+	if sess == nil {
+		t.Fatalf("Ensure returned nil")
+		return
+	}
+	if sess.ID != "s1" || sess.ExpiresAt.IsZero() || !sess.ExpiresAt.After(sess.CreatedAt) {
+		t.Fatalf("bad session: %+v", sess)
+	}
+	found := s.Find("s1")
+	if found == nil {
+		t.Fatalf("Find returned nil")
+		return
+	}
+	if found.ID != "s1" {
+		t.Fatalf("Find wrong id")
+	}
+}
+
+func TestEnsureReturnsSameSession(t *testing.T) {
+	s := &session.Service{}
+	a, err1 := s.Ensure("x")
+	b, err2 := s.Ensure("x")
+	if err1 != nil || err2 != nil {
+		t.Fatalf("Ensure errors: %v %v", err1, err2)
+		return
+	}
+	if a == nil {
+		t.Fatalf("Ensure returned nil for a")
+		return
+	}
+	if b == nil {
+		t.Fatalf("Ensure returned nil for b")
+		return
+	}
+	if a.ID != b.ID {
+		t.Fatalf("different sessions")
+	}
+}
+
+func TestFindReturnsNilForMissing(t *testing.T) {
+	s := &session.Service{}
+	if s.Find("nope") != nil {
+		t.Fatalf("expected nil")
+	}
+}
+
+func TestAppendAndEventsInOrder(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("What is Spring AI?"))
+	appendMsg(t, s, "s1", assistant("Spring AI is a framework."))
+	appendMsg(t, s, "s1", text("Tell me more."))
+
+	events := eventsOf(t, s, "s1")
+	if len(events) != 3 {
+		t.Fatalf("got %d events", len(events))
+	}
+	msgs := []ai.Message{}
+	for _, e := range events {
+		m := e.Message ?? ai.Message{}
+		msgs = append(msgs, m)
+	}
+	want := []string{"What is Spring AI?", "Spring AI is a framework.", "Tell me more."}
+	if got := describe(msgs); !slices.Equal(got, want) {
+		t.Fatalf("messages: %v", got)
+	}
+}
+
+func TestAppendStaleVersionReturnsFalse(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	v := versionOf(t, s, "s1")
+	ok, err := s.Append(t.Context(), "s1", v, session.Event{ID: "e1", Session: "s1", Type: session.EventMessage, Message: text("hi")})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+		return
+	}
+	if !ok {
+		t.Fatalf("first append failed")
+	}
+	ok, err = s.Append(t.Context(), "s1", v, session.Event{ID: "e2", Session: "s1", Type: session.EventMessage, Message: text("bye")})
+	if err != nil {
+		t.Fatalf("stale Append err: %v", err)
+		return
+	}
+	if ok {
+		t.Fatalf("stale append returned true")
+	}
+}
+
+func TestAppendSystemMessageRejectedBeforeVersion(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	v := versionOf(t, s, "s1")
+	ok, err := s.Append(t.Context(), "s1", v, session.Event{ID: "e1", Session: "s1", Type: session.EventMessage, Message: system("sys")})
+	if err == nil {
+		t.Fatalf("expected error for system message")
+		return
+	}
+	_ = ok
+	ok, err = s.Append(t.Context(), "s1", v+999, session.Event{ID: "e2", Session: "s1", Type: session.EventMessage, Message: system("sys2")})
+	if err == nil {
+		t.Fatalf("expected error on stale version")
+		return
+	}
+	_ = ok
+}
+
+type appendResult struct {
+	ok   atomic.Bool
+	err  atomic.Value
+	done chan<- struct{}
+}
+
+type appendParams struct {
+	s   *session.Service
+	ctx context.Context
+	id  string
+	v   int64
+}
+
+func appendForTest(p appendParams, res *appendResult) {
+	ok, err := p.s.Append(p.ctx, "s1", p.v, session.Event{ID: p.id, Session: "s1", Type: session.EventMessage, Message: text("one")})
+	if err != nil {
+		res.ok.Store(false)
+		res.err.Store(err)
+	} else {
+		res.ok.Store(ok)
+	}
+	select {
+	case res.done <- struct{}{}:
+	case <-p.ctx.Done():
+	}
+}
+
+func TestConcurrentAppendsExactlyOneSucceeds(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	v := versionOf(t, s, "s1")
+	ctx := t.Context()
+	done := make(chan struct{}, 2)
+	res1 := &appendResult{done: done}
+	res2 := &appendResult{done: done}
+	run := func() error {
+		go group (ctx) {
+			go { appendForTest(appendParams{s: s, ctx: ctx, id: "a1", v: v}, res1) }
+			go { appendForTest(appendParams{s: s, ctx: ctx, id: "a2", v: v}, res2) }
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("go group: %v", err)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	if res1.ok.Load() == res2.ok.Load() {
+		t.Fatalf("both appends same result: %v %v", res1.ok.Load(), res2.ok.Load())
+	}
+	e1 := res1.err.Load()
+	e2 := res2.err.Load()
+	if e1 != nil || e2 != nil {
+		t.Fatalf("errors: %v %v", e1, e2)
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+}
+
+func TestExpiryWithFakeClock(t *testing.T) {
+	now := time.Now()
+	s := &session.Service{TTL: time.Hour, Now: func() time.Time { return now }}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hi"))
+	if s.Find("s1") == nil {
+		t.Fatalf("session should exist")
+	}
+	now = now.Add(2 * time.Hour)
+	if s.Find("s1") != nil {
+		t.Fatalf("session should be expired")
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 0 {
+		t.Fatalf("expired session should have no events")
+	}
+	if v := versionOf(t, s, "s1"); v != 0 {
+		t.Fatalf("expired session version: %d", v)
+	}
+}
+
+func TestCompactFromAnExpiredSessionCannotHideTheNewTurn(t *testing.T) {
+	now := time.Now()
+	s := &session.Service{TTL: time.Hour, Now: func() time.Time { return now }}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("before the expiry"))
+	stale := versionOf(t, s, "s1")
+	now = now.Add(2 * time.Hour)
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("after the expiry"))
+
+	ok, err := s.Compact(t.Context(), "s1", stale, session.Boundary{Summary: []ai.Message{assistant("stale summary")}})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+		return
+	}
+	if ok {
+		t.Fatalf("a compaction of the expired session was accepted")
+	}
+	msgs, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	want := []string{"after the expiry"}
+	if got := describe(msgs); !slices.Equal(got, want) {
+		t.Fatalf("active = %v, want the replacement turn %v", got, want)
+	}
+}
+
+func TestAppendKeepsThePartsOfTheStoredMessage(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	m := text("original")
+	appendMsg(t, s, "s1", m)
+	if m.Parts[0].(ai.Text).Text != "original" {
+		t.Fatalf("the caller's message changed")
+	}
+	m.Parts[0] = ai.Text{Text: "edited by the caller"}
+
+	msgs, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	if got := msgText(msgs[0]); got != "original" {
+		t.Fatalf("stored text = %q, want the text at append time", got)
+	}
+}
+
+func TestActiveKeepsThePartsOfTheReturnedMessage(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("original"))
+
+	msgs, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	msgs[0].Parts[0] = ai.Text{Text: "edited by the caller"}
+
+	again, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	if got := msgText(again[0]); got != "original" {
+		t.Fatalf("stored text = %q, want the text at append time", got)
+	}
+}
+
+func TestLastNExtendsToTurnStart(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	for i := 1; i <= 6; i++ {
+		appendMsg(t, s, "s1", text(fmt.Sprintf("message %d", i)))
+	}
+	events, err := s.LastN(t.Context(), "s1", 3)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events", len(events))
+	}
+	m0 := events[0].Message ?? ai.Message{}
+	m2 := events[2].Message ?? ai.Message{}
+	if msgText(m0) != "message 4" {
+		t.Fatalf("first event: %+v", events[0])
+	}
+	if msgText(m2) != "message 6" {
+		t.Fatalf("last event: %+v", events[2])
+	}
+}
+
+func TestLastNExtendsBackToTurnBoundary(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hello"))
+	appendMsg(t, s, "s1", assistant("hi"))
+	appendMsg(t, s, "s1", text("and now?"))
+	appendMsg(t, s, "s1", assistant("still here"))
+
+	events, err := s.LastN(t.Context(), "s1", 1)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	m0 := events[0].Message ?? ai.Message{}
+	m1 := events[1].Message ?? ai.Message{}
+	if msgText(m0) != "and now?" || msgText(m1) != "still here" {
+		t.Fatalf("wrong window")
+	}
+
+	events, err = s.LastN(t.Context(), "s1", 3)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
+	}
+}
+
+func TestLastNCountsNonMessageEvents(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hello"))
+	appendMsg(t, s, "s1", assistant("hi"))
+	v := versionOf(t, s, "s1")
+	_, err := s.Append(t.Context(), "s1", v, session.Event{ID: "marker", Session: "s1", Type: session.EventCompaction})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+		return
+	}
+	appendMsg(t, s, "s1", text("and now?"))
+	appendMsg(t, s, "s1", assistant("still here"))
+
+	events, err := s.LastN(t.Context(), "s1", 1)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (user2+assistant2), got %d", len(events))
+	}
+}
+
+func TestLastNWithoutTurnStartIsPlainWindow(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", assistant("Be brief."))
+	appendMsg(t, s, "s1", assistant("And polite."))
+
+	events, err := s.LastN(t.Context(), "s1", 1)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	m := events[0].Message ?? ai.Message{}
+	if msgText(m) != "And polite." {
+		t.Fatalf("wrong event: %+v", events[0])
+	}
+}
+
+func TestLastNLargerThanLogReturnsWholeLog(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hello"))
+	appendMsg(t, s, "s1", assistant("hi"))
+
+	events, err := s.LastN(t.Context(), "s1", 100)
+	if err != nil {
+		t.Fatalf("LastN: %v", err)
+		return
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+}
+
+func TestLastNMustBePositive(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	_, err := s.LastN(t.Context(), "s1", 0)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestActiveViewWithoutBoundaryIsWholeLog(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hello"))
+	appendMsg(t, s, "s1", assistant("hi"))
+
+	msgs, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	}
+}
+
+func TestCompactRecordsBoundary(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	for i := 1; i <= 5; i++ {
+		appendMsg(t, s, "s1", text(fmt.Sprintf("user turn %d", i)))
+		appendMsg(t, s, "s1", assistant(fmt.Sprintf("assistant reply %d", i)))
+	}
+	v := versionOf(t, s, "s1")
+	ok, err := s.Compact(t.Context(), "s1", v, session.Boundary{
+		Summary: []ai.Message{assistant("summary")},
+	})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+		return
+	}
+	if !ok {
+		t.Fatalf("Compact returned false")
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 12 {
+		t.Fatalf("expected 12 events (10 msgs + boundary + summary), got %d", len(events))
+	}
+	msgs, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 active message (summary), got %d", len(msgs))
+	}
+}
+
+func TestCompactStaleVersionReturnsFalse(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hi"))
+	v := versionOf(t, s, "s1")
+	ok, err := s.Compact(t.Context(), "s1", v+1, session.Boundary{})
+	if err != nil {
+		t.Fatalf("Compact err: %v", err)
+		return
+	}
+	if ok {
+		t.Fatalf("expected false")
+	}
+}
+
+func TestHistoryPutsSystemFirst(t *testing.T) {
+	stored := []ai.Message{system("Be brief."), text("hello"), assistant("hi")}
+	request := []ai.Message{text("and now?")}
+	got := session.History(stored, request)
+	want := []string{"Be brief.", "hello", "hi", "and now?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryDeduplicatesSystem(t *testing.T) {
+	stored := []ai.Message{system("Be brief."), text("hello"), system("Be brief."), assistant("hi")}
+	request := []ai.Message{text("and now?")}
+	got := session.History(stored, request)
+	want := []string{"Be brief.", "hello", "hi", "and now?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryDropsBlankSystem(t *testing.T) {
+	stored := []ai.Message{system(""), text("hello"), assistant("hi")}
+	request := []ai.Message{system("Be brief."), text("and now?")}
+	got := session.History(stored, request)
+	want := []string{"Be brief.", "hello", "hi", "and now?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryDropsOrphanToolCall(t *testing.T) {
+	stored := []ai.Message{text("Weather in Lisbon?"), toolCall("c1")}
+	request := []ai.Message{text("And Porto?")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "And Porto?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryDropsOrphanToolResult(t *testing.T) {
+	stored := []ai.Message{text("Weather in Lisbon?"), toolResult("c9"), assistant("Sunny.")}
+	request := []ai.Message{text("And Porto?")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "Sunny.", "And Porto?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryKeepsOnlyTheResultThatAnswersAStoredCall(t *testing.T) {
+	stored := []ai.Message{
+		text("Weather in Lisbon?"),
+		toolCall("c1"),
+		{Role: ai.RoleTool, Parts: []ai.Part{ai.ToolResult{ID: "c1", Name: "weather", Content: "sunny"}, ai.ToolResult{ID: "c9", Name: "weather", Content: "orphan"}}},
+	}
+	request := []ai.Message{text("And Porto?")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "call:c1", "result:c1", "And Porto?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+	if n := len(got[2].Parts); n != 1 {
+		t.Fatalf("the kept tool message holds %d parts, want the one result that answers the call", n)
+	}
+}
+
+func TestHistoryKeepsAnsweredToolCall(t *testing.T) {
+	stored := []ai.Message{text("Weather in Lisbon?"), toolCall("c1"), toolResult("c1")}
+	request := []ai.Message{text("And Porto?")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "call:c1", "result:c1", "And Porto?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryDoesNotDoubleOverlap(t *testing.T) {
+	stored := []ai.Message{text("And Porto?"), toolCall("c1")}
+	request := []ai.Message{text("And Porto?"), toolCall("c1"), toolResult("c1")}
+	got := session.History(stored, request)
+	want := []string{"And Porto?", "call:c1", "result:c1"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryLaterRoundPrependsOnlyWhatLoopDoesNotCarry(t *testing.T) {
+	u1 := text("Weather in Lisbon?")
+	a1 := assistant("Sunny.")
+	u2 := text("And Porto?")
+	call := toolCall("c1")
+	stored := []ai.Message{u1, a1, u2, call}
+	request := []ai.Message{u2, call, toolResult("c1")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "Sunny.", "And Porto?", "call:c1", "result:c1"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryWithLoopsOwnHistoryOff(t *testing.T) {
+	call := toolCall("c1")
+	stored := []ai.Message{text("Weather in Lisbon?"), assistant("Sunny."), text("And Porto?"), call}
+	request := []ai.Message{toolResult("c1")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "Sunny.", "And Porto?", "call:c1", "result:c1"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistoryRequestSystemFirst(t *testing.T) {
+	stored := []ai.Message{text("hello"), assistant("hi")}
+	request := []ai.Message{system("Be brief."), text("and now?")}
+	got := session.History(stored, request)
+	want := []string{"Be brief.", "hello", "hi", "and now?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestHistorySingleMessageRequestNoOverlap(t *testing.T) {
+	stored := []ai.Message{text("Weather in Lisbon?")}
+	request := []ai.Message{text("Weather in Lisbon?")}
+	got := session.History(stored, request)
+	want := []string{"Weather in Lisbon?", "Weather in Lisbon?"}
+	if !slices.Equal(describe(got), want) {
+		t.Fatalf("got %v want %v", describe(got), want)
+	}
+}
+
+func TestLastUserOrTool(t *testing.T) {
+	msgs := []ai.Message{system("sys"), text("hello"), assistant("hi")}
+	got := session.LastUserOrTool(msgs)
+	if got == nil {
+		t.Fatalf("expected user message")
+		return
+	}
+	g := got ?? ai.Message{}
+	if msgText(g) != "hello" {
+		t.Fatalf("expected user message, got %+v", got)
+	}
+	msgs = []ai.Message{system("sys"), text("hello"), toolResult("c1")}
+	got = session.LastUserOrTool(msgs)
+	if got == nil {
+		t.Fatalf("expected tool message")
+		return
+	}
+	g = got ?? ai.Message{}
+	if g.Role != ai.RoleTool {
+		t.Fatalf("expected the tool message, got %+v", got)
+	}
+	msgs = []ai.Message{system("sys")}
+	got = session.LastUserOrTool(msgs)
+	if got != nil {
+		t.Fatalf("expected nil, got %+v", got)
+	}
+}
+
+type wireCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type wireMsg struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCallID string     `json:"tool_call_id"`
+	ToolCalls  []wireCall `json:"tool_calls"`
+}
+
+type wireReq struct {
+	Stream   bool      `json:"stream"`
+	Messages []wireMsg `json:"messages"`
+}
+
+type scripted struct {
+	bodies sync.Locked[[]string]
+	chat string
+	stream string
+	fail error
+	during func()
+	answer func(req wireReq) string
+}
+
+func (s *scripted) requests(t *testing.T) []wireReq {
+	t.Helper()
+	var bodies []string
+	s.bodies.WithLock(func(b *[]string) {
+		bodies = slices.Clone(*b)
+	})
+	out := make([]wireReq, 0, len(bodies))
+	for _, raw := range bodies {
+		var req wireReq
+		if err := json.Unmarshal([]byte(raw), &req); err != nil {
+			t.Fatalf("request body is not JSON: %v", err)
+			return nil
+		}
+		out = append(out, req)
+	}
+	return out
+}
+func serveModel(t *testing.T, s *scripted) *openai.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+			return
+		}
+		var req wireReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			t.Errorf("server decode: %v", err)
+			return
+		}
+		s.bodies.WithLock(func(b *[]string) {
+			*b = append(*b, string(raw))
+		})
+		if s.during != nil {
+			s.during()
+		}
+		if s.fail != nil {
+			http.Error(w, s.fail.Error(), http.StatusInternalServerError)
+			return
+		}
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			if _, err := io.WriteString(w, s.stream); err != nil {
+				t.Errorf("server write: %v", err)
+			}
+			return
+		}
+		body := s.chat
+		if s.answer != nil {
+			body = s.answer(req)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return &openai.Client{
+		BaseURL: srv.URL,
+		Model:   "gpt-6-astra",
+		HTTP:    srv.Client(),
+		Policy:  resilience.Policy{Timeout: 2 * time.Second},
+	}
+}
+
+func chatAnswer(content string) string {
+	return fmt.Sprintf(`{"id":"chatcmpl-1","model":"gpt-6-astra","choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`, content)
+}
+
+func chatCallsAnswer(calls ...string) string {
+	var b strings.Builder
+	b.WriteString(`{"id":"chatcmpl-1","model":"gpt-6-astra","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[`)
+	for i, call := range calls {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		parts := strings.SplitN(call, ":", 2)
+		fmt.Fprintf(&b, `{"id":%q,"type":"function","function":{"name":%q,"arguments":"{}"}}`, parts[0], parts[1])
+	}
+	b.WriteString(`]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	return b.String()
+}
+
+func sseAnswer(texts ...string) string {
+	var b strings.Builder
+	for _, s := range texts {
+		fmt.Fprintf(&b, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-6-astra\",\"choices\":[{\"index\":0,\"delta\":{\"content\":%q},\"finish_reason\":null}]}\n\n", s)
+	}
+	b.WriteString("data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-6-astra\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n")
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+func TestRememberChatAppendsUserAndReply(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{chat: chatAnswer("Hello!")}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	reply, err := wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	if reply.Message.Role != ai.RoleAssistant {
+		t.Fatalf("bad reply")
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	m0 := events[0].Message ?? ai.Message{}
+	m1 := events[1].Message ?? ai.Message{}
+	if msgText(m0) != "Hi" || msgText(m1) != "Hello!" {
+		t.Fatalf("wrong events")
+	}
+}
+
+func TestRememberChatLoadsHistory(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("What is Spring?"))
+	appendMsg(t, s, "s1", assistant("Spring is a framework."))
+
+	model := &scripted{chat: chatAnswer("More info.")}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	_, err := wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Tell me more.")}})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	reqs := model.requests(t)
+	if len(reqs) != 1 {
+		t.Fatalf("the provider saw %d requests, want 1", len(reqs))
+		return
+	}
+	got := describeWire(reqs[0].Messages)
+	want := []string{"What is Spring?", "Spring is a framework.", "Tell me more."}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func describeWire(messages []wireMsg) []string {
+	var out []string
+	for _, m := range messages {
+		if len(m.ToolCalls) > 0 {
+			out = append(out, "call:"+m.ToolCalls[0].ID)
+			continue
+		}
+		if m.Role == "tool" {
+			out = append(out, "result:"+m.ToolCallID)
+			continue
+		}
+		out = append(out, m.Content)
+	}
+	return out
+}
+
+func TestRememberChatFailedCallAppendsNothing(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{fail: errors.New("model down")}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	_, err := wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 0 {
+		t.Fatalf("expected no events, got %d", len(events))
+	}
+}
+
+func TestRememberStreamAppendsOnce(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{stream: sseAnswer("Hello", " world")}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	var chunks []ai.Chunk
+	for c, err := range wrapped.Stream(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("expected 3 chunks (2 text + 1 finish), got %d", len(chunks))
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (user+reply), got %d", len(events))
+	}
+	m1 := events[1].Message ?? ai.Message{}
+	if msgText(m1) != "Hello world" {
+		t.Fatalf("wrong reply: %v", msgText(m1))
+	}
+}
+
+func TestRememberStreamFailedCallAppendsNothing(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{fail: errors.New("stream cut")}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	var failures []error
+	for _, err := range wrapped.Stream(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}) {
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if len(failures) != 1 {
+		t.Fatalf("the stream gave the errors %v, want one error", failures)
+	}
+	if !errors.Is(failures[0], openai.ErrProviderError) {
+		t.Fatalf("the stream error is not the provider fault: %v", failures[0])
+	}
+	if events := eventsOf(t, s, "s1"); len(events) != 0 {
+		t.Fatalf("a stream that failed left %d events, want 0", len(events))
+	}
+}
+
+func TestRememberRecordsATurnBesideAConcurrentTurn(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{chat: chatAnswer("Hello!")}
+	model.during = func() { appendMsg(t, s, "s1", text("from another request")) }
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	if _, err := wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	stored, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	want := []string{"from another request", "Hi", "Hello!"}
+	if got := describe(stored); !slices.Equal(got, want) {
+		t.Fatalf("stored = %v, want %v", got, want)
+	}
+}
+
+func TestRememberRecordsATurnWhenTheSessionExpiresDuringTheCall(t *testing.T) {
+	var now sync.Locked[time.Time]
+	now.WithLock(func(v *time.Time) {
+		*v = time.Now()
+	})
+	at := func() time.Time {
+		var out time.Time
+		now.WithLock(func(v *time.Time) {
+			out = *v
+		})
+		return out
+	}
+	s := &session.Service{TTL: time.Hour, Now: at}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("before the expiry"))
+	model := &scripted{chat: chatAnswer("Hello!")}
+	model.during = func() {
+		now.WithLock(func(v *time.Time) {
+			*v = v.Add(2 * time.Hour)
+		})
+	}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+	if _, err := wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	stored, err := s.Active(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+		return
+	}
+	want := []string{"Hi", "Hello!"}
+	if got := describe(stored); !slices.Equal(got, want) {
+		t.Fatalf("stored = %v, want the turn alone in a new session %v", got, want)
+	}
+}
+
+func TestRememberStreamStoppedEarlyAppendsNothing(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{stream: sseAnswer("Hello", " world")}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+
+	for _, err := range wrapped.Stream(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}) {
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		break
+	}
+	if events := eventsOf(t, s, "s1"); len(events) != 0 {
+		t.Fatalf("a stream that the caller stopped left %d events, want 0", len(events))
+	}
+}
+
+func TestRememberRecordsADirectToolAnswer(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{answer: func(req wireReq) string {
+		for _, m := range req.Messages {
+			if len(m.ToolCalls) > 0 {
+				return chatAnswer("It is a window seat.")
+			}
+		}
+		return chatCallsAnswer("c1:weather")
+	}}
+	client := serveModel(t, model)
+
+	reply, err := s.Run(t.Context(), "s1", session.Turn{
+		Model: client,
+		Request: ai.Request{
+			Messages: []ai.Message{text("Is my seat a window seat?")},
+			Tools: []ai.Tool{{
+				Name:        "weather",
+				Description: "look up a booking",
+				Schema:      `{"type":"object","properties":{}}`,
+				Call: func(ctx context.Context, arguments string) (string, error) {
+					return "14C, a window seat", nil
+				},
+				Direct: true,
+			}},
+		},
+		Limits: ai.Limits{},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	if reply.Message.Role != ai.RoleTool {
+		t.Fatalf("the direct reply has role %q, want tool", reply.Message.Role)
+	}
+
+	wrapped := session.Remember(s, "s1")(client)
+	_, err = wrapped.Chat(t.Context(), ai.Request{
+		Messages: []ai.Message{text("thanks")},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	reqs := model.requests(t)
+	if len(reqs) < 2 {
+		t.Fatalf("the provider saw %d requests, want at least 2", len(reqs))
+		return
+	}
+	requireCallBeforeResult(t, reqs[len(reqs)-1].Messages, "c1")
+}
+
+func requireCallBeforeResult(t *testing.T, messages []wireMsg, id string) {
+	t.Helper()
+	callAt, resultAt := -1, -1
+	for i, m := range messages {
+		if callsID(m, id) {
+			callAt = i
+		}
+		if m.Role == "tool" && m.ToolCallID == id {
+			resultAt = i
+		}
+	}
+	if callAt < 0 || resultAt < 0 || resultAt < callAt {
+		t.Fatalf("the prompt does not hold the call before its result: %v", describeWire(messages))
+	}
+}
+
+func callsID(m wireMsg, id string) bool {
+	if m.Role != "assistant" {
+		return false
+	}
+	for _, c := range m.ToolCalls {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func confirmBooked(req wireReq) string {
+	for _, m := range req.Messages {
+		if m.Role == "tool" && m.ToolCallID == "c1" {
+			return chatAnswer("Booked.")
+		}
+	}
+	return chatCallsAnswer("c1:book_flight")
+}
+
+func TestRememberKeepsAResumedToolExchangeTogether(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{answer: confirmBooked}
+	client := serveModel(t, model)
+
+	tools := []ai.Tool{{
+		Name:        "book_flight",
+		Description: "book a flight",
+		Schema:      `{"type":"object","properties":{}}`,
+		Call: func(ctx context.Context, arguments string) (string, error) {
+			return "booked", nil
+		},
+		Confirm: true,
+	}}
+	wrapped := session.Remember(s, "s1")(client)
+
+	_, err := ai.Run(t.Context(), wrapped, ai.Request{
+		Messages: []ai.Message{text("Book me a flight.")},
+		Tools:    tools,
+	}, ai.Limits{})
+	paused := &ai.ConfirmError{}
+	if !errors.As(err, &paused) {
+		t.Fatalf("Run error = %v, want a ConfirmError", err)
+		return
+	}
+
+	appendMsg(t, s, "s1", text("unrelated question"))
+	appendMsg(t, s, "s1", assistant("unrelated answer"))
+
+	_, err = ai.Run(t.Context(), wrapped, ai.Request{
+		Messages:  paused.Messages,
+		Tools:     tools,
+		Decisions: []ai.Decision{{Call: "c1"}},
+		Resume:    &paused.Reply,
+	}, ai.Limits{})
+	if err != nil {
+		t.Fatalf("resumed Run: %v", err)
+	}
+
+	_, err = ai.Run(t.Context(), wrapped, ai.Request{
+		Messages: []ai.Message{text("what happened?")},
+	}, ai.Limits{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	reqs := model.requests(t)
+	if len(reqs) == 0 {
+		t.Fatalf("the provider saw no request")
+		return
+	}
+	requireCallBeforeResult(t, reqs[len(reqs)-1].Messages, "c1")
+}
+
+func TestRememberRestoresAResumedCallAfterExpiry(t *testing.T) {
+	now := time.Now()
+	s := &session.Service{TTL: time.Hour, Now: func() time.Time { return now }}
+	ensureSession(t, s, "s1")
+	model := &scripted{answer: confirmBooked}
+	client := serveModel(t, model)
+	tools := []ai.Tool{{
+		Name:        "book_flight",
+		Description: "book a flight",
+		Schema:      `{"type":"object","properties":{}}`,
+		Call: func(ctx context.Context, arguments string) (string, error) {
+			return "booked", nil
+		},
+		Confirm: true,
+	}}
+	wrapped := session.Remember(s, "s1")(client)
+	_, err := ai.Run(t.Context(), wrapped, ai.Request{
+		Messages: []ai.Message{text("Book me a flight.")},
+		Tools:    tools,
+	}, ai.Limits{})
+	paused := &ai.ConfirmError{}
+	if !errors.As(err, &paused) {
+		t.Fatalf("Run error = %v, want a ConfirmError", err)
+		return
+	}
+	now = now.Add(2 * time.Hour)
+	_, err = ai.Run(t.Context(), wrapped, ai.Request{
+		Messages:  paused.Messages,
+		Tools:     tools,
+		Decisions: []ai.Decision{{Call: "c1"}},
+		Resume:    &paused.Reply,
+	}, ai.Limits{})
+	if err != nil {
+		t.Fatalf("resumed Run: %v", err)
+	}
+	_, err = wrapped.Chat(t.Context(), ai.Request{
+		Messages: []ai.Message{text("what happened?")},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	reqs := model.requests(t)
+	if len(reqs) == 0 {
+		t.Fatalf("the provider saw no request")
+		return
+	}
+	requireCallBeforeResult(t, reqs[len(reqs)-1].Messages, "c1")
+}
+
+func TestAppendRejectsAnEventOfAnotherSession(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	foreign := session.Event{ID: "e0", Session: "s2", Type: session.EventMessage, Message: text("hi")}
+
+	ok, err := s.Append(t.Context(), "s1", 0, foreign)
+
+	if err == nil {
+		t.Fatalf("Append took an event of session s2 into s1 (ok = %v)", ok)
+	}
+	if events := eventsOf(t, s, "s1"); len(events) != 0 {
+		t.Fatalf("the refused append left %d events", len(events))
+	}
+}
+
+func TestEventsReturnsACopyOfTheLog(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("hi"))
+
+	eventsOf(t, s, "s1")[0].ID = "changed by the caller"
+
+	if got := eventsOf(t, s, "s1")[0].ID; got != "e0" {
+		t.Fatalf("a write to the returned events changed the stored id to %q", got)
+	}
+}
+
+func TestRunStoresTheCallWithTheDirectResultAcrossAnExpiry(t *testing.T) {
+	now := time.Now()
+	s := &session.Service{TTL: time.Hour, Now: func() time.Time { return now }}
+	ensureSession(t, s, "s1")
+	appendMsg(t, s, "s1", text("before the expiry"))
+	model := &scripted{chat: chatCallsAnswer("c1:book_flight")}
+	client := serveModel(t, model)
+
+	reply, err := s.Run(t.Context(), "s1", session.Turn{
+		Model: client,
+		Request: ai.Request{
+			Messages: []ai.Message{text("Book me a flight.")},
+			Tools: []ai.Tool{{
+				Name:        "book_flight",
+				Description: "book a flight",
+				Schema:      `{"type":"object","properties":{}}`,
+				Call: func(ctx context.Context, arguments string) (string, error) {
+					now = now.Add(2 * time.Hour)
+					return "booked", nil
+				},
+				Direct: true,
+			}},
+		},
+		Limits: ai.Limits{},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	if reply.Message.Role != ai.RoleTool {
+		t.Fatalf("the direct reply has role %q, want tool", reply.Message.Role)
+	}
+
+	wrapped := session.Remember(s, "s1")(client)
+	_, err = wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("what happened?")}})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	reqs := model.requests(t)
+	if len(reqs) == 0 {
+		t.Fatalf("the provider saw no request")
+		return
+	}
+	requireCallBeforeResult(t, reqs[len(reqs)-1].Messages, "c1")
+}
+
+func TestRunRefusesAModelTheSessionAlreadyWrapped(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	client := serveModel(t, &scripted{chat: chatAnswer("Hi")})
+	wrapped := session.Remember(s, "s1")(client)
+
+	_, err := s.Run(t.Context(), "s1", session.Turn{
+		Model:   wrapped,
+		Request: ai.Request{Messages: []ai.Message{text("Hi")}},
+		Limits:  ai.Limits{},
+	})
+	if err == nil {
+		t.Fatalf("Run took an already wrapped model")
+		return
+	}
+	if !errors.Is(err, session.ErrAlreadyWrapped) {
+		t.Fatalf("Run error = %v, want the double-wrap refusal", err)
+	}
+}
+
+func TestRunRecordsADirectAnswerAfterAConfirmResume(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{answer: func(req wireReq) string {
+		for _, m := range req.Messages {
+			if m.Role == "tool" && m.ToolCallID == "c1" {
+				return chatAnswer("Booked.")
+			}
+		}
+		return chatCallsAnswer("c1:book_flight")
+	}}
+	client := serveModel(t, model)
+
+	tools := []ai.Tool{{
+		Name:        "book_flight",
+		Description: "book a flight",
+		Schema:      `{"type":"object","properties":{}}`,
+		Call: func(ctx context.Context, arguments string) (string, error) {
+			return "booked", nil
+		},
+		Direct:  true,
+		Confirm: true,
+	}}
+	req := ai.Request{Messages: []ai.Message{text("Book me a flight.")}, Tools: tools}
+	_, err := s.Run(t.Context(), "s1", session.Turn{Model: client, Request: req, Limits: ai.Limits{}})
+	paused := &ai.ConfirmError{}
+	if !errors.As(err, &paused) {
+		t.Fatalf("Run error = %v, want a ConfirmError", err)
+		return
+	}
+
+	resume := req
+	resume.Messages = paused.Messages
+	resume.Decisions = []ai.Decision{{Call: "c1"}}
+	resume.Resume = &paused.Reply
+	reply, err := s.Run(t.Context(), "s1", session.Turn{Model: client, Request: resume, Limits: ai.Limits{}})
+	if err != nil {
+		t.Fatalf("resumed Run: %v", err)
+		return
+	}
+	if reply.Message.Role != ai.RoleTool {
+		t.Fatalf("the resumed direct reply has role %q, want tool", reply.Message.Role)
+	}
+
+	wrapped := session.Remember(s, "s1")(client)
+	_, err = wrapped.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("what happened?")}})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	reqs := model.requests(t)
+	if len(reqs) == 0 {
+		t.Fatalf("the provider saw no request")
+		return
+	}
+	requireCallBeforeResult(t, reqs[len(reqs)-1].Messages, "c1")
+}
+
+func TestRunRecordsOnceWhenRememberHidesInsideSearch(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	model := &scripted{chat: chatAnswer("Hello!")}
+	client := serveModel(t, model)
+	_, searchLayer := ai.SearchTools([]ai.Tool{})
+	hidden := searchLayer(session.Remember(s, "s1")(client))
+	_, err := s.Run(t.Context(), "s1", session.Turn{
+		Model:   hidden,
+		Request: ai.Request{Messages: []ai.Message{text("Hi")}},
+		Limits:  ai.Limits{},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	events := eventsOf(t, s, "s1")
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (user+reply), got %d", len(events))
+	}
+
+}
+
+func TestRememberNestedSameSessionRecordsOnce(t *testing.T) {
+	s := &session.Service{}
+	model := &scripted{chat: chatAnswer("Hello!")}
+	client := serveModel(t, model)
+	stacked := session.Remember(s, "a")(session.Remember(s, "b")(session.Remember(s, "a")(client)))
+	if _, err := stacked.Chat(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}); err != nil {
+		t.Fatalf("Chat: %v", err)
+		return
+	}
+	if events := eventsOf(t, s, "a"); len(events) != 2 {
+		t.Fatalf("session a holds %d events, want the turn once", len(events))
+	}
+	if events := eventsOf(t, s, "b"); len(events) != 2 {
+		t.Fatalf("session b holds %d events, want the turn once", len(events))
+	}
+}
+
+func TestRememberStreamLateFailureAppendsNothing(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	partial := "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-6-astra\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n"
+	model := &scripted{stream: partial}
+	wrapped := session.Remember(s, "s1")(serveModel(t, model))
+	var okChunks int
+	var failures []error
+	for _, err := range wrapped.Stream(t.Context(), ai.Request{Messages: []ai.Message{text("Hi")}}) {
+		if err != nil {
+			failures = append(failures, err)
+		} else {
+			okChunks++
+		}
+	}
+	if okChunks == 0 {
+		t.Fatalf("the cut stream gave no chunks before failing")
+	}
+	if len(failures) != 1 {
+		t.Fatalf("the cut stream gave %d errors, want one", len(failures))
+	}
+	if events := eventsOf(t, s, "s1"); len(events) != 0 {
+		t.Fatalf("a stream that failed after chunks left %d events, want 0", len(events))
+	}
+}

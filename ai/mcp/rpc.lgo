@@ -1,0 +1,101 @@
+package mcp
+
+import (
+	"encoding/json"
+	"encoding/json/jsontext"
+	"fmt"
+	"strconv"
+)
+
+const ProtocolVersion = "2025-11-25"
+
+type Envelope struct {
+	JSONRPC string         `json:"jsonrpc"`
+	ID      jsontext.Value `json:"id,omitempty"`
+	Method  string         `json:"method,omitempty"`
+	Params  jsontext.Value `json:"params,omitempty"`
+	Result  jsontext.Value `json:"result,omitempty"`
+	Error   *RPCError?     `json:"error,omitzero"`
+}
+
+type RPCError struct {
+	Code    int32          `json:"code"`
+	Message string         `json:"message"`
+	Data    jsontext.Value `json:"data,omitempty"`
+}
+
+func (e *RPCError) Error() string {
+	return $"mcp: protocol error {e.Code}: {e.Message}"
+}
+
+func encodeEnvelope(msg Envelope) ([]byte, error) {
+	if msg.JSONRPC == "" {
+		msg.JSONRPC = "2.0"
+	}
+	line, err := json.Marshal(msg)
+	if err != nil {
+		return nil, ErrTransportFailed.Wrap(fmt.Errorf("mcp: encode message: %w", err))
+	}
+	return line, nil
+}
+
+func decodeEnvelope(line []byte) (Envelope, error) {
+	var msg Envelope
+	if err := json.Unmarshal(line, &msg); err != nil {
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: decode message: %w", err))
+	}
+	if msg.JSONRPC == "" {
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: message holds no jsonrpc member"))
+	}
+	return msg, nil
+}
+
+func newRequest(id int64, method string, params any) (Envelope, error) {
+	raw, err := marshalParams(method, params)
+	if err != nil {
+		return Envelope{}, err
+	}
+	return Envelope{
+		JSONRPC: "2.0",
+		ID:      jsontext.Value(strconv.FormatInt(id, 10)),
+		Method:  method,
+		Params:  raw,
+	}, nil
+}
+
+func newNotification(method string, params any) (Envelope, error) {
+	raw, err := marshalParams(method, params)
+	if err != nil {
+		return Envelope{}, err
+	}
+	return Envelope{JSONRPC: "2.0", Method: method, Params: raw}, nil
+}
+
+func marshalParams(method string, params any) (jsontext.Value, error) {
+	if params == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, ErrProtocolError.Wrap(fmt.Errorf("mcp: encode %s params: %w", method, err))
+	}
+	return raw, nil
+}
+
+func idKey(id jsontext.Value) string {
+	var v any
+	if err := json.Unmarshal(id, &v); err != nil {
+		return "raw:" + string(id)
+	}
+	switch n := v.(type) {
+	case string:
+		return "s:" + n
+	case float64:
+		return "n:" + strconv.FormatFloat(n, 'f', -1, 64)
+	}
+	return "raw:" + string(id)
+}
+
+func isResponse(msg Envelope) bool {
+	return len(msg.ID) > 0 && msg.Method == "" && (len(msg.Result) > 0 || msg.Error != nil)
+}

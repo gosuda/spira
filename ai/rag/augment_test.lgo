@@ -1,0 +1,197 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-rag/src/test/java/org/springframework/ai/rag/retrieval/join/ConcatenationDocumentJoinerTests.java
+// and spring-ai-rag/src/test/java/org/springframework/ai/rag/generation/augmentation/ContextualQueryAugmenterTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"logos/sync"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/resilience"
+)
+
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatPayload struct {
+	Messages []chatMessage `json:"messages"`
+}
+
+type chatCatcher struct {
+	state sync.Locked[string]
+}
+
+func (c *chatCatcher) add(body string) {
+	c.state.WithLock(func(s *string) {
+		*s = body
+	})
+}
+
+func (c *chatCatcher) get() string {
+	var out string
+	c.state.WithLock(func(s *string) {
+		out = *s
+	})
+	return out
+}
+
+func (c *chatCatcher) serve(t *testing.T, answer string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		c.add(string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, answerBody(answer)); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func answerBody(answer string) string {
+	escaped := strings.ReplaceAll(answer, "\\", "\\\\")
+	escaped = strings.ReplaceAll(escaped, "\"", "\\\"")
+	escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+	escaped = strings.ReplaceAll(escaped, "\r", "\\r")
+	escaped = strings.ReplaceAll(escaped, "\t", "\\t")
+	return "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1694268190,\"model\":\"gpt-6-astra\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + escaped + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
+}
+
+func chatPair(t *testing.T, answer string) (*chatCatcher, *openai.Client) {
+	t.Helper()
+	catcher := &chatCatcher{}
+	srv := catcher.serve(t, answer)
+	return catcher, &openai.Client{BaseURL: srv.URL, Model: "gpt-6-astra", HTTP: srv.Client(), Policy: resilience.Policy{}}
+}
+
+func recordedPrompt(t *testing.T, c *chatCatcher) string {
+	t.Helper()
+	var payload chatPayload
+	if err := json.Unmarshal([]byte(c.get()), &payload); err != nil {
+		t.Fatalf("decode request: %v", err)
+		return ""
+	}
+	for i := len(payload.Messages) - 1; i >= 0; i-- {
+		if payload.Messages[i].Role == "user" {
+			return payload.Messages[i].Content
+		}
+	}
+	t.Fatalf("no user message in %v", payload.Messages)
+	return ""
+}
+
+func TestAugmentSortsByScoreAndKeepsTheFirstOfEachID(t *testing.T) {
+	catcher, client := chatPair(t, "ok")
+	var gotQuery string
+	search := func(ctx context.Context, q rag.Search) ([]rag.Document, error) {
+		gotQuery = q.Query
+		return []rag.Document{
+			{ID: "1", Text: "Content 1", Score: 0.81},
+			{ID: "2", Text: "Content 2", Score: 0.83},
+			{ID: "3", Text: "Content 3"},
+			{ID: "2", Text: "Content 2 duplicate", Score: 0.99},
+			{ID: "4", Text: "Content 4", Score: 0.85},
+			{ID: "5", Text: "Content 5", Score: 0.77},
+			{ID: "0", Text: "Content 0"},
+		}, nil
+	}
+	model := ai.Wrap(client, rag.Augment(search, rag.Search{Query: "stale"}))
+	ask := ai.Request{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "What is retrieval?"}}},
+		},
+	}
+	_, err := model.Chat(t.Context(), ask)
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	if gotQuery != "What is retrieval?" {
+		t.Fatalf("search query = %q, want the last user text", gotQuery)
+	}
+	want := "Context information is below.\n\n---------------------\nContent 4\nContent 2\nContent 1\nContent 5\nContent 0\nContent 3\n---------------------\n\nGiven the context information and no prior knowledge, answer the query.\n\nFollow these rules:\n\n1. If the answer is not in the context, just say that you don't know.\n2. Avoid statements like \"Based on the context...\" or \"The provided information...\".\n\nQuery: What is retrieval?\n\nAnswer:\n"
+	if got := recordedPrompt(t, catcher); got != want {
+		t.Fatalf("augmented prompt:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestAugmentWithNoDocumentUsesTheEmptyContextText(t *testing.T) {
+	catcher, client := chatPair(t, "ok")
+	search := func(ctx context.Context, q rag.Search) ([]rag.Document, error) {
+		return []rag.Document{}, nil
+	}
+	model := ai.Wrap(client, rag.Augment(search, rag.Search{}))
+	ask := ai.Request{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "What is retrieval?"}}},
+		},
+	}
+	_, err := model.Chat(t.Context(), ask)
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+		return
+	}
+	want := "The user query is outside your knowledge base.\nPolitely inform the user that you can't answer it.\n"
+	if got := recordedPrompt(t, catcher); got != want {
+		t.Fatalf("empty context prompt:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestAugmentKeepsTypedSearchFaults(t *testing.T) {
+	store := newStore(t, map[string][]float32{"What is retrieval?": {1, 0, 0}, "doc": {0, 1, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "doc"})
+	_, client := chatPair(t, "ok")
+	ask := ai.Request{
+		Messages: []ai.Message{
+			{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "What is retrieval?"}}},
+		},
+	}
+	limited := ai.Wrap(client, rag.Augment(store.Search, rag.Search{TopK: -1}))
+	_, err := limited.Chat(t.Context(), ask)
+	if err == nil {
+		t.Fatal("a negative TopK must fail the augmented call")
+		return
+	}
+	topFault := fault.Of(err)
+	if topFault == nil {
+		t.Fatalf("TopK error = %v, carries no fault", err)
+		return
+	}
+	if topFault.Code != rag.ErrInvalidRequest.Code {
+		t.Fatalf("TopK error = %v, want the outermost rag.invalid_request fault", err)
+	}
+	keyless := rag.Filter(rag.Expression{Type: rag.OpEq, Left: rag.Const{Text: "x"}, Right: rag.Filter(rag.Const{Text: "x"})})
+	filtered := ai.Wrap(client, rag.Augment(store.Search, rag.Search{Filter: keyless}))
+	_, ferr := filtered.Chat(t.Context(), ask)
+	if ferr == nil {
+		t.Fatal("a keyless filter must fail the augmented call")
+		return
+	}
+	keyFault := fault.Of(ferr)
+	if keyFault == nil {
+		t.Fatalf("filter error = %v, carries no fault", ferr)
+		return
+	}
+	if keyFault.Code != rag.ErrInvalidFilter.Code {
+		t.Fatalf("filter error = %v, want the outermost rag.invalid_filter fault", ferr)
+	}
+}

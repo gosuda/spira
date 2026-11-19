@@ -1,0 +1,38 @@
+package rag
+
+func ProbeFilterSQL(f Filter, start int) (string, []any, error) {
+	b := &filterArgs{args: []any{}, next: start}
+	out, err := translate(f, b)
+	if err != nil {
+		return "", nil, err
+	}
+	return out, b.args, nil
+}
+
+func ProbeValidTable(name string) bool {
+	return validTable(name)
+}
+
+func ProbeMetadataText(meta map[string]Value) (string, error) {
+	return metadataText(meta)
+}
+
+func ProbeVectorText(vector const []float32) string {
+	return vectorText(vector)
+}
+
+func ProbeFilterMismatch(err error) bool {
+	return filterMismatch(err)
+}
+
+func ProbeSearchError(err error) error {
+	return searchError(err)
+}
+
+func ProbeScanError(err error) error {
+	return scanError(err)
+}
+
+func ProbeMetadataMap(raw string) (map[string]Value, error) {
+	return decodeMetadata(raw, "")
+}

@@ -1,0 +1,314 @@
+// Translated and changed by spira from Spring AI,
+// models/spring-ai-deepseek/src/main/java/org/springframework/ai/deepseek/api/DeepSeekApi.java
+// and models/spring-ai-mistral-ai/src/main/java/org/springframework/ai/mistralai/api/MistralAiApi.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package openai
+
+import (
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type wireMessage struct {
+	Role             string        `json:"role"`
+	Content          *string?      `json:"content,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	ToolCalls        []wireReqCall `json:"tool_calls,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+}
+
+type wireReqCall struct {
+	ID       string          `json:"id"`
+	Type     string          `json:"type"`
+	Function wireReqCallFunc `json:"function"`
+}
+
+type wireReqCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type wireTool struct {
+	Type     string       `json:"type"`
+	Function wireFunction `json:"function"`
+}
+
+type wireFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+type wireInt int
+
+func (w wireInt) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.Itoa(int(w))), nil
+}
+
+func (w *wireInt) UnmarshalJSON(b []byte) error {
+	var raw jsontext.Value
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if raw.Kind() == jsontext.KindNull {
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		*w = wireInt(n)
+		return nil
+	}
+	var s string
+	if serr := json.Unmarshal(raw, &s); serr != nil {
+		return fmt.Errorf("ai/openai: integer field: %w", serr)
+	}
+	parsed, perr := strconv.Atoi(s)
+	if perr != nil {
+		return fmt.Errorf("ai/openai: integer field: %w", perr)
+	}
+	*w = wireInt(parsed)
+	return nil
+}
+
+type chatResponse struct {
+	ID      string       `json:"id"`
+	Model   string       `json:"model"`
+	Choices []wireChoice `json:"choices"`
+	Usage   *wireUsage?  `json:"usage"`
+}
+
+type wireChoice struct {
+	Message      wireRespMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+type wireRespMessage struct {
+	Content          *wireContent `json:"content"`
+	ReasoningContent string       `json:"reasoning_content"`
+	Reasoning        string       `json:"reasoning"`
+	ToolCalls        []wireCall   `json:"tool_calls"`
+}
+
+type wireCall struct {
+	ID       string           `json:"id"`
+	Function wireCallFunction `json:"function"`
+}
+
+type wireCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type wireChunk struct {
+	ID      string            `json:"id"`
+	Model   string            `json:"model"`
+	Choices []wireDelta       `json:"choices"`
+	Usage   *wireUsage?       `json:"usage"`
+	Error   *wireStreamError? `json:"error"`
+}
+
+type wireStreamError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type wireDelta struct {
+	Delta        wireDeltaMsg `json:"delta"`
+	FinishReason string       `json:"finish_reason"`
+}
+
+type wireDeltaMsg struct {
+	Content          wireContent     `json:"content"`
+	ReasoningContent string          `json:"reasoning_content"`
+	Reasoning        string          `json:"reasoning"`
+	ToolCalls        []wireDeltaCall `json:"tool_calls"`
+}
+
+type wireDeltaCall struct {
+	Index    wireInt          `json:"index"`
+	ID       string           `json:"id"`
+	Function wireCallFunction `json:"function"`
+}
+
+type wireUsage struct {
+	PromptTokens     wireInt `json:"prompt_tokens"`
+	CompletionTokens wireInt `json:"completion_tokens"`
+	TotalTokens      wireInt `json:"total_tokens"`
+}
+
+type wireContent struct {
+	text    string
+	chunks  []wireContentChunk
+	present bool
+}
+
+type wireContentChunk struct {
+	Type     string              `json:"type"`
+	Text     string              `json:"text"`
+	Thinking []wireThinkingChunk `json:"thinking"`
+}
+
+type wireThinkingChunk struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+func (c *wireContent) UnmarshalJSON(b []byte) error {
+	var raw jsontext.Value
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	switch raw.Kind() {
+	case jsontext.KindNull:
+		return nil
+	case jsontext.KindString:
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return err
+		}
+		c.text = s
+		c.present = true
+		return nil
+	case jsontext.KindBeginArray:
+		var chunks []wireContentChunk
+		if err := json.Unmarshal(raw, &chunks); err != nil {
+			return err
+		}
+		c.chunks = chunks
+		c.present = true
+		return nil
+	}
+	return fmt.Errorf("ai/openai: content has unsupported JSON kind")
+}
+
+func (c *wireContent) parts() []ai.Part {
+	if !c.present {
+		return nil
+	}
+	if c.chunks == nil {
+		return []ai.Part{ai.Text{Text: c.text}}
+	}
+	return chunkParts(c.chunks)
+}
+
+func chunkParts(chunks []wireContentChunk) []ai.Part {
+	var out []ai.Part
+	var text strings.Builder
+	var thinking strings.Builder
+	for _, chunk := range chunks {
+		switch chunk.Type {
+		case "text":
+			flushThinking(&out, &thinking)
+			text.WriteString(chunk.Text)
+		case "thinking":
+			flushText(&out, &text)
+			thinkText(&thinking, chunk)
+		}
+	}
+	flushText(&out, &text)
+	flushThinking(&out, &thinking)
+	return out
+}
+
+func flushText(out *[]ai.Part, text *strings.Builder) {
+	if text.Len() == 0 {
+		return
+	}
+	*out = append(*out, ai.Text{Text: text.String()})
+	text.Reset()
+}
+
+func flushThinking(out *[]ai.Part, thinking *strings.Builder) {
+	if thinking.Len() == 0 {
+		return
+	}
+	*out = append(*out, ai.Reasoning{Text: thinking.String()})
+	thinking.Reset()
+}
+
+func thinkText(thinking *strings.Builder, chunk wireContentChunk) {
+	for _, inner := range chunk.Thinking {
+		if inner.Type == "text" {
+			thinking.WriteString(inner.Text)
+		}
+	}
+}
+
+type embedRequest struct {
+	Model          string   `json:"model"`
+	Input          []string `json:"input"`
+	EncodingFormat string   `json:"encoding_format"`
+}
+
+type embedResponse struct {
+	Data []wireEmbedding `json:"data"`
+}
+
+type wireEmbedding struct {
+	Index     wireInt   `json:"index"`
+	Embedding []float32 `json:"embedding"`
+}
+
+func (r *chatResponse) parts() []ai.Part {
+	if len(r.Choices) == 0 {
+		return nil
+	}
+	msg := r.Choices[0].Message
+	var out []ai.Part
+	if msg.Content != nil {
+		out = append(out, msg.Content.parts()...)
+	}
+	if msg.ReasoningContent != "" {
+		out = append(out, ai.Reasoning{Text: msg.ReasoningContent})
+	}
+	if msg.Reasoning != "" {
+		out = append(out, ai.Reasoning{Text: msg.Reasoning})
+	}
+	for _, call := range msg.ToolCalls {
+		out = append(out, ai.ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
+	}
+	return out
+}
+
+func (r *chatResponse) finish() string {
+	if len(r.Choices) == 0 {
+		return ""
+	}
+	return r.Choices[0].FinishReason
+}
+
+func (r *chatResponse) usageOf() ai.Usage {
+	if r.Usage == nil {
+		return ai.Usage{}
+	}
+	var empty wireUsage
+	u := *(r.Usage ?? &empty)
+	return ai.Usage{Input: int(u.PromptTokens), Output: int(u.CompletionTokens), Total: int(u.TotalTokens)}
+}
+
+func (c *wireChunk) usageOf() ai.Usage {
+	if c.Usage == nil {
+		return ai.Usage{}
+	}
+	var empty wireUsage
+	u := *(c.Usage ?? &empty)
+	return ai.Usage{Input: int(u.PromptTokens), Output: int(u.CompletionTokens), Total: int(u.TotalTokens)}
+}
+
+func (e *embedResponse) vectors() ([][]float32, error) {
+	out := make([][]float32, len(e.Data))
+	for _, d := range e.Data {
+		if d.Index < 0 || int(d.Index) >= len(out) {
+			return nil, fmt.Errorf("ai/openai: embedding index %d is outside the %d vectors of the answer", d.Index, len(out))
+		}
+		out[d.Index] = d.Embedding
+	}
+	return out, nil
+}

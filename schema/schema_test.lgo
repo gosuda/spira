@@ -1,0 +1,377 @@
+package schema_test
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"logos/rt"
+
+	"github.com/gosuda/spira/schema"
+)
+
+type slug string
+
+type userID int
+
+type ratio float64
+
+type scalars struct {
+	S string
+	B bool
+	I int
+	I8 int8
+	I16 int16
+	I32 int32
+	I64 int64
+	U uint
+	U8 uint8
+	U16 uint16
+	U32 uint32
+	U64 uint64
+	F32 float32
+	F64 float64
+	Blob []byte
+	At time.Time
+	For time.Duration
+	Named slug
+	Count userID
+	Ratio ratio
+}
+
+type tags struct {
+	Renamed int64 `json:"qty,omitempty"`
+	Hidden string `json:"-"`
+	Plain string
+}
+
+type inner struct {
+	X int64
+	Y string `json:"y"`
+}
+
+type nested struct {
+	Inner inner
+	ID int64
+}
+
+type compound struct {
+	Tags []string
+	Scores []int64
+	Stamps []time.Time
+}
+
+type optFields struct {
+	Name string? `json:"name"`
+	Flag bool? `json:"flag"`
+	Count int64? `json:"count"`
+	When time.Time? `json:"when"`
+}
+
+type optArrays struct {
+	Prices []float64? `json:"prices"`
+	Names []string? `json:"names"`
+	Seen []rt.Option[bool] `json:"seen"`
+}
+
+type badMap struct {
+	Bad map[string]int
+}
+
+type badChan struct {
+	Bad chan int
+}
+
+type badArray struct {
+	Bad [4]int
+}
+
+func TestScalars(t *testing.T) {
+	s := schema.Of[scalars]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("scalars: not an object")
+		return
+	}
+	checkFields(t, "scalars", obj.Fields, []fieldWant{
+		{"S", "S", schema.String{}},
+		{"B", "B", schema.Boolean{}},
+		{"I", "I", schema.Integer{}},
+		{"I8", "I8", schema.Integer{}},
+		{"I16", "I16", schema.Integer{}},
+		{"I32", "I32", schema.Integer{}},
+		{"I64", "I64", schema.Integer{}},
+		{"U", "U", schema.Integer{}},
+		{"U8", "U8", schema.Integer{}},
+		{"U16", "U16", schema.Integer{}},
+		{"U32", "U32", schema.Integer{}},
+		{"U64", "U64", schema.Integer{}},
+		{"F32", "F32", schema.Number{}},
+		{"F64", "F64", schema.Number{}},
+		{"Blob", "Blob", schema.String{}},
+		{"At", "At", schema.String{Format: schema.FormatDateTime}},
+		{"For", "For", schema.String{Format: schema.FormatDuration}},
+		{"Named", "Named", schema.String{}},
+		{"Count", "Count", schema.Integer{}},
+		{"Ratio", "Ratio", schema.Number{}},
+	})
+}
+
+func TestTags(t *testing.T) {
+	s := schema.Of[tags]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("tags: not an object")
+		return
+	}
+	checkFields(t, "tags", obj.Fields, []fieldWant{
+		{"Renamed", "qty", schema.Integer{}},
+		{"Plain", "Plain", schema.String{}},
+	})
+}
+
+func TestNested(t *testing.T) {
+	s := schema.Of[nested]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("nested: not an object")
+		return
+	}
+	checkFields(t, "nested", obj.Fields, []fieldWant{
+		{"Inner", "Inner", schema.Of[inner]()},
+		{"ID", "ID", schema.Integer{}},
+	})
+}
+
+func TestSlices(t *testing.T) {
+	s := schema.Of[compound]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("compound: not an object")
+		return
+	}
+	checkFields(t, "compound", obj.Fields, []fieldWant{
+		{"Tags", "Tags", schema.Array{Items: &schema.Node{Value: schema.String{}}}},
+		{"Scores", "Scores", schema.Array{Items: &schema.Node{Value: schema.Integer{}}}},
+		{"Stamps", "Stamps", schema.Array{Items: &schema.Node{Value: schema.String{Format: schema.FormatDateTime}}}},
+	})
+}
+
+func TestOptionFields(t *testing.T) {
+	s := schema.Of[optFields]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("options: not an object")
+		return
+	}
+	checkFields(t, "options", obj.Fields, []fieldWant{
+		{"Name", "name", schema.Optional{Items: &schema.Node{Value: schema.String{}}}},
+		{"Flag", "flag", schema.Optional{Items: &schema.Node{Value: schema.Boolean{}}}},
+		{"Count", "count", schema.Optional{Items: &schema.Node{Value: schema.Integer{}}}},
+		{"When", "when", schema.Optional{Items: &schema.Node{Value: schema.String{Format: schema.FormatDateTime}}}},
+	})
+}
+
+func TestOptionArrays(t *testing.T) {
+	s := schema.Of[optArrays]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("optarrays: not an object")
+		return
+	}
+	checkFields(t, "optarrays", obj.Fields, []fieldWant{
+		{"Prices", "prices", schema.Optional{Items: &schema.Node{Value: schema.Array{Items: &schema.Node{Value: schema.Number{}}}}}},
+		{"Names", "names", schema.Optional{Items: &schema.Node{Value: schema.Array{Items: &schema.Node{Value: schema.String{}}}}}},
+		{"Seen", "seen", schema.Array{Items: &schema.Node{Value: schema.Optional{Items: &schema.Node{Value: schema.Boolean{}}}}}},
+	})
+}
+
+func TestTopLevelSchemas(t *testing.T) {
+	if got := schema.Of[string](); !sameSchema(got, schema.String{}) {
+		t.Fatalf("string: %+v", got)
+		return
+	}
+	if got := schema.Of[[]int64](); !sameSchema(got, schema.Array{Items: &schema.Node{Value: schema.Integer{}}}) {
+		t.Fatalf("[]int64: %+v", got)
+		return
+	}
+}
+
+type fieldWant struct {
+	name string
+	wire string
+	sch schema.Schema
+}
+
+func checkFields(t *testing.T, at string, got []schema.Field, want []fieldWant) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: %d fields, want %d", at, len(got), len(want))
+		return
+	}
+	for i := range want {
+		if got[i].Name != want[i].name {
+			t.Fatalf("%s[%d]: name %q, want %q", at, i, got[i].Name, want[i].name)
+			return
+		}
+		if got[i].Wire != want[i].wire {
+			t.Fatalf("%s[%d]: wire %q, want %q", at, i, got[i].Wire, want[i].wire)
+			return
+		}
+		if !sameSchema(got[i].Schema.Value, want[i].sch) {
+			t.Fatalf("%s[%d] %q: got %s, want %s", at, i, got[i].Name, schemaKind(got[i].Schema.Value), schemaKind(want[i].sch))
+			return
+		}
+	}
+}
+
+type sourced struct {
+	ID string `path:"id"`
+	Q string `query:"q"`
+	Note string `json:"note"`
+}
+
+func TestSourceStaysEmpty(t *testing.T) {
+	s := schema.Of[sourced]()
+	obj, ok := s.(schema.Object)
+	if !ok {
+		t.Fatalf("sourced: not an object")
+		return
+	}
+	for _, f := range obj.Fields {
+		if f.Source != "" {
+			t.Fatalf("%s: source %q, want empty", f.Name, f.Source)
+			return
+		}
+	}
+	checkFields(t, "sourced", obj.Fields, []fieldWant{
+		{"ID", "ID", schema.String{}},
+		{"Q", "Q", schema.String{}},
+		{"Note", "note", schema.String{}},
+	})
+}
+
+func TestWireName(t *testing.T) {
+	if got := schema.WireName("qty,omitempty", "Renamed"); got != "qty" {
+		t.Fatalf("comma: %q", got)
+		return
+	}
+	if got := schema.WireName("-", "Hidden"); got != "" {
+		t.Fatalf("dash: %q", got)
+		return
+	}
+	if got := schema.WireName("", "Plain"); got != "Plain" {
+		t.Fatalf("empty: %q", got)
+		return
+	}
+}
+
+func TestUnsupportedPanics(t *testing.T) {
+	expectPanic(t, "map field", fmt.Sprintf("schema: %T.Bad: unsupported type", badMap{}), func() {
+		schema.Of[badMap]()
+	})
+	expectPanic(t, "chan field", fmt.Sprintf("schema: %T.Bad: unsupported type", badChan{}), func() {
+		schema.Of[badChan]()
+	})
+	expectPanic(t, "array field", fmt.Sprintf("schema: %T.Bad: unsupported type", badArray{}), func() {
+		schema.Of[badArray]()
+	})
+	expectPanic(t, "top level", fmt.Sprintf("schema: %T: unsupported type", map[string]int(nil)), func() {
+		schema.Of[map[string]int]()
+	})
+}
+
+func sameFields(got []schema.Field, want []schema.Field) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i].Name != want[i].Name {
+			return false
+		}
+		if got[i].Wire != want[i].Wire {
+			return false
+		}
+		if !sameSchema(got[i].Schema.Value, want[i].Schema.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameSchema(got schema.Schema, want schema.Schema) bool {
+ 	switch g := got.(type) {
+ 	case schema.Object:
+ 		w, ok := want.(schema.Object)
+ 		if !ok {
+ 			return false
+ 		}
+		return sameFields(g.Fields, w.Fields)
+ 	case schema.Array:
+ 		w, ok := want.(schema.Array)
+ 		if !ok {
+ 			return false
+ 		}
+ 		return sameSchema(g.Items.Value, w.Items.Value)
+ 	case schema.Optional:
+ 		w, ok := want.(schema.Optional)
+ 		if !ok {
+ 			return false
+ 		}
+ 		return sameSchema(g.Items.Value, w.Items.Value)
+ 	case schema.String:
+ 		w, ok := want.(schema.String)
+ 		return ok && g.Format == w.Format
+ 	case schema.Integer:
+ 		_, ok := want.(schema.Integer)
+ 		return ok
+ 	case schema.Number:
+ 		_, ok := want.(schema.Number)
+ 		return ok
+ 	case schema.Boolean:
+ 		_, ok := want.(schema.Boolean)
+ 		return ok
+ 	case nil:
+ 		return false
+ 	}
+ 	return false
+ }
+
+func schemaKind(s schema.Schema) string {
+	switch s.(type) {
+	case schema.Object:
+		return "object"
+	case schema.Array:
+		return "array"
+	case schema.Optional:
+		return "optional"
+	case schema.String:
+		return "string"
+	case schema.Integer:
+		return "integer"
+	case schema.Number:
+		return "number"
+	case schema.Boolean:
+		return "boolean"
+	case nil:
+		return "nil"
+	}
+	return "unknown"
+}
+
+func expectPanic(t *testing.T, at string, want string, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("%s: no panic", at)
+			return
+		}
+		msg, ok := r.(string)
+		if !ok || msg != want {
+			t.Fatalf("%s: panic %v, want %q", at, r, want)
+			return
+		}
+	}()
+	fn()
+}

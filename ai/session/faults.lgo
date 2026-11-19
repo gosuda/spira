@@ -1,0 +1,27 @@
+package session
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrBlankID = fault.New("session.blank_id", fault.Invalid, "The session id must not be blank.")
+
+var ErrIDTooLarge = fault.New("session.id_too_large", fault.TooLarge, "The id exceeds the 255-byte limit.")
+
+var ErrEmptyBatch = fault.New("session.empty_batch", fault.Invalid, "The append batch is empty.")
+
+var ErrSystemMessage = fault.New("session.system_message", fault.Invalid, "A system message is not stored.")
+
+var ErrForeignEvent = fault.New("session.foreign_event", fault.Invalid, "The event names another session.")
+
+var ErrInvalidCount = fault.New("session.invalid_count", fault.Invalid, "The count must be positive.")
+
+var ErrAlreadyWrapped = fault.New("session.already_wrapped", fault.Invalid, "The model is already wrapped.")
+
+var ErrContention = fault.New("session.contention", fault.Unavailable, "The session store is busy.")
+
+var ErrStoredMessage = fault.New("session.stored_message", fault.Internal, "The stored message is invalid.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrBlankID, ErrIDTooLarge, ErrEmptyBatch, ErrSystemMessage, ErrForeignEvent, ErrInvalidCount, ErrAlreadyWrapped, ErrContention, ErrStoredMessage}
+}

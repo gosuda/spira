@@ -1,0 +1,3 @@
+ticker.wasm
+ticker.loader.mjs
+wasm_exec.js

@@ -1,0 +1,62 @@
+package job
+
+import (
+	"context"
+	"time"
+)
+
+func SetTicker(s *Scheduler, tick func(time.Duration) <-chan time.Time) {
+	s.tick = tick
+}
+
+func MarkEntryBusy(s *Scheduler, name string) bool {
+	found := false
+	s.life.WithLock(func(l *schedLife) {
+		for i := range s.jobs {
+			if s.jobs[i].name == name {
+				s.jobs[i].claimedBy = l.starts
+				found = true
+				return
+			}
+		}
+	})
+	return found
+}
+
+func ReleaseAsEarlierStart(s *Scheduler, name string) {
+	var earlier uint64
+	s.life.WithLock(func(l *schedLife) {
+		earlier = l.starts - 1
+	})
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			s.release(jobLoop{entry: &s.jobs[i], start: earlier})
+		}
+	}
+}
+
+func DeliverTick(s *Scheduler, name string, ctx context.Context, start uint64) bool {
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			s.deliver(ctx, jobLoop{entry: &s.jobs[i], tick: make(chan struct{}, 1), start: start})
+			return true
+		}
+	}
+	return false
+}
+
+func DeliverTickBlocked(s *Scheduler, name string, ctx context.Context, start uint64) bool {
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			tick := make(chan struct{}, 1)
+			select {
+			case tick <- struct{}{}:
+			case <-ctx.Done():
+				return false
+			}
+			s.deliver(ctx, jobLoop{entry: &s.jobs[i], tick: tick, start: start})
+			return true
+		}
+	}
+	return false
+}

@@ -1,0 +1,219 @@
+package websocket
+
+import (
+	"crypto/sha1"
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"strings"
+)
+
+const handshakeGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+var errHandshakeMethod = errors.New("websocket: handshake requires GET method")
+var errHandshakeProtocol = errors.New("websocket: handshake requires HTTP/1.1 or later")
+var errHandshakeConnection = errors.New("websocket: handshake requires Connection header with upgrade token")
+var errHandshakeUpgrade = errors.New("websocket: handshake requires Upgrade header with websocket token")
+var errHandshakeVersion = errors.New("websocket: handshake requires Sec-WebSocket-Version 13")
+var errHandshakeKey = errors.New("websocket: handshake requires Sec-WebSocket-Key with base64 of 16 bytes")
+var errHandshakeSubprotocol = errors.New("websocket: Sec-WebSocket-Protocol must be an RFC 7230 token")
+
+func acceptKey(key string) string {
+	sum := sha1.Sum([]byte(strings.TrimSpace(key) + handshakeGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func checkUpgrade(r *http.Request) error {
+	if r.Method != http.MethodGet {
+		return errHandshakeMethod
+	}
+	if r.ProtoMajor < 1 || (r.ProtoMajor == 1 && r.ProtoMinor < 1) {
+		return errHandshakeProtocol
+	}
+	if !handshakeHasToken(r.Header.Values("Connection"), "upgrade") {
+		return errHandshakeConnection
+	}
+	if !handshakeHasToken(r.Header.Values("Upgrade"), "websocket") {
+		return errHandshakeUpgrade
+	}
+	version, ok := handshakeSingleValue(r.Header.Values("Sec-WebSocket-Version"))
+	if !ok {
+		return errHandshakeVersion
+	}
+	if version != "13" {
+		return errHandshakeVersion
+	}
+	key, ok := handshakeSingleValue(r.Header.Values("Sec-WebSocket-Key"))
+	if !ok {
+		return errHandshakeKey
+	}
+	if !handshakeValidKey(key) {
+		return errHandshakeKey
+	}
+	return nil
+}
+
+func upgradeStatus(err error) int {
+	if err == nil {
+		return http.StatusSwitchingProtocols
+	}
+	if err == errHandshakeVersion {
+		return http.StatusUpgradeRequired
+	}
+	if err == errHandshakeMethod {
+		return http.StatusMethodNotAllowed
+	}
+	if err == errHandshakeOrigin {
+		return http.StatusForbidden
+	}
+	return http.StatusBadRequest
+}
+
+func handshakeFailureHeaders(err error) http.Header {
+	h := http.Header{}
+	if err == errHandshakeVersion {
+		h.Set("Sec-WebSocket-Version", "13")
+	}
+	return h
+}
+
+func upgradeHeaders(key string, subprotocol string) (http.Header, error) {
+	h := http.Header{}
+	h.Set("Upgrade", "websocket")
+	h.Set("Connection", "Upgrade")
+	h.Set("Sec-WebSocket-Accept", acceptKey(key))
+	if subprotocol == "" {
+		return h, nil
+	}
+	if !handshakeValidToken(subprotocol) {
+		return nil, errHandshakeSubprotocol
+	}
+	h.Set("Sec-WebSocket-Protocol", subprotocol)
+	return h, nil
+}
+
+func pickSubprotocol(offered []string, supported []string) (string, error) {
+	for _, name := range supported {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if !handshakeValidToken(trimmed) {
+			return "", errHandshakeSubprotocol
+		}
+		if handshakeOfferedHas(offered, trimmed) {
+			return trimmed, nil
+		}
+	}
+	return "", nil
+}
+
+func handshakeOfferedHas(offered []string, name string) bool {
+	for _, line := range offered {
+		for _, part := range strings.Split(line, ",") {
+			if strings.TrimSpace(part) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func handshakeHasToken(values []string, want string) bool {
+	for _, v := range values {
+		for _, part := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func handshakeSingleValue(values []string) (string, bool) {
+	found := ""
+	count := 0
+	for _, v := range values {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			continue
+		}
+		if count > 0 {
+			return "", false
+		}
+		found = trimmed
+		count++
+	}
+	if count == 0 {
+		return "", false
+	}
+	return found, true
+}
+
+func handshakeValidKey(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if !handshakeBase64Chars(s) {
+		return false
+	}
+	decoded, derr := base64.StdEncoding.DecodeString(s)
+	if derr != nil {
+		return false
+	}
+	return len(decoded) == 16
+}
+
+func handshakeBase64Chars(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if handshakeBase64Char(s[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func handshakeBase64Char(c byte) bool {
+	if c >= 'a' && c <= 'z' {
+		return true
+	}
+	if c >= 'A' && c <= 'Z' {
+		return true
+	}
+	if c >= '0' && c <= '9' {
+		return true
+	}
+	return c == '+' || c == '/' || c == '='
+}
+
+func handshakeValidToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if handshakeTokenChar(s[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func handshakeTokenChar(c byte) bool {
+	if c >= '0' && c <= '9' {
+		return true
+	}
+	if c >= 'a' && c <= 'z' {
+		return true
+	}
+	if c >= 'A' && c <= 'Z' {
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
+}

@@ -1,0 +1,117 @@
+package session
+
+import (
+	"context"
+	"errors"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/db"
+)
+
+func StoredSessions(s *Service) int {
+	count := 0
+	s.store.WithLock(func(m *memory) { count = len(m.logs) })
+	return count
+}
+
+func EncodeStoredMessage(m ai.Message) (string, error) {
+	return encodeMessage(m)
+}
+
+func DecodeStoredMessage(role string, raw string) (ai.Message?, error) {
+	return decodeMessage(role, raw)
+}
+
+func SessionInsert(d db.Dialect) string {
+	return stmtsFor(d).insertNew
+}
+
+func SessionClaim(d db.Dialect) string {
+	return stmtsFor(d).claim
+}
+
+func SessionNewestBoundary(d db.Dialect) string {
+	return stmtsFor(d).newestBoundary
+}
+
+func SessionTables(d db.Dialect) (string, string) {
+	stmts := stmtsFor(d)
+	return stmts.createSessions, stmts.createEvents
+}
+
+var ErrHeldStale = errors.New("ai/session: append held: stale version")
+
+type HeldAppend struct {
+	Store    *SQLStore
+	ID       string
+	Version  int64
+	Events   []Event
+	Inserted chan<- struct{}
+	Release  <-chan struct{}
+}
+
+func AppendHeld(ctx context.Context, h HeldAppend) error {
+	_, err := db.InTx[int](ctx, h.Store.Pool, func(tx *db.Tx) (int, error) {
+		w := sessionTx{ctx: ctx, tx: tx, stmts: stmtsFor(h.Store.Pool.Dialect()), id: h.ID}
+		if err := checkSessionID(h.ID); err != nil {
+			return 0, err
+		}
+		if err := checkEventIDs(h.Events); err != nil {
+			return 0, err
+		}
+		batch, err := encodeEvents(h.ID, h.Events)
+		if err != nil {
+			return 0, err
+		}
+		claimed, err := w.claimVersion(h.Version, h.Store.now().UnixNano())
+		if err != nil {
+			return 0, err
+		}
+		if !claimed {
+			return 0, ErrHeldStale
+		}
+		for _, r := range batch {
+			if _, err := db.Exec(w.ctx, w.tx, w.stmts.insert, r.id, keyArg(w.stmts, r.session), r.at, r.eventType, r.role, r.parts); err != nil {
+				return 0, err
+			}
+		}
+		select {
+		case h.Inserted <- struct{}{}:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		select {
+		case <-h.Release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		return 0, nil
+	})
+	return err
+}
+
+func EventCount(ctx context.Context, s *SQLStore, id string) (int64, error) {
+	stmts := stmtsFor(s.Pool.Dialect())
+	found, err := db.One[int64](ctx, s.Pool, stmts.countEvents, keyArg(stmts, id))
+	if err != nil {
+		return 0, err
+	}
+	if found == nil {
+		return 0, nil
+	}
+	return found ?? 0, nil
+}
+
+func ClaimStale(s *SQLStore, id string, oldVersion int64, oldExpires int64) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sqlOpTimeout)
+	defer cancel()
+	at := s.now()
+	return db.InTx[bool](ctx, s.Pool, func(tx *db.Tx) (bool, error) {
+		w := sessionTx{ctx: ctx, tx: tx, stmts: stmtsFor(s.Pool.Dialect()), id: id}
+		res, err := w.claimStale(at.UnixNano(), at.Add(s.ttl()).UnixNano(), sessionRow{Version: oldVersion, Expires: oldExpires})
+		if err != nil {
+			return false, err
+		}
+		return !res.retry, nil
+	})
+}

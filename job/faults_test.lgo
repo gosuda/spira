@@ -1,0 +1,105 @@
+package job_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/job"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/job.md", job.Faults())
+}
+
+func TestQueueClosedThroughEnqueueBeforeStart(t *testing.T) {
+	q := job.NewQueue[int](1, 1, func(ctx context.Context, v int) error { return nil })
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := q.Enqueue(ctx, 1); !errors.Is(err, job.ErrQueueClosed) {
+		t.Fatalf("Enqueue before Start = %v, want queue_closed", err)
+	}
+}
+
+func TestQueueStoppedThroughStartAfterStop(t *testing.T) {
+	q := job.NewQueue[int](1, 1, func(ctx context.Context, v int) error { return nil })
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := q.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := q.Start(t.Context()); !errors.Is(err, job.ErrQueueStopped) {
+		t.Fatalf("Start after Stop = %v, want queue_stopped", err)
+	}
+}
+
+func TestAlreadyStartedFaults(t *testing.T) {
+	var s job.Scheduler
+	if err := s.Start(t.Context()); err != nil {
+		t.Fatalf("scheduler Start: %v", err)
+	}
+	defer func() {
+		if err := s.Stop(t.Context()); err != nil {
+			t.Fatalf("scheduler Stop: %v", err)
+		}
+	}()
+	if err := s.Start(t.Context()); !errors.Is(err, job.ErrSchedulerStarted) {
+		t.Fatalf("second scheduler Start = %v, want scheduler_already_started", err)
+	}
+	q := job.NewQueue[int](1, 1, func(ctx context.Context, v int) error { return nil })
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatalf("queue Start: %v", err)
+	}
+	defer func() {
+		if err := q.Stop(t.Context()); err != nil {
+			t.Fatalf("queue Stop: %v", err)
+		}
+	}()
+	if err := q.Start(t.Context()); !errors.Is(err, job.ErrQueueStarted) {
+		t.Fatalf("second queue Start = %v, want queue_already_started", err)
+	}
+}
+
+func TestChunkFailedThroughWriteError(t *testing.T) {
+	planted := []string{"hunter2", "<script>alert(1)</script>", "'; DROP TABLE x; --", "/etc/passwd"}
+	cause := errors.New("write: password=hunter2 <script>alert(1)</script> '; DROP TABLE x; --' /etc/passwd")
+	c := job.Chunk[int, int]{
+		Read: func(ctx context.Context, yield func(int, error) bool) {
+			if !yield(0, nil) {
+				return
+			}
+		},
+		Process: func(in int) (int, error) {
+			return in, nil
+		},
+		Write: func(ctx context.Context, items const []int) error {
+			return cause
+		},
+		Size: 1,
+	}
+	_, err := c.Run(t.Context())
+	if err == nil {
+		t.Fatal("Run error = nil, want chunk_failed")
+		return
+	}
+	if !errors.Is(err, job.ErrChunkFailed) {
+		t.Fatalf("Run error = %v, want chunk_failed", err)
+		return
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("Run error = %v, want the write cause", err)
+		return
+	}
+	ce, ok := errors.AsType[*job.ChunkError](err)
+	if !ok {
+		t.Fatalf("Run error %T carries no chunk stats", err)
+		return
+	}
+	if ce.Stats.Items != 0 || ce.Stats.Chunks != 0 {
+		t.Fatalf("ChunkError stats = %+v, want zero items before the write error", ce.Stats)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), planted...)
+}

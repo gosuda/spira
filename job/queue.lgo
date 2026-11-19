@@ -2,16 +2,12 @@ package job
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
 
 	"logos/rt"
 	"logos/sync"
 )
-
-var errQueueClosed = errors.New("job: queue closed")
 
 type queueRun[T any] struct {
 	items      chan T
@@ -21,15 +17,20 @@ type queueRun[T any] struct {
 	joinCancel context.CancelFunc
 }
 
+type queueLife[T any] struct {
+	started bool
+	stopped bool
+	open    bool
+	run     *queueRun[T]?
+	sending int64
+}
+
 type Queue[T any] struct {
 	workers  int
 	capacity int
 	handle   func(ctx context.Context, item T) error
 	wake     sync.Locked[chan struct{}]
-	sending  atomic.Int64
-	started  atomic.Bool
-	open     atomic.Bool
-	run      atomic.Pointer[queueRun[T]]
+	life     sync.Locked[queueLife[T]]
 }
 
 func NewQueue[T any](workers int, capacity int, handle func(ctx context.Context, item T) error) *Queue[T] {
@@ -47,83 +48,124 @@ func NewQueue[T any](workers int, capacity int, handle func(ctx context.Context,
 }
 
 func (q *Queue[T]) Start(ctx context.Context) error {
-	if !q.started.CompareAndSwap(false, true) {
-		return fmt.Errorf("job: queue already started")
-	}
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	items := make(chan T, q.capacity)
-	stop := make(chan struct{})
-	g, _ := rt.NewGroup(runCtx, 0)
-	for range q.workers {
-		g.Go(func(gctx context.Context) error {
-			return q.worker(gctx, items, stop)
+	var startErr error
+	q.life.WithLock(func(l *queueLife[T]) {
+		if l.stopped {
+			startErr = ErrQueueStopped.Err()
+			return
+		}
+		if l.started {
+			startErr = ErrQueueStarted.Err()
+			return
+		}
+		l.started = true
+		l.open = true
+		items := make(chan T, q.capacity)
+		stop := make(chan struct{})
+		js := &joinState{done: make(chan struct{})}
+		joinCtx, joinCancel := context.WithCancel(context.Background())
+		g, _ := rt.NewGroup(runCtx, 0)
+		for range q.workers {
+			g.Go(func(gctx context.Context) error {
+				return q.worker(gctx, items, stop)
+			})
+		}
+		context.AfterFunc(joinCtx, func() {
+			js.err.WithLock(func(e *error) {
+				*e = g.Wait()
+			})
+			close(js.done)
 		})
+		l.run = &queueRun[T]{
+			items:      items,
+			stop:       stop,
+			join:       js,
+			cancel:     cancel,
+			joinCancel: joinCancel,
+		}
+		q.wake.WithLock(func(w *chan struct{}) {
+			*w = make(chan struct{})
+		})
+	})
+	if startErr != nil {
+		cancel()
+		return startErr
 	}
-	js := &joinState{done: make(chan struct{})}
-	joinCtx, joinCancel := context.WithCancel(context.Background())
-	context.AfterFunc(joinCtx, func() {
-		js.err.WithLock(func(e *error) {
-			*e = g.Wait()
-		})
-		close(js.done)
-	})
-	q.wake.WithLock(func(w *chan struct{}) {
-		*w = make(chan struct{})
-	})
-	q.run.Store(&queueRun[T]{
-		items:      items,
-		stop:       stop,
-		join:       js,
-		cancel:     cancel,
-		joinCancel: joinCancel,
-	})
-	q.open.Store(true)
 	return nil
 }
 
+func (q *Queue[T]) takeRun() *queueRun[T]? {
+	var r *queueRun[T]?
+	q.life.WithLock(func(l *queueLife[T]) {
+		l.stopped = true
+		if !l.started {
+			return
+		}
+		l.started = false
+		l.open = false
+		r = l.run
+		l.run = nil
+	})
+	return r
+}
+
+func (q *Queue[T]) activeRun() *queueRun[T]? {
+	var r *queueRun[T]?
+	q.life.WithLock(func(l *queueLife[T]) {
+		if l.open && l.run != nil {
+			r = l.run
+		}
+	})
+	return r
+}
+
 func (q *Queue[T]) Stop(ctx context.Context) error {
-	if !q.started.Swap(false) {
+	run := q.takeRun()
+	if run == nil {
 		return nil
 	}
-	q.open.Store(false)
-	r := q.run.Load()
-	if r == nil {
-		return nil
-	}
-	close(r.stop)
-	r.joinCancel()
-	defer r.cancel()
+	close(run.stop)
+	run.joinCancel()
+	defer run.cancel()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-r.join.done:
+	case <-run.join.done:
 	}
 	var err error
-	r.join.err.WithLock(func(e *error) {
+	run.join.err.WithLock(func(e *error) {
 		err = *e
 	})
 	return err
 }
 
 func (q *Queue[T]) Enqueue(ctx context.Context, item T) error {
-	q.sending.Add(1)
+	q.life.WithLock(func(l *queueLife[T]) {
+		l.sending++
+	})
 	defer func() {
-		if q.sending.Add(-1) == 0 {
+		wake := false
+		q.life.WithLock(func(l *queueLife[T]) {
+			l.sending--
+			wake = l.sending == 0
+		})
+		if wake {
 			q.broadcast()
 		}
 	}()
-	r := q.run.Load()
-	if r == nil || !q.open.Load() {
-		return errQueueClosed
+	run := q.activeRun()
+	if run != nil {
+		select {
+		case run.items <- item:
+			return nil
+		case <-run.stop:
+			return ErrQueueClosed.Err()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	select {
-	case r.items <- item:
-		return nil
-	case <-r.stop:
-		return errQueueClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return ErrQueueClosed.Err()
 }
 
 func (q *Queue[T]) broadcast() {
@@ -139,6 +181,14 @@ func (q *Queue[T]) waitCh() chan struct{} {
 		w = *x
 	})
 	return w
+}
+
+func (q *Queue[T]) sendingNow() int64 {
+	var n int64
+	q.life.WithLock(func(l *queueLife[T]) {
+		n = l.sending
+	})
+	return n
 }
 
 func (q *Queue[T]) worker(ctx context.Context, items chan T, stop <-chan struct{}) error {
@@ -183,7 +233,7 @@ func (q *Queue[T]) takeItem(ctx context.Context, items chan T) bool {
 	default:
 	}
 	w := q.waitCh()
-	if q.sending.Load() == 0 {
+	if q.sendingNow() == 0 {
 		return true
 	}
 	select {

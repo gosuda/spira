@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -29,6 +30,86 @@ type serverRun struct {
 	srv        *http.Server
 	join       *joinState
 	joinCancel context.CancelFunc
+	upgrades   *upgrades
+	listener   net.Listener
+}
+
+type upgradesKey struct{}
+
+type upgrades struct {
+	state sync.Locked[upgradeState]
+}
+
+type upgradeState struct {
+	open    map[*upgradedConn]struct{}
+	stopped bool
+}
+
+type upgradedConn struct {
+	net.Conn
+	owner *upgrades
+}
+
+func newUpgrades() *upgrades {
+	u := &upgrades{}
+	u.state.WithLock(func(st *upgradeState) {
+		st.open = map[*upgradedConn]struct{}{}
+	})
+	return u
+}
+
+func (u *upgrades) adopt(conn net.Conn, buf *bufio.ReadWriter) (net.Conn, *bufio.ReadWriter, error) {
+	c := &upgradedConn{Conn: conn, owner: u}
+	stopped := false
+	u.state.WithLock(func(st *upgradeState) {
+		stopped = st.stopped
+		if !stopped {
+			st.open[c] = struct{}{}
+		}
+	})
+	if stopped {
+		return c, buf, errors.Join(errors.New("web: server is stopping"), conn.Close())
+	}
+	return c, buf, nil
+}
+
+func (c *upgradedConn) Close() error {
+	c.owner.state.WithLock(func(st *upgradeState) {
+		delete(st.open, c)
+	})
+	return c.Conn.Close()
+}
+
+func (c *upgradedConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return errors.New("web: CloseRead not supported by the underlying connection")
+}
+
+func (c *upgradedConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return errors.New("web: CloseWrite not supported by the underlying connection")
+}
+
+func (u *upgrades) closeAll() error {
+	var open []*upgradedConn
+	u.state.WithLock(func(st *upgradeState) {
+		st.stopped = true
+		for c := range st.open {
+			open = append(open, c)
+		}
+		clear(st.open)
+	})
+	var errs []error
+	for _, c := range open {
+		if err := c.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, fmt.Errorf("web: close upgraded connection: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 type joinState struct {
@@ -68,7 +149,10 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
-	srv := &http.Server{Handler: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout}
+	ups := newUpgrades()
+	srv := &http.Server{Handler: s.Router, DisableGeneralOptionsHandler: true, ReadHeaderTimeout: s.ReadHeaderTimeout, BaseContext: func(_ net.Listener) context.Context {
+		return context.WithValue(context.Background(), upgradesKey{}, ups)
+	}}
 	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
 	g.Go(func(_ context.Context) error {
 		if serr := srv.Serve(l); !errors.Is(serr, http.ErrServerClosed) {
@@ -84,7 +168,7 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 		})
 		close(js.done)
 	})
-	return &serverRun{srv: srv, join: js, joinCancel: joinCancel}
+	return &serverRun{srv: srv, join: js, joinCancel: joinCancel, upgrades: ups, listener: l}
 }
 
 func (s *Server) Stop(ctx context.Context) error {
@@ -107,6 +191,7 @@ func (r *serverRun) stop(ctx context.Context, grace time.Duration) error {
 	if shutdownErr != nil {
 		shutdownErr = errors.Join(fmt.Errorf("web: shutdown: %w", shutdownErr), r.srv.Close())
 	}
+	shutdownErr = errors.Join(shutdownErr, r.upgrades.closeAll())
 	r.joinCancel()
 	select {
 	case <-r.join.done:

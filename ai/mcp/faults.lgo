@@ -1,0 +1,29 @@
+package mcp
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrForbiddenOrigin = fault.New("mcp.forbidden_origin", fault.Forbidden, "The origin is forbidden.")
+
+var ErrUnsupportedVersion = fault.New("mcp.unsupported_version", fault.Invalid, "The protocol version is unsupported.")
+
+var ErrParseError = fault.New("mcp.parse_error", fault.Invalid, "The request could not be parsed.")
+
+var ErrMethodNotFound = fault.New("mcp.method_not_found", fault.Invalid, "The method was not found.")
+
+var ErrInvalidParams = fault.New("mcp.invalid_params", fault.Invalid, "The tool call parameters are invalid.")
+
+var ErrUnknownTool = fault.New("mcp.unknown_tool", fault.Invalid, "The tool was not found.")
+
+var ErrToolFailed = fault.New("mcp.tool_failed", fault.Unprocessable, "The tool call failed.")
+
+var ErrProtocolError = fault.New("mcp.protocol_error", fault.Invalid, "The protocol request failed.")
+
+var ErrUpstreamFailed = fault.New("mcp.upstream_failed", fault.Unavailable, "The MCP server returned an error.")
+
+var ErrTransportFailed = fault.New("mcp.transport_failed", fault.Internal, "The MCP transport failed.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrForbiddenOrigin, ErrUnsupportedVersion, ErrParseError, ErrMethodNotFound, ErrInvalidParams, ErrUnknownTool, ErrToolFailed, ErrProtocolError, ErrUpstreamFailed, ErrTransportFailed}
+}
