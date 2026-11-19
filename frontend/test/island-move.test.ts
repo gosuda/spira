@@ -1,5 +1,6 @@
 import { loader as wasmLoader } from "../src/adapters/wasm";
 import { defineIslands, type IslandTable } from "../src/island";
+import counterDefault from "./fixtures/Counter.react";
 import reactDisposableDefault, {
 	reactDisposable,
 	resetReactDisposable,
@@ -242,6 +243,30 @@ describe("island moves", () => {
 		});
 		expect(pendingLoads).toBe(2);
 		expect(reactDisposable.cleanups).toBe(0);
+		expect(box.contains(el)).toBe(true);
+	});
+
+	test("a stale load that resolves after the new mount leaves the mount alone", async () => {
+		resetReactDisposable();
+		const el = island(pendingEntry);
+		await vi.waitFor(() => {
+			expect(pendingLoads).toBe(1);
+		});
+		const box = document.createElement("div");
+		document.body.append(box);
+		box.append(el);
+		await vi.waitFor(() => {
+			expect(pendingLoads).toBe(2);
+		});
+		pendingResolvers[1]?.({ default: reactDisposableDefault });
+		await vi.waitFor(() => {
+			expect(el.querySelector("span")?.textContent).toBe("react go 0");
+		});
+		pendingResolvers[0]?.({ default: counterDefault });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(el.querySelector("span")?.textContent).toBe("react go 0");
+		expect(reactDisposable.cleanups).toBe(0);
+		expect(pendingLoads).toBe(2);
 		expect(box.contains(el)).toBe(true);
 	});
 });

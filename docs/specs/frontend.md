@@ -107,7 +107,7 @@ export function installSlotMover(root?: ParentNode): void
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
  - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
-- `test/island-move.test.ts` proves that a move keeps one mount with no dispose and no cleanup, that a removal runs one cleanup and still one after extra microtask turns, that a move followed by a removal disposes once without remounting, that a re-inserted island mounts again and disposes the new mount once, that a moved wasm island keeps one Go program, and that a move during a pending load mounts only the new load.
+- `test/island-move.test.ts` proves that a move keeps one mount with no dispose and no cleanup, that a removal runs one cleanup and still one after extra microtask turns, that a move followed by a removal disposes once without remounting, that a re-inserted island mounts again and disposes the new mount once, that a moved wasm island keeps one Go program, that a move during a pending load mounts only the new load, and that a stale load resolving after the new mount leaves the mount alone.
  - `test/production-build.test.ts` proves each island table ships its component and registration key, the compiled bodies with their runtimes, production output, and the application entry that owns the island glob.
  - It also proves a glob result derives repo relative island keys.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
