@@ -1,0 +1,403 @@
+package admin
+
+import (
+	"bytes"
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/bus"
+	"github.com/gosuda/spira/client"
+	"github.com/gosuda/spira/job"
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+const topicBuffer = 64
+
+const (
+	statusUp      = "up"
+	statusDown    = "down"
+	statusUnknown = "unknown"
+)
+
+type Instance struct {
+	Name   string `json:"name"`
+	OpsURL string `json:"opsUrl"`
+}
+
+type Server struct {
+	Interval     time.Duration = 10 * time.Second
+	Now          (func() time.Time)?
+	MaxInstances int = 100
+	state  sync.Locked[serverState]
+	events *bus.Topic[live.Event]?
+	sched  job.Scheduler
+}
+
+type Client struct {
+	Server string
+	Self   Instance
+}
+
+
+type serverState struct {
+	entries map[string]*record
+	armed   bool
+}
+
+type record struct {
+	inst    Instance
+	status  string
+	breaker *resilience.Breaker
+}
+
+type healthReport struct {
+	Status string `json:"status"`
+}
+
+type rowView struct {
+	name   string
+	status string
+}
+
+type pollItem struct {
+	name    string
+	opsURL  string
+	breaker *resilience.Breaker
+}
+
+type pollResult struct {
+	name string
+	up   bool
+}
+
+func (s *Server) Mount(r *web.Router, guard web.Stage) {
+	if guard == nil {
+		panic("admin: Mount requires a guard stage")
+	}
+	s.ensure()
+	r.Group("", func(g *web.Router) {
+		g.Use(guard)
+		g.Handle("POST", "/admin/instances", s.handlePost)
+		g.Handle("DELETE", "/admin/instances/{name}", s.handleDelete)
+		g.Handle("GET", "/admin", s.handlePage)
+		g.Handle("GET", "/admin/events", s.handleEvents)
+	})
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	s.ensure()
+	return s.sched.Start(ctx)
+}
+
+func (s *Server) Stop(ctx context.Context) error {
+	return s.sched.Stop(ctx)
+}
+
+func (s *Server) ensure() {
+	if s.Interval <= 0 {
+		panic("admin: Interval must be positive")
+	}
+	if s.MaxInstances < 1 {
+		panic("admin: MaxInstances must be at least 1")
+	}
+	if s.events == nil {
+		s.events = bus.NewTopic[live.Event](topicBuffer)
+	}
+	armed := false
+	s.state.WithLock(func(st *serverState) {
+		if st.entries == nil {
+			st.entries = map[string]*record{}
+		}
+		if !st.armed {
+			st.armed = true
+			armed = true
+		}
+	})
+	if armed {
+		s.sched.Every("admin/poll", s.Interval, func(ctx context.Context) error { return s.pollOnce(ctx) })
+	}
+}
+
+func (s *Server) bound() int {
+	return max(s.MaxInstances, 1)
+}
+
+func (s *Server) handlePost(ctx *web.Context) (web.Reply, error) {
+	inst, err := decodeInstance(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !validName(inst.Name) {
+		return nil, web.Fail(web.Problem{Title: "Unprocessable Entity", Status: http.StatusUnprocessableEntity, Detail: "admin: invalid instance name"})
+	}
+	if !validOpsURL(inst.OpsURL) {
+		return nil, web.Fail(web.Problem{Title: "Unprocessable Entity", Status: http.StatusUnprocessableEntity, Detail: "admin: invalid ops URL"})
+	}
+	stored, created := s.store(inst)
+	if !stored {
+		return nil, web.Fail(web.Problem{Title: "Too Many Requests", Status: http.StatusTooManyRequests, Detail: "admin: registry full"})
+	}
+	code := http.StatusOK
+	if created {
+		code = http.StatusCreated
+	}
+	return web.Data{Value: inst, Status: code}, nil
+}
+
+func (s *Server) handleDelete(ctx *web.Context) (web.Reply, error) {
+	name := ctx.Request.PathValue("name")
+	removed := false
+	s.state.WithLock(func(st *serverState) {
+		if _, ok := st.entries[name]; ok {
+			delete(st.entries, name)
+			removed = true
+		}
+	})
+	if !removed {
+		return nil, web.Fail(web.Problem{Title: "Not Found", Status: http.StatusNotFound, Detail: $"admin: unknown instance {name}"})
+	}
+	return web.Empty{}, nil
+}
+
+func (s *Server) handlePage(ctx *web.Context) (web.Reply, error) {
+	return web.Page{Title: "Instances", Body: pageNode(s.snapshot())}, nil
+}
+
+func (s *Server) handleEvents(ctx *web.Context) (web.Reply, error) {
+	topic := s.events
+	if topic == nil {
+		return nil, web.Fail(web.Problem{Title: "Internal Server Error", Status: http.StatusInternalServerError, Detail: "admin: events not ready"})
+	}
+	return live.Events(ctx, topic.Subscribe(ctx.Ctx())), nil
+}
+
+func decodeInstance(ctx *web.Context) (Instance, error) {
+	body, err := io.ReadAll(io.LimitReader(ctx.Request.Body, 1<<20+1))
+	if err != nil {
+		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: $"admin: read instance: {err}"})
+	}
+	if cerr := ctx.Request.Body.Close(); cerr != nil {
+		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: $"admin: close instance body: {cerr}"})
+	}
+	if len(body) > 1<<20 {
+		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: "admin: instance body too large"})
+	}
+	var inst Instance
+	if uerr := json.Unmarshal(body, &inst); uerr != nil {
+		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: $"admin: decode instance: {uerr}"})
+	}
+	return inst, nil
+}
+
+func validName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	return !strings.ContainsAny(name, "/\n\r")
+}
+
+func validOpsURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u == nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if u.Host == "" {
+		return false
+	}
+	return u.User == nil
+}
+
+func (s *Server) store(inst Instance) (bool, bool) {
+	stored := false
+	created := false
+	s.state.WithLock(func(st *serverState) {
+		if st.entries == nil {
+			st.entries = map[string]*record{}
+		}
+		if old, ok := st.entries[inst.Name]; ok {
+			if old.inst.OpsURL == inst.OpsURL {
+				stored = true
+				return
+			}
+			st.entries[inst.Name] = &record{inst: inst, status: statusUnknown, breaker: &resilience.Breaker{}}
+			stored = true
+			return
+		}
+		if len(st.entries) >= s.bound() {
+			return
+		}
+		st.entries[inst.Name] = &record{inst: inst, status: statusUnknown, breaker: &resilience.Breaker{}}
+		stored = true
+		created = true
+	})
+	return stored, created
+}
+
+func (s *Server) snapshot() []rowView {
+	var names []string
+	s.state.WithLock(func(st *serverState) {
+		for name := range st.entries {
+			names = append(names, name)
+		}
+	})
+	slices.Sort(names)
+	var rows []rowView
+	s.state.WithLock(func(st *serverState) {
+		for _, name := range names {
+			if rec, ok := st.entries[name]; ok {
+				rows = append(rows, rowView{name: name, status: rec.status})
+			}
+		}
+	})
+	return rows
+}
+
+func (s *Server) pollOnce(ctx context.Context) error {
+	items := s.snapshotPoll()
+	results := make([]pollResult, 0, len(items))
+	for _, it := range items {
+		results = append(results, pollResult{name: it.name, up: s.probe(ctx, it.opsURL, it.breaker)})
+	}
+	for _, changed := range s.applyPoll(results) {
+		s.publish(changed.name, changed.status)
+	}
+	return nil
+}
+
+func (s *Server) snapshotPoll() []pollItem {
+	var items []pollItem
+	s.state.WithLock(func(st *serverState) {
+		for name, rec := range st.entries {
+			items = append(items, pollItem{name: name, opsURL: rec.inst.OpsURL, breaker: rec.breaker})
+		}
+	})
+	return items
+}
+
+func (s *Server) applyPoll(results []pollResult) []rowView {
+	var changed []rowView
+	s.state.WithLock(func(st *serverState) {
+		for _, r := range results {
+			rec, ok := st.entries[r.name]
+			if !ok {
+				continue
+			}
+			want := statusDown
+			if r.up {
+				want = statusUp
+			}
+			if rec.status == want {
+				continue
+			}
+			rec.status = want
+			changed = append(changed, rowView{name: r.name, status: want})
+		}
+	})
+	return changed
+}
+
+func (s *Server) probe(ctx context.Context, opsURL string, breaker *resilience.Breaker) bool {
+	breaker.Now = s.Now
+	c := client.New(strings.TrimSuffix(opsURL, "/"), resilience.Policy{Timeout: 5 * time.Second, Breaker: breaker})
+	report, err := client.Get[healthReport](ctx, c, "/ops/health")
+	if err != nil {
+		return false
+	}
+	return report.Status == "ok"
+}
+
+func (s *Server) publish(name string, status string) {
+	topic := s.events
+	if topic == nil {
+		return
+	}
+	topic.Publish(live.Event{Name: "instance", Body: rowNode(name, status)})
+}
+
+func pageNode(rows []rowView) view.Node {
+	return view.Div(
+		view.H1(view.T("Instances")),
+		view.Table(
+			view.Thead(view.Tr(view.Th(view.T("Name")), view.Th(view.T("Status")))),
+			view.Tbody(view.Each(rows, item => rowNode(item.name, item.status))),
+		),
+	)
+}
+
+func rowNode(name string, status string) view.Node {
+	return view.Tr(view.Attr("id", "instance-"+name), view.Td(view.T(name)), view.Td(view.T(status)))
+}
+
+func (c *Client) Start(ctx context.Context) error {
+	return c.post(ctx)
+}
+
+func (c *Client) Stop(ctx context.Context) error {
+	return c.remove(ctx)
+}
+
+func (c *Client) post(ctx context.Context) error {
+	data, err := json.Marshal(c.Self)
+	if err != nil {
+		return fmt.Errorf("admin: encode instance %s: %w", c.Self.Name, err)
+	}
+	return c.send(ctx, http.MethodPost, "/admin/instances", data)
+}
+
+func (c *Client) remove(ctx context.Context) error {
+	return c.send(ctx, http.MethodDelete, "/admin/instances/"+url.PathEscape(c.Self.Name), nil)
+}
+
+func (c *Client) send(ctx context.Context, method string, path string, body []byte) error {
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(reqCtx, method, strings.TrimSuffix(c.Server, "/")+path, reader)
+	if err != nil {
+		return fmt.Errorf("admin: %s %s: %w", method, path, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("admin: %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()?
+	if resp.StatusCode == http.StatusNotFound && method == http.MethodDelete {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		note, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if rerr != nil {
+			return fmt.Errorf("admin: %s %s: status %d", method, path, resp.StatusCode)
+		}
+		return fmt.Errorf("admin: %s %s: status %d: %s", method, path, resp.StatusCode, string(note))
+	}
+	if _, cerr := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); cerr != nil {
+		return fmt.Errorf("admin: %s %s: drain: %w", method, path, cerr)
+	}
+	return nil
+}
