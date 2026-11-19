@@ -521,3 +521,22 @@ func drivePendingBound(t *testing.T, w *os.File, transport mcp.Transport, ctx co
 	}
 	return feed.written.Load(), feed.refused.Load(), nil
 }
+
+func TestStdioOverlongLineWithReadErrorPoisonsTransport(t *testing.T) {
+	over := strings.Repeat("x", (4<<20)+1)
+	transport := mcp.NewStdio(bytes.NewReader([]byte(over)), io.Discard)
+	defer func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	}()
+	_, err := transport.Request(context.Background(), mcp.Envelope{JSONRPC: "2.0", ID: jsontext.Value("1"), Method: "tools/list"})
+	if err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("err = %v, want the overlong line report", err)
+		return
+	}
+	if serr := transport.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/done"}); serr == nil || !strings.Contains(serr.Error(), "unusable") {
+		t.Fatalf("send after an overlong line: %v, want the unusable transport", serr)
+		return
+	}
+}

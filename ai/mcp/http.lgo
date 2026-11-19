@@ -31,11 +31,7 @@ func (h *HTTP) Notify(ctx context.Context, msg Envelope) error {
 		return err
 	}
 	if !okStatus(reply.status) {
-		payload, err := readBody(reply.body)
-		if err != nil {
-			return err
-		}
-		return statusError(reply.status, payload)
+		return failureOf(reply)
 	}
 	return closeBody(reply.body)
 }
@@ -56,9 +52,20 @@ func (h *HTTP) Request(ctx context.Context, msg Envelope) (Envelope, error) {
 }
 
 func failureOf(reply httpReply) error {
-	payload, err := readBody(reply.body)
-	if err != nil {
-		return err
+	if reply.body == nil {
+		return statusError(reply.status, nil)
+	}
+	payload, readErr := io.ReadAll(reply.body)
+	if readErr != nil {
+		fault := statusError(reply.status, payload)
+		joined := fmt.Errorf("%w: body read ended early: %w", fault, readErr)
+		if closeErr := closeBody(reply.body); closeErr != nil {
+			return errors.Join(joined, closeErr)
+		}
+		return joined
+	}
+	if closeErr := closeBody(reply.body); closeErr != nil {
+		return errors.Join(statusError(reply.status, payload), closeErr)
 	}
 	return statusError(reply.status, payload)
 }

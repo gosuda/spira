@@ -84,15 +84,7 @@ func (s *Stdio) nextMessage(ctx context.Context) (Envelope, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				s.keep(line)
-				return Envelope{}, fmt.Errorf("mcp: stdio: %w", ctxErr)
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				s.keep(line)
-				return Envelope{}, fmt.Errorf("mcp: stdio: %w", context.DeadlineExceeded)
-			}
-			return Envelope{}, fmt.Errorf("mcp: stdio read: %w", err)
+			return s.readError(ctx, s.pending, line, err)
 		}
 		if len(s.pending) > 0 {
 			line = string(s.pending) + line
@@ -104,6 +96,23 @@ func (s *Stdio) nextMessage(ctx context.Context) (Envelope, error) {
 		}
 		return decodeEnvelope([]byte(line))
 	}
+}
+
+func (s *Stdio) readError(ctx context.Context, pending []byte, line string, err error) (Envelope, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		s.keep(line)
+		return Envelope{}, fmt.Errorf("mcp: stdio: %w", ctxErr)
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		s.keep(line)
+		return Envelope{}, fmt.Errorf("mcp: stdio: %w", context.DeadlineExceeded)
+	}
+	if int64(len(pending)+len(line)) > maxMessage {
+		s.pending = nil
+		s.broken = true
+		return Envelope{}, fmt.Errorf("mcp: stdio line exceeds the size limit of %d bytes: %w", maxMessage, err)
+	}
+	return Envelope{}, fmt.Errorf("mcp: stdio read: %w", err)
 }
 
 func (s *Stdio) keep(prefix string) {
