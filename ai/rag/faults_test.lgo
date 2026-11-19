@@ -3,11 +3,15 @@ package rag_test
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/gosuda/spira/ai/openai"
 	"github.com/gosuda/spira/ai/rag"
 	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/resilience"
 )
 
 func TestRAGFaultsMatchSpecTable(t *testing.T) {
@@ -44,13 +48,18 @@ func (f refusingEmbed) Embed(ctx context.Context, texts const []string) ([][]flo
 }
 
 func TestRAGFaultStoreFailed(t *testing.T) {
-	store := &rag.Memory{Embed: refusingEmbed{message: "sk-live-3k8secret"}}
+	secret := "sk-live-3k8secret"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "embed refused: "+secret, http.StatusBadRequest)
+	}))
+	t.Cleanup(srv.Close)
+	store := &rag.Memory{Embed: &openai.Client{BaseURL: srv.URL, Model: "text-embedding-3-small", HTTP: srv.Client(), Policy: resilience.Policy{}}}
 	_, err := store.Search(context.Background(), rag.Search{Query: "q"})
 	if !errors.Is(err, rag.ErrStoreFailed) {
 		t.Fatalf("error = %v, want the rag.store_failed fault", err)
 		return
 	}
-	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "sk-live-3k8secret")
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), secret)
 }
 
 func TestRAGFaultsHideSecretsAndHostileText(t *testing.T) {
