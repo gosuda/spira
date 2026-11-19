@@ -8,9 +8,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/fault"
 	"github.com/gosuda/spira/meter"
 	"github.com/gosuda/spira/web"
 )
+
+var errTestStale = fault.New("metertest.stale", fault.Conflict, "The value is stale.")
 
 type metricSample struct {
 	name   string
@@ -110,7 +114,7 @@ func meteredGet(r *web.Router, path string) *httptest.ResponseRecorder {
 func refusingStage() web.Stage {
 	return func(next web.Handler) web.Handler {
 		return func(ctx *web.Context) (web.Reply, error) {
-			return nil, web.Fail(web.Problem{Status: http.StatusUnauthorized, Title: "denied"})
+			return nil, auth.ErrInvalidCredentials.Err()
 		}
 	}
 }
@@ -178,7 +182,7 @@ func TestHTTPRecordsErrorStatuses(t *testing.T) {
 	rf := web.NewRouter()
 	rf.Use(meter.HTTP(failing))
 	rf.Handle("GET", "/conflict", func(ctx *web.Context) (web.Reply, error) {
-		return nil, web.Fail(web.Problem{Status: http.StatusConflict, Title: "stale"})
+		return nil, errTestStale.Err()
 	})
 	if rec := meteredGet(rf, "/conflict"); rec.Code != http.StatusConflict {
 		t.Fatalf("GET /conflict status = %d, want 409", rec.Code)

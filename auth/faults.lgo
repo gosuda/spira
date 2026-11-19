@@ -1,0 +1,34 @@
+package auth
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrBadRequest = fault.New("auth.bad_request", fault.Invalid, "The authentication request is invalid.")
+
+var ErrCrossOrigin = fault.New("auth.cross_origin", fault.Forbidden, "The cross-origin request was rejected.")
+
+var ErrEntropyFailed = fault.New("auth.entropy_failed", fault.Internal, "The service could not create a secure value.")
+
+var ErrForbidden = fault.New("auth.forbidden", fault.Forbidden, "Access is forbidden.")
+
+var ErrInvalidCredentials = fault.New("auth.invalid_credentials", fault.Unauthenticated, "The credentials are invalid.")
+
+var ErrMisconfigured = fault.New("auth.misconfigured", fault.Internal, "The service is misconfigured.")
+
+var ErrPasswordFailed = fault.New("auth.password_failed", fault.Internal, "The password check could not be completed.")
+
+var ErrSessionUnavailable = fault.New("auth.session_unavailable", fault.Unavailable, "The session service is unavailable.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{
+		ErrBadRequest,
+		ErrCrossOrigin,
+		ErrEntropyFailed,
+		ErrForbidden,
+		ErrInvalidCredentials,
+		ErrMisconfigured,
+		ErrPasswordFailed,
+		ErrSessionUnavailable,
+	}
+}

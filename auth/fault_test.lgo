@@ -1,0 +1,289 @@
+package auth_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/web"
+)
+
+type failingAuthStore struct {
+	err   error
+	loads int
+}
+
+func (s *failingAuthStore) Load(ctx context.Context, id string) (auth.Principal?, error) {
+	s.loads++
+	return nil, s.err
+}
+
+func (s *failingAuthStore) Save(ctx context.Context, id string, p auth.Principal, ttl time.Duration) error {
+	return s.err
+}
+
+func (s *failingAuthStore) Delete(ctx context.Context, id string) error {
+	return s.err
+}
+
+func assertProblemCode(t *testing.T, body string, code string) {
+	t.Helper()
+	if !strings.Contains(body, `"`+code+`"`) {
+		t.Fatalf("body %q lacks problem code %q", body, code)
+	}
+}
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/auth.md", auth.Faults())
+}
+
+func TestInvalidCredentialsReachesClientAs401(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(brokenAuthenticator))
+	r.Handle("GET", "/x", okHandler)
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.invalid_credentials")
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), "idp unreachable")
+	if !errors.Is(auth.ErrInvalidCredentials.Wrap(fmt.Errorf("idp unreachable")), auth.ErrInvalidCredentials) {
+		t.Fatal("errors.Is does not match the wrapped credentials fault")
+	}
+}
+
+func TestForbiddenReachesClientAs403(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(principalB))
+	r.Use(auth.Require(func(p auth.Principal?) bool { return false }))
+	r.Handle("GET", "/x", okHandler)
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d want 403 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.forbidden")
+	if !errors.Is(auth.ErrForbidden.Err(), auth.ErrForbidden) {
+		t.Fatal("errors.Is does not match the bare forbidden fault")
+	}
+}
+
+func TestCrossOriginFaultReachesClientAs403(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.CrossOrigin())
+	r.Handle("POST", "/x", okHandler)
+	req := httptest.NewRequest(http.MethodPost, "http://shop.example/x", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	rec := callAuth(t, r, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d want 403 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.cross_origin")
+	if !errors.Is(auth.ErrCrossOrigin.Wrap(fmt.Errorf("client denied by policy")), auth.ErrCrossOrigin) {
+		t.Fatal("errors.Is does not match the wrapped cross-origin fault")
+	}
+}
+
+func TestSessionUnavailableReachesClientAs503(t *testing.T) {
+	store := &failingAuthStore{err: fmt.Errorf("db connection refused")}
+	s := &auth.Sessions{Store: store}
+	var captured error
+	r := web.NewRouter()
+	r.Handle("POST", "/login", func(ctx *web.Context) (web.Reply, error) {
+		_, err := s.Login(ctx, auth.Principal{ID: "u-1"})
+		if err != nil {
+			captured = err
+			return nil, err
+		}
+		return web.Empty{}, nil
+	})
+	rec := callAuth(t, r, httptest.NewRequest(http.MethodPost, "/login", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d want 503 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.session_unavailable")
+	if !errors.Is(captured, auth.ErrSessionUnavailable) {
+		t.Fatalf("login error %v is not the session fault", captured)
+	}
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), "db connection refused")
+}
+
+func TestSessionLogoutFailureIsSessionUnavailable(t *testing.T) {
+	store := &failingAuthStore{err: fmt.Errorf("db connection refused")}
+	s := &auth.Sessions{Store: store}
+	var captured error
+	r := web.NewRouter()
+	r.Handle("POST", "/logout", func(ctx *web.Context) (web.Reply, error) {
+		_, err := s.Logout(ctx)
+		if err != nil {
+			captured = err
+			return nil, err
+		}
+		return web.Empty{}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.AddCookie(&http.Cookie{Name: s.Cookie, Value: "old-id"})
+	rec := callAuth(t, r, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d want 503 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.session_unavailable")
+	if !errors.Is(captured, auth.ErrSessionUnavailable) {
+		t.Fatalf("logout error %v is not the session fault", captured)
+	}
+}
+
+func TestSessionAuthenticatorFailureIsSessionUnavailable(t *testing.T) {
+	store := &failingAuthStore{err: fmt.Errorf("db connection refused")}
+	s := &auth.Sessions{Store: store}
+	var captured error
+	r := web.NewRouter()
+	r.Handle("GET", "/who", func(ctx *web.Context) (web.Reply, error) {
+		_, err := s.Authenticator()(ctx)
+		if err != nil {
+			captured = err
+			return nil, err
+		}
+		return web.Empty{}, nil
+	})
+	req := httptest.NewRequest(http.MethodGet, "/who", nil)
+	req.AddCookie(&http.Cookie{Name: s.Cookie, Value: "some-id"})
+	rec := callAuth(t, r, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d want 503 body %s", rec.Code, rec.Body.String())
+	}
+	if !errors.Is(captured, auth.ErrSessionUnavailable) {
+		t.Fatalf("authenticator error %v is not the session fault", captured)
+	}
+}
+
+func TestPasswordFaultIsInternal(t *testing.T) {
+	hostile := "$argon2id$v=19$m=<script>alert(1)</script>,t=1,p=1$" + validSalt + "$" + validKey
+	_, err := auth.VerifyPassword(hostile, "password")
+	if err == nil {
+		t.Fatal("VerifyPassword accepted a hostile parameter")
+		return
+	}
+	if !errors.Is(err, auth.ErrPasswordFailed) {
+		t.Fatalf("error %v is not the password fault", err)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "<script>")
+}
+
+func TestEntropyFaultIsInternal(t *testing.T) {
+	err := auth.ErrEntropyFailed.Wrap(fmt.Errorf("auth: session id entropy: exhausted"))
+	if !errors.Is(err, auth.ErrEntropyFailed) {
+		t.Fatalf("error %v is not the entropy fault", err)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "auth.entropy_failed", "The service could not create a secure value.")
+}
+
+func TestBadRequestFaultContract(t *testing.T) {
+	err := auth.ErrBadRequest.Wrap(fmt.Errorf("account: parse form: bad encoding"))
+	if !errors.Is(err, auth.ErrBadRequest) {
+		t.Fatalf("error %v is not the bad request fault", err)
+	}
+	view := fault.Public(err)
+	if string(view.Code) != "auth.bad_request" {
+		t.Fatalf("public code %q is not auth.bad_request", view.Code)
+	}
+	if view.Message != auth.ErrBadRequest.Message {
+		t.Fatalf("public message %q is not the constant message", view.Message)
+	}
+}
+
+func TestMisconfiguredFaultContract(t *testing.T) {
+	err := auth.ErrMisconfigured.Wrap(errors.New("auth.Require used without auth.Authenticate"))
+	if !errors.Is(err, auth.ErrMisconfigured) {
+		t.Fatalf("error %v is not the misconfigured fault", err)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "auth.misconfigured")
+}
+
+func TestVerifyAgainstDummyBurnsWorkAndReturnsFalse(t *testing.T) {
+	for _, password := range []string{"", "hunter2", "<script>alert(1)</script>", strings.Repeat("x", 128)} {
+		start := time.Now()
+		if auth.VerifyAgainstDummy(password) {
+			t.Fatalf("VerifyAgainstDummy returned true")
+		}
+		if time.Since(start) < time.Millisecond {
+			t.Fatalf("VerifyAgainstDummy finished without Argon2id work")
+		}
+	}
+}
+
+func TestAdversarialTokenEchoNeverReachesClient(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(auth.Bearer(func(ctx context.Context, token string) (auth.Principal?, error) {
+		return nil, fmt.Errorf("provider rejected token %q", token)
+	})))
+	r.Handle("GET", "/who", principalHandler)
+	req := httptest.NewRequest(http.MethodGet, "/who", nil)
+	req.Header.Set("Authorization", "Bearer test-credential-1")
+	rec := callAuth(t, r, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.invalid_credentials")
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), "test-credential-1", "provider rejected")
+}
+
+func TestAdversarialHostileSessionCookieNeverReachesClient(t *testing.T) {
+	hostile := "sess-<script>alert(1)</script>-/etc/passwd"
+	store := &failingAuthStore{err: fmt.Errorf("db connection refused")}
+	s := &auth.Sessions{Store: store}
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(s.Authenticator()))
+	r.Use(auth.Require(auth.Authenticated()))
+	r.Handle("GET", "/who", principalHandler)
+	req := httptest.NewRequest(http.MethodGet, "/who", nil)
+	req.AddCookie(&http.Cookie{Name: s.Cookie, Value: hostile})
+	rec := callAuth(t, r, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.invalid_credentials")
+	if store.loads != 1 {
+		t.Fatalf("store Load ran %d times, want 1", store.loads)
+	}
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), "<script>", "/etc/passwd", "db connection refused")
+}
+
+func TestAdversarialHostileOriginNeverReachesClient(t *testing.T) {
+	hostile := "https://evil.example/<script>alert(1)</script>"
+	r := web.NewRouter()
+	r.Use(auth.CrossOrigin())
+	r.Handle("POST", "/x", okHandler)
+	req := httptest.NewRequest(http.MethodPost, "http://shop.example/x", nil)
+	req.Header.Set("Origin", hostile)
+	rec := callAuth(t, r, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d want 403 body %s", rec.Code, rec.Body.String())
+	}
+	assertProblemCode(t, rec.Body.String(), "auth.cross_origin")
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), "<script>")
+}
+
+func TestAdversarialPublicViewsHideCauses(t *testing.T) {
+	cause := fmt.Errorf("token=AKIA-SECRET-123 <script>alert(1)</script> '; DROP TABLE sessions; -- /etc/passwd")
+	wrapped := []error{
+		auth.ErrInvalidCredentials.Wrap(cause),
+		auth.ErrForbidden.Wrap(cause),
+		auth.ErrBadRequest.Wrap(cause),
+		auth.ErrCrossOrigin.Wrap(cause),
+		auth.ErrSessionUnavailable.Wrap(cause),
+		auth.ErrMisconfigured.Wrap(cause),
+		auth.ErrPasswordFailed.Wrap(cause),
+		auth.ErrEntropyFailed.Wrap(cause),
+	}
+	for _, err := range wrapped {
+		faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "AKIA-SECRET-123", "<script>", "DROP TABLE", "/etc/passwd")
+	}
+}
