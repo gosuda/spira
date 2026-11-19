@@ -135,7 +135,7 @@ func Faults() []*fault.Error
 - `TestFaultNotReversible` proves a bad pair returns `migrate.not_reversible`.
 - `TestFaultScratchNotEmpty` proves a dirty scratch database returns `migrate.scratch_not_empty`.
 - `TestFaultUnavailable` proves store failures return `migrate.unavailable`.
-- `TestFaultPartialDDLMySQL` proves a bad MySQL `up` returns `migrate.partial_ddl`.
+- `TestEnginePartialDDLMySQL` proves a bad MySQL `up` returns `migrate.partial_ddl`.
 - `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
 - `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
 
