@@ -81,6 +81,7 @@ export function installSlotMover(root?: ParentNode): void
  - Before a successful mount, the element MUST remove its child nodes.
  - A removed island MUST dispose its mount in a microtask unless it reconnects first.
  - A moved island MUST keep its mount without remounting and without disposing.
+ - A stale load that resolves after its island moved MUST NOT mount.
  - A moved wasm island MUST NOT start a second Go program.
 - The React adapter MUST call `createRoot(target).render(createElement(component, props))`.
 - The Svelte adapter MUST call Svelte 5 `mount` with `target` and `props`.
@@ -106,8 +107,7 @@ export function installSlotMover(root?: ParentNode): void
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
  - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
-- `test/island-dispose.test.ts` proves that removing a React, Solid or Svelte island releases its mount with exactly one cleanup.
-- `test/island-move.test.ts` proves that a move keeps one mount with no dispose and no cleanup, that a removal runs one cleanup and still one after extra microtask turns, that a move followed by a removal disposes once without remounting, that a re-inserted island mounts again and disposes the new mount once, and that a moved wasm island keeps one Go program.
+- `test/island-move.test.ts` proves that a move keeps one mount with no dispose and no cleanup, that a removal runs one cleanup and still one after extra microtask turns, that a move followed by a removal disposes once without remounting, that a re-inserted island mounts again and disposes the new mount once, that a moved wasm island keeps one Go program, and that a move during a pending load mounts only the new load.
  - `test/production-build.test.ts` proves each island table ships its component and registration key, the compiled bodies with their runtimes, production output, and the application entry that owns the island glob.
  - It also proves a glob result derives repo relative island keys.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.

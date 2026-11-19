@@ -9,7 +9,8 @@ const runCalls: Array<unknown> = [];
 let lastUrl: string | null = null;
 let reactLoads = 0;
 let wasmLoads = 0;
-
+let pendingLoads = 0;
+let pendingResolvers: Array<(value: { default: unknown }) => void> = [];
 class FakeGo {
 	importObject = { spira: true };
 
@@ -44,6 +45,7 @@ function installStubs(): void {
 
 const reactEntry = "example/shop/move-disposable.react.tsx";
 const wasmEntry = "example/shop/stock/islands/ticker/ticker.wasm";
+const pendingEntry = "example/shop/pending-disposable.react.tsx";
 
 const table: IslandTable = {
 	[reactEntry]: () => {
@@ -53,6 +55,12 @@ const table: IslandTable = {
 	[wasmEntry]: () => {
 		wasmLoads += 1;
 		return wasmLoader(wasmEntry)();
+	},
+	[pendingEntry]: () => {
+		pendingLoads += 1;
+		return new Promise<{ default: unknown }>((resolve) => {
+			pendingResolvers.push(resolve);
+		});
 	},
 };
 
@@ -80,6 +88,8 @@ beforeEach(() => {
 	lastUrl = null;
 	reactLoads = 0;
 	wasmLoads = 0;
+	pendingLoads = 0;
+	pendingResolvers = [];
 });
 
 afterEach(async () => {
@@ -208,5 +218,30 @@ describe("island moves", () => {
 		await flushDispose();
 		expect(reactDisposable.cleanups).toBe(2);
 		expect(reactLoads).toBe(2);
+	});
+
+	test("a move during a pending load mounts only the new load", async () => {
+		resetReactDisposable();
+		const el = island(pendingEntry);
+		await vi.waitFor(() => {
+			expect(pendingLoads).toBe(1);
+		});
+		const box = document.createElement("div");
+		document.body.append(box);
+		box.append(el);
+		await vi.waitFor(() => {
+			expect(pendingLoads).toBe(2);
+		});
+		pendingResolvers[0]?.({ default: reactDisposableDefault });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(el.querySelector("span")?.textContent).toBe("fallback");
+		expect(reactDisposable.effectRuns).toBe(0);
+		pendingResolvers[1]?.({ default: reactDisposableDefault });
+		await vi.waitFor(() => {
+			expect(el.querySelector("span")?.textContent).toBe("react go 0");
+		});
+		expect(pendingLoads).toBe(2);
+		expect(reactDisposable.cleanups).toBe(0);
+		expect(box.contains(el)).toBe(true);
 	});
 });
