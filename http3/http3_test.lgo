@@ -724,3 +724,71 @@ func TestFaultPublicHidesSecrets(t *testing.T) {
 	raw := faulttest.PublicJSON(t, err)
 	faulttest.RefuseLeak(t, raw, "sk-secret-abc123", "evil.example", "<script>", "'; DROP TABLE x; --", "127.0.0.1")
 }
+func h3ExtendedConnect(t *testing.T, tr *qhttp3.Transport, url string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodConnect, url, nil)
+	if rerr != nil {
+		t.Fatalf("build request: %v", rerr)
+		return 0
+	}
+	req.Proto = "websocket"
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("extended CONNECT: %v", err)
+		return 0
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, derr := io.ReadAll(resp.Body); derr != nil {
+		t.Fatalf("read body: %v", derr)
+		return 0
+	}
+	return resp.StatusCode
+}
+
+func TestH3RefusesExtendedConnect(t *testing.T) {
+	reached := sync.Locked[bool]{}
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	r.Handle("CONNECT", "/tunnel", func(ctx *web.Context) (web.Reply, error) {
+		reached.WithLock(func(v *bool) { *v = true })
+		return web.Data{Value: "tunneled"}, nil
+	})
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	if status := h3ExtendedConnect(t, tr, "https://"+udpAddr+"/tunnel"); status != http.StatusNotImplemented {
+		t.Fatalf("extended CONNECT status %d want 501", status)
+		return
+	}
+	hit := false
+	reached.WithLock(func(v *bool) { hit = *v })
+	if hit {
+		t.Fatal("extended CONNECT reached the router")
+		return
+	}
+	status, proto, body := h3Get(t, tr, "https://"+udpAddr+"/hello")
+	if status != http.StatusOK || proto != "HTTP/3.0" || !strings.Contains(body, `"hi"`) {
+		t.Fatalf("plain GET over H3 broke: status %d proto %q body %q", status, proto, body)
+		return
+	}
+}

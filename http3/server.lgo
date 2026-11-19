@@ -160,8 +160,18 @@ func newH3(router *web.Router, cfg *tls.Config, conn net.PacketConn, port int) *
 	if tlsCopy.MinVersion < tls.VersionTLS13 {
 		tlsCopy.MinVersion = tls.VersionTLS13
 	}
-	srv := &http3.Server{TLSConfig: tlsCopy, Handler: router, QUICConfig: &quic.Config{Allow0RTT: false}}
+	srv := &http3.Server{TLSConfig: tlsCopy, Handler: refuseExtendedConnect(router), QUICConfig: &quic.Config{Allow0RTT: false}}
 	return &h3Bound{srv: srv, conn: conn, port: port}
+}
+
+func refuseExtendedConnect(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodConnect && req.ProtoMajor == 3 && req.Proto != "HTTP/3.0" {
+			http.Error(w, "extended CONNECT is not implemented", http.StatusNotImplemented)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
 }
 
 func (s *Server) serve(startCtx context.Context, inner *web.Server, tcpAddr string, bound *h3Bound?) *serverRun {

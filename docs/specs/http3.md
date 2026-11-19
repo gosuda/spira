@@ -64,6 +64,8 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - Extended CONNECT over HTTP/3 MUST stay unbuilt, as [web](web.md) states for HTTP/2.
+- The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
+- `quic-go` v0.65.0 sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` on every connection: `http3.Server.settings` hardcodes `ExtendedConnect: true` with no knob, and `AdditionalSettings` refuses RFC 9114 ids. Peers may therefore attempt extended CONNECT, and the 501 boundary above is the enforcement.
 
 ### Faults
 
@@ -99,6 +101,7 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 - `TestH3StopDrainsWithinGrace` proves that `Stop` waits for a live HTTP/3 request.
 - `TestH3StopClosesUDPListener` proves that the UDP port rebinds right after `Stop`.
 - `TestH3StopShutsTCPWhileH3Drains` proves that TCP stops accepting while an HTTP/3 request drains.
+- `TestH3RefusesExtendedConnect` proves that an extended CONNECT request answers 501 without reaching the router while plain H3 traffic still passes.
 - `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
 - `TestH3RefusesEarlyData` proves that the QUIC config refuses 0-RTT.
 - `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.
