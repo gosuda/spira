@@ -135,10 +135,17 @@ func validRest(c byte, first bool) bool {
 	return c == '_' && !first
 }
 
-func (e *Error) Wrap(cause error) *Error {
+func (e *Error) Wrap(cause error) error {
 	cp := *e
 	cp.cause = cause
 	return &cp
+}
+
+func (e *Error) Err() error {
+	if e == nil {
+		return nil
+	}
+	return e
 }
 
 func (e *Error) WithFields(fields ...Field) *Error {

@@ -40,7 +40,8 @@ type Error struct {
 }
 
 func New(code Code, kind Kind, message string) *Error
-func (e *Error) Wrap(cause error) *Error
+func (e *Error) Wrap(cause error) error
+func (e *Error) Err() error
 func (e *Error) WithFields(fields ...Field) *Error
 func (e *Error) Error() string
 func (e *Error) Unwrap() error
@@ -69,7 +70,8 @@ type View struct {
 - A package that declares faults MUST export `Faults() []*Error`.
 - Its test MUST compare that set with its specification code table.
 - Its test MUST reject duplicate codes in that set.
-- `Wrap` MUST return a copy that carries the cause and MUST NOT change the receiver.
+- `Wrap` MUST carry the cause, return an `error`, and keep the receiver unchanged.
+- `Err` MUST return the declared fault itself as an `error`.
 - `WithFields` MUST return a copy that carries the given fields and MUST NOT change the receiver.
 - `Error` MUST return `<code>: <message>`, plus `: <cause>` for each wrapped cause in order.
 - `Unwrap` MUST return the wrapped cause, or nil when there is none.
@@ -106,7 +108,8 @@ type View struct {
 - `fault: code internal needs kind internal` panics from `New` when the reserved code meets another kind.
 
 ## Proof
-
+- `TestAsFindsFaultThroughWraps` proves recovery of the fault through three wraps. Planted fault: losing the fault past one wrap.
+- `TestErrAndWrapReturnErrors` proves `Err` matching and `Wrap` as `error`. Planted fault: returning a typed nil from `Err`.
 - `TestPublicWithoutFaultReturnsFixedInternal` proves rule 1 for a chain with no fault. Planted fault: returning the cause text as the message.
 - `TestPublicInternalKindReturnsFixedInternal` proves rule 1 for kind `Internal`. Planted fault: exposing the declared message of an internal fault.
 - `TestPublicNeverReturnsCauseText` proves rule 2 for two kinds. Planted fault: appending the cause text to the message.

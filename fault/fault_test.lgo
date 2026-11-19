@@ -397,3 +397,27 @@ func TestNewAcceptsCodeGrammar(t *testing.T) {
 		return
 	}
 }
+
+func TestErrAndWrapReturnErrors(t *testing.T) {
+	decl := fault.New("db.io_failed", fault.Unavailable, "database temporarily unavailable")
+	if !errors.Is(decl.Err(), decl) {
+		t.Fatalf("Is missed Err of the declared fault")
+		return
+	}
+	wrapped := decl.Wrap(errors.New("password=hunter2"))
+	got := fault.Of(wrapped)
+	if got == nil {
+		t.Fatalf("Of found no fault in the wrapped error")
+		return
+	}
+	first := got ?? &fault.Error{}
+	if first.Code != "db.io_failed" {
+		t.Fatalf("Of = %q, want db.io_failed", first.Code)
+		return
+	}
+	bs := mustMarshal(t, fault.Public(wrapped))
+	if strings.Contains(string(bs), "hunter2") {
+		t.Fatalf("Public JSON holds the cause: %s", bs)
+		return
+	}
+}
