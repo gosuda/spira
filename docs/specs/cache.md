@@ -15,6 +15,8 @@ func (c *Memory[K, V]) Get(k K) V?
 func (c *Memory[K, V]) Put(k K, v V)
 func (c *Memory[K, V]) Delete(k K)
 func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load func(ctx context.Context) (V, error)) (V, error)
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -57,10 +59,16 @@ func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load f
 - That waiter MUST NOT lead the next load.
 - A waiter whose context ends while it waits MUST return that context error.
 
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `cache.load_failed` | internal | "The cache load failed." |
+
 ## Errors
 
 - `cache: capacity must be at least 1` when `capacity` is below 1.
-- Each waiter of a panicking `load` receives the error `cache: load panicked`.
+- Each waiter of a panicking `load` receives the `cache.load_failed` fault.
 - The leader MUST panic again with the original panic value.
 
 ## Proof
@@ -70,7 +78,7 @@ func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load f
 - `TestLoadRunsOnceForConcurrentCallers` proves that many callers of one key run `load` once.
 - `TestLoadFailureSharedAndNotCached` proves that a failure is shared and is not stored.
 - `TestLoadWaiterContextCancel` proves that a waiter cancel returns the context error.
-- `TestLoadPanicReleasesWaiters` proves the waiter error after a panic.
+- `TestLoadPanicReleasesWaiters` proves the waiter `cache.load_failed` match after a panic.
 - `TestDifferentKeysLoadConcurrently` proves that different keys can load at the same time.
 - `TestNewMemoryRejectsBadCapacity` proves the capacity panic.
 - `TestGetPutDeleteRoundTrip` proves a stored value, a replace and a delete.
@@ -81,6 +89,9 @@ func Load[K comparable, V any](ctx context.Context, c *Memory[K, V], k K, load f
 - `TestLeaderCancelRestartsLoadForWaiters` proves that a cancelled leader tells waiters to start again.
 - `TestLeaderOrdinaryFailureStillReachesWaiters` proves that a normal failure still reaches the waiters.
 - `TestRestartedWaiterWithAnEndedContextDoesNotLoad` proves that an ended waiter does not lead the next load.
+- `TestLoadFailedThroughPanickingLoad` proves the `cache.load_failed` match for waiters, the leader re-panic, and that hostile input in the panic value reaches no public view.
+- `TestLoadErrorPassesThroughUnchanged` proves that an ordinary loader error returns with no fault and stays out of the public view.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 
 ## Not in scope
 

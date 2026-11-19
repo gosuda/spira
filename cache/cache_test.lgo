@@ -449,8 +449,8 @@ func TestLoadPanicReleasesWaiters(t *testing.T) {
 		t.Fatalf("panic value = %q, want cache test: load exploded", got)
 	}
 	for i := range 2 {
-		if waiterErrs[i] == nil || !strings.Contains(waiterErrs[i].Error(), "cache: load panicked") {
-			t.Fatalf("waiter %d error = %v, want cache: load panicked", i, waiterErrs[i])
+		if waiterErrs[i] == nil || !errors.Is(waiterErrs[i], cache.ErrLoadFailed) {
+			t.Fatalf("waiter %d error = %v, want cache.load_failed", i, waiterErrs[i])
 		}
 	}
 	assertLoadRerunsAfterPanic(t, ctx, c)

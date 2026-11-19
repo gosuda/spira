@@ -3,13 +3,11 @@ package cache
 import (
 	"container/list"
 	"context"
-	"errors"
+	"fmt"
 	"time"
 
 	"logos/sync"
 )
-
-var errLoadPanicked = errors.New("cache: load panicked")
 
 type Memory[K comparable, V any] struct {
 	ttl   time.Duration
@@ -194,7 +192,7 @@ func (c *Memory[K, V]) finish(out outcome[V]) (V, error) {
 func (c *Memory[K, V]) runLoad(ctx context.Context, k K, f *flight[K, V], load func(ctx context.Context) (V, error)) (V, error) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.failFlight(k, f)
+			c.failFlight(k, f, r)
 			panic(r)
 		}
 	}()
@@ -227,9 +225,9 @@ func (c *Memory[K, V]) clearFlight(k K) {
 	})
 }
 
-func (c *Memory[K, V]) failFlight(k K, f *flight[K, V]) {
+func (c *Memory[K, V]) failFlight(k K, f *flight[K, V], value any) {
 	c.clearFlight(k)
-	out := outcome[V]{err: errLoadPanicked}
+	out := outcome[V]{err: ErrLoadFailed.Wrap(fmt.Errorf("cache: load panicked: %v", value))}
 	for _, w := range f.waiters {
 		sendOutcome(w, out)
 	}

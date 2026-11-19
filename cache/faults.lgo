@@ -1,0 +1,11 @@
+package cache
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrLoadFailed = fault.New("cache.load_failed", fault.Internal, "The cache load failed.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrLoadFailed}
+}
