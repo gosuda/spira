@@ -8,6 +8,7 @@ package rag_test
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -109,6 +110,8 @@ var accepted = []struct {
 	{"year == 3L AND open == true", `(AND (EQ [year] 3) (EQ [open] true))`},
 	{"id in [3L, 4 l]", `(IN [id] list(3 4))`},
 	{"Lima == 1", `(EQ [Lima] 1)`},
+	{"'L' == 1", `(EQ [L] 1)`},
+	{"'l' == 1", `(EQ [l] 1)`},
 }
 
 var rejected = []string{
@@ -170,6 +173,64 @@ func TestParseFilterRefusesWhatTheGrammarRefuses(t *testing.T) {
 		got, err := rag.ParseFilter(input)
 		if err == nil {
 			t.Errorf("ParseFilter(%q) = %s, want an error", input, spell(got))
+		}
+	}
+}
+func TestMemoryFilterWithNaNMetadataMatchesOnlyInequality(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{"n": num(math.NaN())}})
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{"n == 5", false},
+		{"n != 5", true},
+		{"n < 5", false},
+		{"n <= 5", false},
+		{"n > 5", false},
+		{"n >= 5", false},
+		{"n in [5, 6]", false},
+		{"n nin [5, 6]", true},
+		{"n == 5.5", false},
+		{"n != 5.5", true},
+		{"n < 5.5", false},
+		{"n <= 5.5", false},
+		{"n > 5.5", false},
+		{"n >= 5.5", false},
+		{"n in [5.5, 6.5]", false},
+		{"n nin [5.5, 6.5]", true},
+	}
+	for _, c := range cases {
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q on a NaN value kept the document = %v, want %v", c.filter, got, c.want)
+		}
+	}
+}
+
+func TestMemoryFilterWithAQuotedLKeyMatchesTheDocument(t *testing.T) {
+	store := newStore(t, map[string][]float32{"q": {1, 0, 0}, "d": {1, 0, 0}})
+	add(t, store, rag.Document{ID: "d", Text: "d", Metadata: map[string]rag.Value{"L": num(1), "l": num(2)}})
+	cases := []struct {
+		filter string
+		want   bool
+	}{
+		{"'L' == 1", true},
+		{"'l' == 2", true},
+		{"'L' == 2", false},
+	}
+	for _, c := range cases {
+		filter, err := rag.ParseFilter(c.filter)
+		if err != nil {
+			t.Errorf("ParseFilter(%q): %v", c.filter, err)
+			continue
+		}
+		if got := len(search(t, store, rag.Search{Query: "q", Filter: filter})) == 1; got != c.want {
+			t.Errorf("filter %q kept the document = %v, want %v", c.filter, got, c.want)
 		}
 	}
 }

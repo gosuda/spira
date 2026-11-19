@@ -1,0 +1,522 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-commons/src/test/java/org/springframework/ai/transformer/splitter/TokenTextSplitterTest.java.
+// The chunk texts are the reference's expected values.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/rag"
+)
+
+func mustEncoder(t *testing.T) *rag.Encoder? {
+	t.Helper()
+	enc, err := rag.NewEncoder()
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+		return nil
+	}
+	return enc
+}
+
+func mustSplit(t *testing.T, enc *rag.Encoder?, text string, o rag.SplitOptions) []string {
+	t.Helper()
+	o.Encoder = enc
+	chunks, err := rag.Split(text, o)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+		return nil
+	}
+	return chunks
+}
+
+func TestSplitDefaultsToSingleChunkPerText(t *testing.T) {
+	enc := mustEncoder(t)
+	first := "In the end, writing arises when man realizes that memory is not enough."
+	if got := mustSplit(t, enc, first, rag.SplitOptions{}); !slices.Equal(got, []string{first}) {
+		t.Errorf("first text: %q", got)
+	}
+	second := "The most oppressive thing about the labyrinth is that you are constantly " +
+		"being forced to choose. It isn’t the lack of an exit, but the abundance of exits that is so disorienting."
+	if got := mustSplit(t, enc, second, rag.SplitOptions{}); !slices.Equal(got, []string{second}) {
+		t.Errorf("second text: %q", got)
+	}
+}
+
+func TestSplitCutsAtTenTokens(t *testing.T) {
+	enc := mustEncoder(t)
+	first := "In the end, writing arises when man realizes that memory is not enough."
+	second := "The most oppressive thing about the labyrinth is that you are constantly " +
+		"being forced to choose. It isn't the lack of an exit, but the abundance of exits that is so disorienting."
+	o := rag.SplitOptions{ChunkSize: 10, MinChunkSizeChars: 5, MinChunkLengthToEmbed: 3, MaxNumChunks: 50, KeepSeparator: true}
+	if got := mustSplit(t, enc, first, o); !slices.Equal(got, []string{
+		"In the end, writing arises when man realizes that",
+		"memory is not enough.",
+	}) {
+		t.Errorf("first text: %q", got)
+	}
+	if got := mustSplit(t, enc, second, o); !slices.Equal(got, []string{
+		"The most oppressive thing about the labyrinth is that you",
+		"are constantly being forced to choose.",
+		"It isn't the lack of an exit, but",
+		"the abundance of exits that is so disorienting",
+	}) {
+		t.Errorf("second text: %q", got)
+	}
+}
+
+func TestSplitOverlapNoneAndTwo(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "one two three four five six seven eight nine ten eleven twelve"
+	plain := rag.SplitOptions{ChunkSize: 5, MinChunkSizeChars: 1000, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, text, plain); !slices.Equal(got, []string{
+		"one two three four five",
+		"six seven eight nine ten",
+		"eleven twelve",
+	}) {
+		t.Errorf("without overlap: %q", got)
+	}
+	overlapped := rag.SplitOptions{ChunkSize: 5, ChunkOverlap: 2, MinChunkSizeChars: 1000, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, text, overlapped); !slices.Equal(got, []string{
+		"one two three four five",
+		"four five six seven eight",
+		"seven eight nine ten eleven",
+		"ten eleven twelve",
+	}) {
+		t.Errorf("with overlap: %q", got)
+	}
+}
+
+func TestSplitOverlapKeepsTheFactWhole(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "The consumer kept failing in production. " +
+		"The fix is to set the timeout to 30 seconds on the consumer. Then restart the service."
+	fact := "set the timeout to 30 seconds"
+	plain := mustSplit(t, enc, text, rag.SplitOptions{ChunkSize: 12, MinChunkSizeChars: 1000, MinChunkLengthToEmbed: 0})
+	for _, chunk := range plain {
+		if strings.Contains(chunk, fact) {
+			t.Errorf("chunk without overlap holds the whole fact: %q", chunk)
+		}
+	}
+	overlapped := mustSplit(t, enc, text, rag.SplitOptions{ChunkSize: 12, ChunkOverlap: 8, MinChunkSizeChars: 1000, MinChunkLengthToEmbed: 0})
+	found := false
+	for _, chunk := range overlapped {
+		if strings.Contains(chunk, fact) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no chunk with overlap holds the whole fact: %q", overlapped)
+	}
+}
+
+func TestSplitKeepsTheRemainderWhenMaxChunksHit(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "one two three four five six seven eight nine ten eleven twelve"
+	o := rag.SplitOptions{ChunkSize: 5, ChunkOverlap: 2, MaxNumChunks: 2, MinChunkSizeChars: 1000, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, text, o); !slices.Equal(got, []string{
+		"one two three four five",
+		"four five six seven eight",
+		"seven eight nine ten eleven twelve",
+	}) {
+		t.Errorf("max chunks: %q", got)
+	}
+}
+
+func TestSplitDroppedChunksStillCount(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "one two three four five six seven eight nine ten"
+	o := rag.SplitOptions{ChunkSize: 2, MinChunkSizeChars: 1000, MinChunkLengthToEmbed: 15, MaxNumChunks: 3}
+	if got := mustSplit(t, enc, text, o); !slices.Equal(got, []string{"seven eight nine ten"}) {
+		t.Errorf("dropped chunks: %q", got)
+	}
+}
+
+func TestSplitRefusesNilEncoder(t *testing.T) {
+	_, err := rag.Split("hello world", rag.SplitOptions{})
+	if err == nil || !strings.Contains(err.Error(), "ai/rag: split: encoder is nil") {
+		t.Errorf("nil encoder: error = %v, want the encoder complaint", err)
+	}
+}
+
+func TestSplitRefusesBadOptions(t *testing.T) {
+	enc := mustEncoder(t)
+	cases := []struct {
+		name    string
+		options rag.SplitOptions
+		message string
+	}{
+		{"zero chunk size", rag.SplitOptions{ChunkSize: 0}, "chunkSize must be greater than zero"},
+		{"negative chunk size", rag.SplitOptions{ChunkSize: -1}, "chunkSize must be greater than zero"},
+		{"overlap equals size", rag.SplitOptions{ChunkSize: 10, ChunkOverlap: 10}, "chunk overlap must be less than chunk size"},
+		{"overlap above size", rag.SplitOptions{ChunkSize: 10, ChunkOverlap: 15}, "chunk overlap must be less than chunk size"},
+		{"negative overlap", rag.SplitOptions{ChunkSize: 10, ChunkOverlap: -1}, "chunk overlap must not be negative"},
+		{"zero max chunks", rag.SplitOptions{MaxNumChunks: 0}, "maxNumChunks must be greater than zero"},
+		{"negative min chars", rag.SplitOptions{MinChunkSizeChars: -1}, "minChunkSizeChars must not be negative"},
+		{"negative min length", rag.SplitOptions{MinChunkLengthToEmbed: -1}, "minChunkLengthToEmbed must not be negative"},
+		{"empty punctuation", rag.SplitOptions{Punctuation: ""}, "punctuation must not be empty"},
+	}
+	for _, c := range cases {
+		c.options.Encoder = enc
+		_, err := rag.Split("hello world from Spring AI", c.options)
+		if err == nil || !strings.Contains(err.Error(), c.message) {
+			t.Errorf("%s: error = %v, want one that says %q", c.name, err, c.message)
+		}
+	}
+	valid := rag.SplitOptions{ChunkSize: 10, ChunkOverlap: 9}
+	valid.Encoder = enc
+	if _, err := rag.Split("hello world from Spring AI", valid); err != nil {
+		t.Errorf("largest valid overlap: %v", err)
+	}
+}
+
+func TestSplitTrimsToTheSentenceWithOverlap(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "First sentence here. Second sentence follows immediately. " +
+		"Third sentence is next. Fourth sentence continues the text. " +
+		"Fifth sentence completes this test."
+	o := rag.SplitOptions{ChunkSize: 22, ChunkOverlap: 3, MinChunkSizeChars: 20, MinChunkLengthToEmbed: 5, KeepSeparator: true}
+	if got := mustSplit(t, enc, text, o); !slices.Equal(got, []string{
+		"First sentence here. Second sentence follows immediately. Third sentence is next. Fourth sentence continues the text.",
+		"the text. Fifth sentence completes this test.",
+	}) {
+		t.Errorf("boundary with overlap: %q", got)
+	}
+}
+
+func TestSplitKeepsOrReplacesNewlines(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "Line one content here.\nLine two content here.\nLine three content here."
+	keep := rag.SplitOptions{ChunkSize: 50, ChunkOverlap: 0, KeepSeparator: true}
+	if got := mustSplit(t, enc, text, keep); !slices.Equal(got, []string{text}) {
+		t.Errorf("keep separator: %q", got)
+	}
+	drop := rag.SplitOptions{ChunkSize: 50, ChunkOverlap: 0, KeepSeparator: false}
+	if got := mustSplit(t, enc, text, drop); !slices.Equal(got, []string{
+		"Line one content here. Line two content here. Line three content here.",
+	}) {
+		t.Errorf("drop separator: %q", got)
+	}
+}
+
+func TestSplitHasNoRepeatingTail(t *testing.T) {
+	enc := mustEncoder(t)
+	var b strings.Builder
+	for i := range 100 {
+		b.WriteString("This is sentence number ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(" and it contains some meaningful content to test the chunking behavior. ")
+	}
+	text := b.String()
+	o := rag.SplitOptions{ChunkSize: 100, ChunkOverlap: 10, MinChunkSizeChars: 50, MinChunkLengthToEmbed: 5, KeepSeparator: true}
+	chunks := mustSplit(t, enc, text, o)
+	if len(chunks) == 0 {
+		t.Fatalf("no chunks from a long text")
+		return
+	}
+	for i := 1; i < len(chunks); i++ {
+		if strings.Contains(chunks[i-1], chunks[i]) {
+			t.Errorf("chunk %d only repeats chunk %d", i, i-1)
+		}
+	}
+	last := "This is sentence number 99 and it contains some meaningful content to test the chunking behavior."
+	if !strings.HasSuffix(chunks[len(chunks)-1], last) {
+		t.Errorf("last chunk = %q, want suffix %q", chunks[len(chunks)-1], last)
+	}
+}
+
+func TestSplitChunksFitTheTokenBudget(t *testing.T) {
+	enc := mustEncoder(t)
+	var b strings.Builder
+	for i := range 50 {
+		b.WriteString("Sentence ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(" contains important information for testing. ")
+	}
+	text := b.String()
+	o := rag.SplitOptions{ChunkSize: 80, ChunkOverlap: 10, MinChunkSizeChars: 100, MinChunkLengthToEmbed: 5, KeepSeparator: false}
+	chunks := mustSplit(t, enc, text, o)
+	if len(chunks) < 2 {
+		t.Fatalf("one chunk from a long text: %q", chunks)
+		return
+	}
+	for i, chunk := range chunks {
+		if again := mustSplit(t, enc, chunk, o); !slices.Equal(again, []string{chunk}) {
+			t.Errorf("chunk %d resplits to %q", i, again)
+		}
+	}
+}
+
+func TestSplitLosesNoText(t *testing.T) {
+	enc := mustEncoder(t)
+	var b strings.Builder
+	for i := range 70 {
+		b.WriteString("word")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteByte(' ')
+	}
+	b.WriteString(". ")
+	for i := range 1500 {
+		b.WriteString("tok")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteByte(' ')
+	}
+	text := b.String()
+	for _, overlap := range []int{0, 50, 200} {
+		chunks := mustSplit(t, enc, text, rag.SplitOptions{ChunkOverlap: overlap})
+		assertNoTextLost(t, text, chunks)
+	}
+}
+
+func assertNoTextLost(t *testing.T, text string, chunks []string) {
+	t.Helper()
+	covered := 0
+	from := 0
+	for _, chunk := range chunks {
+		at := strings.Index(text[from:], chunk)
+		if at < 0 {
+			t.Fatalf("chunk not found in the original text: %q", chunk)
+			return
+		}
+		at += from
+		top := max(covered, at)
+		if rest := strings.TrimSpace(text[covered:top]); rest != "" {
+			t.Errorf("text lost before chunk: %q", rest)
+		}
+		if end := at + len(chunk); end > covered {
+			covered = end
+		}
+		from = at + 1
+	}
+	if rest := strings.TrimSpace(text[covered:]); rest != "" {
+		t.Errorf("text lost after the last chunk: %q", rest)
+	}
+}
+
+func TestSplitShortTextStaysWhole(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "Hi. This is a small text without one of the ending chars. It is splitted into multiple chunks but shouldn't"
+	o := rag.SplitOptions{ChunkSize: 10000, MinChunkSizeChars: 10, KeepSeparator: true}
+	if got := mustSplit(t, enc, text, o); !slices.Equal(got, []string{text}) {
+		t.Errorf("short text: %q", got)
+	}
+}
+
+func TestSplitLongTextCutsAtTheSentence(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "This is the first sentence with enough words. This is the second sentence. And this is the third sentence."
+	o := rag.SplitOptions{ChunkSize: 15, MinChunkSizeChars: 10, KeepSeparator: true}
+	chunks := mustSplit(t, enc, text, o)
+	if len(chunks) < 2 {
+		t.Fatalf("long text stays whole: %q", chunks)
+		return
+	}
+	if !strings.HasSuffix(chunks[0], ".") {
+		t.Errorf("first chunk = %q, want it to end with a period", chunks[0])
+	}
+}
+
+func TestSplitLastChunkStaysWhole(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "one two three four five six seven eight nine ten eleven. twelve thirteen"
+	o := rag.SplitOptions{ChunkSize: 10, MinChunkSizeChars: 5, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, text, o); !slices.Equal(got, []string{
+		"one two three four five six seven eight nine ten",
+		"eleven. twelve thirteen",
+	}) {
+		t.Errorf("last chunk: %q", got)
+	}
+}
+
+func TestSplitCutsAtCustomMarks(t *testing.T) {
+	enc := mustEncoder(t)
+	first := "Here, we set custom punctuation marks。？！. We just want to test it works or not？"
+	second := "And more, we add protected method getLastPunctuationIndex in TokenTextSplitter class！" +
+		"The subclasses can override this method to achieve their own business logic。We just want to test it works or not？"
+	o := rag.SplitOptions{ChunkSize: 10, MinChunkSizeChars: 5, MinChunkLengthToEmbed: 3, MaxNumChunks: 50, KeepSeparator: true, Punctuation: "。？！"}
+	if got := mustSplit(t, enc, first, o); !slices.Equal(got, []string{
+		"Here, we set custom punctuation marks。？！",
+		". We just want to test it works or not",
+	}) {
+		t.Errorf("first text: %q", got)
+	}
+	if got := mustSplit(t, enc, second, o); !slices.Equal(got, []string{
+		"And more, we add protected method getLastPunctuation",
+		"Index in TokenTextSplitter class！",
+		"The subclasses can override this method to achieve their own",
+		"business logic。",
+		"We just want to test it works or not？",
+	}) {
+		t.Errorf("second text: %q", got)
+	}
+}
+
+func TestSplitOverlapWithSemicolons(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "red green blue; one two. black white gray; three four. pink brown gold; five six."
+	o := rag.SplitOptions{ChunkSize: 10, ChunkOverlap: 2, MinChunkSizeChars: 5, MinChunkLengthToEmbed: 0, Punctuation: ";"}
+	if got := mustSplit(t, enc, text, o); !slices.Equal(got, []string{
+		"red green blue;",
+		"blue; one two. black white gray;",
+		"gray; three four. pink brown gold;",
+		"gold; five six.",
+	}) {
+		t.Errorf("semicolons: %q", got)
+	}
+}
+
+func TestSplitChunkSizeOneTerminates(t *testing.T) {
+	enc := mustEncoder(t)
+	o := rag.SplitOptions{ChunkSize: 1, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, "Hello world from Spring AI", o); len(got) == 0 {
+		t.Errorf("chunk size one gives no chunks")
+	}
+}
+
+func TestSplitCountsTokensByTheWindow(t *testing.T) {
+	enc := mustEncoder(t)
+	five := "one two three four five"
+	wide := rag.SplitOptions{ChunkSize: 5, MinChunkSizeChars: 1000000, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, five, wide); !slices.Equal(got, []string{five}) {
+		t.Errorf("five words in five tokens: %q", got)
+	}
+	narrow := rag.SplitOptions{ChunkSize: 4, MinChunkSizeChars: 1000000, MinChunkLengthToEmbed: 0}
+	if got := mustSplit(t, enc, five, narrow); len(got) != 2 {
+		t.Errorf("five words in four tokens: %q, want two chunks", got)
+	}
+	two := "one two"
+	if got := mustSplit(t, enc, two, rag.SplitOptions{ChunkSize: 2, MinChunkSizeChars: 1000000, MinChunkLengthToEmbed: 0}); !slices.Equal(got, []string{two}) {
+		t.Errorf("two words in two tokens: %q", got)
+	}
+	if got := mustSplit(t, enc, two, rag.SplitOptions{ChunkSize: 1, MinChunkSizeChars: 1000000, MinChunkLengthToEmbed: 0}); !slices.Equal(got, []string{"one", "two"}) {
+		t.Errorf("two words in one token: %q", got)
+	}
+	ten := "In the end, writing arises when man realizes that"
+	if got := mustSplit(t, enc, ten, rag.SplitOptions{ChunkSize: 10, MinChunkSizeChars: 1000000, MinChunkLengthToEmbed: 0}); !slices.Equal(got, []string{ten}) {
+		t.Errorf("ten words in ten tokens: %q", got)
+	}
+	if got := mustSplit(t, enc, ten, rag.SplitOptions{ChunkSize: 9, MinChunkSizeChars: 1000000, MinChunkLengthToEmbed: 0}); len(got) < 2 {
+		t.Errorf("ten words in nine tokens: %q, want more than one chunk", got)
+	}
+}
+
+func TestSplitDefaultsToEightHundredTokens(t *testing.T) {
+	enc := mustEncoder(t)
+	words := []string{"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"}
+	all := make([]string, 0, 2000)
+	for range 2000 {
+		all = append(all, words[len(all)%len(words)])
+	}
+	text := strings.Join(all, " ")
+	want := []string{strings.Join(all[:800], " "), strings.Join(all[800:1600], " "), strings.Join(all[1600:], " ")}
+	if got := mustSplit(t, enc, text, rag.SplitOptions{}); !slices.Equal(got, want) {
+		t.Errorf("default options give %d chunks, want 3 of 800, 800 and 400 words", len(got))
+	}
+}
+
+func TestSplitDefaultMinimumLength(t *testing.T) {
+	enc := mustEncoder(t)
+	if got := mustSplit(t, enc, "hello", rag.SplitOptions{}); len(got) != 0 {
+		t.Errorf("five characters: %q, want no chunk", got)
+	}
+	if got := mustSplit(t, enc, "hello!", rag.SplitOptions{}); !slices.Equal(got, []string{"hello!"}) {
+		t.Errorf("six characters: %q, want one chunk", got)
+	}
+}
+
+func TestSplitDefaultKeepsTheSeparator(t *testing.T) {
+	enc := mustEncoder(t)
+	if got := mustSplit(t, enc, "hello\nworld", rag.SplitOptions{}); !slices.Equal(got, []string{"hello\nworld"}) {
+		t.Errorf("default separator: %q", got)
+	}
+}
+
+func TestSplitBlankTextIsEmpty(t *testing.T) {
+	enc := mustEncoder(t)
+	for _, text := range []string{"", "   ", " \n\t "} {
+		if got := mustSplit(t, enc, text, rag.SplitOptions{}); len(got) != 0 {
+			t.Errorf("Split(%q) = %q, want empty", text, got)
+		}
+	}
+}
+
+func TestEncodeTable(t *testing.T) {
+	enc := mustEncoder(t)
+	cases := []struct {
+		text string
+		want []int
+	}{
+		{"", []int{}},
+		{"a", []int{64}},
+		{"ab", []int{370}},
+		{"abc", []int{13997}},
+		{"bby", []int{65, 1729}},
+		{"xaby", []int{87, 6243}},
+		{"hello", []int{15339}},
+		{"é", []int{978}},
+		{"’t", []int{1431}},
+	}
+	for _, c := range cases {
+		got, err := rag.EncodeTextForTest(enc, c.text)
+		if err != nil {
+			t.Errorf("encode %q: %v", c.text, err)
+			continue
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("encode %q = %v, want %v", c.text, got, c.want)
+		}
+	}
+}
+
+func TestEncodeFailingText(t *testing.T) {
+	enc := mustEncoder(t)
+	text := "The most oppressive thing about the labyrinth is that you are constantly " +
+		"being forced to choose. It isn’t the lack of an exit, but the abundance of exits that is so disorienting."
+	want := []int{791, 1455, 78612, 3245, 922, 279, 99810, 374, 430, 499, 527, 15320, 1694, 9770, 311, 5268, 13, 1102, 4536, 1431, 279, 6996, 315, 459, 4974, 11, 719, 279, 37492, 315, 43186, 430, 374, 779, 834, 15226, 287, 13}
+	got, err := rag.EncodeTextForTest(enc, text)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+		return
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("encode = %v, want %v", got, want)
+		return
+	}
+}
+
+func TestEncodeDecodeRoundTrip(t *testing.T) {
+	enc := mustEncoder(t)
+	seed := uint64(0x243F6A8885A308D3)
+	next := func() uint64 {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		return seed >> 33
+	}
+	for range 500 {
+		n := int(next() % 65)
+		buf := make([]byte, n)
+		for j := range buf {
+			buf[j] = byte(next())
+		}
+		s := string(buf)
+		tokens, err := rag.EncodeTextForTest(enc, s)
+		if err != nil {
+			t.Fatalf("encode %q: %v", s, err)
+			return
+		}
+		back, err := rag.DecodeTokensForTest(enc, tokens)
+		if err != nil {
+			t.Fatalf("decode %q: %v", s, err)
+			return
+		}
+		if back != s {
+			t.Fatalf("round trip of %q gives %q", s, back)
+			return
+		}
+	}
+}

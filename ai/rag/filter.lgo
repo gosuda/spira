@@ -12,6 +12,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -521,6 +522,9 @@ func evalComparison(e Expression, meta map[string]Value) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("%s needs a constant on the right", e.Type)
 	}
+	if isNaNValue(meta[key.Name]) {
+		return e.Type == OpNe, nil
+	}
 	n, err := compareConst(meta[key.Name], c)
 	if err != nil {
 		return false, fmt.Errorf("key %q: %w", key.Name, err)
@@ -546,6 +550,9 @@ func evalInclusion(e Expression, meta map[string]Value) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("%s needs a list on the right", e.Type)
 	}
+	if isNaNValue(meta[key.Name]) {
+		return e.Type == OpNin, nil
+	}
 	for _, item := range list.Items {
 		n, err := compareConst(meta[key.Name], item)
 		if err != nil {
@@ -568,6 +575,23 @@ func operands(e Expression) (Key, Filter, error) {
 		return Key{}, Key{}, fmt.Errorf("%s needs a right operand", e.Type)
 	}
 	return key, right, nil
+}
+
+func isNaNValue(held Value?) bool {
+	if held == nil {
+		return false
+	}
+	switch have := held.(type) {
+	case Number:
+		return math.IsNaN(have.Number)
+	case Text:
+		return false
+	case Flag:
+		return false
+	case nil:
+		return false
+	}
+	return false
 }
 
 func compareConst(held Value?, want Const) (int, error) {
