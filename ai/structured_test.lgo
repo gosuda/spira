@@ -90,6 +90,53 @@ func TestStructuredUsesFirstFence(t *testing.T) {
 	}
 }
 
+func TestStructuredDecodesBareDocumentWithFenceInsideAString(t *testing.T) {
+	got, err := ai.Structured[structuredItem]("{\"name\":\"Type ``` to open a code fence\",\"count\":3}")
+	if err != nil {
+		t.Fatalf("Structured bare fence inside a string: %v", err)
+		return
+	}
+	if got.Name != "Type ``` to open a code fence" || got.Count != 3 {
+		t.Fatalf("Structured bare fence inside a string = %+v, want the full name and 3", got)
+	}
+}
+
+func TestStructuredDecodesFenceHoldingFenceInsideAString(t *testing.T) {
+	text := "```json\n{\"name\":\"Type ``` to open\",\"count\":3}\n```"
+	got, err := ai.Structured[structuredItem](text)
+	if err != nil {
+		t.Fatalf("Structured fence inside a string: %v", err)
+		return
+	}
+	if got.Name != "Type ``` to open" || got.Count != 3 {
+		t.Fatalf("Structured fence inside a string = %+v, want the full name and 3", got)
+	}
+}
+
+func TestStructuredExtractsInlineFenceBeforeTrailingProse(t *testing.T) {
+	text := "```{\"name\":\"one\",\"count\":1}```\nHope that helps."
+	got, err := ai.Structured[structuredItem](text)
+	if err != nil {
+		t.Fatalf("Structured inline fence with prose: %v", err)
+		return
+	}
+	if got.Name != "one" || got.Count != 1 {
+		t.Fatalf("Structured inline fence with prose = %+v, want {one 1}", got)
+	}
+}
+
+func TestStructuredUsesFirstInlineFenceBeforeASecondFence(t *testing.T) {
+	text := "```{\"name\":\"one\",\"count\":1}```\n```json\n{\"name\":\"two\",\"count\":2}\n```"
+	got, err := ai.Structured[structuredItem](text)
+	if err != nil {
+		t.Fatalf("Structured first inline fence: %v", err)
+		return
+	}
+	if got.Name != "one" || got.Count != 1 {
+		t.Fatalf("Structured first inline fence = %+v, want {one 1}", got)
+	}
+}
+
 func TestStructuredRefusesUnterminatedFence(t *testing.T) {
 	_, err := ai.Structured[structuredItem]("```json\n{\"name\":\"ada\",\"count\":3}\n")
 	if err == nil {

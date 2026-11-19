@@ -33,7 +33,15 @@ func Structured[T any](text string) (T, error) {
 	if len(text) > structuredLimit {
 		return zero, ErrTooLarge
 	}
-	doc, err := structuredDocument(text)
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return zero, ErrEmpty
+	}
+	var bare T
+	if uerr := json.Unmarshal([]byte(trimmed), &bare); uerr == nil {
+		return bare, nil
+	}
+	doc, err := structuredDocument(trimmed)
 	if err != nil {
 		return zero, err
 	}
@@ -57,10 +65,10 @@ func structuredDocument(text string) (string, error) {
 
 func fencedDocument(from string) (string, error) {
 	rest := from[3:]
-	if nl := strings.Index(rest, "\n"); nl >= 0 {
+	if nl := strings.Index(rest, "\n"); nl >= 0 && fenceClose(rest[:nl]) < 0 {
 		rest = rest[nl+1:]
 	}
-	end := strings.Index(rest, "```")
+	end := fenceClose(rest)
 	if end < 0 {
 		return "", ErrUnterminatedFence
 	}
@@ -69,4 +77,32 @@ func fencedDocument(from string) (string, error) {
 		return "", ErrEmpty
 	}
 	return inner, nil
+}
+
+func fenceClose(s string) int {
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] == '"' {
+			i = stringEnd(s, i)
+			continue
+		}
+		if s[i] == '`' && s[i+1] == '`' && s[i+2] == '`' {
+			return i
+		}
+	}
+	return -1
+}
+
+func stringEnd(s string, open int) int {
+	i := open + 1
+	for i < len(s) {
+		if s[i] == '\\' {
+			i += 2
+			continue
+		}
+		if s[i] == '"' {
+			return i
+		}
+		i++
+	}
+	return len(s)
 }

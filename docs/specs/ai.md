@@ -268,10 +268,13 @@ func Structured[T any](text string) (T, error)
 ### Structured output
 
 - `Structured` MUST decode a bare JSON document into the typed value.
+- `Structured` MUST decode a bare JSON document that holds a fence delimiter inside a string value.
 - `Structured` MUST strip one wrapping markdown fence before decoding.
 - `Structured` MUST accept a fence with a language tag or a bare fence.
 - `Structured` MUST extract the first fence when prose surrounds fences.
 - `Structured` MUST ignore a second fence after the first fence.
+- `Structured` MUST end a fence at the first delimiter outside a string value.
+- `Structured` MUST keep an inline fence and ignore the lines after it.
 - `Structured` MUST trim surrounding whitespace before decoding.
 - `Structured` MUST ignore unknown JSON fields during decoding.
 - `Structured` MUST refuse text beyond 1048576 bytes with `ErrTooLarge`.
@@ -373,6 +376,10 @@ func Structured[T any](text string) (T, error)
 - `TestStructuredExtractsFenceFromProse` proves the fence inside prose.
 - `TestStructuredTrimsSurroundingWhitespace` proves the whitespace trim.
 - `TestStructuredUsesFirstFence` proves that the first fence wins.
+- `TestStructuredDecodesBareDocumentWithFenceInsideAString` proves the bare document with a delimiter inside a string.
+- `TestStructuredDecodesFenceHoldingFenceInsideAString` proves the fence with a delimiter inside a string.
+- `TestStructuredExtractsInlineFenceBeforeTrailingProse` proves the inline fence with prose after it.
+- `TestStructuredUsesFirstInlineFenceBeforeASecondFence` proves the first inline fence with a second fence after it.
 - `TestStructuredRefusesUnterminatedFence` proves the unterminated fence error.
 - `TestStructuredRefusesTrailingText` proves the trailing text error.
 - `TestStructuredRefusesEmptyAnswer` proves the empty answer error.
