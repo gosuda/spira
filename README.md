@@ -173,7 +173,7 @@ The other replies follow the same rule. `web.Fragment` writes HTML with `HX-Reta
 
 ### Data and migrations
 
-`example/shop/db` holds the migration pairs and annotated queries of the sample schema; `docs/specs/example-shop.md` specifies the application around them. `db.Open` takes the driver name and DSN, `db.InTx` hands a transaction to the work function, and `db.Query`/`db.One` scan rows by `col` tag. `migrate.Apply` runs `*.up.sql`/`*.down.sql` pairs in order, and `migrate.CheckReversible` proves that each `down` restores the schema.
+`example/shop/db` holds the migration pairs and annotated queries of the sample schema; `docs/specs/example-shop.md` specifies the application around them. `db.Open` takes the driver name and DSN, `db.InTx` hands a transaction to the work function, and `db.Query`/`db.One` scan rows by `col` tag. `migrate.Apply` runs the pending `*.up.sql` scripts in order, `migrate.Rollback` runs the matching `*.down.sql` scripts, and `migrate.CheckReversible` proves that each `down` restores the schema.
 
 `cmd/sqlc-gen-spira` is a sqlc process plugin. It reads sqlc's `GenerateRequest` and writes table structs plus typed functions for `:one`, `:many`, `:exec`, `:execrows` and `:execlastid` queries. The accepted engines are SQLite, PostgreSQL, MySQL and SQL Server. `tools/go.mod` pins sqlc with a Go `tool` directive.
 
