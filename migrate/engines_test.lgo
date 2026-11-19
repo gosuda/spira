@@ -38,7 +38,7 @@ func TestEnginePartialDDLMySQL(t *testing.T) {
 		return
 	}
 	t.Cleanup(func() {
-		if serr := pool.Stop(t.Context()); serr != nil {
+		if serr := pool.Stop(context.Background()); serr != nil {
 			t.Errorf("Stop: %v", serr)
 		}
 	})
