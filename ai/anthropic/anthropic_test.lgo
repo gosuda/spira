@@ -20,6 +20,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1555,7 +1556,9 @@ func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
 	c.Policy = resilience.Policy{Timeout: 60 * time.Second, Retry: resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 20 * time.Millisecond}}
-	reply, err := c.Chat(context.Background(), ai.Request{
+	call, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	reply, err := c.Chat(call, ai.Request{
 		Model:     "claude-opus-5-5",
 		MaxTokens: 1024,
 		Messages:  []ai.Message{userTurn("hi")},
@@ -1840,5 +1843,53 @@ func TestStreamCancelKeepsThePrefixAndTheCause(t *testing.T) {
 	}
 	if !errors.Is(got, context.Canceled) {
 		t.Fatalf("errors.Is(err, context.Canceled) = false for %w", got)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls *atomic.Int64
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestChatBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	transport := &cutTransport{calls: &calls, total: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}
+	c := &anthropic.Client{BaseURL: "http://anthropic.invalid", Key: "test-key", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
+	_, err := c.Chat(context.Background(), ai.Request{Model: "claude-opus-5-5"})
+	if err == nil || !strings.Contains(err.Error(), "ai/anthropic: response exceeds the size limit of 1048576 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
 	}
 }

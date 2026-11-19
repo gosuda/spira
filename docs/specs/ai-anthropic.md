@@ -66,6 +66,7 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 - A nonempty `Format` MUST go out as `output_config.format` with `type` `json_schema`.
 - A `Format` that is not a JSON object MUST fail before any request.
 - Tool arguments and schemas MUST reach the wire byte for byte as written.
+- A body over 1 MiB cut by a read error MUST still end as the size limit error.
 
 ## Errors
 
@@ -102,6 +103,7 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 - `TestBodyOverTheLimitIsFinal` proves the size limit error ends the call.
 - `TestFailingStatusBodyIsCutAtOneMiB` proves the failing body is cut.
 - `TestKeyNeverAppearsInError` proves the key stays out of errors.
+- `TestChatBodyOverLimitWithCutConnectionIsFinal` proves the cut oversize body ends after one attempt.
 - `TestTruncatedFailingBodyKeepsTheStatus` proves the status of a cut 400, the single attempt, the empty breaker sample and the read cause.
 - `TestRedirectToAnotherOriginDropsTheKey` proves the key stops at the origin, and `TestRedirectOnTheSameOriginKeepsTheKey` proves it survives there.
 - `TestRetryAfterHoldsTheNextAttempt` proves the second attempt waits out the advertised second.

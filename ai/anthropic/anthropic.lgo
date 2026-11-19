@@ -191,11 +191,11 @@ func (c *Client) post(ctx context.Context, payload []byte, budget time.Duration)
 		}
 		return chatResponse{}, fault
 	}
-	if rerr != nil {
-		return chatResponse{}, fmt.Errorf("ai/anthropic: read response: %w", rerr)
-	}
 	if len(data) > replyLimit {
 		return chatResponse{}, fmt.Errorf("%w of %d bytes", errOversize, replyLimit)
+	}
+	if rerr != nil {
+		return chatResponse{}, fmt.Errorf("ai/anthropic: read response: %w", rerr)
 	}
 	var out chatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
