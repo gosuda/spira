@@ -113,7 +113,7 @@ Vary: HX-Request, HX-Boosted, HX-History-Restore-Request
 
 ## Installation
 
-The system `go` cannot build this module. You need a LoGOs toolchain built from source; the `loGos` repository's default branch is `release-branch.go1.27`.
+The system `go` cannot build this module. You need a LoGOs toolchain built from source; the `loGos` repository's default branch is `release-branch.go1.27`, built with the fixes that [AGENTS.md](AGENTS.md) lists under "Toolchain environment". A plain default-branch build misses them.
 
 1. Clone and build LoGOs. Go 1.27.4 is known to work as the bootstrap compiler.
 
@@ -125,15 +125,16 @@ The system `go` cannot build this module. You need a LoGOs toolchain built from 
    (cd src && GOROOT_BOOTSTRAP="$bootstrap_root" ./make.bash)
    ```
 
-2. Put the toolchain on `PATH` for every later command.
+2. Put the toolchain on `PATH` for every later command. When you run spira's own recipes from another checkout, point `LOGOS_ROOT` at your LoGOs build; the `justfile` default is the maintainer's worktree path.
 
    ```sh
    export GOROOT="$PWD"
    export PATH="$GOROOT/bin:$PATH"
    export GOTOOLCHAIN=local
+   export LOGOS_ROOT="$PWD"
    ```
 
-3. Check the install. The output starts with `logos version go1.27.4`.
+3. Check the install. The output starts with `logos version go1.27.4`, but the version line alone does not prove the listed fixes are present; confirm them in your LoGOs checkout.
 
    ```sh
    logos version
