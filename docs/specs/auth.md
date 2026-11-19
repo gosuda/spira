@@ -16,6 +16,9 @@ func DevHeaders() web.Stage
 func HashPassword(password string) (string, error)
 func VerifyPassword(encoded string, password string) (bool, error)
 
+func VerifyAgainstDummy(password string) bool
+func Faults() []*fault.Error
+
 type Principal struct {
 	ID    string
 	Roles []string
@@ -60,16 +63,17 @@ func (s *memoryStore) Delete(ctx context.Context, id string) error
 
 - `Authenticate` MUST record that it ran before it calls a method.
 - `Authenticate` MUST try each method in order.
-- `Authenticate` MUST stop at the first non-nil principal.
-- `Authenticate` MUST store that principal under `PrincipalKey`.
-- `Authenticate` MUST NOT call a later method after one method returns a principal.
-- If a method returns an error, `Authenticate` MUST answer 401 `Unauthorized` as a problem.
+- If a method returns an error, `Authenticate` MUST answer 401 `Unauthorized` with the `auth.invalid_credentials` fault.
+- The fault MUST wrap the method error as its cause.
 - The 401 problem MUST NOT contain the error text.
-- `Require` MUST answer 500 `Internal Server Error` when `Authenticate` did not run.
-- `Require` MUST log `auth.Require used without auth.Authenticate` for that case.
+- `Require` MUST answer 500 `Internal Server Error` with the `auth.misconfigured` fault when `Authenticate` did not run.
+- The fault MUST wrap `auth.Require used without auth.Authenticate` as its cause.
+- Stages MUST NOT write log lines. The cause chain carries the operator detail.
 - `Require` MUST call the next handler when the rule returns true.
-- If the rule returns false and no principal is present, `Require` MUST answer 401 `Unauthorized`.
-- If the rule returns false and a principal is present, `Require` MUST answer 403 `Forbidden`.
+- If the rule returns false and no principal is present, `Require` MUST answer 401 `Unauthorized` with the `auth.invalid_credentials` fault.
+- If the rule returns false and a principal is present, `Require` MUST answer 403 `Forbidden` with the `auth.forbidden` fault.
+- Deny faults MUST NOT carry a cause.
+- One code MUST cover every anonymous credential failure.
 - `Authenticated` MUST return true only when a principal is present.
 - `HasRole` MUST return false when no principal is present.
 - `HasRole` MUST compare the role name exactly.
@@ -93,6 +97,14 @@ func (s *memoryStore) Delete(ctx context.Context, id string) error
 - `VerifyPassword` MUST accept memory 1 to 1048576 KiB, time 1 to 16 and parallelism 1 to 16.
 - `VerifyPassword` MUST accept a salt of 1 to 64 bytes and a key of 16 to 64 bytes.
 - `VerifyPassword` MUST return false with an error that names the cause for a malformed hash.
+- `HashPassword` MUST return the `auth.password_failed` fault when the salt cannot be created.
+- `VerifyPassword` MUST return the `auth.password_failed` fault with the parse cause for a malformed hash.
+- `VerifyAgainstDummy` MUST run `VerifyPassword` with the production parameters against a fixed dummy hash.
+- `VerifyAgainstDummy` MUST return false.
+- `VerifyAgainstDummy` MUST log `auth: dummy password verification failed` when the dummy hash does not verify.
+- The dummy hash MUST use the same parameters as `HashPassword`.
+- An application MUST call `VerifyAgainstDummy` when the user does not exist.
+- An application MUST answer the `auth.invalid_credentials` fault for a missing user and for a wrong password.
 
 ### Sessions
 
@@ -113,7 +125,11 @@ func (s *memoryStore) Delete(ctx context.Context, id string) error
 - If the request has no session cookie, `Logout` MUST NOT call `Delete`.
 - `Authenticator` MUST return no principal when the request has no session cookie.
 - `Authenticator` MUST load the principal under the hash of the cookie value.
-- `Authenticator` MUST return the store error wrapped as `auth: session load: <cause>`.
+- `Authenticator` MUST return the `auth.session_unavailable` fault that wraps `auth: session load: <cause>`.
+- `Login` MUST return the `auth.session_unavailable` fault that wraps `auth: session save: <cause>` when the save fails.
+- `Login` MUST return the `auth.session_unavailable` fault that wraps `auth: session delete: <cause>` when the delete fails.
+- `Login` MUST return the `auth.entropy_failed` fault that wraps `auth: session id entropy: <cause>` when creation fails.
+- `Logout` MUST return the `auth.session_unavailable` fault that wraps `auth: session delete: <cause>` when the delete fails.
 - `NewMemoryStore` MUST return a store that `Load`, `Save` and `Delete` can call at the same time.
 - The memory store MUST return no principal for an unknown id.
 - The memory store MUST return no principal for an expired entry.
@@ -126,23 +142,43 @@ func (s *memoryStore) Delete(ctx context.Context, id string) error
 - The nonce MUST be the hex text of 16 bytes from `crypto/rand`.
 - Two requests MUST receive different nonces.
 - `SecureHeaders` MUST store the nonce under `NonceKey`.
+- `SecureHeaders` MUST return the `auth.entropy_failed` fault that wraps `auth: nonce entropy: <cause>` when creation fails.
 - `SecureHeaders` MUST set `Strict-Transport-Security` to `max-age=63072000; includeSubDomains`.
 - `SecureHeaders` MUST set `X-Content-Type-Options` to `nosniff`.
 - `SecureHeaders` MUST set `Referrer-Policy` to `strict-origin-when-cross-origin`.
 - `DevHeaders` MUST set the same three headers and MUST NOT set `Content-Security-Policy`.
 - `DevHeaders` MUST NOT store a nonce.
-- `CrossOrigin` MUST answer 403 `Forbidden` for an unsafe method when `Sec-Fetch-Site` is `cross-site`.
-- `CrossOrigin` MUST answer 403 `Forbidden` for an unsafe method when `Origin` does not match the request host.
+- `CrossOrigin` MUST answer 403 `Forbidden` with the `auth.cross_origin` fault for an unsafe method when `Sec-Fetch-Site` is `cross-site`.
+- `CrossOrigin` MUST answer 403 `Forbidden` with the `auth.cross_origin` fault when `Origin` does not match the request host.
 - `CrossOrigin` MUST pass an unsafe method when `Sec-Fetch-Site` is `same-origin` or `none`.
 - `CrossOrigin` MUST pass a safe method when `Sec-Fetch-Site` is `cross-site`.
 - `CrossOrigin` MUST pass a request that has neither `Origin` nor `Sec-Fetch-Site`.
-- The 403 problem MUST have the check error as its detail.
+- The 403 problem MUST NOT contain the check error text.
+- The fault MUST wrap the check error as its cause.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `auth.bad_request` | invalid | The authentication request is invalid. |
+| `auth.cross_origin` | forbidden | The cross-origin request was rejected. |
+| `auth.entropy_failed` | internal | The service could not create a secure value. |
+| `auth.forbidden` | forbidden | Access is forbidden. |
+| `auth.invalid_credentials` | unauthenticated | The credentials are invalid. |
+| `auth.misconfigured` | internal | The service is misconfigured. |
+| `auth.password_failed` | internal | The password check could not be completed. |
+| `auth.session_unavailable` | unavailable | The session service is unavailable. |
 
 ## Errors
 
-- `auth: authenticator failed` is the log line when a method returns an error. The problem detail stays empty.
-- `auth.Require used without auth.Authenticate` is the log line when `Require` runs first.
-- `auth: password hash: <cause>` wraps each password parse or random failure. `VerifyPassword` adds this prefix to each cause below.
+- `auth.invalid_credentials` wraps the authenticator error and covers the anonymous deny.
+- `auth.forbidden` carries no cause and covers the authenticated deny.
+- `auth.bad_request` is returned by application login handlers for a form that does not parse.
+- `auth.cross_origin` wraps the `CrossOriginProtection` check error.
+- `auth.session_unavailable` wraps `auth: session load: <cause>`, `auth: session save: <cause>` or `auth: session delete: <cause>`.
+- `auth.entropy_failed` wraps `auth: session id entropy: <cause>` or `auth: nonce entropy: <cause>`.
+- `auth.password_failed` wraps `auth: password hash: <cause>`.
+- `auth.misconfigured` wraps `auth.Require used without auth.Authenticate`.
 
 `parsePasswordHash` returns these causes in this order:
 
@@ -161,19 +197,13 @@ malformed key: <cause>
 
 `decodeBounded` returns `salt length out of bounds` or `key length out of bounds` when the encoded field is empty or too long. It returns `malformed salt: <cause>` or `malformed key: <cause>` when base64 decoding fails.
 
-- `auth: nonce entropy: <cause>` when the nonce cannot be read.
-- `auth: session id entropy: <cause>` when the session id cannot be read.
-- `auth: session load: <cause>` when the store load fails.
-- `auth: session save: <cause>` when the store save fails.
-- `auth: session delete: <cause>` when the store delete fails.
-
 ## Proof
 
-- `TestRequireWithoutAuthenticateAnswers500` proves the 500 and the log line.
-- `TestRequireAnswers401WithoutPrincipal403WithOne` proves 401 and 403 for a false rule.
+- `TestRequireWithoutAuthenticateAnswers500` proves the 500 and the hidden code.
+- `TestRequireAnswers401WithoutPrincipal403WithOne` proves 401 and 403 with the two codes.
 - `TestRequirePassesAuthenticatedPrincipal` and `TestHasRole` prove the pass cases.
 - `TestAuthenticateTriesMethodsInOrderAndStoresFirst` proves method order and the first principal.
-- `TestAuthenticateErrorIs401Problem` proves the 401 problem and its content type.
+- `TestAuthenticateErrorIs401Problem` proves the 401 problem, its content type and the shared code.
 - `TestBearerVerifiesTokenAndFallsThrough` proves the token, the fallback and the case of the scheme name.
 - `TestVerifyPasswordAcceptsVector` proves the reference Argon2id vector.
 - `TestVerifyPasswordRejectsWrongPassword` and `TestVerifyPasswordRejectsOneBitChanges` prove rejection.
@@ -189,6 +219,20 @@ malformed key: <cause>
 - `TestSecureHeadersWriteExactValuesWithFreshNonce` proves the CSP, the nonce and the three headers.
 - `TestDevHeadersWriteCommonHeadersWithoutCSP` proves the dev headers.
 - `TestCrossOriginRejectsUnsafeCrossSiteRequests` proves the cross-origin table, including a headerless post.
+- `TestFaultsMatchSpecCodeTable` proves the declared set, kind text and messages equal the code table.
+- `TestInvalidCredentialsReachesClientAs401` proves the shared 401 code and the hidden cause.
+- `TestForbiddenReachesClientAs403` proves the 403 code.
+- `TestCrossOriginFaultReachesClientAs403` proves the 403 code for a rejected cross-site post.
+- `TestSessionUnavailableReachesClientAs503` proves the 503 code and the hidden store cause.
+- `TestSessionLogoutFailureIsSessionUnavailable` and `TestSessionAuthenticatorFailureIsSessionUnavailable` prove the other store paths.
+- `TestPasswordFaultIsInternal` proves the fixed view and the hidden hostile input.
+- `TestEntropyFaultIsInternal` and `TestMisconfiguredFaultContract` prove the fixed view for silent faults.
+- `TestBadRequestFaultContract` proves the code for the application login parse failure.
+- `TestVerifyAgainstDummyBurnsWorkAndReturnsFalse` proves the constant work and the false result.
+- `TestAdversarialTokenEchoNeverReachesClient` proves a token echo never reaches the client.
+- `TestAdversarialHostileSessionCookieNeverReachesClient` proves a hostile cookie never reaches the client.
+- `TestAdversarialHostileOriginNeverReachesClient` proves a hostile origin never reaches the client.
+- `TestAdversarialPublicViewsHideCauses` proves no cause text reaches the public view.
 
 ## Not in scope
 

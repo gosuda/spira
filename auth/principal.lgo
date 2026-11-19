@@ -2,14 +2,12 @@ package auth
 
 import (
 	"context"
-	"log/slog"
-	"net/http"
+	"errors"
 	"slices"
 	"strings"
 
 	"github.com/gosuda/spira/web"
 )
-
 type Principal struct {
 	ID    string
 	Roles []string
@@ -43,8 +41,7 @@ func firstPrincipal(ctx *web.Context, methods []Authenticator) (Principal?, erro
 	for _, m := range methods {
 		p, err := m(ctx)
 		if err != nil {
-			slog.Error("auth: authenticator failed", "error", err)
-			return nil, web.Fail(web.Problem{Title: "Unauthorized", Status: http.StatusUnauthorized})
+			return nil, ErrInvalidCredentials.Wrap(err)
 		}
 		if p != nil {
 			return p, nil
@@ -57,11 +54,7 @@ func Require(rule Rule) web.Stage {
 	return func(next web.Handler) web.Handler {
 		return func(ctx *web.Context) (web.Reply, error) {
 			if web.Get(ctx, authenticateRanKey) == nil {
-				slog.Error("auth.Require used without auth.Authenticate")
-				return nil, web.Fail(web.Problem{
-					Title:  "Internal Server Error",
-					Status: http.StatusInternalServerError,
-				})
+				return nil, ErrMisconfigured.Wrap(errors.New("auth.Require used without auth.Authenticate"))
 			}
 			p := web.Get(ctx, PrincipalKey)
 			if rule(p) {
@@ -74,9 +67,9 @@ func Require(rule Rule) web.Stage {
 
 func deny(p Principal?) error {
 	if p == nil {
-		return web.Fail(web.Problem{Title: "Unauthorized", Status: http.StatusUnauthorized})
+		return ErrInvalidCredentials.Err()
 	}
-	return web.Fail(web.Problem{Title: "Forbidden", Status: http.StatusForbidden})
+	return ErrForbidden.Err()
 }
 
 func Authenticated() Rule {
