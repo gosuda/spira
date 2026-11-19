@@ -57,11 +57,12 @@ func One[T any](ctx context.Context, q Querier, query string, args ...any) (foun
 func PlanFields[T any](prefix string, plan *ScanPlan) error
 func PlanField[F any](path string, name string, tag string, plan *ScanPlan) error
 func PlanLeaf(path string, name string, tag string, plan *ScanPlan)
-func ScanRow[T any](row *T, rows *sql.Rows, plan ScanPlan) error
-func ScanFields[T any](row *T, prefix string, dests *[]any) error
-func ScanField[F any](dst *F, path string, dests *[]any) error
-func AppendPlain[F any](dst *F, path string, dests *[]any)
-func AppendOption[F any](dst *F, path string, dests *[]any)
+func ScanRow[T any](row *(T), rows *sql.Rows, plan ScanPlan) error
+func ScanFields[T any](row *(T), prefix string, dests *[]any) error
+func ScanField[F any](dst *(F), path string, dests *[]any) error
+func AppendNamed[F any](dst *(F), path string, dests *[]any)
+func ScanPlain(dst any, path string, dests *[]any) bool
+func ScanOption(dst any, path string, dests *[]any) bool
 func CheckScan(cols []string, plan ScanPlan) error
 func TypeName[T any]() string
 func SnakeName(name string) string
@@ -152,15 +153,15 @@ func (d *OptionDest[V]) Scan(src any) error
 - `One` MUST reject a second row.
 - An option field MUST become absent when the column is NULL.
 - An option field MUST hold the column value when the column is not NULL.
+- An option field MUST read the same value at any position among plain fields.
 - A NULL in a field that is not an option MUST be an error.
 - `Query` MUST report an unsupported field type before it reads a row.
-- `AppendPlain` MUST accept `time.Time`, `[]byte`, `string` and `bool`.
-- `AppendPlain` MUST accept `int`, `int8`, `int16`, `int32` and `int64`.
-- `AppendPlain` MUST accept `float32` and `float64`.
-- `AppendPlain` MUST accept a named type whose underlying type is `string`.
-- `AppendOption` MUST accept `time.Time?`, `string?`, `bool?`, `int16?`, `int32?` and `int64?`.
-- `AppendOption` MUST accept `float32?` and `float64?`.
-- The pool MUST serve concurrent `Query` calls.
+- `ScanField` MUST accept `time.Time`, `[]byte`, `string` and `bool`.
+- `ScanField` MUST accept `int`, `int8`, `int16`, `int32` and `int64`.
+- `ScanField` MUST accept `float32` and `float64`.
+- `ScanField` MUST accept a named type whose underlying type is `string`.
+- `ScanField` MUST accept `time.Time?`, `string?`, `bool?`, `int16?`, `int32?` and `int64?`.
+- `ScanField` MUST accept `float32?` and `float64?`.
 
 ## Errors
 
@@ -217,8 +218,10 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestQueryScansTimestampColumn` proves that a `time.Time` field scans a timestamp column. The oracle is a direct `rows.Scan`.
 - `TestOneReturnsAbsentWithoutARow` and `TestOneReturnsTheOnlyRow` prove the absent result and the single row.
 - `TestOneRejectsTwoRows` proves the second-row error.
-- `TestQueryRejectsNullInNonOptional` proves the NULL error for a field that is not an option.
-- No test proves the option field rules. A row type with an option field does not build with LoGOs `144fcceb02`.
+- `TestQueryRoundTripsOptionFields` proves absent and present values for every option field type.
+- `TestOneRoundTripsAnOptionField` proves `One` returns absent option fields for a NULL row.
+- `TestQueryKeepsOptionPosition` proves an option field scans between plain fields.
+- `TestQueryScansNamedStringBesideOption` proves a named string field scans beside an option field.
 - `TestQueryRejectsUnsupportedFieldBeforeRows` proves the unsupported-type error before a row is read.
 - `TestQueryServesSixteenConcurrentReaders` proves concurrent reads on one pool.
 - `TestEnginePostgres`, `TestEngineMySQL` and `TestEngineMSSQL` prove a round trip, a commit, a rollback and `Prepare` on each engine. `just engines` starts the three engines. Each test skips when its DSN variable is not set.

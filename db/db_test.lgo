@@ -807,3 +807,229 @@ func TestQueryExpectsSnakeCaseWithoutTag(t *testing.T) {
 		t.Fatalf("error = %v, want %q", aerr, want)
 	}
 }
+
+type optionRow struct {
+	OptS string? `col:"opt_s"`
+	OptB bool? `col:"opt_b"`
+	OptI16 int16? `col:"opt_i16"`
+	OptI32 int32? `col:"opt_i32"`
+	OptI64 int64? `col:"opt_i64"`
+	OptF32 float32? `col:"opt_f32"`
+	OptF64 float64? `col:"opt_f64"`
+	OptT time.Time? `col:"opt_t"`
+}
+
+type optionRaw struct {
+	OptS sql.Null[string]
+	OptB sql.Null[bool]
+	OptI16 sql.Null[int16]
+	OptI32 sql.Null[int32]
+	OptI64 sql.Null[int64]
+	OptF32 sql.Null[float32]
+	OptF64 sql.Null[float64]
+	OptT sql.Null[time.Time]
+}
+
+const createOpts = `CREATE TABLE opts (
+	id INTEGER PRIMARY KEY,
+	opt_s TEXT,
+	opt_b INTEGER,
+	opt_i16 INTEGER,
+	opt_i32 INTEGER,
+	opt_i64 INTEGER,
+	opt_f32 REAL,
+	opt_f64 REAL,
+	opt_t TIMESTAMP
+)`
+
+const insertOptsNull = `INSERT INTO opts (id) VALUES (1)`
+
+const insertOptsFull = `INSERT INTO opts (id, opt_s, opt_b, opt_i16, opt_i32, opt_i64, opt_f32, opt_f64, opt_t)
+	VALUES (2, 'sku', 1, -16, -32, -64, 1.5, 2.25, '2026-11-18 10:30:00')`
+
+const optCols = `opt_s, opt_b, opt_i16, opt_i32, opt_i64, opt_f32, opt_f64, opt_t`
+
+const selectOpts = `SELECT ` + optCols + ` FROM opts ORDER BY id`
+
+const selectOneOpt = `SELECT ` + optCols + ` FROM opts WHERE id = 1`
+
+func optsPool(t *testing.T) *db.Pool {
+	t.Helper()
+	pool := openPool(t)
+	mustExec(t, pool, createOpts)
+	mustExec(t, pool, insertOptsNull)
+	mustExec(t, pool, insertOptsFull)
+	return pool
+}
+
+func readOptsRaw(t *testing.T, pool *db.Pool) []optionRaw {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), selectOpts)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: raw query: %v", err))
+	}
+	if rows == nil {
+		panic("db_test: raw query returned no rows handle")
+	}
+	defer closeRows(t, rows)
+	var out []optionRaw
+	for rows.Next() {
+		var raw optionRaw
+		if serr := rows.Scan(&raw.OptS, &raw.OptB, &raw.OptI16, &raw.OptI32, &raw.OptI64, &raw.OptF32, &raw.OptF64, &raw.OptT); serr != nil {
+			t.Fatalf("raw scan: %v", serr)
+			return out
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+func optDiff[V comparable](opt V?, raw sql.Null[V]) error {
+	present := opt != nil
+	if present != raw.Valid {
+		return fmt.Errorf("present = %v, raw valid = %v", present, raw.Valid)
+	}
+	if !present {
+		return nil
+	}
+	var zero V
+	if value := opt ?? zero; value != raw.V {
+		return fmt.Errorf("value = %v, raw %v", value, raw.V)
+	}
+	return nil
+}
+
+func optTimeDiff(opt time.Time?, raw sql.Null[time.Time]) error {
+	present := opt != nil
+	if present != raw.Valid {
+		return fmt.Errorf("present = %v, raw valid = %v", present, raw.Valid)
+	}
+	if !present {
+		return nil
+	}
+	var zero time.Time
+	if value := opt ?? zero; !value.Equal(raw.V) {
+		return fmt.Errorf("value = %v, raw %v", value, raw.V)
+	}
+	return nil
+}
+
+func TestQueryRoundTripsOptionFields(t *testing.T) {
+	pool := optsPool(t)
+	rows, err := db.Query[optionRow](t.Context(), pool, selectOpts)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query opts: %v", err))
+	}
+	raw := readOptsRaw(t, pool)
+	if len(rows) != 2 || len(raw) != 2 {
+		t.Fatalf("Query returned %d rows, raw %d, want 2", len(rows), len(raw))
+		return
+	}
+	diff := errors.Join(
+		optDiff(rows[0].OptS, raw[0].OptS),
+		optDiff(rows[0].OptB, raw[0].OptB),
+		optDiff(rows[0].OptI16, raw[0].OptI16),
+		optDiff(rows[0].OptI32, raw[0].OptI32),
+		optDiff(rows[0].OptI64, raw[0].OptI64),
+		optDiff(rows[0].OptF32, raw[0].OptF32),
+		optDiff(rows[0].OptF64, raw[0].OptF64),
+		optTimeDiff(rows[0].OptT, raw[0].OptT),
+		optDiff(rows[1].OptS, raw[1].OptS),
+		optDiff(rows[1].OptB, raw[1].OptB),
+		optDiff(rows[1].OptI16, raw[1].OptI16),
+		optDiff(rows[1].OptI32, raw[1].OptI32),
+		optDiff(rows[1].OptI64, raw[1].OptI64),
+		optDiff(rows[1].OptF32, raw[1].OptF32),
+		optDiff(rows[1].OptF64, raw[1].OptF64),
+		optTimeDiff(rows[1].OptT, raw[1].OptT),
+	)
+	if diff != nil {
+		t.Fatalf("option round trip: %v", diff)
+	}
+}
+
+func TestOneRoundTripsAnOptionField(t *testing.T) {
+	pool := optsPool(t)
+	got, err := db.One[optionRow](t.Context(), pool, selectOneOpt)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: one null row: %v", err))
+	}
+	if got == nil {
+		t.Fatalf("One returned no row")
+		return
+	}
+	var absent optionRow
+	row := got ?? absent
+	if row.OptS != nil || row.OptT != nil {
+		t.Fatalf("NULL row = %+v, want every option absent", row)
+	}
+}
+
+type mixedRow struct {
+	A string `col:"a"`
+	Mid int64? `col:"mid"`
+	B string `col:"b"`
+}
+
+func TestQueryKeepsOptionPosition(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE mixed (a TEXT, mid INTEGER, b TEXT)")
+	mustExec(t, pool, "INSERT INTO mixed (a, mid, b) VALUES ('p', 42, 'q')")
+	mustExec(t, pool, "INSERT INTO mixed (a, mid, b) VALUES ('x', NULL, 'y')")
+	rows, err := db.Query[mixedRow](t.Context(), pool, "SELECT a, mid, b FROM mixed ORDER BY a")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query mixed: %v", err))
+	}
+	if len(rows) != 2 {
+		t.Fatalf("Query returned %d rows, want 2", len(rows))
+		return
+	}
+	if rows[0].A != "p" || rows[0].B != "q" {
+		t.Fatalf("first row = %+v, want a=p b=q", rows[0])
+		return
+	}
+	if value := rows[0].Mid ?? 0; value != 42 {
+		t.Fatalf("first mid = %d, want 42", value)
+		return
+	}
+	if rows[1].Mid != nil {
+		t.Fatalf("second mid holds a value, want absent")
+		return
+	}
+	if rows[1].A != "x" || rows[1].B != "y" {
+		t.Fatalf("second row = %+v, want a=x b=y", rows[1])
+	}
+}
+
+type Status string
+
+type statusRow struct {
+	Name Status `col:"name"`
+	Note string? `col:"note"`
+}
+
+func TestQueryScansNamedStringBesideOption(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE status (name TEXT, note TEXT)")
+	mustExec(t, pool, "INSERT INTO status (name, note) VALUES ('open', NULL)")
+	mustExec(t, pool, "INSERT INTO status (name, note) VALUES ('shut', 'x')")
+	rows, err := db.Query[statusRow](t.Context(), pool, "SELECT name, note FROM status ORDER BY name")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query status: %v", err))
+	}
+	if len(rows) != 2 {
+		t.Fatalf("Query returned %d rows, want 2", len(rows))
+		return
+	}
+	if rows[0].Name != "open" || rows[0].Note != nil {
+		t.Fatalf("first row = %+v, want name=open note absent", rows[0])
+		return
+	}
+	if rows[1].Name != "shut" {
+		t.Fatalf("second row = %+v, want name=shut", rows[1])
+		return
+	}
+	if value := rows[1].Note ?? ""; value != "x" {
+		t.Fatalf("second note = %q, want x", value)
+	}
+}

@@ -93,8 +93,8 @@ func PlanFields[T any](prefix string, plan *ScanPlan) error {
 }
 
 func PlanField[F any](path string, name string, tag string, plan *ScanPlan) error {
-	const switch F {
-	case time.Time:
+	var zero F
+	if _, isTime := any(zero).(time.Time); isTime {
 		PlanLeaf(path, name, tag, plan)
 		return nil
 	}
@@ -120,7 +120,7 @@ func PlanLeaf(path string, name string, tag string, plan *ScanPlan) {
 	plan.Paths = append(plan.Paths, path)
 }
 
-func ScanRow[T any](row *T, rows *sql.Rows, plan ScanPlan) error {
+func ScanRow[T any](row *(T), rows *sql.Rows, plan ScanPlan) error {
 	var dests []any
 	const if comptime.IsStruct[T]() {
 		ScanFields[T](row, plan.Type, &dests)?
@@ -136,7 +136,7 @@ func ScanRow[T any](row *T, rows *sql.Rows, plan ScanPlan) error {
 	return nil
 }
 
-func ScanFields[T any](row *T, prefix string, dests *[]any) error {
+func ScanFields[T any](row *(T), prefix string, dests *[]any) error {
 	const for _, f := range comptime.Fields[T]() {
 		if err := ScanField[f.Type](&row.[f], prefix+"."+f.Name, dests); err != nil {
 			return err
@@ -145,18 +145,15 @@ func ScanFields[T any](row *T, prefix string, dests *[]any) error {
 	return nil
 }
 
-func ScanField[F any](dst *F, path string, dests *[]any) error {
-	const switch F {
-	case time.Time:
-		AppendPlain[time.Time](dst, path, dests)
+func ScanField[F any](dst *(F), path string, dests *[]any) error {
+	if ScanPlain(any(dst), path, dests) || ScanOption(any(dst), path, dests) {
 		return nil
 	}
 	const if comptime.IsStruct[F]() {
 		return ScanFields[F](dst, path, dests)
 	} else {
 		before := len(*dests)
-		AppendPlain[F](dst, path, dests)
-		AppendOption[F](dst, path, dests)
+		AppendNamed[F](dst, path, dests)
 		if len(*dests) != before+1 {
 			return fmt.Errorf("db: %s: unsupported type", path)
 		}
@@ -164,54 +161,80 @@ func ScanField[F any](dst *F, path string, dests *[]any) error {
 	}
 }
 
-func AppendPlain[F any](dst *F, path string, dests *[]any) {
+func AppendNamed[F any](dst *(F), path string, dests *[]any) {
 	const switch F {
-	case time.Time:
-		*dests = append(*dests, &NotNullDest[time.Time]{dst: dst, path: path})
-	case []byte:
-		*dests = append(*dests, &NotNullDest[[]byte]{dst: dst, path: path})
-	case string:
-		*dests = append(*dests, &NotNullDest[string]{dst: dst, path: path})
-	case bool:
-		*dests = append(*dests, &NotNullDest[bool]{dst: dst, path: path})
-	case int:
-		*dests = append(*dests, &NotNullDest[int]{dst: dst, path: path})
-	case int8:
-		*dests = append(*dests, &NotNullDest[int8]{dst: dst, path: path})
-	case int16:
-		*dests = append(*dests, &NotNullDest[int16]{dst: dst, path: path})
-	case int32:
-		*dests = append(*dests, &NotNullDest[int32]{dst: dst, path: path})
-	case int64:
-		*dests = append(*dests, &NotNullDest[int64]{dst: dst, path: path})
-	case float32:
-		*dests = append(*dests, &NotNullDest[float32]{dst: dst, path: path})
-	case float64:
-		*dests = append(*dests, &NotNullDest[float64]{dst: dst, path: path})
 	case ~string:
 		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
 	}
 }
 
-func AppendOption[F any](dst *F, path string, dests *[]any) {
-	const switch F {
-	case rt.Option[time.Time]:
-		*dests = append(*dests, &OptionDest[time.Time]{dst: dst, path: path})
-	case rt.Option[string]:
-		*dests = append(*dests, &OptionDest[string]{dst: dst, path: path})
-	case rt.Option[bool]:
-		*dests = append(*dests, &OptionDest[bool]{dst: dst, path: path})
-	case rt.Option[int16]:
-		*dests = append(*dests, &OptionDest[int16]{dst: dst, path: path})
-	case rt.Option[int32]:
-		*dests = append(*dests, &OptionDest[int32]{dst: dst, path: path})
-	case rt.Option[int64]:
-		*dests = append(*dests, &OptionDest[int64]{dst: dst, path: path})
-	case rt.Option[float32]:
-		*dests = append(*dests, &OptionDest[float32]{dst: dst, path: path})
-	case rt.Option[float64]:
-		*dests = append(*dests, &OptionDest[float64]{dst: dst, path: path})
+func ScanPlain(dst any, path string, dests *[]any) bool {
+	switch p := dst.(type) {
+	case *time.Time:
+		*dests = append(*dests, &NotNullDest[time.Time]{dst: p, path: path})
+		return true
+	case *[]byte:
+		*dests = append(*dests, &NotNullDest[[]byte]{dst: p, path: path})
+		return true
+	case *string:
+		*dests = append(*dests, &NotNullDest[string]{dst: p, path: path})
+		return true
+	case *bool:
+		*dests = append(*dests, &NotNullDest[bool]{dst: p, path: path})
+		return true
+	case *int:
+		*dests = append(*dests, &NotNullDest[int]{dst: p, path: path})
+		return true
+	case *int8:
+		*dests = append(*dests, &NotNullDest[int8]{dst: p, path: path})
+		return true
+	case *int16:
+		*dests = append(*dests, &NotNullDest[int16]{dst: p, path: path})
+		return true
+	case *int32:
+		*dests = append(*dests, &NotNullDest[int32]{dst: p, path: path})
+		return true
+	case *int64:
+		*dests = append(*dests, &NotNullDest[int64]{dst: p, path: path})
+		return true
+	case *float32:
+		*dests = append(*dests, &NotNullDest[float32]{dst: p, path: path})
+		return true
+	case *float64:
+		*dests = append(*dests, &NotNullDest[float64]{dst: p, path: path})
+		return true
 	}
+	return false
+}
+
+func ScanOption(dst any, path string, dests *[]any) bool {
+	switch p := dst.(type) {
+	case *rt.Option[time.Time]:
+		*dests = append(*dests, &OptionDest[time.Time]{dst: p, path: path})
+		return true
+	case *rt.Option[string]:
+		*dests = append(*dests, &OptionDest[string]{dst: p, path: path})
+		return true
+	case *rt.Option[bool]:
+		*dests = append(*dests, &OptionDest[bool]{dst: p, path: path})
+		return true
+	case *rt.Option[int16]:
+		*dests = append(*dests, &OptionDest[int16]{dst: p, path: path})
+		return true
+	case *rt.Option[int32]:
+		*dests = append(*dests, &OptionDest[int32]{dst: p, path: path})
+		return true
+	case *rt.Option[int64]:
+		*dests = append(*dests, &OptionDest[int64]{dst: p, path: path})
+		return true
+	case *rt.Option[float32]:
+		*dests = append(*dests, &OptionDest[float32]{dst: p, path: path})
+		return true
+	case *rt.Option[float64]:
+		*dests = append(*dests, &OptionDest[float64]{dst: p, path: path})
+		return true
+	}
+	return false
 }
 
 func CheckScan(cols []string, plan ScanPlan) error {
