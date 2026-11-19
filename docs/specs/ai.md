@@ -151,7 +151,17 @@ func (n narrowing) Chat(ctx context.Context, req Request) (Reply, error)
 func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, error]
 func ToolOf[In any](name string, description string, call func(ctx context.Context, in In) (string, error)) Tool
 func ToolFromSchema[In any](name string, description string, call func(ctx context.Context, in In) (string, error), s schema.Schema) Tool
-
+func ToolSchemaText(s schema.Schema) string
+type ToolFieldContext struct {
+	Raw  map[string]jsontext.Value
+	Path string
+}
+func DecodeToolFields[T any](dst *(T), ctx ToolFieldContext) error
+func DecodeToolField[F any](dst *(F), tag string, name string, ctx ToolFieldContext) error
+func DecodeToolFieldValue[F any](dst *(F), v jsontext.Value, at string) error
+func FillToolValue(dst any, v jsontext.Value) (bool, error)
+func FillToolOption(dst any, v jsontext.Value) (bool, error)
+func RecodeToolValue(dst any, v jsontext.Value) error
 var ErrConfirmationRequired = fault.New("ai.confirmation_required", fault.Unprocessable, "Tool calls wait for a decision.")
 var ErrToolLimitExceeded = fault.New("ai.tool_limit_exceeded", fault.Unprocessable, "The tool call limit was exceeded.")
 var ErrInvalidDecision = fault.New("ai.invalid_decision", fault.Unprocessable, "The tool call decision is invalid.")
@@ -276,14 +286,18 @@ func Structured[T any](text string) (T, error)
 - The layer MUST drop managed tools that no search result names.
 - The layer MUST NOT add a tool that the request does not carry.
 - The layer MUST remove from each search result the names of tools that the request does not carry.
-
-### Typed tools
-
 - `ToolOf` MUST set `Schema` to the JSON Schema text of `schema.Of[In]`().
+- `ToolOf` MUST panic at derivation when `schema.Of[In]()` names an unsupported field type.
 - `ToolFromSchema` MUST keep the given name, description and call in the returned `Tool`.
 - The tool call MUST decode its arguments into `In`.
+- The tool call MUST call with the zero value of `In` for blank arguments.
 - The tool call MUST reject unknown JSON members.
-- The tool call MUST decode blank arguments as `{}`.
+- Argument keys MUST match wire names byte for byte.
+- A duplicate key MUST keep the last value.
+- A missing required field MUST fail decoding; a missing option field MUST stay none.
+- JSON null in a non-option field MUST fail decoding; null in an option field MUST stay none.
+- A number MUST keep its literal digits through decoding and MUST fit the field type; a fraction in an integer field MUST fail decoding.
+- A date-time field MUST decode from a date-time string; a duration field from a duration string; a bytes field from a plain string.
 - A decode failure MUST come back as the tool error text.
 - The tool call MUST NOT run `call` when decoding fails.
 - The schema text MUST hold `type`, `properties` in field order and `required`.

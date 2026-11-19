@@ -1,0 +1,635 @@
+package ai
+
+import (
+	"comptime"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"strings"
+	"time"
+
+	"logos/rt"
+
+	"github.com/gosuda/spira/schema"
+)
+
+func ToolOf[In any](name string, description string, call func(ctx context.Context, in In) (string, error)) Tool {
+	const if comptime.IsStruct[In]() {
+		return ToolFromSchema[In](name, description, call, schema.Of[In]())
+	} else {
+		return ToolFromSchema[In](name, description, call, schema.Of[In]())
+	}
+}
+
+func ToolFromSchema[In any](name string, description string, call func(ctx context.Context, in In) (string, error), s schema.Schema) Tool {
+	const if comptime.IsStruct[In]() {
+		return Tool{
+			Name:        name,
+			Description: description,
+			Schema:      ToolSchemaText(s),
+			Call: func(ctx context.Context, arguments string) (string, error) {
+				if strings.TrimSpace(arguments) == "" {
+					var empty In
+					return call(ctx, empty)
+				}
+				var raw map[string]jsontext.Value
+				if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
+					return "", ErrInvalidToolArguments.Wrap(fmt.Errorf("ai: tool %s: arguments: want an object: %w", name, err))
+				}
+				var in In
+				fields := ToolFieldContext{Raw: raw, Path: ""}
+				if err := DecodeToolFields[In](&in, fields); err != nil {
+					return "", ErrInvalidToolArguments.Wrap(fmt.Errorf("ai: tool %s: arguments: %w", name, err))
+				}
+				return call(ctx, in)
+			},
+		}
+	} else {
+		return Tool{
+			Name:        name,
+			Description: description,
+			Schema:      ToolSchemaText(s),
+			Call: func(ctx context.Context, arguments string) (string, error) {
+				if strings.TrimSpace(arguments) == "" {
+					var empty In
+					return call(ctx, empty)
+				}
+				var in In
+				if err := json.Unmarshal([]byte(arguments), any(&in)); err != nil {
+					return "", ErrInvalidToolArguments.Wrap(fmt.Errorf("ai: tool %s: arguments: %w", name, err))
+				}
+				return call(ctx, in)
+			},
+		}
+	}
+}
+
+type ToolFieldContext struct {
+	Raw  map[string]jsontext.Value
+	Path string
+}
+
+func DecodeToolFields[T any](dst *(T), ctx ToolFieldContext) error {
+	known := map[string]bool{}
+	const for _, f := range comptime.Fields[T]() {
+		wire := schema.WireName(f.Tag.Get("json"), f.Name)
+		if wire != "" {
+			known[wire] = true
+		}
+	}
+	for key := range ctx.Raw {
+		_, ok := known[key]
+		if !ok {
+			at := key
+			if ctx.Path != "" {
+				at = ctx.Path + "." + key
+			}
+			return fmt.Errorf("unknown field %q", at)
+		}
+	}
+	const for _, f := range comptime.Fields[T]() {
+		if err := DecodeToolField[f.Type](&dst.[f], f.Tag.Get("json"), f.Name, ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func DecodeToolField[F any](dst *(F), tag string, name string, ctx ToolFieldContext) error {
+	wire := schema.WireName(tag, name)
+	if wire == "" {
+		return nil
+	}
+	at := wire
+	if ctx.Path != "" {
+		at = ctx.Path + "." + wire
+	}
+	v, present := ctx.Raw[wire]
+	if !present || len(v) == 0 || string(v) == "null" {
+		filled, fillErr := FillToolOption(any(dst), nil)
+		if fillErr != nil {
+			return fillErr
+		}
+		if filled {
+			return nil
+		}
+		if !present {
+			return fmt.Errorf("missing field %q", at)
+		}
+		return fmt.Errorf("null in field %q", at)
+	}
+	const if comptime.IsStruct[F]() {
+		return DecodeToolFieldValue[F](dst, v, at)
+	} else {
+		return DecodeToolFieldValue[F](dst, v, at)
+	}
+}
+func DecodeToolFieldValue[F any](dst *(F), v jsontext.Value, at string) error {
+	filled, fillErr := FillToolValue(any(dst), v)
+	if fillErr != nil {
+		return fmt.Errorf("field %q: %w", at, fillErr)
+	}
+	if filled {
+		return nil
+	}
+	const if comptime.IsStruct[F]() {
+		var inner map[string]jsontext.Value
+		if err := json.Unmarshal([]byte(v), &inner); err != nil {
+			return fmt.Errorf("field %q: want an object", at)
+		}
+		innerCtx := ToolFieldContext{Raw: inner, Path: at}
+		return DecodeToolFields[F](dst, innerCtx)
+	} else {
+		filled, fillErr := FillToolOption(any(dst), v)
+		if fillErr != nil {
+			return fmt.Errorf("field %q: %w", at, fillErr)
+		}
+		if filled {
+			return nil
+		}
+		if err := RecodeToolValue(any(dst), v); err != nil {
+			var zero F
+			return fmt.Errorf("field %q: unsupported type %T: %w", at, zero, err)
+		}
+		return nil
+	}
+}
+
+func FillToolValue(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *time.Time:
+		s, err := toolJSONString(v)
+		if err != nil {
+			return true, fmt.Errorf("want a date-time string")
+		}
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return true, err
+		}
+		*p = t
+		return true, nil
+	case *time.Duration:
+		d, err := toolDuration(v)
+		if err != nil {
+			return true, err
+		}
+		*p = d
+		return true, nil
+	case *[]byte:
+		s, err := toolJSONString(v)
+		if err != nil {
+			return true, fmt.Errorf("want a string")
+		}
+		*p = []byte(s)
+		return true, nil
+	}
+	return toolFillSlice(dst, v)
+}
+
+func FillToolOption(dst any, v jsontext.Value) (bool, error) {
+	filled, err := toolFillOptionA(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	filled, err = toolFillOptionB(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	filled, err = toolFillOptionC(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	filled, err = toolFillOptionSliceA(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	filled, err = toolFillOptionSliceB(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	return toolFillOptionItems(dst, v)
+}
+
+func RecodeToolValue(dst any, v jsontext.Value) error {
+	return json.Unmarshal([]byte(v), dst)
+}
+
+func toolFillSlice(dst any, v jsontext.Value) (bool, error) {
+	filled, err := toolFillSliceA(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	return toolFillSliceB(dst, v)
+}
+
+func toolFillSliceA(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *[]string:
+		return true, RecodeToolValue(p, v)
+	case *[]bool:
+		return true, RecodeToolValue(p, v)
+	case *[]int:
+		return true, RecodeToolValue(p, v)
+	case *[]int8:
+		return true, RecodeToolValue(p, v)
+	case *[]int16:
+		return true, RecodeToolValue(p, v)
+	case *[]int32:
+		return true, RecodeToolValue(p, v)
+	case *[]int64:
+		return true, RecodeToolValue(p, v)
+	}
+	return false, nil
+}
+
+func toolFillSliceB(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *[]uint:
+		return true, RecodeToolValue(p, v)
+	case *[]uint16:
+		return true, RecodeToolValue(p, v)
+	case *[]uint32:
+		return true, RecodeToolValue(p, v)
+	case *[]uint64:
+		return true, RecodeToolValue(p, v)
+	case *[]float32:
+		return true, RecodeToolValue(p, v)
+	case *[]float64:
+		return true, RecodeToolValue(p, v)
+	case *[]time.Time:
+		return true, RecodeToolValue(p, v)
+	case *[]time.Duration:
+		out, err := toolDurationList(v)
+		if err != nil {
+			return true, err
+		}
+		*p = out
+		return true, nil
+	}
+	return false, nil
+}
+func toolDurationList(v jsontext.Value) ([]time.Duration, error) {
+	var arr []jsontext.Value
+	if err := json.Unmarshal([]byte(v), &arr); err != nil {
+		return nil, fmt.Errorf("want an array")
+	}
+	out := make([]time.Duration, 0, len(arr))
+	for _, item := range arr {
+		d, err := toolDuration(item)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func toolWrapOptionValue[E any](dst *rt.Option[E], v jsontext.Value) (bool, error) {
+	if toolValueNull(v) {
+		*dst = rt.Option[E]{}
+		return true, nil
+	}
+	var e E
+	if err := RecodeToolValue(&e, v); err != nil {
+		return true, err
+	}
+	*dst = rt.Option[E]{Value: e, Present: true}
+	return true, nil
+}
+
+func toolWrapOptionSlice[E any](dst *rt.Option[[]E], v jsontext.Value) (bool, error) {
+	if toolValueNull(v) {
+		*dst = rt.Option[[]E]{}
+		return true, nil
+	}
+	var e []E
+	if err := RecodeToolValue(&e, v); err != nil {
+		return true, err
+	}
+	*dst = rt.Option[[]E]{Value: e, Present: true}
+	return true, nil
+}
+
+func toolFillOptionA(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *rt.Option[string]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[bool]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[int]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[int8]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[int16]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[int32]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[int64]:
+		return toolWrapOptionValue(p, v)
+	}
+	return false, nil
+}
+
+func toolFillOptionB(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *rt.Option[uint]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[uint8]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[uint16]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[uint32]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[uint64]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[float32]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[float64]:
+		return toolWrapOptionValue(p, v)
+	}
+	return false, nil
+}
+
+func toolFillOptionC(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *rt.Option[[]byte]:
+		if toolValueNull(v) {
+			*p = rt.Option[[]byte]{}
+			return true, nil
+		}
+		s, err := toolJSONString(v)
+		if err != nil {
+			return true, fmt.Errorf("want a string")
+		}
+		*p = rt.Option[[]byte]{Value: []byte(s), Present: true}
+		return true, nil
+	case *rt.Option[time.Time]:
+		return toolWrapOptionValue(p, v)
+	case *rt.Option[time.Duration]:
+		if toolValueNull(v) {
+			*p = rt.Option[time.Duration]{}
+			return true, nil
+		}
+		d, err := toolDuration(v)
+		if err != nil {
+			return true, err
+		}
+		*p = rt.Option[time.Duration]{Value: d, Present: true}
+		return true, nil
+	}
+	return false, nil
+}
+
+func toolFillOptionSliceA(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *rt.Option[[]string]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]bool]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]int]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]int8]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]int16]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]int32]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]int64]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]uint]:
+		return toolWrapOptionSlice(p, v)
+	}
+	return false, nil
+}
+
+func toolFillOptionSliceB(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *rt.Option[[]uint16]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]uint32]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]uint64]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]float32]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]float64]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]time.Time]:
+		return toolWrapOptionSlice(p, v)
+	case *rt.Option[[]time.Duration]:
+		if toolValueNull(v) {
+			*p = rt.Option[[]time.Duration]{}
+			return true, nil
+		}
+		out, err := toolDurationList(v)
+		if err != nil {
+			return true, err
+		}
+		*p = rt.Option[[]time.Duration]{Value: out, Present: true}
+		return true, nil
+	}
+	return false, nil
+}
+
+func toolFillOptionItems(dst any, v jsontext.Value) (bool, error) {
+	filled, err := toolFillOptionItemsA(dst, v)
+	if err != nil {
+		return false, err
+	}
+	if filled {
+		return true, nil
+	}
+	return toolFillOptionItemsB(dst, v)
+}
+
+func toolFillOptionItemsA(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *[]rt.Option[string]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[bool]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[int]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[int8]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[int16]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[int32]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[int64]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionA)
+	case *[]rt.Option[uint]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	case *[]rt.Option[uint8]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	}
+	return false, nil
+}
+
+func toolFillOptionItemsB(dst any, v jsontext.Value) (bool, error) {
+	switch p := dst.(type) {
+	case *[]rt.Option[uint16]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	case *[]rt.Option[uint32]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	case *[]rt.Option[uint64]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	case *[]rt.Option[float32]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	case *[]rt.Option[float64]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionB)
+	case *[]rt.Option[[]byte]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionC)
+	case *[]rt.Option[time.Time]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionC)
+	case *[]rt.Option[time.Duration]:
+		return true, toolAppendOptionGroup(p, v, toolFillOptionC)
+	}
+	return false, nil
+}
+
+func toolAppendOptionGroup[E any](dst *[]rt.Option[E], arr jsontext.Value, fill func(any, jsontext.Value) (bool, error)) error {
+	var items []jsontext.Value
+	if err := json.Unmarshal([]byte(arr), &items); err != nil {
+		return fmt.Errorf("want an array")
+	}
+	out := make([]rt.Option[E], 0, len(items))
+	for _, item := range items {
+		var e rt.Option[E]
+		done, err := fill(any(&e), item)
+		if err != nil {
+			return err
+		}
+		if !done {
+			return fmt.Errorf("unsupported element type %T", e)
+		}
+		out = append(out, e)
+	}
+	*dst = out
+	return nil
+}
+
+func toolDuration(v jsontext.Value) (time.Duration, error) {
+	if toolValueNull(v) {
+		return 0, fmt.Errorf("want a duration string")
+	}
+	var s string
+	if err := json.Unmarshal([]byte(v), &s); err != nil {
+		return 0, fmt.Errorf("want a duration string")
+	}
+	return time.ParseDuration(s)
+}
+
+func toolValueNull(v jsontext.Value) bool {
+	return len(v) == 0 || string(v) == "null"
+}
+
+func toolJSONString(v jsontext.Value) (string, error) {
+	if toolValueNull(v) {
+		return "", fmt.Errorf("not a string")
+	}
+	var s string
+	if err := json.Unmarshal([]byte(v), &s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+func ToolSchemaText(s schema.Schema) string {
+	switch v := s.(type) {
+	case schema.Object:
+		return objectText(v)
+	case schema.Array:
+		return `{"type":"array","items":` + nodeText(v.Items) + `}`
+	case schema.Optional:
+		return nodeText(v.Items)
+	case schema.String:
+		return stringText(v)
+	case schema.Integer:
+		return `{"type":"integer"}`
+	case schema.Number:
+		return `{"type":"number"}`
+	case schema.Boolean:
+		return `{"type":"boolean"}`
+	case nil:
+		return "true"
+	}
+	return "true"
+}
+
+func nodeText(n *schema.Node) string {
+	if n == nil {
+		return "true"
+	}
+	return ToolSchemaText(n.Value)
+}
+
+func objectText(o schema.Object) string {
+	var out strings.Builder
+	out.WriteString(`{"type":"object","properties":{`)
+	first := true
+	var required []string
+	for _, f := range o.Fields {
+		if !first {
+			out.WriteString(",")
+		}
+		first = false
+		out.WriteString(jsonString(f.Wire))
+		out.WriteString(":")
+		out.WriteString(nodeText(f.Schema))
+		if !isOptional(f.Schema) {
+			required = append(required, f.Wire)
+		}
+	}
+	out.WriteString(`},"required":[`)
+	for i, name := range required {
+		if i > 0 {
+			out.WriteString(",")
+		}
+		out.WriteString(jsonString(name))
+	}
+	out.WriteString(`],"additionalProperties":false}`)
+	return out.String()
+}
+
+func stringText(s schema.String) string {
+	if s.Format == "" {
+		return `{"type":"string"}`
+	}
+	return `{"type":"string","format":` + jsonString(s.Format) + `}`
+}
+
+func isOptional(n *schema.Node) bool {
+	if n == nil {
+		return false
+	}
+	_, ok := n.Value.(schema.Optional)
+	return ok
+}
+
+func jsonString(s string) string {
+	out, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(out)
+}
