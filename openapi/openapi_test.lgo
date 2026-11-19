@@ -423,3 +423,78 @@ func TestDefaultResponseDocumentsFaultFields(t *testing.T) {
 		}
 	}
 }
+
+func TestWildcardSegmentsNormalizeToNamedParameters(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/files/{rest...}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Handle("GET", "/items/{$}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := openapi.Document(r, fixtureInfo())
+	if _, bad := doc.Paths["/files/{rest...}"]; bad {
+		t.Fatalf("document keeps the raw multi wildcard key")
+		return
+	}
+	if _, bad := doc.Paths["/items/{$}"]; bad {
+		t.Fatalf("document keeps the raw anchor key")
+		return
+	}
+	files := doc.Paths["/files/{rest}"] ?? openapi.PathItem{}
+	if files.Get == nil {
+		t.Fatalf("document needs /files/{rest}")
+		return
+	}
+	op := files.Get ?? &openapi.Operation{}
+	found := false
+	for _, p := range op.Parameters {
+		if p.Name == "rest" && p.In == "path" && p.Required {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("files operation names no required path parameter rest")
+		return
+	}
+	items := doc.Paths["/items/"] ?? openapi.PathItem{}
+	if items.Get == nil {
+		t.Fatalf("document needs /items/")
+		return
+	}
+	anchor := items.Get ?? &openapi.Operation{}
+	if len(anchor.Parameters) != 0 {
+		t.Fatalf("anchor route documents %d parameters, want none", len(anchor.Parameters))
+		return
+	}
+}
+
+func TestDocEndpointExclusionKeepsUnrelatedRoutes(t *testing.T) {
+	r := web.NewRouter()
+	openapi.Mount(r, fixtureInfo())
+	r.Handle("POST", "/openapi.json", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Handle("GET", "/reports/openapi.json", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := openapi.Document(r, fixtureInfo())
+	if len(doc.Paths) != 2 {
+		t.Fatalf("document holds %d paths, want 2", len(doc.Paths))
+		return
+	}
+	posted := doc.Paths["/openapi.json"] ?? openapi.PathItem{}
+	if posted.Post == nil {
+		t.Fatalf("document drops POST /openapi.json")
+		return
+	}
+	if posted.Get != nil {
+		t.Fatalf("document keeps the served GET /openapi.json")
+		return
+	}
+	reports := doc.Paths["/reports/openapi.json"] ?? openapi.PathItem{}
+	if reports.Get == nil {
+		t.Fatalf("document drops GET /reports/openapi.json")
+		return
+	}
+}

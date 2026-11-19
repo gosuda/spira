@@ -77,7 +77,8 @@ func Mount(r *web.Router, info Info)
 - `Document` MUST build one path item per distinct path of `Routes`.
 - `Document` MUST skip a route whose method has no item field.
 - `Document` MUST strip a host prefix from the pattern before it builds the path.
-- `Document` MUST skip the `/openapi.json` route that `Mount` serves.
+- `Document` MUST skip the `GET /openapi.json` route that `Mount` serves and keep every other method and path.
+- `Document` MUST rewrite a `{name...}` segment to `{name}` and drop a trailing `{$}` segment, keeping the slash, before it builds the path.
 - `Document` MUST take each path parameter from a `{name}` segment of the path.
 - `Document` MUST mark every path parameter as required.
 - `Document` MUST refine a path parameter with the input field whose source is path and whose wire name matches.
