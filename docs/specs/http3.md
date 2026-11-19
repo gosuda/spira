@@ -30,7 +30,7 @@ var ErrH3Shutdown = fault.New("http3.h3_shutdown", fault.Internal, "The HTTP/3 s
 func Faults() []*fault.Error
 ```
 
-The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP/3 on.
+The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on.
 
 ## Requirements
 
@@ -46,6 +46,7 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 - When `H3` is true and `TLS` is nil, `Start` MUST fail and MUST NOT listen.
 - The UDP listener MUST negotiate only ALPN `h3`.
 - The UDP listener MUST use TLS 1.3 with no older version.
+- `ReadHeaderTimeout` MUST bound the TCP listener header reads only. It MUST NOT be presented as bounding HTTP/3 header reads: `quic-go` v0.65.0 parses HEADERS with no per-stream deadline (a size cap only, through `MaxHeaderBytes`), so a stalled header block outlives the setting while other streams keep the connection alive.
 - The TCP listener MUST keep the ALPN list that [web](web.md) fixes.
 - Each HTTPS response MUST carry `Alt-Svc: h3=":<port>"; ma=2592000` while the UDP listener is open, with the actual UDP port.
 - A cleartext response MUST NOT carry that header.
@@ -69,6 +70,8 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - Extended CONNECT over HTTP/3 MUST stay unbuilt, as [web](web.md) states for HTTP/2.
+- The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
+- `quic-go` v0.65.0 sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` on every connection: `http3.Server.settings` hardcodes `ExtendedConnect: true` with no knob, and `AdditionalSettings` refuses RFC 9114 ids. Peers may therefore attempt extended CONNECT, and the 501 boundary above is the enforcement.
 
 ### Faults
 
@@ -100,10 +103,12 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 - `TestH3ServesHTTP3OverUDP` proves that a request over UDP gets the router answer with ALPN `h3`.
 - `TestH3SharesRouterWithTCP` proves that the same route answers over both listeners.
 - `TestH3AltSvcOnHTTPSOnly` proves the header value on HTTPS and its absence on cleartext and when `H3` is false.
+- `TestH3AltSvcIgnoresRegistrationOrder` proves that discovery works whether the stage is added before or after route registration.
 - `TestH3RequiresTLS13` proves that a pre-1.3 handshake on the UDP listener fails.
 - `TestH3StopDrainsWithinGrace` proves that `Stop` waits for a live HTTP/3 request.
 - `TestH3StopClosesUDPListener` proves that the UDP port rebinds right after `Stop`.
 - `TestH3StopShutsTCPWhileH3Drains` proves that TCP stops accepting while an HTTP/3 request drains.
+- `TestH3RefusesExtendedConnect` proves that an extended CONNECT request answers 501 without reaching the router while plain H3 traffic still passes.
 - `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
 - `TestH3RefusesEarlyData` proves that the QUIC config refuses 0-RTT.
 - `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.

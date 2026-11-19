@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -273,6 +274,27 @@ func (s *Server) hostAllowed(raw string) bool {
 	return false
 }
 
+func tokenHostAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return false
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return true
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 func (s *Server) store(inst Instance) (bool, bool) {
 	stored := false
 	created := false
@@ -382,7 +404,7 @@ func (s *Server) probe(ctx context.Context, opsURL string, breaker *resilience.B
 	}
 	breaker.Now = s.Now
 	header := http.Header{}
-	if token := s.ProbeToken ?? ""; token != "" {
+	if token := s.ProbeToken ?? ""; token != "" && tokenHostAllowed(opsURL) {
 		header.Set("Authorization", "Bearer "+token)
 	}
 	c := client.New(strings.TrimSuffix(opsURL, "/"), resilience.Policy{Timeout: 5 * time.Second, Breaker: breaker})
@@ -437,6 +459,9 @@ func (c *Client) remove(ctx context.Context) error {
 }
 
 func (c *Client) send(ctx context.Context, method string, path string, body []byte) error {
+	if token := c.Token ?? ""; token != "" && !tokenHostAllowed(c.Server) {
+		return ErrRegistryUnreachable.Wrap(errors.New("admin: refuses to send a token over plaintext HTTP to a non-loopback host"))
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var reader io.Reader

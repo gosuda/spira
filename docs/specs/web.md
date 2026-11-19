@@ -256,6 +256,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - The first registered stage MUST be the outermost stage.
 - `Group` MUST give the inner router the parent stages from the time of the call.
 - A `Use` after `Group` MUST NOT apply to a route inside that group.
+- A `Use` on a router MUST apply to the routes that router registered before the call.
 - `Routes` MUST list each route in registration order.
 - `Routes` MUST return a new slice on each call.
 - `Routes` MUST copy each `Doc` response list.
@@ -468,6 +469,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 
 - `TestPageReplyRespectsHtmxHeaders` proves the full page, the fragment and the boosted page, plus `Vary`.
 - `TestStageOrderFollowsRegistration` and `TestStageAfterGroupSkipsInnerRoutes` prove stage order.
+- `TestLateUseAppliesToEarlierRoutes` proves that a stage added after route registration still runs.
 - `TestRedirectUnderHtmxAndPlain` proves `HX-Redirect` and `Location`.
 - `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped or joined fault.
 - `TestInternalFaultIsLoggedOnce` proves that a 500 fault is logged once while a 409 fault stays quiet.
@@ -502,6 +504,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestUnmatchedChainWrapsAStageOnlyAtUse` proves that an unmatched request wraps no stage and that a later `Use` still applies.
 - `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*` and the root stage header.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
+- `TestServerClosesSlowHeadersWithinReadHeaderTimeout` proves that the TCP listener closes stalled headers within the timeout.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
 - `TestStartWithoutTLSCertificateFailsAndFreesThePort` proves that a missing certificate fails `Start` before binding and leaves the port free.
 - `TestStartWithDynamicCertificateConfigServes` proves that a dynamic certificate config still starts.

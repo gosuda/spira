@@ -99,10 +99,11 @@ func Faults() []*fault.Error
 - The poll client MUST NOT follow redirects.
 - The poll MUST use one breaker per instance.
 - A nil `Now` MUST mean `time.Now`.
-- The probe MUST send the operator token when set.
+- The probe MUST send the operator token when set and the target uses TLS or a loopback host; otherwise it MUST probe without the token.
+- The probe MUST NOT send the token over plaintext HTTP to a non-loopback host. Loopback means the literal host `localhost` (any case) or an IP literal in a loopback range (`127.0.0.0/8`, `::1`).
 - The poll MUST probe each instance concurrently with a bound of 8.
 - Each result MUST apply and publish as its probe completes.
-- A cancelled sweep MUST apply and publish nothing.
+- A cancelled sweep MUST apply and publish nothing further: results that completed before the cancellation stay applied and published, and the rest are dropped.
 - An unhealthy answer MUST mark that instance down.
 - A status change MUST publish exactly one event.
 - `Start` MUST begin polling and `Stop` MUST end it.
@@ -111,7 +112,7 @@ func Faults() []*fault.Error
 
 - `Client.Start` MUST register `Self` with `POST /admin/instances`.
 - `Client.Stop` MUST remove `Self` with `DELETE /admin/instances/{name}`.
-- `Client` MUST send its token as a bearer header when set.
+- `Client` MUST send its token as a bearer header when set and the server URL uses TLS or a loopback host; otherwise `Start` and `Stop` MUST fail without sending.
 - `Client.Stop` MUST tolerate a 404 answer.
 - A second `Stop` MUST still succeed.
 
@@ -158,6 +159,7 @@ func Faults() []*fault.Error
 - `TestAdminHandoff` proves that an old client stop keeps the replacement.
 - `TestAdminPollConcurrent` proves that a healthy row flips before a blocked probe ends.
 - `TestAdminStopPreservesStatus` proves that a stopped sweep keeps the status silent.
+- `TestAdminCancelledSweepKeepsCompletedDropsRest` proves that a cancelled sweep keeps completed results, drops the rest, and the caller gets nil.
 - `TestAdminMountRequiresGuard` proves the panic for a nil guard.
 - `TestAdminRejectsBadConfig` proves the panics for a bad interval and a bad bound.
 - `TestAdminReRegisterSameURLKeepsStatus` proves that a repeat keeps up and a move resets unknown.
@@ -166,6 +168,8 @@ func Faults() []*fault.Error
 - `TestAdminListedHostAcceptedAndPolled` proves that a listed host is accepted and polled.
 - `TestAdminRedirectOutsideAllowlistMakesNoSecondRequest` proves that a redirect outside the allowlist is not followed.
 - `TestAdminRefusesCredentialedAndForeignSchemeURLs` proves that credentialed and foreign-scheme URLs are refused without echo.
+- `TestTokenHostAllowedScope` proves that tokens go over TLS and to loopback hosts only.
+- `TestAdminClientRefusesTokenOverPlaintextRemote` proves that `Start` and `Stop` fail without sending over plaintext HTTP to a remote host.
 
 ## Not in scope
 

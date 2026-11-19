@@ -40,7 +40,7 @@ func fullPattern(prefix string, pattern string) string {
 func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler) {
 	full := fullPattern(r.prefix, pattern)
 	r.recordRoute(method, full, in, nil)
-	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
+	r.mux.Handle(method+" "+full, r.remember(h))
 }
 
 func RouteSchema[In any]() schema.Schema {

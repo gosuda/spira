@@ -1022,3 +1022,160 @@ func TestDeleteWithEmptySelectorKeepsTheRecord(t *testing.T) {
 		return
 	}
 }
+func TestTokenHostAllowedScope(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"https://registry.example/", true},
+		{"https://registry.example:8443/admin", true},
+		{"http://127.0.0.1:8080/", true},
+		{"http://127.1.2.3:8080/", true},
+		{"http://[::1]:8080/", true},
+		{"http://localhost:8080/", true},
+		{"http://LOCALHOST:8080/", true},
+		{"http://203.0.113.7/", false},
+		{"http://registry.example/", false},
+		{"http://[2001:db8::1]/", false},
+		{"http://refused.invalid/", false},
+		{"http://without-port", false},
+		{"://bad", false},
+	}
+	for _, tc := range cases {
+		if got := admin.TokenHostAllowedForTest(tc.url); got != tc.want {
+			t.Fatalf("token host %q allowed = %v, want %v", tc.url, got, tc.want)
+			return
+		}
+	}
+}
+
+func TestAdminClientRefusesTokenOverPlaintextRemote(t *testing.T) {
+	remote := &admin.Client{Server: "http://refused.invalid", Self: admin.Instance{Name: "shop", OpsURL: "http://shop.example"}, Token: testToken}
+	if err := remote.Start(t.Context()); err == nil {
+		t.Fatal("token send over plaintext HTTP to a remote host succeeded")
+		return
+	} else if !strings.Contains(err.Error(), "refuses to send a token") {
+		t.Fatalf("plaintext remote token error = %v, want the token refusal", err)
+		return
+	}
+	if err := remote.Stop(t.Context()); err == nil {
+		t.Fatal("token delete over plaintext HTTP to a remote host succeeded")
+		return
+	} else if !strings.Contains(err.Error(), "refuses to send a token") {
+		t.Fatalf("plaintext remote token delete error = %v, want the token refusal", err)
+		return
+	}
+}
+func cancelWhenRowUp(ts *httptest.Server, ctx context.Context, wants []string, cancel context.CancelFunc) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/admin", nil)
+		if err != nil {
+			return fmt.Errorf("admin test: page request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			return fmt.Errorf("admin test: page get: %w", err)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if cerr := resp.Body.Close(); cerr != nil {
+			return fmt.Errorf("admin test: close page: %w", cerr)
+		}
+		if err != nil {
+			return fmt.Errorf("admin test: read page: %w", err)
+		}
+		if pageHolds(string(body), wants) {
+			cancel()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("admin test: row never held %v within budget", wants)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type sweepCancel struct {
+	tap    *sseTap
+	ts     *httptest.Server
+	stream *http.Response
+	cancel context.CancelFunc
+}
+
+func (d *sweepCancel) run(ctx context.Context) error {
+	if cerr := cancelWhenRowUp(d.ts, ctx, []string{"fast", "up"}, d.cancel); cerr != nil {
+		return cerr
+	}
+	event, ok := d.tap.next(ctx, 3*time.Second)
+	if !ok {
+		return fmt.Errorf("stream sent no heartbeat within 3s")
+	}
+	if event != ": live\n\n" {
+		return fmt.Errorf("first stream message %q, want the heartbeat comment", event)
+	}
+	event, ok = d.tap.next(ctx, 3*time.Second)
+	if !ok {
+		return fmt.Errorf("fast instance sent no event within 3s")
+	}
+	if !strings.Contains(event, "instance-fast") || !strings.Contains(event, "<td>up</td>") {
+		return fmt.Errorf("first event %q must name fast as up", event)
+	}
+	if second, ok := d.tap.next(ctx, 300*time.Millisecond); ok {
+		return fmt.Errorf("second stream message %q after cancel, want exactly one event", second)
+	}
+	if cerr := d.stream.Body.Close(); cerr != nil {
+		return fmt.Errorf("admin test: close events: %w", cerr)
+	}
+	return nil
+}
+
+func TestAdminCancelledSweepKeepsCompletedDropsRest(t *testing.T) {
+	fast := fixedHealth(http.StatusOK, "ok")
+	defer fast.Close()
+	release := make(chan struct{})
+	defer close(release)
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		select {
+		case <-release:
+		case <-req.Context().Done():
+		}
+	}))
+	defer blocked.Close()
+	srv := &admin.Server{Interval: time.Hour, MaxInstances: 10, AllowedHosts: []string{hostOf(t, fast.URL), hostOf(t, blocked.URL)}}
+	ts := httptest.NewServer(newAdminRouter(srv, tokenGuard()))
+	defer ts.Close()
+	if code := postInstance(t, ts, "fast", fast.URL); code != http.StatusCreated {
+		t.Fatalf("fast POST status = %d, want 201", code)
+		return
+	}
+	if code := postInstance(t, ts, "slow", blocked.URL); code != http.StatusCreated {
+		t.Fatalf("slow POST status = %d, want 201", code)
+		return
+	}
+	gctx, gcancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer gcancel()
+	sctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stream := openEvents(t, ts, gctx)
+	if stream == nil {
+		t.Fatal("events stream did not open")
+		return
+	}
+	tap := newSseTap()
+	if gerr := func() error {
+		go group (gctx) {
+			go { tap.read(gctx, stream.Body)? }
+			go { (&sweepCancel{tap: tap, ts: ts, stream: stream, cancel: cancel}).run(gctx)? }
+			go { srv.PollOnceForTest(sctx)? }
+		}
+		return nil
+	}(); gerr != nil {
+		t.Fatalf("go group: %v", gerr)
+		return
+	}
+	if code, body := getPage(t, ts, "/admin"); !pageHolds(body, []string{"fast", "up", "slow", "unknown"}) {
+		t.Fatalf("page after cancelled sweep status = %d, body %q must keep fast up and slow unknown", code, body)
+		return
+	}
+}

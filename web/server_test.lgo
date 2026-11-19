@@ -1265,3 +1265,45 @@ func TestTrackConnWithoutServerReturnsUntracked(t *testing.T) {
 		return
 	}
 }
+func TestServerClosesSlowHeadersWithinReadHeaderTimeout(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "hi"}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ReadHeaderTimeout: 300 * time.Millisecond}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+	conn, derr := net.DialTimeout("tcp", addr, 5*time.Second)
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, werr := fmt.Fprintf(conn, "GET /hello HTTP/1.1\r\nHost: %s\r\nX-Stall: ", addr); werr != nil {
+		t.Fatalf("write partial headers: %v", werr)
+		return
+	}
+	if derr := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); derr != nil {
+		t.Fatalf("set read deadline: %v", derr)
+		return
+	}
+	start := time.Now()
+	_, rerr := conn.Read(make([]byte, 1))
+	elapsed := time.Since(start)
+	if rerr == nil {
+		t.Fatal("stalled headers got a response byte")
+		return
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("stalled headers stayed open %v past the 300ms header timeout", elapsed)
+		return
+	}
+}
