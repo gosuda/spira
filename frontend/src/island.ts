@@ -13,6 +13,15 @@ export type IslandMount = (
 	props: Record<string, unknown>,
 ) => IslandCleanup | undefined;
 
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable {
+	const table: IslandTable = {};
+	for (const [path, loader] of Object.entries(modules)) {
+		const entry = path.replace(/^\.\.\/\.\.\//, "");
+		table[entry] = loader as IslandLoader;
+	}
+	return table;
+}
+
 type Adapter = { ext: string; mount: IslandMount };
 
 const adapters: Adapter[] = [

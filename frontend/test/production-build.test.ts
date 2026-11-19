@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { build } from "vite";
+import { tableFromGlob } from "../src/island";
 
 const BUILD_TIMEOUT_MS = 120000;
 
@@ -253,5 +254,25 @@ describe("production build", () => {
 	test("builds the application entry that owns the island glob", () => {
 		const codes = codesOf(closureChunks(appChunks, APP_ENTRY));
 		expect(codes).toContain("spira-island");
+		expect(codes).toContain("defineIslands");
+	});
+
+	test("derives island table rows from glob paths", () => {
+		const table = tableFromGlob({
+			"../../example/shop/catalog/islands/gallery.react.tsx": () =>
+				Promise.resolve({ default: {} }),
+			"../../example/shop/catalog/islands/filter.solid.tsx": () =>
+				Promise.resolve({ default: {} }),
+			"../../example/shop/catalog/islands/badge.svelte": () =>
+				Promise.resolve({ default: {} }),
+		});
+		expect(Object.keys(table).sort()).toEqual([
+			"example/shop/catalog/islands/badge.svelte",
+			"example/shop/catalog/islands/filter.solid.tsx",
+			"example/shop/catalog/islands/gallery.react.tsx",
+		]);
+		for (const key of Object.keys(table)) {
+			expect(typeof table[key]).toBe("function");
+		}
 	});
 });

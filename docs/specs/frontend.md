@@ -11,7 +11,7 @@ File layout:
 - `src/entry.ts`, `src/island.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
  - `test/island.test.ts`, `test/island-dispose.test.ts`, `test/island-move.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`, `test/production-build.test.ts`
- - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`, `test/fixtures/Disposable.react.tsx`, `test/fixtures/Disposable.solid.tsx`, `test/fixtures/Disposable.svelte`, `test/fixtures/disposable-svelte.ts`, `test/fixtures/build-entry.ts`
+ - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`, `test/fixtures/Disposable.react.tsx`, `test/fixtures/Disposable.solid.tsx`, `test/fixtures/Disposable.svelte`, `test/fixtures/disposable-svelte.ts`, `test/fixtures/build-entry.react.ts`, `test/fixtures/build-entry.solid.ts`, `test/fixtures/build-entry.svelte.ts`
 
 Scripts in `package.json`:
 
@@ -33,7 +33,8 @@ export type IslandTable = Record<string, IslandLoader>
  ) => IslandCleanup | undefined
  export class SpiraIslandElement extends HTMLElement
  export function defineIslands(table: IslandTable): void
- export function installSlotMover(root?: ParentNode): void
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable
+export function installSlotMover(root?: ParentNode): void
  // src/adapters/react.ts, src/adapters/svelte.ts and src/adapters/solid.ts
  export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
  // src/adapters/wasm.ts
@@ -103,9 +104,10 @@ export type IslandTable = Record<string, IslandLoader>
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
  - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
- - `test/island-dispose.test.ts` proves that removing a React, Solid or Svelte island releases its mount.
- - `test/island-move.test.ts` proves that a move keeps one mount with no dispose, that a removal disposes once, that a move followed by a removal disposes once without remounting, and that a moved wasm island keeps one Go program.
- - `test/production-build.test.ts` proves one entry chunk per island, no raw JSX or Svelte markup in the output, and the Solid compiler in the Solid chunk.
+- `test/island-dispose.test.ts` proves that removing a React, Solid or Svelte island releases its mount with exactly one cleanup.
+- `test/island-move.test.ts` proves that a move keeps one mount with no dispose and no cleanup, that a removal runs one cleanup and still one after extra microtask turns, that a move followed by a removal disposes once without remounting, that a re-inserted island mounts again and disposes the new mount once, and that a moved wasm island keeps one Go program.
+ - `test/production-build.test.ts` proves each island table ships its component and registration key, the compiled bodies with their runtimes, production output, and the application entry that owns the island glob.
+ - It also proves a glob result derives repo relative island keys.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
 - `test/entry.test.ts` proves `spira-island` is defined and the `sse` extension is registered after `entry.ts` loads.
 - `test/corpus.test.ts` checks the slot and island lines of `wire/corpus.jsonl` against the client.
