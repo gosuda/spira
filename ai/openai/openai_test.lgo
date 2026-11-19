@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1477,5 +1478,53 @@ func TestIdleProbeAffectsOnlyItsOwnClient(t *testing.T) {
 	}
 	if probe.Resets != resets {
 		t.Fatalf("the probe counted %d resets after another client streamed, want %d", probe.Resets, resets)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls *atomic.Int64
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestEmbedBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	transport := &cutTransport{calls: &calls, total: (1 << 20) + (128 << 10) + 1, cut: io.ErrUnexpectedEOF}
+	c := &openai.Client{BaseURL: "http://openai.invalid", Model: "text-embedding-3-small", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
+	_, err := c.Embed(context.Background(), []string{"one"})
+	if err == nil || !strings.Contains(err.Error(), "ai/openai: response exceeds the size limit of 1179648 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1179648 bytes", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
 	}
 }

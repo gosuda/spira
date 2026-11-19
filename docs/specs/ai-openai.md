@@ -47,6 +47,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `Chat` MUST accept a response body of at most 1 MiB.
 - `Embed` MUST accept a response body of at most 1 MiB plus 128 KiB for each input text.
 - A larger body MUST end the call after one attempt.
+- A body already over its limit MUST end the call even when its read fails.
 - The body of a failing status MUST be cut at 1 MiB.
 - `Chat` and `Embed` MUST run each attempt under `resilience.Do` with `Policy`.
 - A 4xx answer other than 408 and 429 MUST end the call after one attempt.
@@ -107,6 +108,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestTopKGoesOutWhenTheCallerSetsIt` proves `top_k` on the wire only for a caller value.
 - `TestEmbeddingsReturnVectorsInInputOrder` proves the embed path and the vector order.
 - `TestEmbedBodyOverItsLimitIsFinal` proves the size limit and that the call is not repeated.
+- `TestEmbedBodyOverLimitWithCutConnectionIsFinal` proves a cut body over the limit ends after one attempt.
 - `TestEmbeddingIndexOutsideTheAnswerIsAnError` proves the error for an index outside the answer.
 - `TestDeepSeekReasoningPart` proves `reasoning_content` becomes a reasoning part.
 - `TestMistralChunkArrayContentAndOptions` proves the chunk-array content and the Mistral options on the wire.
