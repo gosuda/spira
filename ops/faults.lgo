@@ -1,0 +1,11 @@
+package ops
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrCheckFailed = fault.New("ops.check_failed", fault.Unavailable, "A health check failed.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrCheckFailed}
+}
