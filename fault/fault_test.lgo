@@ -10,17 +10,8 @@ import (
 	"testing"
 
 	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
 )
-
-func mustMarshal(t *testing.T, v any) []byte {
-	t.Helper()
-	bs, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-		return nil
-	}
-	return bs
-}
 
 func mustWire(t *testing.T, bs []byte) map[string]any {
 	t.Helper()
@@ -54,18 +45,14 @@ func TestPublicWithoutFaultReturnsFixedInternal(t *testing.T) {
 		t.Fatalf("Message = %q, want internal error", got.Message)
 		return
 	}
-	bs := mustMarshal(t, got)
-	for _, secret := range []string{"hunter2", "10.0.0.5", "passwd", "connect"} {
-		if strings.Contains(string(bs), secret) {
-			t.Fatalf("Public JSON holds %q: %s", secret, bs)
-			return
-		}
-	}
+	bs := faulttest.PublicJSON(t, cause)
+	faulttest.RefuseLeak(t, bs, "hunter2", "10.0.0.5", "passwd", "connect")
 }
 
 func TestPublicInternalKindReturnsFixedInternal(t *testing.T) {
 	declared := fault.New("db.io_failed", fault.Internal, "database shard unavailable")
-	got := fault.Public(declared.Wrap(errors.New("disk /dev/sda1 full")))
+	wrapped := declared.Wrap(errors.New("disk /dev/sda1 full"))
+	got := fault.Public(wrapped)
 	if got.Code != "internal" {
 		t.Fatalf("Code = %q, want internal", got.Code)
 		return
@@ -74,15 +61,8 @@ func TestPublicInternalKindReturnsFixedInternal(t *testing.T) {
 		t.Fatalf("Message = %q, want internal error", got.Message)
 		return
 	}
-	bs := mustMarshal(t, got)
-	for _, secret := range []string{"shard", "sda1"} {
-		if strings.Contains(string(bs), secret) {
-			t.Fatalf("Public JSON holds %q: %s", secret, bs)
-			return
-		}
-	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, wrapped), "shard", "sda1")
 }
-
 func TestPublicNeverReturnsCauseText(t *testing.T) {
 	secret := errors.New("token abc123 path /secret/x")
 	cases := []struct {
@@ -99,15 +79,7 @@ func TestPublicNeverReturnsCauseText(t *testing.T) {
 			t.Fatalf("%s: Code = %q, want %q", tc.name, got.Code, tc.code)
 			return
 		}
-		bs := mustMarshal(t, got)
-		if strings.Contains(string(bs), "abc123") {
-			t.Fatalf("%s: Public JSON holds the token: %s", tc.name, bs)
-			return
-		}
-		if strings.Contains(string(bs), "/secret/x") {
-			t.Fatalf("%s: Public JSON holds the path: %s", tc.name, bs)
-			return
-		}
+		faulttest.RefuseLeak(t, faulttest.PublicJSON(t, tc.err), "abc123", "/secret/x")
 	}
 }
 
@@ -149,17 +121,14 @@ func TestCredentialFaultsShareOneCode(t *testing.T) {
 	unknown := fault.New("auth.invalid_credentials", fault.Unauthenticated, message).Wrap(errors.New("no such user eve"))
 	wrong := fault.New("auth.invalid_credentials", fault.Unauthenticated, message).Wrap(errors.New("password mismatch"))
 	locked := fault.New("auth.invalid_credentials", fault.Unauthenticated, message).Wrap(errors.New("account locked"))
-	a := mustMarshal(t, fault.Public(unknown))
-	b := mustMarshal(t, fault.Public(wrong))
-	c := mustMarshal(t, fault.Public(locked))
+	a := faulttest.PublicJSON(t, unknown)
+	b := faulttest.PublicJSON(t, wrong)
+	c := faulttest.PublicJSON(t, locked)
 	if !bytes.Equal(a, b) || !bytes.Equal(b, c) {
 		t.Fatalf("credential Views differ: %s %s %s", a, b, c)
 		return
 	}
-	if strings.Contains(string(a), "eve") {
-		t.Fatalf("credential View leaks the cause: %s", a)
-		return
-	}
+	faulttest.RefuseLeak(t, a, "eve")
 	if unknown.Error() == wrong.Error() {
 		t.Fatalf("operator texts match, the log cannot tell the cases apart")
 		return
@@ -176,25 +145,23 @@ func TestFieldsCarryNoSubmittedValue(t *testing.T) {
 		t.Fatalf("Fields = %d, want 2", len(got.Fields))
 		return
 	}
-	bs := mustMarshal(t, got)
+	bs := faulttest.PublicJSON(t, bad)
 	for _, keep := range []string{"email", "format", "email is not valid", "min"} {
 		if !strings.Contains(string(bs), keep) {
 			t.Fatalf("Public JSON lacks %q: %s", keep, bs)
 			return
 		}
 	}
-	if strings.Contains(string(bs), "eve@") {
-		t.Fatalf("Public JSON holds the submitted value: %s", bs)
-		return
-	}
-	dropped := fault.Public(fault.New("db.not_found", fault.NotFound, "no such row").WithFields(
+	faulttest.RefuseLeak(t, bs, "eve@")
+	missing := fault.New("db.not_found", fault.NotFound, "no such row").WithFields(
 		fault.Field{Name: "id", Rule: "exists", Message: "constant"},
-	))
+	)
+	dropped := fault.Public(missing)
 	if len(dropped.Fields) != 0 {
 		t.Fatalf("NotFound kept %d fields, want none", len(dropped.Fields))
 		return
 	}
-	flat := mustMarshal(t, dropped)
+	flat := faulttest.PublicJSON(t, missing)
 	if strings.Contains(string(flat), "errors") {
 		t.Fatalf("NotFound JSON carries errors: %s", flat)
 		return
@@ -202,25 +169,12 @@ func TestFieldsCarryNoSubmittedValue(t *testing.T) {
 }
 
 func TestCodesAreStableAndUnique(t *testing.T) {
-	table := []fault.Code{"internal"}
-	seen := map[fault.Code]bool{}
-	for _, code := range table {
-		if seen[code] ?? false {
-			t.Fatalf("duplicate code %q in the fault code table", code)
-			return
-		}
-		seen[code] = true
-	}
-	fixed := fault.Public(errors.New("boom"))
-	if !(seen[fixed.Code] ?? false) {
-		t.Fatalf("fixed code %q is not in the fault code table", fixed.Code)
-		return
-	}
+	faulttest.CheckTable(t, "../docs/specs/fault.md", fault.Faults())
 }
 
 func TestViewCarriesNoStatus(t *testing.T) {
-	got := fault.Public(fault.New("web.not_found", fault.NotFound, "no such page"))
-	wire := mustWire(t, mustMarshal(t, got))
+	bs := faulttest.PublicJSON(t, fault.New("web.not_found", fault.NotFound, "no such page"))
+	wire := mustWire(t, bs)
 	if _, ok := wire["status"]; ok {
 		t.Fatalf("View JSON carries status: %v", wire)
 		return
@@ -337,10 +291,9 @@ func TestKindStringIsLowerSnake(t *testing.T) {
 }
 
 func TestViewUsesWireNames(t *testing.T) {
-	got := fault.Public(fault.New("web.invalid_input", fault.Invalid, "invalid request").WithFields(
+	wire := mustWire(t, faulttest.PublicJSON(t, fault.New("web.invalid_input", fault.Invalid, "invalid request").WithFields(
 		fault.Field{Name: "email", Rule: "format", Message: "email is not valid"},
-	))
-	wire := mustWire(t, mustMarshal(t, got))
+	)))
 	for _, key := range []string{"code", "message", "errors"} {
 		if _, ok := wire[key]; !ok {
 			t.Fatalf("View JSON lacks %q: %v", key, wire)
@@ -415,9 +368,6 @@ func TestErrAndWrapReturnErrors(t *testing.T) {
 		t.Fatalf("Of = %q, want db.io_failed", first.Code)
 		return
 	}
-	bs := mustMarshal(t, fault.Public(wrapped))
-	if strings.Contains(string(bs), "hunter2") {
-		t.Fatalf("Public JSON holds the cause: %s", bs)
-		return
-	}
+	bs := faulttest.PublicJSON(t, wrapped)
+	faulttest.RefuseLeak(t, bs, "hunter2")
 }

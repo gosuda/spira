@@ -217,3 +217,7 @@ type View struct {
 	Message string  `json:"message"`
 	Fields  []Field `json:"errors,omitzero"`
 }
+
+func Faults() []*Error {
+	return []*Error{New(internalCode, Internal, internalMessage)}
+}

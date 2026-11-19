@@ -48,13 +48,23 @@ func (e *Error) Unwrap() error
 func (e *Error) Is(target error) bool
 func Of(err error) *Error?
 func Public(err error) View
+func Faults() []*Error
 
 type View struct {
 	Code    Code    `json:"code"`
 	Kind    Kind    `json:"-"`
 	Message string  `json:"message"`
 	Fields  []Field `json:"errors,omitzero"`
-}
+```
+
+### Test kit
+
+Package `fault/faulttest` holds the shared disclosure checks.
+
+```lgo
+func CheckTable(t *testing.T, specPath string, faults []*fault.Error)
+func PublicJSON(t *testing.T, err error) []byte
+func RefuseLeak(t *testing.T, public []byte, planted ...string)
 ```
 
 ## Requirements
@@ -68,8 +78,12 @@ type View struct {
 - `New` MUST panic when the code is `internal` and the kind is not `Internal`.
 - `New` MUST be pure: it MUST NOT write a registry, and the package MUST hold no table of declared faults.
 - A package that declares faults MUST export `Faults() []*Error`.
-- Its test MUST compare that set with its specification code table.
+- Its test MUST call `faulttest.CheckTable` on that set.
 - Its test MUST reject duplicate codes in that set.
+- `CheckTable` MUST read the `### Code table` rows from the spec file.
+- `CheckTable` MUST fail on a duplicate, missing, or mismatched code, kind, or message.
+- `PublicJSON` MUST return the JSON of `Public` for the error.
+- `RefuseLeak` MUST fail when a planted value occurs in output.
 - `Wrap` MUST carry the cause, return an `error`, and keep the receiver unchanged.
 - `Err` MUST return the declared fault itself as an `error`.
 - `WithFields` MUST return a copy that carries the given fields and MUST NOT change the receiver.
@@ -97,9 +111,9 @@ type View struct {
 
 ### Code table
 
-| Code | Meaning |
-|---|---|
-| `internal` | The fixed view for every failure the client MUST NOT see. |
+| Code | Kind | Message |
+|---|---|---|
+| `internal` | internal | internal error |
 
 ## Errors
 
@@ -126,6 +140,7 @@ type View struct {
 - `TestViewUsesWireNames` proves the wire names of `View` and `Field`.
 - `TestNewRejectsMalformedCodes` proves the grammar panics and the kind panics.
 - `TestNewAcceptsCodeGrammar` proves the valid codes and the reserved code.
+- `TestCheckTableAcceptsMatchingSet` and five failure tests prove each defect fails. Planted fault: a table row with a wrong kind.
 
 ## Not in scope
 
