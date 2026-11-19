@@ -78,6 +78,7 @@ func readTable(f failer, specPath string) ([][3]string, bool) {
 		return nil, false
 	}
 	var table [][3]string
+	seenCodes := map[string]bool{}
 	inTable := false
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.HasPrefix(line, "### Code table") {
@@ -94,6 +95,11 @@ func readTable(f failer, specPath string) ([][3]string, bool) {
 		if !ok {
 			continue
 		}
+		if seenCodes[row[0]] ?? false {
+			f.Fatalf("duplicate fault code %q in the spec table", row[0])
+			return nil, false
+		}
+		seenCodes[row[0]] = true
 		table = append(table, row)
 	}
 	return table, true

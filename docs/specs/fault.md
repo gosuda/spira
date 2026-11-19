@@ -55,6 +55,7 @@ type View struct {
 	Kind    Kind    `json:"-"`
 	Message string  `json:"message"`
 	Fields  []Field `json:"errors,omitzero"`
+}
 ```
 
 ### Test kit
@@ -139,8 +140,7 @@ func RefuseLeak(t *testing.T, public []byte, planted ...string)
 - `TestKindStringIsLowerSnake` proves the kind texts.
 - `TestViewUsesWireNames` proves the wire names of `View` and `Field`.
 - `TestNewRejectsMalformedCodes` proves the grammar panics and the kind panics.
-- `TestNewAcceptsCodeGrammar` proves the valid codes and the reserved code.
-- `TestCheckTableAcceptsMatchingSet` and five failure tests prove each defect fails. Planted fault: a table row with a wrong kind.
+- `TestCheckTableAcceptsMatchingSet` and six failure tests prove each defect fails. Planted fault: a table row with a wrong kind.
 
 ## Not in scope
 

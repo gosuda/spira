@@ -68,6 +68,13 @@ func TestCheckTableFailsTableCodeWithoutFault(t *testing.T) {
 	expectFailure(t, path, []*fault.Error{}, "no declared fault")
 }
 
+func TestCheckTableFailsDuplicateSpecRow(t *testing.T) {
+	path := writeSpec(t, specHead+"| `a.b` | invalid | bad input |\n| `a.b` | not_found | bad input |\n")
+	expectFailure(t, path, []*fault.Error{
+		fault.New("a.b", fault.Invalid, "bad input"),
+	}, "in the spec table")
+}
+
 func TestCheckTableFailsKindMismatch(t *testing.T) {
 	path := writeSpec(t, specHead+"| `a.b` | not_found | bad input |\n")
 	expectFailure(t, path, []*fault.Error{
