@@ -1,0 +1,110 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/gosuda/spira/app"
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+	_ "{{DRIVER_IMPORT}}"
+
+	"{{MODULE}}/db/store"
+	appdb "{{MODULE}}/db"
+	"{{MODULE}}/features/account"
+	"{{MODULE}}/features/home"
+)
+
+type application struct {
+	DB  *db.Pool
+	Web *web.Server
+}
+
+func main() {
+	if err := run(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
+	pool := openPool()?
+	steps := migrate.Load(appdb.FS())?
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		return err
+	}
+	if err := store.PrepareAll(ctx, pool); err != nil {
+		return err
+	}
+	if err := ensureDemoUser(ctx, pool); err != nil {
+		return err
+	}
+	manifest := loadManifest()?
+	if manifest == nil {
+		return fmt.Errorf("demo: no asset manifest (run just web or set SPIRA_VITE_ORIGIN)")
+	}
+	tags := manifest.Tags("src/entry.ts")?
+	r := web.NewRouter()
+	for _, stage := range web.Defaults() {
+		r.Use(stage)
+	}
+	sessions := &auth.Sessions{Store: &account.DBStore{DB: pool}, Cookie: "__Host-demo", TTL: 12 * time.Hour}
+	r.Use(auth.Authenticate(sessions.Authenticator()))
+	r.Layout = func(ctx *web.Context, p web.Page) view.Node {
+		return layout(tags, p)
+	}
+	home.Mount(r)
+	(&account.Account{DB: pool, Sessions: sessions}).Mount(r)
+	r.Handle("GET", "/assets/", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: manifest.Files(os.DirFS("frontend/dist"))}, nil
+	})
+	srv := &web.Server{Addr: ":8080", Router: r}
+	return app.Run(ctx, &application{DB: pool, Web: srv})
+}
+
+func openPool() (*db.Pool, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "{{DSN}}"
+	}
+	pool := db.Open("{{DRIVER_NAME}}", dsn)?
+	if pool == nil {
+		return nil, fmt.Errorf("demo: no database pool")
+	}
+	return pool, nil
+}
+
+func loadManifest() (*asset.Manifest?, error) {
+	origin := os.Getenv("SPIRA_VITE_ORIGIN")
+	if origin != "" {
+		return asset.Dev(origin), nil
+	}
+	return asset.Load(os.DirFS("frontend/dist"), ".vite/manifest.json")
+}
+
+func ensureDemoUser(ctx context.Context, pool *db.Pool) error {
+	found := store.GetUserByName(ctx, pool, "demo")?
+	if found != nil {
+		return nil
+	}
+	hash := auth.HashPassword("demo")?
+	_, err := account.CreateUser(ctx, pool, "demo", hash)
+	return err
+}
+
+func layout(tags view.Node, p web.Page) view.Node {
+	return view.Html(
+		view.Head(
+			view.Meta(view.Attr("charset", "utf-8")),
+			view.Title(view.T(p.Title)),
+			tags,
+		),
+		view.Body(p.Body),
+	)
+}

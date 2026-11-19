@@ -154,8 +154,8 @@ func TestStructuredRefusesTrailingText(t *testing.T) {
 		t.Fatal("Structured trailing text: expected an error")
 		return
 	}
-	if !strings.HasPrefix(err.Error(), "ai: structured: ") {
-		t.Fatalf("Structured trailing text error = %q, want the ai: structured: prefix", err.Error())
+	if !errors.Is(err, ai.ErrInvalidAnswer) {
+		t.Fatalf("Structured trailing text error = %q, want the ai.invalid_answer fault", err.Error())
 	}
 }
 
@@ -165,8 +165,8 @@ func TestStructuredRefusesEmptyAnswer(t *testing.T) {
 		t.Fatal("Structured empty answer: expected an error")
 		return
 	}
-	if !errors.Is(err, ai.ErrEmpty) {
-		t.Fatalf("Structured empty answer error = %v, want ErrEmpty", err)
+	if !errors.Is(err, ai.ErrEmptyAnswer) {
+		t.Fatalf("Structured empty answer error = %v, want ErrEmptyAnswer", err)
 	}
 }
 
@@ -187,8 +187,8 @@ func TestStructuredRefusesOversizeInput(t *testing.T) {
 		t.Fatal("Structured oversize input: expected an error")
 		return
 	}
-	if !errors.Is(err, ai.ErrTooLarge) {
-		t.Fatalf("Structured oversize input error = %v, want ErrTooLarge", err)
+	if !errors.Is(err, ai.ErrAnswerTooLarge) {
+		t.Fatalf("Structured oversize input error = %v, want ErrAnswerTooLarge", err)
 	}
 }
 

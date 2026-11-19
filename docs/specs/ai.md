@@ -149,10 +149,21 @@ func Wrap(m Model, layers ...Layer) Model
 func SearchTools(all const []Tool) (Tool, Layer)
 func (n narrowing) Chat(ctx context.Context, req Request) (Reply, error)
 func (n narrowing) Stream(ctx context.Context, req Request) iter.Seq2[Chunk, error]
+func ToolOf[In any](name string, description string, call func(ctx context.Context, in In) (string, error)) Tool
+func ToolFromSchema[In any](name string, description string, call func(ctx context.Context, in In) (string, error), s schema.Schema) Tool
 
-var ErrEmpty = errors.New("ai: structured: empty answer")
-var ErrTooLarge = errors.New("ai: structured: answer exceeds the size limit of 1048576 bytes")
-var ErrUnterminatedFence = errors.New("ai: structured: unterminated code fence")
+var ErrConfirmationRequired = fault.New("ai.confirmation_required", fault.Unprocessable, "Tool calls wait for a decision.")
+var ErrToolLimitExceeded = fault.New("ai.tool_limit_exceeded", fault.Unprocessable, "The tool call limit was exceeded.")
+var ErrInvalidDecision = fault.New("ai.invalid_decision", fault.Unprocessable, "The tool call decision is invalid.")
+var ErrUnknownTool = fault.New("ai.unknown_tool", fault.Invalid, "The tool is unknown.")
+var ErrModelFailed = fault.New("ai.model_failed", fault.Unavailable, "The model request failed.")
+var ErrInvalidToolArguments = fault.New("ai.invalid_tool_arguments", fault.Invalid, "The tool arguments are invalid.")
+var ErrEmptyAnswer = fault.New("ai.empty_answer", fault.Unprocessable, "The answer is empty.")
+var ErrAnswerTooLarge = fault.New("ai.answer_too_large", fault.TooLarge, "The answer is too large.")
+var ErrUnterminatedFence = fault.New("ai.unterminated_fence", fault.Unprocessable, "The answer format is invalid.")
+var ErrInvalidAnswer = fault.New("ai.invalid_answer", fault.Unprocessable, "The answer is not valid JSON.")
+
+func Faults() []*fault.Error
 
 func FormatInstruction() string
 func Structured[T any](text string) (T, error)
@@ -194,7 +205,7 @@ func Structured[T any](text string) (T, error)
 - `Collect` MUST keep the last id and model whose trimmed text is not empty.
 - `Collect` MUST use other when no chunk carries a finish.
 - `Collect` MUST set the reply role to assistant.
-- `Collect` MUST return the stream error wrapped as `ai: collect: %w`.
+- `Collect` MUST wrap a stream failure in `ai.model_failed`.
 
 ### Run
 
@@ -203,11 +214,12 @@ func Structured[T any](text string) (T, error)
 - `Run` MUST stop when the reply holds no tool call.
 - `Run` MUST execute pending tool calls when the last message is an assistant message with tool calls.
 - `Run` MUST treat a blank argument string as `{}`.
-- `Run` MUST return an unknown tool name as the error `ai: run: no tool named "<name>"`.
+- `Run` MUST return `ai.unknown_tool` for a missing tool.
 - `Run` MUST turn a tool error into that call's result text.
+- `Run` MUST use the public message for a tool error that holds a fault.
 - `Run` MUST turn blank tool error text into `tool <name> failed`.
 - `Run` MUST return the context error when the context ends during a tool call.
-- `Run` MUST wrap a model error as `ai: run: %w`.
+- `Run` MUST wrap a model error in `ai.model_failed`.
 - `Run` MUST count only the tool results after the last user message.
 - `Run` MUST set `Skipped` on the result of a call that a denial or a limit kept from running.
 - `Run` MUST NOT count a `Skipped` result toward a limit.
@@ -265,6 +277,21 @@ func Structured[T any](text string) (T, error)
 - The layer MUST NOT add a tool that the request does not carry.
 - The layer MUST remove from each search result the names of tools that the request does not carry.
 
+### Typed tools
+
+- `ToolOf` MUST set `Schema` to the JSON Schema text of `schema.Of[In]`().
+- `ToolFromSchema` MUST keep the given name, description and call in the returned `Tool`.
+- The tool call MUST decode its arguments into `In`.
+- The tool call MUST reject unknown JSON members.
+- The tool call MUST decode blank arguments as `{}`.
+- A decode failure MUST come back as the tool error text.
+- The tool call MUST NOT run `call` when decoding fails.
+- The schema text MUST hold `type`, `properties` in field order and `required`.
+- `required` MUST hold exactly the fields whose schema is not an option.
+- The schema text MUST set `additionalProperties` to false.
+- Nested objects and arrays MUST use the same schema shape.
+- An option field MUST keep its inner schema outside `required`.
+
 ### Structured output
 
 - `Structured` MUST decode a bare JSON document into the typed value.
@@ -277,12 +304,27 @@ func Structured[T any](text string) (T, error)
 - `Structured` MUST keep an inline fence and ignore the lines after it.
 - `Structured` MUST trim surrounding whitespace before decoding.
 - `Structured` MUST ignore unknown JSON fields during decoding.
-- `Structured` MUST refuse text beyond 1048576 bytes with `ErrTooLarge`.
-- `Structured` MUST refuse blank text with `ErrEmpty`.
-- `Structured` MUST refuse an unterminated fence with `ErrUnterminatedFence`.
-- `Structured` MUST refuse trailing text after JSON with a decode error.
+- `Structured` MUST refuse text beyond 1048576 bytes with `ai.answer_too_large`.
+- `Structured` MUST refuse blank text with `ai.empty_answer`.
+- `Structured` MUST refuse an unterminated fence with `ai.unterminated_fence`.
+- `Structured` MUST refuse trailing text after JSON with `ai.invalid_answer`.
 - `FormatInstruction` MUST ask for JSON without explanations or markdown fences.
 - `FormatInstruction` MUST NOT embed a JSON Schema instance.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `ai.answer_too_large` | too_large | The answer is too large. |
+| `ai.confirmation_required` | unprocessable | Tool calls wait for a decision. |
+| `ai.empty_answer` | unprocessable | The answer is empty. |
+| `ai.invalid_answer` | unprocessable | The answer is not valid JSON. |
+| `ai.invalid_decision` | unprocessable | The tool call decision is invalid. |
+| `ai.invalid_tool_arguments` | invalid | The tool arguments are invalid. |
+| `ai.model_failed` | unavailable | The model request failed. |
+| `ai.tool_limit_exceeded` | unprocessable | The tool call limit was exceeded. |
+| `ai.unknown_tool` | invalid | The tool is unknown. |
+| `ai.unterminated_fence` | unprocessable | The answer format is invalid. |
 
 ## Errors
 
@@ -300,6 +342,7 @@ func Structured[T any](text string) (T, error)
 - `ai: run: tool calls wait for a decision: <keys>` from `ConfirmError.Error`.
 - `ai: run: Tool call limit (<n>) exceeded for tool '<name>'. No further calls to this tool are allowed in this turn.` from `LimitError.Error`.
 - `ai: run: Total tool call limit (<n>) exceeded for this turn. No further tool calls are allowed.` from `LimitError.Error`.
+- `ai: tool <name>: arguments: %w` when the tool arguments do not decode into the input type.
 - `ai: structured: empty answer` when the answer holds no JSON text.
 - `ai: structured: answer exceeds the size limit of 1048576 bytes` when the answer is too large.
 - `ai: structured: unterminated code fence` when a fence never closes.
@@ -369,6 +412,12 @@ func Structured[T any](text string) (T, error)
 - `TestSearchToolsShowsTheModelOnlyTheSearchToolAndWhatEarlierSearchesFound` proves layer narrowing.
 - `TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage` proves ignored results.
 - `TestSearchToolsNamesOnlyToolsTheRequestCarries` proves the search scope.
+- `TestToolOfSchemaMatchesHandWrittenSchema` proves the schema text.
+- `TestToolOfLeavesOptionFieldsOutOfRequired` proves the `required` rule.
+- `TestToolOfRejectsAWrongTypeWithoutRunningTheFunction` proves the type refusal.
+- `TestToolOfRejectsAnUnknownMemberWithoutRunningTheFunction` proves the unknown-member refusal.
+- `TestToolOfDecodesBlankArgumentsAsAnEmptyObject` proves the blank rule.
+- `TestToolOfRunsThroughRun` proves the loop round trip.
 - The `BeanOutputConverterTest` and `MarkdownCodeBlockCleanerTest` cases prove the structured output rules.
 - `TestStructuredDecodesBareDocument` proves the bare JSON document.
 - `TestStructuredDecodesJsonFence` proves the fence with a language tag.
@@ -394,6 +443,5 @@ func Structured[T any](text string) (T, error)
 - `MessageWindowChatMemory`. Sessions replace it.
 - The fluent builder, ordered integers, the safeguard advisor and the logger advisor. Layers replace them.
 - Lucene, vector-store and decision tool indexes. Each needs a library or a second model call.
-- Tool schemas from Go types and structured output decoding. They wait for `schema`.
 - JSON Schema generation for the format instruction. It waits for the `schema` package.
 - Thinking-tag removal. The listed rules cover fences and whitespace only.

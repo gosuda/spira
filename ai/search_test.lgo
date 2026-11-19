@@ -8,6 +8,7 @@ package ai_test
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -121,8 +122,8 @@ func TestSearchToolsReturnsAnEmptyListWhenNothingMatches(t *testing.T) {
 func TestSearchToolsRefusesArgumentsThatAreNotJSON(t *testing.T) {
 	search, _ := ai.SearchTools([]ai.Tool{described("one", "first")})
 	_, err := search.Call(t.Context(), `{"query":`)
-	if err == nil || !strings.HasPrefix(err.Error(), "ai: search tools: arguments: ") {
-		t.Fatalf("error = %v, want one behind the ai: search tools: arguments: prefix", err)
+	if err == nil || !errors.Is(err, ai.ErrInvalidToolArguments) {
+		t.Fatalf("error = %v, want the ai.invalid_tool_arguments fault", err)
 	}
 }
 

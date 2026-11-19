@@ -261,8 +261,8 @@ func TestCollectEndsWithTheStreamError(t *testing.T) {
 		t.Fatalf("error = %v, want the stream error", err)
 		return
 	}
-	if !strings.HasPrefix(err.Error(), "ai: collect: ") {
-		t.Fatalf("error %q lacks the ai: collect: prefix", err.Error())
+	if !errors.Is(err, ai.ErrModelFailed) {
+		t.Fatalf("error %q lacks the ai.model_failed fault", err.Error())
 	}
 }
 

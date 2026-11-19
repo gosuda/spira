@@ -1,0 +1,9 @@
+-- name: GetUserByName :one
+SELECT id, name, password_hash
+FROM users
+WHERE name = $1;
+
+-- name: CreateUser :one
+INSERT INTO users (name, password_hash)
+VALUES ($1, $2)
+RETURNING id;
