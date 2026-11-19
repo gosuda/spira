@@ -1,0 +1,150 @@
+package admin_test
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/admin"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestAdminFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/admin.md", admin.Faults())
+}
+
+func TestAdminFaultInvalidInstanceName(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
+	r := newAdminRouter(srv, tokenGuard())
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "a/<script>", "http://shop.example"), token: true})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST hostile name status = %d, want 422", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "admin.invalid_instance") {
+		t.Fatalf("POST hostile name body %q holds no fault code", body)
+		return
+	}
+	if strings.Contains(body, "<script>") {
+		t.Fatalf("POST hostile name body echoes the name: %q", body)
+		return
+	}
+}
+
+func TestAdminFaultInvalidInstanceURL(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
+	r := newAdminRouter(srv, tokenGuard())
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://user:s3cr3t-token@shop.example/"), token: true})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST credentialed URL status = %d, want 422", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "admin.invalid_instance") {
+		t.Fatalf("POST credentialed URL body %q holds no fault code", body)
+		return
+	}
+	if strings.Contains(body, "s3cr3t-token") {
+		t.Fatalf("POST credentialed URL body echoes the secret: %q", body)
+		return
+	}
+}
+
+func TestAdminFaultMalformedBodyHidesSecret(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, tokenGuard())
+	raw := `{"name": "shop", "opsUrl": "http://shop.example", "note": "sk-secret-abc"`
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: []byte(raw), token: true})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST malformed body status = %d, want 422", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "admin.invalid_instance") {
+		t.Fatalf("POST malformed body %q holds no fault code", body)
+		return
+	}
+	if strings.Contains(body, "sk-secret-abc") {
+		t.Fatalf("POST malformed body echoes the secret: %q", body)
+		return
+	}
+}
+
+func TestAdminFaultUnknownInstanceHidesName(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, tokenGuard())
+	rec := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/a%3Cscript%3E", token: true})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("DELETE missing status = %d, want 404", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "admin.unknown_instance") {
+		t.Fatalf("DELETE missing body %q holds no fault code", body)
+		return
+	}
+	if strings.Contains(body, "script") {
+		t.Fatalf("DELETE missing body echoes the name: %q", body)
+		return
+	}
+}
+
+func TestAdminFaultRegistryFull(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 1, AllowedHosts: []string{"a.example", "b.example"}}
+	r := newAdminRouter(srv, tokenGuard())
+	first := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "a", "http://a.example"), token: true})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first POST status = %d, want 201", first.Code)
+		return
+	}
+	second := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "b", "http://b.example"), token: true})
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second POST status = %d, want 429", second.Code)
+		return
+	}
+	if !strings.Contains(second.Body.String(), "admin.registry_full") {
+		t.Fatalf("second POST body %q holds no fault code", second.Body.String())
+		return
+	}
+}
+
+func TestAdminFaultRegistryUnreachable(t *testing.T) {
+	secret := "sk-secret-body-xyz"
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if _, err := w.Write([]byte(`{"error":"` + secret + `"}`)); err != nil {
+			return
+		}
+	}))
+	defer bad.Close()
+	c := &admin.Client{Server: bad.URL, Self: admin.Instance{Name: "shop", OpsURL: "http://shop.example"}}
+	err := c.Start(t.Context())
+	if err == nil {
+		t.Fatalf("Client.Start against a failing registry: want error, got nil")
+		return
+	}
+	if !errors.Is(err, admin.ErrRegistryUnreachable) {
+		t.Fatalf("Start error = %v, want ErrRegistryUnreachable", err)
+		return
+	}
+	found := fault.Of(err)
+	if found == nil {
+		t.Fatalf("Start error holds no fault")
+		return
+	}
+	if got := string(found.Code); got != "admin.registry_unreachable" {
+		t.Fatalf("fault code = %q, want admin.registry_unreachable", got)
+		return
+	}
+	raw := faulttest.PublicJSON(t, err)
+	faulttest.RefuseLeak(t, raw, secret)
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("operator error holds the registry body: %v", err)
+		return
+	}
+}
