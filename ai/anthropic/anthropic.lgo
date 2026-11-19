@@ -66,7 +66,7 @@ func (c *Client) payload(req ai.Request, stream bool) ([]byte, error) {
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	payload, err := c.payload(req, false)
 	if err != nil {
-		return ai.Reply{}, err
+		return ai.Reply{}, ErrInvalidRequest.Wrap(err)
 	}
 	var hold time.Time
 	budget := time.Duration(0)
@@ -75,7 +75,7 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	}
 	out, err := resilience.Do[chatResponse](ctx, c.Policy, func(actx context.Context) (chatResponse, error) {
 		if err := holdUntil(ctx, hold); err != nil {
-			return chatResponse{}, err
+			return chatResponse{}, ErrProviderError.Wrap(err)
 		}
 		value, err := c.post(actx, payload, budget)
 		if err == nil {
@@ -87,7 +87,7 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 				hold = when
 			}
 		}
-		if callerFault(err) || errors.Is(err, errOversize) {
+		if callerFault(err) || errors.Is(err, ErrProviderTooLarge) || errors.Is(err, ErrInvalidRequest) {
 			return chatResponse{}, resilience.Ignored(err)
 		}
 		return chatResponse{}, err
@@ -101,7 +101,7 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
 	payload, err := c.payload(req, true)
 	if err != nil {
-		yield ai.Chunk{}, err
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(err)
 		return
 	}
 	budget := time.Duration(0)
@@ -111,34 +111,34 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	var hold time.Time
 	head, err := resilience.Do[streamHead](ctx, c.Policy, func(actx context.Context) (streamHead, error) {
 		if err := holdUntil(ctx, hold); err != nil {
-			return streamHead{}, err
+			return streamHead{}, ErrProviderError.Wrap(err)
 		}
 		status, header, body, derr := c.do(actx, payload)
 		if derr != nil {
-			return streamHead{}, derr
+			return streamHead{}, transportFault(derr)
 		}
 		if status >= 200 && status <= 299 {
 			return streamHead{body: body}, nil
 		}
-		data, rerr := io.ReadAll(io.LimitReader(body, c.limit(status, replyLimit)))
-		fault := statusError(status, []byte(c.bodyText(data)))
+		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
+		failure := classifyStatus(status, statusDetailOf(status, data))
 		closeBody(body)
 		if rerr != nil {
-			fault = fmt.Errorf("%w: body read ended early: %w", fault, rerr)
+			failure = classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", statusDetailOf(status, data), rerr))
 		}
 		if wait := retryWait(header, budget); wait > 0 {
-			fault = &deferred{cause: fault, wait: wait}
+			failure = &deferred{cause: failure, wait: wait}
 		}
-		if wait := deferredWait(fault); wait > 0 {
+		if wait := deferredWait(failure); wait > 0 {
 			when := time.Now().Add(wait)
 			if when.After(hold) {
 				hold = when
 			}
 		}
-		if callerFault(fault) {
-			return streamHead{}, resilience.Ignored(fault)
+		if callerFault(failure) {
+			return streamHead{}, resilience.Ignored(failure)
 		}
-		return streamHead{}, fault
+		return streamHead{}, failure
 	})
 	if err != nil {
 		yield ai.Chunk{}, err
@@ -146,9 +146,6 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	}
 	defer closeBody(head.body)
 	for chunk, cerr := range streamEvents(ctx, head.body) {
-		if cerr != nil {
-			cerr = &redacted{text: c.hide(cerr.Error()), cause: cerr}
-		}
 		yield chunk, cerr
 	}
 }
@@ -163,43 +160,39 @@ func closeBody(body io.Closer) {
 	}
 }
 
-var errOversize = errors.New("ai/anthropic: response exceeds the size limit")
-
 func callerFault(err error) bool {
-	answer := &statusAnswer{}
-	if !errors.As(err, &answer) {
-		return false
-	}
-	s := answer.status
-	return s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests
+	return errors.Is(err, ErrProviderRejected)
 }
 
 func (c *Client) post(ctx context.Context, payload []byte, budget time.Duration) (chatResponse, error) {
 	status, header, body, err := c.do(ctx, payload)
 	if err != nil {
-		return chatResponse{}, err
+		return chatResponse{}, transportFault(err)
 	}
 	defer body.Close()?
-	data, rerr := io.ReadAll(io.LimitReader(body, c.limit(status, replyLimit+1)))
+	data, rerr := io.ReadAll(io.LimitReader(body, replyLimit+1))
 	if status < 200 || status > 299 {
-		fault := statusError(status, []byte(c.bodyText(data)))
+		if len(data) > replyLimit {
+			data = data[:replyLimit]
+		}
+		failure := classifyStatus(status, statusDetailOf(status, data))
 		if rerr != nil {
-			fault = fmt.Errorf("%w: body read ended early: %w", fault, rerr)
+			failure = classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", statusDetailOf(status, data), rerr))
 		}
 		if wait := retryWait(header, budget); wait > 0 {
-			return chatResponse{}, &deferred{cause: fault, wait: wait}
+			return chatResponse{}, &deferred{cause: failure, wait: wait}
 		}
-		return chatResponse{}, fault
+		return chatResponse{}, failure
 	}
 	if len(data) > replyLimit {
-		return chatResponse{}, fmt.Errorf("%w of %d bytes", errOversize, replyLimit)
+		return chatResponse{}, ErrProviderTooLarge.Wrap(fmt.Errorf("response size %d exceeds the limit %d", len(data), replyLimit))
 	}
 	if rerr != nil {
-		return chatResponse{}, fmt.Errorf("ai/anthropic: read response: %w", rerr)
+		return chatResponse{}, ErrProviderError.Wrap(fmt.Errorf("read response: %w", rerr))
 	}
 	var out chatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		return chatResponse{}, fmt.Errorf("ai/anthropic: decode response: %w", err)
+		return chatResponse{}, ErrProviderError.Wrap(fmt.Errorf("decode response: %w", err))
 	}
 	return out, nil
 }
@@ -248,25 +241,6 @@ func sameOrigin(a *url.URL, b *url.URL) bool {
 }
 
 var errRedirects = errors.New("ai/anthropic: stopped after 10 redirects")
-
-func (c *Client) hide(text string) string {
-	if c.Key == "" {
-		return text
-	}
-	return strings.ReplaceAll(text, c.Key, "[redacted]")
-}
-
-func (c *Client) bodyText(data []byte) string {
-	hidden := c.hide(string(data))
-	return hidden[:min(len(hidden), replyLimit)]
-}
-
-func (c *Client) limit(status int, cut int64) int64 {
-	if status >= 200 && status <= 299 {
-		return cut
-	}
-	return cut + int64(len(c.Key)) + 1
-}
 
 func holdUntil(ctx context.Context, at time.Time) error {
 	wait := time.Until(at)
@@ -318,40 +292,12 @@ func (d *deferred) Error() string {
 func (d *deferred) Unwrap() error {
 	return d.cause
 }
-
-
-type redacted struct {
-	text  string
-	cause error
-}
-
-func (r *redacted) Error() string {
-	return r.text
-}
-
-func (r *redacted) Unwrap() error {
-	return r.cause
-}
-
 func deferredWait(err error) time.Duration {
 	noted := &deferred{}
 	if errors.As(err, &noted) {
 		return noted.wait
 	}
 	return 0
-}
-
-type statusAnswer struct {
-	status int
-	body   string
-}
-
-func (a *statusAnswer) Error() string {
-	return fmt.Sprintf("ai/anthropic: %d: %s", a.status, a.body)
-}
-
-func statusError(status int, body []byte) error {
-	return &statusAnswer{status: status, body: string(body)}
 }
 
 func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
@@ -367,14 +313,14 @@ func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error
 		}
 		if rerr != nil {
 			if err := ctx.Err(); err != nil {
-				yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream: %w", err)
+				yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
 				return
 			}
-			yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream ended before message_stop")
+			yield ai.Chunk{}, ErrProviderStreamCut.Err()
 			return
 		}
 		if err := ctx.Err(); err != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream: %w", err)
+			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
 			return
 		}
 	}
@@ -421,7 +367,7 @@ func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
 	var ev wireEvent
 	if err := json.Unmarshal([]byte(data), &ev); err != nil {
 		s.ended = true
-		yield ai.Chunk{}, fmt.Errorf("ai/anthropic: decode stream event: %w", err)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(fmt.Errorf("decode stream event: %w", err))
 		return
 	}
 	for chunk, err := range s.event(ev) {
@@ -458,7 +404,7 @@ func (s *streamState) event(ev wireEvent) iter.Seq2[ai.Chunk, error] {
 		yield s.final(), nil
 	case "error":
 		s.ended = true
-		yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream: %s: %s", ev.Error.Type, ev.Error.Message)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(&statusDetail{status: 200, errType: ev.Error.Type, length: len(ev.Error.Message)})
 	}
 }
 

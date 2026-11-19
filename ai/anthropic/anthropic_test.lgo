@@ -470,7 +470,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 	if err == nil {
 		t.Fatal("expected an error chunk")
 	}
-	if !strings.Contains(err.Error(), "message_stop") {
+	if !errors.Is(err, anthropic.ErrProviderStreamCut) {
 		t.Fatalf("error: %v", err)
 	}
 	if _, cerr := ai.Collect(c.Stream(context.Background(), ai.Request{
@@ -501,8 +501,11 @@ func TestStreamErrorEvent(t *testing.T) {
 	if len(errs) != 1 || chunks != 1 {
 		t.Fatalf("the stream gave %d chunks and the errors %v, want the one error chunk of the event", chunks, errs)
 	}
-	if got := errs[0].Error(); got != "ai/anthropic: stream: overloaded_error: Overloaded" {
-		t.Fatalf("error = %q, want the type and the message of the event", got)
+	if !errors.Is(errs[0], anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error = %v, want the stream cut fault for the error event", errs[0])
+	}
+	if status, errType, length, ok := anthropic.FaultDetail(errs[0]); !ok || status != 200 || errType != "overloaded_error" || length != len("Overloaded") {
+		t.Fatalf("detail = %d %q %d, want the parsed error type and the message length", status, errType, length)
 	}
 }
 
@@ -517,7 +520,7 @@ func TestBadRequestIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 400: ") {
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -682,11 +685,8 @@ func TestBodyOverTheLimitIsFinal(t *testing.T) {
 		MaxTokens: 1024,
 		Messages:  []ai.Message{userTurn("hi")},
 	})
-	if err == nil {
-		t.Fatal("expected the size limit error")
-	}
-	if !strings.Contains(err.Error(), "ai/anthropic: response exceeds the size limit of 1048576 bytes") {
-		t.Fatalf("error: %v", err)
+	if err == nil || !errors.Is(err, anthropic.ErrProviderTooLarge) {
+		t.Fatalf("error: %v, want the size limit fault", err)
 	}
 	if rec.count() != 1 {
 		t.Fatalf("oversize body was retried: %d requests", rec.count())
@@ -723,11 +723,11 @@ func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 		t.Fatal("err=nil, want a failing status")
 		return
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 500: ") {
-		t.Fatalf("error does not classify the status: %q", err.Error()[:64])
+	if !errors.Is(err, anthropic.ErrProviderError) {
+		t.Fatalf("error: %v, want the provider error for a 500 answer", err)
 	}
-	if got, want := len(err.Error()), len("ai/anthropic: 500: ")+(1<<20); got != want {
-		t.Fatalf("error holds %d bytes, want %d: the prefix and one mebibyte of body", got, want)
+	if status, _, length, ok := anthropic.FaultDetail(err); !ok || status != 500 || length != 1<<20 {
+		t.Fatalf("detail = %d %d, want status 500 with the body cut at one mebibyte", status, length)
 	}
 	if rec.count() != 2 {
 		t.Fatalf("server saw %d calls, want 2: the 500 is retried, not a caller fault", rec.count())
@@ -867,7 +867,7 @@ func TestStreamRecordThatIsNotJSONIsAnError(t *testing.T) {
 			errs = append(errs, err)
 		}
 	}
-	if len(errs) != 1 || !strings.HasPrefix(errs[0].Error(), "ai/anthropic: decode stream event: ") {
+	if len(errs) != 1 || !errors.Is(errs[0], anthropic.ErrProviderStreamCut) {
 		t.Fatalf("errors = %v, want the one decode error of the stream record", errs)
 	}
 	if chunks != 1 {
@@ -946,7 +946,7 @@ func TestTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 400: ") {
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if !strings.Contains(err.Error(), "body read ended early") {
@@ -1231,7 +1231,7 @@ func TestEchoedKeyNeverAppearsInError(t *testing.T) {
 	if strings.Contains(err.Error(), "sk-ant-super-secret-value") {
 		t.Fatalf("error leaks the key: %v", err)
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 401: ") {
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 }
@@ -1258,7 +1258,7 @@ func TestStreamErrorEventHidesTheKey(t *testing.T) {
 	if strings.Contains(errs[0].Error(), "sk-ant-super-secret-value") {
 		t.Fatalf("stream error leaks the key: %v", errs[0])
 	}
-	if !strings.HasPrefix(errs[0].Error(), "ai/anthropic: stream: ") {
+	if !errors.Is(errs[0], anthropic.ErrProviderStreamCut) {
 		t.Fatalf("error: %v", errs[0])
 	}
 }
@@ -1426,11 +1426,8 @@ func TestFormatThatIsNotAnObjectIsAnError(t *testing.T) {
 		Messages:  []ai.Message{userTurn("hi")},
 		Format:    `["email"]`,
 	})
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if !strings.Contains(err.Error(), "format is not a JSON schema") {
-		t.Fatalf("error: %v", err)
+	if err == nil || !errors.Is(err, anthropic.ErrInvalidRequest) {
+		t.Fatalf("error: %v, want the invalid request fault", err)
 	}
 	if rec.count() != 0 {
 		t.Fatalf("invalid format reached the provider: %d requests", rec.count())
@@ -1606,7 +1603,7 @@ func TestRetryAfterLeavesACallerFaultFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 400: ") {
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -1646,8 +1643,11 @@ func TestKeyStraddlingTheCutIsRedacted(t *testing.T) {
 		t.Fatal("expected an error")
 		return
 	}
-	if got, want := len(err.Error()), len("ai/anthropic: 401: ")+(1<<20); got != want {
-		t.Fatalf("error holds %d bytes, want %d: the prefix and one mebibyte of body", got, want)
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
+		t.Fatalf("error: %v, want the provider rejection", err)
+	}
+	if status, _, length, ok := anthropic.FaultDetail(err); !ok || status != 401 || length != 1<<20 {
+		t.Fatalf("detail = %d %d, want status 401 with the body cut at one mebibyte", status, length)
 	}
 	if strings.Contains(err.Error(), key[:10]) {
 		t.Fatalf("error holds the key prefix at the cut")
@@ -1678,7 +1678,7 @@ func TestStreamMakesOneAttemptOnAFailingStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the failing status as an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 400: ") {
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -1743,7 +1743,7 @@ func TestStreamDoesNotRetryAfterOneEvent(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the cut stream as an error")
 	}
-	if !strings.Contains(err.Error(), "stream ended before message_stop") {
+	if !errors.Is(err, anthropic.ErrProviderStreamCut) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -1780,7 +1780,7 @@ func TestStreamTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/anthropic: 400: ") {
+	if !errors.Is(err, anthropic.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if !strings.Contains(err.Error(), "body read ended early") {
@@ -1838,8 +1838,8 @@ func TestStreamCancelKeepsThePrefixAndTheCause(t *testing.T) {
 	if got == nil {
 		t.Fatal("expected the cancel error from the stream")
 	}
-	if !strings.HasPrefix(got.Error(), "ai/anthropic: ") {
-		t.Fatalf("error %q does not name the package", got.Error())
+	if !errors.Is(got, anthropic.ErrProviderStreamCut) {
+		t.Fatalf("error %v does not carry the stream cut fault", got)
 	}
 	if !errors.Is(got, context.Canceled) {
 		t.Fatalf("errors.Is(err, context.Canceled) = false for %w", got)
@@ -1886,7 +1886,7 @@ func TestChatBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
 	transport := &cutTransport{calls: &calls, total: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}
 	c := &anthropic.Client{BaseURL: "http://anthropic.invalid", Key: "test-key", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
 	_, err := c.Chat(context.Background(), ai.Request{Model: "claude-opus-5-5"})
-	if err == nil || !strings.Contains(err.Error(), "ai/anthropic: response exceeds the size limit of 1048576 bytes") {
+	if err == nil || !errors.Is(err, anthropic.ErrProviderTooLarge) {
 		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
 	}
 	if calls.Load() != 1 {
