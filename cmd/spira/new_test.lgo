@@ -54,7 +54,8 @@ func checkEngineApp(t *testing.T, c newEngineCase) {
 	assertContains(t, dir, "main.lgo", "for _, stage := range web.Defaults()")
 	assertContains(t, dir, "main.lgo", "r.Handle(\"GET\", \"/assets/\"")
 	assertContains(t, dir, "go.mod", "module example.com/demo")
-	assertContains(t, dir, "go.mod", c.driverMod)
+	assertGoModPinsMatchRepo(t, dir)
+	assertContains(t, dir, "go.mod", "replace github.com/gosuda/spira => ")
 	assertContains(t, dir, "sqlc.yaml", "engine: "+c.sqlcEngine)
 	assertContains(t, dir, "db/migrations/0001_create_users.up.sql", c.dialect)
 	assertContains(t, dir, "db/queries/users.sql", c.userQuery)
@@ -127,7 +128,7 @@ func TestNewRejectsBadModulePath(t *testing.T) {
 }
 
 func TestNewUsageShapes(t *testing.T) {
-	shapes := [][]string{{}, {"onlydir"}, {"-engine"}, {"-engine", "sqlite"}, {"-engine", "sqlite", "a", "b", "c"}, {"-bogus", "a", "b"}}
+	shapes := [][]string{{}, {"onlydir"}, {"-engine"}, {"-engine", "sqlite"}, {"-engine", "sqlite", "a", "b", "c"}, {"-bogus", "a", "b"}, {"-spira-dir"}, {"-engine", "sqlite", "-spira-dir"}, {"-spira-dir", "a", "b", "c", "d"}}
 	for _, args := range shapes {
 		err := spira.RunNew(args)
 		if err == nil || !strings.Contains(err.Error(), "usage: spira new") {
@@ -140,11 +141,14 @@ func TestNewUsageShapes(t *testing.T) {
 func genApp(t *testing.T, module string, flag string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "app")
-	var args []string
-	if flag == "" {
-		args = []string{dir, module}
-	} else {
-		args = []string{"-engine", flag, dir, module}
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("repo root: %v", err)
+		return ""
+	}
+	args := []string{"-spira-dir", root, dir, module}
+	if flag != "" {
+		args = []string{"-engine", flag, "-spira-dir", root, dir, module}
 	}
 	if err := spira.RunNew(args); err != nil {
 		t.Fatalf("RunNew: %v", err)

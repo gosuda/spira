@@ -66,3 +66,46 @@ func repoModuleVersion(t *testing.T, module string) string {
 	t.Fatalf("%s not in go.mod", module)
 	return ""
 }
+
+func driverModule(pinned string) string {
+	if i := strings.Index(pinned, " "); i >= 0 {
+		return pinned[:i]
+	}
+	return pinned
+}
+
+func assertGoModPinsMatchRepo(t *testing.T, dir string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+		return
+	}
+	inside := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "require (" {
+			inside = true
+			continue
+		}
+		if trimmed == ")" {
+			inside = false
+			continue
+		}
+		if !inside {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[0] == "github.com/gosuda/spira" {
+			continue
+		}
+		want := repoModuleVersion(t, fields[0])
+		if fields[1] != want {
+			t.Fatalf("go.mod pins %s %s, repo go.mod holds %s", fields[0], fields[1], want)
+			return
+		}
+	}
+}

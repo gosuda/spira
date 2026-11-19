@@ -7,7 +7,7 @@ Status: `spira new` and `spira dev` are both in the tree.
 ## Interface
 
 ```text
-usage: spira new [-engine sqlite|postgresql|mysql|mssql] <dir> <module-path>
+usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>
 usage: spira dev <main-package>
 ```
 
@@ -15,9 +15,9 @@ usage: spira dev <main-package>
 
 ### Arguments
 
-- The command MUST accept `new`, an optional `-engine` flag, and two arguments: a directory and a module path.
+- The command MUST accept `new`, an optional `-engine` flag, an optional `-spira-dir` flag, and two arguments: a directory and a module path.
 - The command MUST accept `dev` and one main-package argument.
-- On any other arguments, the command MUST write `usage: spira new [-engine sqlite|postgresql|mysql|mssql] <dir> <module-path>` or `usage: spira dev <main-package>` to stderr.
+- On any other arguments, the command MUST write `usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>` or `usage: spira dev <main-package>` to stderr.
 - The command MUST then exit 2.
 
 ### spira new
@@ -25,7 +25,7 @@ usage: spira dev <main-package>
 The subcommand `spira new` writes a minimal application into `<dir>` from files embedded with `embed`.
 
 - `spira new` MUST write files embedded with `embed` into `<dir>`.
-- `spira new` MUST write `go.mod`, `logos.toml`, `justfile`, `sqlc.yaml` and `tools/go.mod`.
+- `spira new` MUST write `go.mod`, `go.sum`, `logos.toml`, `justfile`, `sqlc.yaml`, `tools/go.mod` and `tools/go.sum`.
 - The `justfile` MUST have the recipes `gate`, `sql`, `sql-check` and `web`.
 - `spira new` MUST write `db/migrations/0001_create_users.up.sql` and `db/migrations/0001_create_users.down.sql`.
 - `spira new` MUST write `db/migrations/0002_create_sessions.up.sql` and `db/migrations/0002_create_sessions.down.sql`.
@@ -56,6 +56,8 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - A bad session user id MUST wrap the account fault.
 - `spira new` MUST refuse a non-empty `<dir>`.
 - `spira new` MUST accept only `sqlite`, `postgresql`, `mysql` and `mssql` for `-engine`.
+- With `-spira-dir <path>`, `spira new` MUST write a `replace github.com/gosuda/spira => <path>` line into the generated `go.mod` and require `spira` at `v0.0.0`.
+- Without `-spira-dir`, `spira new` MUST require `spira` at the pseudo-version of the binary build revision, or refuse with a message that names `-spira-dir` when no revision is available.
 - After `just sql` in the generated directory, `logos build ./...` MUST pass.
 - After `just sql` in the generated directory, `logos test ./...` MUST pass.
 
@@ -118,6 +120,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - `TestNewRefusesNonEmptyDir` proves generation refuses a non-empty directory without writing.
 - `TestNewRejectsBadModulePath` proves bad module paths are refused without writing.
 - `TestNewUsageShapes` proves every other argument shape prints the `spira new` usage.
+- `TestNewPseudoVersion` proves the pseudo-version shape, its error paths, and the `v0.0.0` version for a `-spira-dir` build.
 - Generation plus `just sql`, `logos build ./...` and `logos test ./...` MUST pass for every engine.
 - The three server engines MUST run with their DSN exported.
 - `TestWatchRestartsServerOnlyOnLgoChange` proves a restart on an `.lgo` change, and no restart for a `.txt` file or for `node_modules`.
