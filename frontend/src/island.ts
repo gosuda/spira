@@ -69,12 +69,16 @@ export class SpiraIslandElement extends HTMLElement {
 	private observer: IntersectionObserver | null = null;
 	private idleId: number | null = null;
 	private activated = false;
+	private mounted = false;
 	private cleanup: IslandCleanup | null = null;
 	private disposeQueued = false;
 	private loadToken = 0;
 
 	connectedCallback(): void {
 		this.cancelPendingDispose();
+		if (this.mounted) {
+			return;
+		}
 		const when = this.getAttribute("when") ?? "visible";
 		if (!WHEN_VALUES.has(when)) {
 			this.reject(
@@ -108,7 +112,10 @@ export class SpiraIslandElement extends HTMLElement {
 
 	private scheduleDispose(): void {
 		this.loadToken += 1;
-		this.activated = false;
+		if (!this.mounted) {
+			this.activated = false;
+			return;
+		}
 		if (this.cleanup === null || this.disposeQueued) {
 			return;
 		}
@@ -120,6 +127,8 @@ export class SpiraIslandElement extends HTMLElement {
 			this.disposeQueued = false;
 			this.cleanup?.();
 			this.cleanup = null;
+			this.mounted = false;
+			this.activated = false;
 		});
 	}
 
@@ -137,7 +146,7 @@ export class SpiraIslandElement extends HTMLElement {
 	}
 
 	private activate(): void {
-		if (this.activated) {
+		if (this.activated || this.mounted) {
 			return;
 		}
 		this.activated = true;
@@ -178,6 +187,7 @@ export class SpiraIslandElement extends HTMLElement {
 				child.remove();
 			}
 			const cleanup = adapter.mount(this, module.default, props);
+			this.mounted = true;
 			if (typeof cleanup === "function") {
 				this.cleanup = cleanup;
 			}
