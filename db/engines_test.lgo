@@ -240,6 +240,16 @@ func checkEngineConstraint(t *testing.T, c engineCase, inner string, prefix bool
 		}
 	})
 	err := engineDuplicateKey(t, ctx, pool, c)
+	table := c.Table + "_uniq"
+	dropped := false
+	defer func() {
+		if dropped {
+			return
+		}
+		if _, derr := db.Exec(context.Background(), pool, "DROP TABLE "+table); derr != nil {
+			t.Errorf("drop %s: %v", table, derr)
+		}
+	}()
 	if !errors.Is(err, db.ErrConstraintViolation) {
 		t.Fatalf("%s duplicate insert error = %v, want db.ErrConstraintViolation", c.Driver, err)
 		return
@@ -253,10 +263,11 @@ func checkEngineConstraint(t *testing.T, c engineCase, inner string, prefix bool
 		t.Fatalf("%s innermost error = %q, want it to hold %q", c.Driver, innerText, inner)
 		return
 	}
-	if _, derr := db.Exec(ctx, pool, "DROP TABLE "+c.Table+"_uniq"); derr != nil {
-		t.Fatalf("drop %s_uniq: %v", c.Table, derr)
+	if _, derr := db.Exec(ctx, pool, "DROP TABLE "+table); derr != nil {
+		t.Fatalf("drop %s: %v", table, derr)
 		return
 	}
+	dropped = true
 }
 
 func TestEnginePostgresConstraintViolation(t *testing.T) {
