@@ -26,8 +26,75 @@ Translated units:
   and advisors/spring-ai-tool-search-advisor/src/main/java/org/springframework/ai/chat/client/advisor/toolsearch/ToolSearchToolCallingAdvisor.java
 - ai/search_test.lgo, from
   spring-ai-tool-search-tool/src/test/java/org/springframework/ai/tool/toolsearch/index/regex/RegexToolIndexTests.java
+- ai/structured.lgo, from
+  spring-ai-model/src/main/java/org/springframework/ai/converter/BeanOutputConverter.java
+  and spring-ai-model/src/main/java/org/springframework/ai/converter/MarkdownCodeBlockCleaner.java
+- ai/structured_test.lgo, from
+  spring-ai-model/src/test/java/org/springframework/ai/converter/BeanOutputConverterTest.java
+  and spring-ai-model/src/test/java/org/springframework/ai/converter/MarkdownCodeBlockCleanerTest.java in that directory
+- ai/anthropic/anthropic.lgo and ai/anthropic/wire.lgo, from
+  models/spring-ai-anthropic/src/main/java/org/springframework/ai/anthropic/AnthropicChatModel.java
+- ai/anthropic/anthropic_test.lgo, from
+  models/spring-ai-anthropic/src/test/java/org/springframework/ai/anthropic/AnthropicChatModelTests.java
+  and AnthropicChatModelStreamingHttpTests.java in that directory
 - ai/ollama/wire.lgo, from
   models/spring-ai-ollama/src/main/java/org/springframework/ai/ollama/api/OllamaApi.java
 - ai/ollama/ollama_test.lgo, from
   models/spring-ai-ollama/src/test/java/org/springframework/ai/ollama/OllamaChatModelTests.java
   and OllamaEmbeddingModelTests.java in that directory
+- ai/session/session.lgo, from
+  spring-ai-session/src/main/java/org/springframework/ai/session/Session.java,
+  SessionEvent.java, DefaultSessionService.java, InMemorySessionRepository.java,
+  EventFilter.java, EventType.java, MessageFilter.java and
+  compaction/CompactionBoundary.java, and
+  advisors/spring-ai-session-advisor/src/main/java/org/springframework/ai/session/advisor/PromptHistory.java.
+- ai/session/remember.lgo, from
+  advisors/spring-ai-session-advisor/src/main/java/org/springframework/ai/session/advisor/PromptHistoryAdvisor.java.
+- ai/session/sql.lgo, from
+  session-repositories/spring-ai-session-jdbc/src/main/java/org/springframework/ai/session/jdbc/JdbcSessionRepository.java,
+  JdbcSessionRepositoryDialect.java, PostgresJdbcSessionRepositoryDialect.java,
+  MysqlJdbcSessionRepositoryDialect.java, SqlServerJdbcSessionRepositoryDialect.java,
+  H2JdbcSessionRepositoryDialect.java and src/main/resources/org/springframework/ai/session/jdbc/schema-postgresql.sql,
+  schema-mysql.sql, schema-sqlserver.sql, schema-h2.sql.
+- ai/session/session_test.lgo, from
+  spring-ai-session/src/test/java/org/springframework/ai/session/SessionMemoryTests.java,
+  EventFilterTests.java, PromptHistoryTests.java and
+  advisors/spring-ai-session-advisor/src/test/java/org/springframework/ai/session/advisor/SessionMemoryAdvisorTests.java.
+- ai/rag/split.lgo, from
+  spring-ai-commons/src/main/java/org/springframework/ai/transformer/splitter/TokenTextSplitter.java
+- ai/rag/split_test.lgo, from
+  spring-ai-commons/src/test/java/org/springframework/ai/transformer/splitter/TokenTextSplitterTest.java
+- ai/rag/read.lgo, from
+  spring-ai-commons/src/main/java/org/springframework/ai/reader/TextReader.java
+  and spring-ai-commons/src/main/java/org/springframework/ai/reader/JsonReader.java
+- ai/rag/read_test.lgo, from
+  spring-ai-commons/src/test/java/org/springframework/ai/reader/TextReaderTests.java
+  and spring-ai-commons/src/test/java/org/springframework/ai/reader/JsonReaderTests.java
+- ai/rag/augment.lgo, from
+  spring-ai-rag/src/main/java/org/springframework/ai/rag/generation/augmentation/ContextualQueryAugmenter.java
+  and spring-ai-rag/src/main/java/org/springframework/ai/rag/retrieval/join/ConcatenationDocumentJoiner.java
+- ai/rag/augment_test.lgo, from
+  spring-ai-rag/src/test/java/org/springframework/ai/rag/retrieval/join/ConcatenationDocumentJoinerTests.java
+  and spring-ai-rag/src/test/java/org/springframework/ai/rag/generation/augmentation/ContextualQueryAugmenterTests.java
+- ai/rag/query.lgo, from
+  spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/transformation/RewriteQueryTransformer.java,
+  spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/transformation/TranslationQueryTransformer.java,
+  spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/transformation/CompressionQueryTransformer.java
+  and spring-ai-rag/src/main/java/org/springframework/ai/rag/preretrieval/query/expansion/MultiQueryExpander.java
+- ai/rag/query_test.lgo, from
+  spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/transformation/RewriteQueryTransformerTests.java,
+  spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/transformation/TranslationQueryTransformerTests.java,
+  spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/transformation/CompressionQueryTransformerTests.java
+  and spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/expansion/MultiQueryExpanderTests.java
+
+This product includes the cl100k_base vocabulary file
+ai/rag/cl100k_base.tiktoken, as distributed in the assets of tiktoken-rs
+(https://github.com/zurawiki/tiktoken-rs), crate version 0.12.1, which
+carries the ranks of OpenAI tiktoken (https://github.com/openai/tiktoken).
+Copyright (c) 2023 Roger Zurawicki (tiktoken-rs).
+Copyright (c) 2022 OpenAI, Shantanu Jain (tiktoken).
+Licensed under the MIT License.
+ai/rag/bpe.lgo implements the encoder over that vocabulary; its split
+pattern and greedy lowest-rank merge follow the cl100k_base tokenizer as
+vendored in tiktoken-rs src/vendor_tiktoken.rs and
+src/tiktoken_ext/openai_public.rs.

@@ -1,0 +1,161 @@
+package websocket
+
+import (
+	"bufio"
+	"errors"
+	"io"
+	"unicode/utf8"
+)
+
+var errStrayContinuation = errors.New("websocket: unexpected continuation frame")
+var errFragmentInProgress = errors.New("websocket: new data frame while fragmented message is open")
+var errMaskMismatch = errors.New("websocket: mask bit does not match endpoint role")
+var errMessageTooLarge = errors.New("websocket: message exceeds size limit")
+var errInvalidUTF8 = errors.New("websocket: text message is not valid UTF-8")
+
+const headerNoLimit = 9223372036854775807
+
+type kind uint8
+
+const (
+	kindText kind = 1
+	kindBinary kind = 2
+	kindPing kind = 3
+	kindPong kind = 4
+	kindClose kind = 5
+)
+
+type engine struct {
+	r      *bufio.Reader
+	limit  int64
+	server bool
+	buf    []byte
+	ctrl   [125]byte
+	open   bool
+	text   bool
+	valid  int
+}
+
+func newEngine(r *bufio.Reader, limit int64, server bool) *engine {
+	return &engine{r: r, limit: limit, server: server}
+}
+
+func (e *engine) next() (kind, []byte, error) {
+	for {
+		h, control := e.acceptHead()?
+		if control {
+			payload := e.readControl(h)?
+			return controlKind(h.opcode), payload, nil
+		}
+		e.acceptData(h)?
+		e.appendData(h)?
+		if h.fin {
+			e.open = false
+			if e.text {
+				return kindText, e.buf, nil
+			}
+			return kindBinary, e.buf, nil
+		}
+	}
+}
+
+func (e *engine) acceptHead() (header, bool, error) {
+	h := readHeader(e.r, headerNoLimit)?
+	if h.masked != e.server {
+		return header{}, false, ErrProtocolError.Wrap(errMaskMismatch)
+	}
+	if h.opcode == 0x8 || h.opcode == 0x9 || h.opcode == 0xa {
+		return h, true, nil
+	}
+	return h, false, nil
+}
+
+func (e *engine) acceptData(h header) error {
+	if h.opcode == 0x0 {
+		if !e.open {
+			return ErrProtocolError.Wrap(errStrayContinuation)
+		}
+		return nil
+	}
+	if e.open {
+		return ErrProtocolError.Wrap(errFragmentInProgress)
+	}
+	e.open = true
+	e.text = h.opcode == 0x1
+	e.buf = e.buf[:0]
+	e.valid = 0
+	return nil
+}
+
+func (e *engine) appendData(h header) error {
+	old := len(e.buf)
+	e.reserve(h.length)?
+	io.ReadFull(e.r, e.buf[old:])?
+	if h.masked {
+		mask(h.key, 0, e.buf[old:])
+	}
+	if e.text {
+		e.valid = checkTail(e.buf, e.valid, h.fin)?
+	}
+	return nil
+}
+
+func controlKind(opcode uint8) kind {
+	if opcode == 0x9 {
+		return kindPing
+	}
+	if opcode == 0xa {
+		return kindPong
+	}
+	return kindClose
+}
+
+func (e *engine) readControl(h header) ([]byte, error) {
+	payload := e.ctrl[:int(h.length)]
+	io.ReadFull(e.r, payload)?
+	if h.masked {
+		mask(h.key, 0, payload)
+	}
+	return payload, nil
+}
+
+func (e *engine) reserve(length int64) error {
+	old := len(e.buf)
+	if length > e.limit-int64(old) {
+		e.open = false
+		e.buf = e.buf[:0]
+		e.valid = 0
+		return ErrTooLarge.Wrap(errMessageTooLarge)
+	}
+	need := old + int(length)
+	if cap(e.buf) < need {
+		grown := make([]byte, need)
+		copy(grown, e.buf)
+		e.buf = grown
+		return nil
+	}
+	e.buf = e.buf[:need]
+	return nil
+}
+
+func checkTail(buf []byte, valid int, fin bool) (int, error) {
+	i := valid
+	for i < len(buf) {
+		if buf[i] < 0x80 {
+			i++
+			continue
+		}
+		if !utf8.FullRune(buf[i:]) {
+			break
+		}
+		r, size := utf8.DecodeRune(buf[i:])
+		if r == utf8.RuneError && size == 1 {
+			return 0, ErrProtocolError.Wrap(errInvalidUTF8)
+		}
+		i += size
+	}
+	if fin && i != len(buf) {
+		return 0, ErrProtocolError.Wrap(errInvalidUTF8)
+	}
+	return i, nil
+}

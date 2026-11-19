@@ -5,7 +5,8 @@ Package `resilience` runs one call under a timeout, an optional retry and an opt
 ## Interface
 
 ```lgo
-var ErrOpen = errors.New("resilience: circuit open")
+var ErrCircuitOpen = fault.New("resilience.circuit_open", fault.Unavailable, "The upstream is unavailable.")
+var ErrTimeout = fault.New("resilience.timeout", fault.Timeout, "The upstream timed out.")
 
 type Retry struct {
 	Attempts int           = 3
@@ -29,6 +30,7 @@ type Policy struct {
 
 func Do[T any](ctx context.Context, p Policy, call func(ctx context.Context) (T, error)) (T, error)
 func Ignored(err error) error
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -47,7 +49,7 @@ func Ignored(err error) error
 - `Do` MUST stop after that success.
 - `Do` MUST return the last error when every attempt fails.
 - `Do` MUST return the zero value of `T` together with an error.
-- `Do` MUST NOT start another attempt after `ErrOpen`.
+- `Do` MUST NOT start another attempt after `ErrCircuitOpen`.
 - `Do` MUST NOT start another attempt after the caller context ends.
 - `Ignored` MUST mark an error that says nothing about the health of the dependency.
 - `Do` MUST NOT start another attempt after an `Ignored` error.
@@ -78,7 +80,7 @@ func Ignored(err error) error
 - A `Window` below 1 MUST count as 1.
 - An omitted `FailureRate` MUST be 0.5.
 - An omitted `OpenFor` MUST be 30 seconds.
-- While the breaker is open, `Do` MUST return `ErrOpen`.
+- While the breaker is open, `Do` MUST return `ErrCircuitOpen`.
 - While the breaker is open, `Do` MUST NOT call the function.
 - The breaker MUST admit one probe when the open age is greater than or equal to `OpenFor`.
 - The breaker MUST stay open when that age is below `OpenFor`.
@@ -99,12 +101,21 @@ func Ignored(err error) error
 - That panic MUST propagate to the caller of `Do`.
 - Policies that hold the same `Breaker` pointer MUST share one breaker state.
 
+### Code table
+
+| code | kind | message |
+|---|---|---|
+| `resilience.circuit_open` | unavailable | The upstream is unavailable. |
+| `resilience.timeout` | timeout | The upstream timed out. |
+
 ## Errors
 
-- `ErrOpen` has the text `resilience: circuit open`.
+- An open breaker is `ErrCircuitOpen`; match it with `errors.Is`.
+- An attempt timeout when the caller context is still active is `ErrTimeout` wrapping the attempt error; match it with `errors.Is`.
 - When the wait stops because the caller context ends, `Do` returns `errors.Join` of the last call error and the context error.
 - When a call fails and the caller context has already ended, `Do` returns that same join.
-- When the caller context has not ended, `Do` returns `ErrOpen` as itself.
+- After the caller context ends, `Do` MUST join an ignored cause with the context error.
+- When the caller context has not ended, `Do` returns `ErrCircuitOpen` as itself.
 
 ## Proof
 
@@ -114,12 +125,17 @@ func Ignored(err error) error
 - `TestBreakerSharedByPointerAcrossPolicies` proves that one pointer is one breaker.
 - `TestDoRetriesUntilAttemptsExhausted` proves that failed attempts stop at `Attempts`.
 - `TestDoReturnsTheFirstSuccess` proves that the first success ends the loop.
-- `TestDoStopsRetryingAfterErrOpen` proves that `ErrOpen` ends the retry.
+- `TestDoStopsRetryingAfterErrCircuitOpen` proves that `ErrCircuitOpen` ends the retry.
+- `TestCircuitOpenIsFault` proves that an open breaker returns `ErrCircuitOpen`.
+- `TestTimeoutIsFault` proves that an attempt timeout returns `ErrTimeout`.
+- `TestFaultPublicHidesSecret` proves that no secret reaches the client view.
+- `TestFaultsMatchCodeTable` proves that `Faults()` matches the code table with no duplicates.
 - `TestBackoffStopsWhenContextEnds` proves that the wait stops with the caller context.
 - `TestCallerCancellationIsNotCountedAsFailure` proves that a caller cancel is not a failure.
 - `TestCancelledProbeReleasesTheSlot` proves that a cancelled probe frees the slot.
 - `TestIgnoredErrorEndsRetriesAndReturnsItsCause` proves that an `Ignored` error is final and that `Do` returns its cause.
 - `TestIgnoredErrorIsNoResultInTheWindow` proves that an `Ignored` error adds no result to the window.
+- `TestIgnoredErrorJoinsContextErrorWhenCallerAlreadyEnded` proves that an ignored cause after cancellation is joined with the context error.
 - `TestIgnoredProbeLeavesTheBreakerHalfOpen` proves that an `Ignored` probe releases its slot and does not close the breaker.
 - `TestAttemptTimeoutCountsAsFailure` proves that an attempt timeout opens the breaker.
 - `TestPolicyAndRetryDefaultsHold` proves the timeout, attempt, base and max defaults.

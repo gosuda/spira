@@ -1,6 +1,7 @@
 package client_test
 
 import (
+	"fmt"
 	"context"
 	"errors"
 	"io"
@@ -14,8 +15,9 @@ import (
 	"logos/sync"
 
 	"github.com/gosuda/spira/client"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
 	"github.com/gosuda/spira/resilience"
-	"github.com/gosuda/spira/web"
 )
 
 type probe struct {
@@ -40,6 +42,114 @@ func serve(t *testing.T, status int, contentType string, body string) http.Handl
 
 func serveJSON(t *testing.T, status int, body string) http.HandlerFunc {
 	return serve(t, status, "application/json", body)
+}
+
+const testMarkHeader = "X-Spira-Test"
+
+const testAttemptHeader = "X-Spira-Attempt"
+
+type requestGuard struct {
+	want string
+	first sync.Locked[int64]
+	count sync.Locked[int64]
+	marked sync.Locked[string]
+	strangers sync.Locked[string]
+}
+
+type markedTransport struct {
+	want string
+	base http.RoundTripper
+	tries *atomic.Int64
+}
+
+func newRequestGuard(t *testing.T) *requestGuard {
+	t.Helper()
+	return &requestGuard{want: t.Name()}
+}
+
+func (grd *requestGuard) admit(r *http.Request) bool {
+	if r.Header.Get(testMarkHeader) != grd.want {
+		grd.strangers.WithLock(func(s *string) {
+			*s = *s + strangerRow(r, grd.age()) + "\n"
+		})
+		return false
+	}
+	grd.first.WithLock(func(p *int64) {
+		if *p == 0 {
+			*p = time.Now().UnixNano()
+		}
+	})
+	var n int64
+	grd.count.WithLock(func(p *int64) {
+		*p = *p + 1
+		n = *p
+	})
+	grd.marked.WithLock(func(s *string) {
+		*s = *s + markedRow(n, r, grd.age()) + "\n"
+	})
+	return true
+}
+
+func (grd *requestGuard) age() string {
+	var start int64
+	grd.first.WithLock(func(p *int64) {
+		start = *p
+	})
+	if start == 0 {
+		return "before-first-marked"
+	}
+	return time.Since(time.Unix(0, start)).String()
+}
+
+func (grd *requestGuard) report() string {
+	var m string
+	grd.marked.WithLock(func(s *string) {
+		m = *s
+	})
+	var u string
+	grd.strangers.WithLock(func(s *string) {
+		u = *s
+	})
+	if m == "" {
+		m = "none\n"
+	}
+	if u == "" {
+		u = "none\n"
+	}
+	return "marked:\n" + m + "strangers:\n" + u
+}
+
+func (grd *requestGuard) wrapClient(t *testing.T, c *client.Client) {
+	t.Helper()
+	grd.wrapCounted(t, c, &atomic.Int64{})
+}
+
+func (grd *requestGuard) wrapCounted(t *testing.T, c *client.Client, tries *atomic.Int64) {
+	t.Helper()
+	fresh := &http.Transport{}
+	t.Cleanup(func() {
+		fresh.CloseIdleConnections()
+	})
+	c.HTTP = &http.Client{Transport: &markedTransport{want: grd.want, base: fresh, tries: tries}}
+}
+
+func (m *markedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	dup := req.Clone(req.Context())
+	dup.Header.Set(testMarkHeader, m.want)
+	dup.Header.Set(testAttemptHeader, fmt.Sprint(m.tries.Add(1)))
+	return m.base.RoundTrip(dup)
+}
+
+func strangerRow(r *http.Request, age string) string {
+	return "method=" + r.Method + " path=" + r.URL.Path + " agent=" + r.UserAgent() + " remote=" + r.RemoteAddr + " conn=" + r.Header.Get("Connection") + " age=" + age
+}
+
+func markedRow(n int64, r *http.Request, age string) string {
+	closeNote := "false"
+	if r.Close {
+		closeNote = "true"
+	}
+	return "#" + fmt.Sprint(n) + " age=" + age + " remote=" + r.RemoteAddr + " close=" + closeNote + " attempt=" + r.Header.Get(testAttemptHeader) + " path=" + r.URL.Path
 }
 
 type countingTransport struct {
@@ -88,8 +198,13 @@ func TestRetriesApplyOnlyToIdempotentMethods(t *testing.T) {
 		{method: http.MethodPatch, failAll: true, wantCalls: 1},
 	} {
 		t.Run(tc.method, func(t *testing.T) {
+			grd := newRequestGuard(t)
 			var calls atomic.Int64
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !grd.admit(r) {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
 				calls.Add(1)
 				if tc.failAll || calls.Load() <= 2 {
 					w.WriteHeader(http.StatusInternalServerError)
@@ -102,6 +217,7 @@ func TestRetriesApplyOnlyToIdempotentMethods(t *testing.T) {
 				Timeout: 2 * time.Second,
 				Retry:   resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond},
 			})
+			grd.wrapClient(t, c)
 			_, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{Method: tc.method, Path: "/thing"})
 			if tc.failAll && err == nil {
 				t.Fatal("err=nil, want the failing answer as an error")
@@ -110,15 +226,20 @@ func TestRetriesApplyOnlyToIdempotentMethods(t *testing.T) {
 				t.Fatalf("err=%v, want success after retries", err)
 			}
 			if got := calls.Load(); got != tc.wantCalls {
-				t.Fatalf("server saw %d calls, want %d (err=%v)", got, tc.wantCalls, err)
+				t.Fatalf("server saw %d calls, want %d (err=%v)\n%s", got, tc.wantCalls, err, grd.report())
 			}
 		})
 	}
 }
 
 func TestSendEncodesJSONBodyAndCallerHeaders(t *testing.T) {
+	grd := newRequestGuard(t)
 	var seen sync.Locked[string]
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("server read body: %v", err)
@@ -130,6 +251,7 @@ func TestSendEncodesJSONBodyAndCallerHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	grd.wrapClient(t, c)
 	got, err := client.Send[probe, probe](t.Context(), c, client.Request[probe]{
 		Method: http.MethodPut,
 		Path:   "/things/9",
@@ -160,6 +282,9 @@ func TestProblemAnswerBecomesStatusErrorWithProblem(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want the problem answer as an error")
 	}
+	if !errors.Is(err, client.ErrUpstreamFailed) {
+		t.Fatalf("err=%v, want client.ErrUpstreamFailed", err)
+	}
 	se := &client.StatusError{}
 	if !errors.As(err, &se) {
 		t.Fatalf("err=%v (%T), want *client.StatusError", err, err)
@@ -167,15 +292,14 @@ func TestProblemAnswerBecomesStatusErrorWithProblem(t *testing.T) {
 	if se.Status != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d, want 503", se.Status)
 	}
-	if p := se.Problem; p != nil {
-		if p.Title != "Stock mismatch" || p.Detail != "two left" || p.Status != 503 {
-			t.Fatalf("problem=%+v, want the server problem", p)
-		}
-		if p.Type != "https://example.com/probs/stock" {
-			t.Fatalf("problem type=%q", p.Type)
-		}
-	} else {
-		t.Fatal("StatusError carries no problem")
+	if se.ProblemType != "https://example.com/probs/stock" {
+		t.Fatalf("problem type=%q, want the server problem type", se.ProblemType)
+	}
+	if se.BodyLen != len(body) {
+		t.Fatalf("body len=%d, want %d", se.BodyLen, len(body))
+	}
+	if strings.Contains(err.Error(), "two left") {
+		t.Fatalf("error %q carries the downstream detail", err.Error())
 	}
 }
 
@@ -188,6 +312,9 @@ func TestPlainErrorStatusNamesStatusAndBoundsBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want the failing answer as an error")
 	}
+	if !errors.Is(err, client.ErrUpstreamFailed) {
+		t.Fatalf("err=%v, want client.ErrUpstreamFailed", err)
+	}
 	se := &client.StatusError{}
 	if !errors.As(err, &se) {
 		t.Fatalf("err=%v (%T), want *client.StatusError", err, err)
@@ -195,15 +322,15 @@ func TestPlainErrorStatusNamesStatusAndBoundsBody(t *testing.T) {
 	if se.Status != http.StatusBadGateway {
 		t.Fatalf("status=%d, want 502", se.Status)
 	}
-	if se.Problem != nil {
-		t.Fatal("a text/plain answer must not carry a problem")
+	if se.ProblemType != "" {
+		t.Fatalf("problem type=%q, want empty for text/plain", se.ProblemType)
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "502") {
 		t.Fatalf("error %q lacks the status", msg)
 	}
-	if !strings.Contains(msg, "upstream fell over") {
-		t.Fatalf("error %q lacks the body prefix", msg)
+	if strings.Contains(msg, "upstream fell over") {
+		t.Fatalf("error %q carries the downstream body", msg)
 	}
 	if strings.Contains(msg, tail) {
 		t.Fatal("error leaks the whole body")
@@ -235,34 +362,45 @@ func TestBodyReadUnderSizeLimit(t *testing.T) {
 }
 
 func TestOpenBreakerStopsRequestsBeforeTheWire(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Breaker: brk})
+	grd.wrapClient(t, c)
 	for range 2 {
 		if _, err := client.Get[probe](t.Context(), c, "/x"); err == nil {
 			t.Fatal("warm-up call succeeded against a failing server")
 		}
 	}
 	if calls.Load() != 2 {
-		t.Fatalf("warm-up made %d calls, want 2", calls.Load())
+		t.Fatalf("warm-up made %d calls, want 2\n%s", calls.Load(), grd.report())
 	}
 	_, err := client.Get[probe](t.Context(), c, "/x")
-	if !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err=%v, want resilience.ErrOpen", err)
+	if !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err=%v, want resilience.ErrCircuitOpen", err)
 	}
 	if calls.Load() != 2 {
-		t.Fatalf("the open breaker let %d calls through in total", calls.Load())
+		t.Fatalf("the open breaker let %d calls through in total\n%s", calls.Load(), grd.report())
 	}
 }
 
 func TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -270,6 +408,7 @@ func TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker(t *testing.T) {
 	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
 	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry, Breaker: brk})
+	grd.wrapClient(t, c)
 	for i := range 3 {
 		_, err := client.Get[probe](t.Context(), c, "/missing")
 		se := &client.StatusError{}
@@ -282,14 +421,19 @@ func TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker(t *testing.T) {
 		}
 	}
 	if calls.Load() != 3 {
-		t.Fatalf("server saw %d calls for three 404 answers, want 3: a client error is not retried", calls.Load())
+		t.Fatalf("server saw %d calls for three 404 answers, want 3: a client error is not retried\n%s", calls.Load(), grd.report())
 	}
 }
 
 func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
+	grd := newRequestGuard(t)
 	statuses := []int{http.StatusInternalServerError, http.StatusInternalServerError, http.StatusNotFound}
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		n := int(calls.Add(1))
 		if n <= len(statuses) {
 			w.WriteHeader(statuses[n-1])
@@ -303,6 +447,7 @@ func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
 	defer srv.Close()
 	brk := &resilience.Breaker{Window: 3, FailureRate: 0.5, OpenFor: time.Hour}
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Breaker: brk})
+	grd.wrapClient(t, c)
 	for range statuses {
 		if _, err := client.Get[probe](t.Context(), c, "/thing"); err == nil {
 			t.Fatal("err=nil, want the failing answer")
@@ -319,28 +464,39 @@ func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
 }
 
 func TestTooManyRequestsIsRetried(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer srv.Close()
 	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry})
+	grd.wrapClient(t, c)
 	if _, err := client.Get[probe](t.Context(), c, "/busy"); err == nil {
 		t.Fatal("Get succeeded against a server that answers 429")
 	}
 	if calls.Load() != 3 {
-		t.Fatalf("server saw %d calls, want 3: 429 is retried", calls.Load())
+		t.Fatalf("server saw %d calls, want 3: 429 is retried\n%s", calls.Load(), grd.report())
 	}
 }
 
 func TestCallerContextCancelsRequest(t *testing.T) {
+	grd := newRequestGuard(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var reached atomic.Int64
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		reached.Add(1)
 		cancel()
 		<-release
@@ -349,18 +505,25 @@ func TestCallerContextCancelsRequest(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 	c := client.New(srv.URL, resilience.Policy{Timeout: 5 * time.Second})
+	grd.wrapClient(t, c)
 	_, err := client.Get[probe](ctx, c, "/hang")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want context.Canceled", err)
 	}
 	if reached.Load() != 1 {
-		t.Fatalf("server reached %d times, want 1", reached.Load())
+		t.Fatalf("server reached %d times, want 1\n%s", reached.Load(), grd.report())
 	}
 }
 
 func TestAttemptTimeoutEndsSlowAttempt(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
+	var tries atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		time.Sleep(120 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
@@ -370,13 +533,14 @@ func TestAttemptTimeoutEndsSlowAttempt(t *testing.T) {
 		Timeout: 25 * time.Millisecond,
 		Retry:   resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 2 * time.Millisecond},
 	})
+	grd.wrapCounted(t, c, &tries)
 	start := time.Now()
 	_, err := client.Get[probe](t.Context(), c, "/slow")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err=%v, want context.DeadlineExceeded", err)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("calls=%d, want 2 attempts each ended by the per-attempt timeout", calls.Load())
+	if got := tries.Load(); got != 2 {
+		t.Fatalf("attempts=%d, want 2 attempts each ended by the per-attempt timeout\n%s", got, grd.report())
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("elapsed=%v, the per-attempt timeout was not enforced", elapsed)
@@ -437,17 +601,22 @@ func TestErrorTextStaysUsable(t *testing.T) {
 	if msg := se.Error(); !strings.Contains(msg, "503") {
 		t.Fatalf("Error()=%q, lacks the status", msg)
 	}
-	withProblem := &client.StatusError{Status: 503, Problem: web.Problem{Title: "Stock mismatch", Status: 503, Detail: "two left"}}
+	withProblem := &client.StatusError{Status: 503, ProblemType: "https://example.com/probs/stock", BodyLen: 41}
 	msg := withProblem.Error()
-	if !strings.Contains(msg, "Stock mismatch") || !strings.Contains(msg, "two left") {
-		t.Fatalf("Error()=%q, lacks the problem title and detail", msg)
+	if !strings.Contains(msg, "503") || !strings.Contains(msg, "https://example.com/probs/stock") {
+		t.Fatalf("Error()=%q, lacks the status and problem type", msg)
 	}
 }
 
 func TestOversizedCallerFaultStaysCallerFault(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
 	tail := strings.Repeat("x", 300)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusNotFound)
@@ -459,6 +628,7 @@ func TestOversizedCallerFaultStaysCallerFault(t *testing.T) {
 	brk := &resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
 	retry := resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second, Retry: retry, Breaker: brk})
+	grd.wrapClient(t, c)
 	c.MaxBody = 64
 	for i := range 4 {
 		_, err := client.Get[probe](t.Context(), c, "/missing")
@@ -471,24 +641,30 @@ func TestOversizedCallerFaultStaysCallerFault(t *testing.T) {
 			t.Fatalf("call %d status = %d, want 404", i, se.Status)
 			return
 		}
-		if len(se.Prefix) != 64 {
-			t.Fatalf("call %d prefix is %d bytes, want the %d bytes MaxBody allows", i, len(se.Prefix), 64)
+		if se.BodyLen != 64 {
+			t.Fatalf("call %d body len is %d bytes, want 64", i, se.BodyLen)
 			return
 		}
 	}
 	if calls.Load() != 4 {
-		t.Fatalf("server saw %d calls for four oversized 404 answers, want 4: not retried, breaker closed", calls.Load())
+		t.Fatalf("server saw %d calls for four oversized 404 answers, want 4: not retried, breaker closed\n%s", calls.Load(), grd.report())
 	}
 }
 
 func TestHeadSuccessSkipsDecode(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	grd.wrapClient(t, c)
 	out, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{Method: http.MethodHead, Path: "/x"})
 	if err != nil {
 		t.Fatalf("HEAD 200 err = %v, want nil: a bodyless HEAD answer is not a decode error", err)
@@ -499,13 +675,18 @@ func TestHeadSuccessSkipsDecode(t *testing.T) {
 		return
 	}
 	if calls.Load() != 1 {
-		t.Fatalf("server saw %d calls, want 1", calls.Load())
+		t.Fatalf("server saw %d calls, want 1\n%s", calls.Load(), grd.report())
 	}
 }
 
 func TestNoContentAndResetContentSkipDecode(t *testing.T) {
+	grd := newRequestGuard(t)
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		calls.Add(1)
 		switch r.URL.Path {
 		case "/gone":
@@ -516,6 +697,7 @@ func TestNoContentAndResetContentSkipDecode(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	grd.wrapClient(t, c)
 	for _, path := range []string{"/gone", "/reset"} {
 		out, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{Method: http.MethodDelete, Path: path})
 		if err != nil {
@@ -528,7 +710,7 @@ func TestNoContentAndResetContentSkipDecode(t *testing.T) {
 		}
 	}
 	if calls.Load() != 2 {
-		t.Fatalf("server saw %d calls, want 2", calls.Load())
+		t.Fatalf("server saw %d calls, want 2\n%s", calls.Load(), grd.report())
 	}
 }
 
@@ -577,4 +759,134 @@ func TestMaxBodyLimitIsExact(t *testing.T) {
 	if !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "client: GET /over") {
 		t.Fatalf("err = %v, want the exceeds error naming method and path", err)
 	}
+}
+
+func TestUpstreamRejectedIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, http.StatusNotFound, "text/plain", "no such item"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/missing")
+	if err == nil {
+		t.Fatal("err=nil, want the 404 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamRejected) {
+		t.Fatalf("err=%v, want ErrUpstreamRejected", err)
+		return
+	}
+	se := &client.StatusError{}
+	if !errors.As(err, &se) {
+		t.Fatalf("err=%v (%T), want *StatusError", err, err)
+		return
+	}
+	if se.Status != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", se.Status)
+	}
+}
+
+func TestUpstreamFailedIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, http.StatusBadGateway, "text/plain", "boom"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/relay")
+	if err == nil {
+		t.Fatal("err=nil, want the 502 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamFailed) {
+		t.Fatalf("err=%v, want ErrUpstreamFailed", err)
+		return
+	}
+}
+
+func TestUpstreamTimeoutIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, http.StatusRequestTimeout, "text/plain", "slow"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/slow")
+	if err == nil {
+		t.Fatal("err=nil, want the 408 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamTimeout) {
+		t.Fatalf("err=%v, want ErrUpstreamTimeout", err)
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "client.upstream_timeout" {
+		t.Fatalf("code=%q, want client.upstream_timeout", got.Code)
+	}
+}
+
+func TestUpstreamRateLimitedIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, 429, "text/plain", "busy"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/busy")
+	if err == nil {
+		t.Fatal("err=nil, want the 429 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamRateLimited) {
+		t.Fatalf("err=%v, want ErrUpstreamRateLimited", err)
+		return
+	}
+}
+
+func TestResponseTooLargeIsFault(t *testing.T) {
+	big := `{"ok":true,"pad":"` + strings.Repeat("b", 4096) + `"}`
+	srv := httptest.NewServer(serveJSON(t, http.StatusOK, big))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	c.MaxBody = 64
+	_, err := client.Get[probe](t.Context(), c, "/big")
+	if err == nil {
+		t.Fatal("err=nil, want the oversize body as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrResponseTooLarge) {
+		t.Fatalf("err=%v, want ErrResponseTooLarge", err)
+		return
+	}
+}
+
+func TestRequestFailedIsFault(t *testing.T) {
+	c := client.New("http://example.invalid", resilience.Policy{Timeout: time.Second})
+	_, err := client.Send[func(), probe](t.Context(), c, client.Request[func()]{Method: http.MethodPost, Path: "/x", Body: func() {}})
+	if err == nil {
+		t.Fatal("err=nil, want the encode failure as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrRequestFailed) {
+		t.Fatalf("err=%v, want ErrRequestFailed", err)
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "internal" {
+		t.Fatalf("code=%q, want internal for an Internal fault", got.Code)
+	}
+}
+
+func TestFaultPublicHidesSecret(t *testing.T) {
+	secret := "api-key=hunter2-secret"
+	hostile := "<script>alert(1)</script>"
+	leak := secret + " " + hostile + " /etc/passwd '; DROP TABLE x; --"
+	srv := httptest.NewServer(serve(t, http.StatusInternalServerError, "text/plain", leak))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/secret")
+	if err == nil {
+		t.Fatal("err=nil, want the 500 as an error")
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "client.upstream_failed" {
+		t.Fatalf("code=%q, want client.upstream_failed", got.Code)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), secret, hostile, "/etc/passwd", "DROP TABLE")
+	faulttest.RefuseLeak(t, []byte(err.Error()), secret, hostile, "/etc/passwd", "DROP TABLE")
+}
+
+func TestFaultsMatchCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/client.md", client.Faults())
 }

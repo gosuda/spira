@@ -1,0 +1,37 @@
+package bus_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/bus"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/bus.md", bus.Faults())
+	if len(bus.Faults()) != 0 {
+		t.Fatalf("Faults holds %d entries, want none: the package has no client-visible failure", len(bus.Faults()))
+	}
+}
+
+func TestPublishSubscribePreservesHostileValues(t *testing.T) {
+	planted := []string{"hunter2", "<script>alert(1)</script>", "'; DROP TABLE x; --", "/etc/passwd"}
+	topic := bus.NewTopic[string](4)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch := topic.Subscribe(ctx)
+	hostile := "password=hunter2 <script>alert(1)</script> '; DROP TABLE x; --' /etc/passwd"
+	topic.Publish(hostile)
+	select {
+	case got := <-ch:
+		if got != hostile {
+			t.Fatalf("subscriber got %q, want the published value unchanged", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber received nothing within 2s")
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, errors.New(hostile)), planted...)
+}

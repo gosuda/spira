@@ -1,0 +1,560 @@
+package admin_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/admin"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+const testToken = "admin-test-token"
+
+func tokenGuard() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if ctx.Request.Header.Get("Authorization") != "Bearer "+testToken {
+				return nil, web.Fail(web.Problem{Status: http.StatusUnauthorized, Title: "Unauthorized"})
+			}
+			return next(ctx)
+		}
+	}
+}
+
+func openGuard() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return next
+	}
+}
+
+func shellLayout(ctx *web.Context, p web.Page) view.Node {
+	return view.Html(view.Head(view.Title(view.T(p.Title))), view.Body(view.H1(view.T(p.Title)), p.Body))
+}
+
+func newAdminRouter(srv *admin.Server, guard web.Stage) *web.Router {
+	r := web.NewRouter()
+	r.Layout = shellLayout
+	srv.Mount(r, guard)
+	return r
+}
+
+func postInstance(t *testing.T, ts *httptest.Server, name string, opsURL string) int {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"name": name, "opsUrl": opsURL})
+	if err != nil {
+		t.Fatalf("marshal instance: %v", err)
+		return 0
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, ts.URL+"/admin/instances", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new POST request: %v", err)
+		return 0
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST instances: %v", err)
+		return 0
+	}
+	if _, rerr := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); rerr != nil {
+		t.Fatalf("drain POST body: %v", rerr)
+		return 0
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Fatalf("close POST body: %v", cerr)
+		return 0
+	}
+	return resp.StatusCode
+}
+
+func getPage(t *testing.T, ts *httptest.Server, path string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+path, nil)
+	if err != nil {
+		t.Fatalf("new GET request: %v", err)
+		return 0, ""
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET page: %v", err)
+		return 0, ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Fatalf("read page: %v", err)
+		return 0, ""
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Fatalf("close page body: %v", cerr)
+		return 0, ""
+	}
+	return resp.StatusCode, string(body)
+}
+
+func pageHolds(body string, wants []string) bool {
+	for _, w := range wants {
+		if !strings.Contains(body, w) {
+			return false
+		}
+	}
+	return true
+}
+
+func waitForPage(t *testing.T, ts *httptest.Server, path string, wants []string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		code, body := getPage(t, ts, path)
+		if code == http.StatusOK && pageHolds(body, wants) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("page %s never held %v", path, wants)
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-t.Context().Done():
+			t.Fatalf("test context ended waiting for %v", wants)
+			return
+		}
+	}
+}
+
+func fixedHealth(code int, status string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		if _, err := w.Write([]byte(`{"status":"` + status + `"}`)); err != nil {
+			return
+		}
+	}))
+}
+
+type sseTap struct {
+	msgs  chan string
+	ended chan error
+}
+
+func newSseTap() *sseTap {
+	return &sseTap{msgs: make(chan string, 32), ended: make(chan error, 1)}
+}
+
+func splitFrame(pending []byte) (string, []byte, bool) {
+	i := bytes.Index(pending, []byte("\n\n"))
+	if i < 0 {
+		return "", pending, false
+	}
+	return string(pending[:i+2]), pending[i+2:], true
+}
+
+func (s *sseTap) emitFrames(ctx context.Context, pending []byte) ([]byte, bool) {
+	for {
+		frame, rest, ok := splitFrame(pending)
+		if !ok {
+			return pending, true
+		}
+		select {
+		case s.msgs <- frame:
+		case <-ctx.Done():
+			return rest, false
+		}
+		pending = rest
+	}
+}
+
+func (s *sseTap) finish(ctx context.Context, rerr error) {
+	select {
+	case s.ended <- rerr:
+	case <-ctx.Done():
+	}
+}
+
+func (s *sseTap) read(ctx context.Context, body io.Reader) error {
+	var pending []byte
+	buf := make([]byte, 4096)
+	for {
+		n, rerr := body.Read(buf)
+		pending = append(pending, buf[:n]...)
+		rest, alive := s.emitFrames(ctx, pending)
+		pending = rest
+		if !alive {
+			return nil
+		}
+		if rerr != nil {
+			s.finish(ctx, rerr)
+			return nil
+		}
+	}
+}
+
+func (s *sseTap) next(ctx context.Context, wait time.Duration) (string, bool) {
+	select {
+	case m := <-s.msgs:
+		return m, true
+	case <-s.ended:
+		return "", false
+	case <-time.After(wait):
+		return "", false
+	case <-ctx.Done():
+		return "", false
+	}
+}
+
+func openEvents(t *testing.T, ts *httptest.Server) *http.Response? {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/admin/events", nil)
+	if err != nil {
+		t.Fatalf("new events request: %v", err)
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open events stream: %v", err)
+		return nil
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("events content type %q, want text/event-stream", ct)
+		return nil
+	}
+	return resp
+}
+
+func flakyHealth(t *testing.T, code *atomic.Int64) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if code.Load() == http.StatusOK {
+			w.WriteHeader(http.StatusOK)
+			if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+				return
+			}
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, err := w.Write([]byte(`{"status":"unavailable"}`)); err != nil {
+			return
+		}
+	}))
+}
+
+func registerInstances(t *testing.T, ts *httptest.Server, shopURL string, billingURL string) {
+	t.Helper()
+	if code := postInstance(t, ts, "shop", shopURL); code != http.StatusCreated {
+		t.Fatalf("POST shop status = %d, want 201", code)
+		return
+	}
+	if code := postInstance(t, ts, "billing", billingURL); code != http.StatusCreated {
+		t.Fatalf("POST billing status = %d, want 201", code)
+		return
+	}
+}
+
+func driveRecovery(ctx context.Context, tap *sseTap, stream *http.Response, flip func()) (err error) {
+	defer func() {
+		if cerr := stream.Body.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close stream body: %w", cerr)
+		}
+	}()
+	beat, ok := tap.next(ctx, 3*time.Second)
+	if !ok {
+		return fmt.Errorf("stream sent no heartbeat within 3s")
+	}
+	if beat != ": live\n\n" {
+		return fmt.Errorf("first stream message %q, want the heartbeat comment", beat)
+	}
+	flip()
+	event, ok := tap.next(ctx, 3*time.Second)
+	if !ok {
+		return fmt.Errorf("recovery of billing sent no event within 3s")
+	}
+	if !strings.Contains(event, "event: instance") || !strings.Contains(event, "billing") || !strings.Contains(event, "<td>up</td>") {
+		return fmt.Errorf("recovery event %q must name billing as up", event)
+	}
+	if second, ok := tap.next(ctx, 300*time.Millisecond); ok {
+		return fmt.Errorf("second stream message %q after recovery, want exactly one event", second)
+	}
+	return nil
+}
+
+func TestAdminListsStatusesAndEmitsSingleRecoveryEvent(t *testing.T) {
+	var nowNanos atomic.Int64
+	nowNanos.Store(time.Now().UnixNano())
+	srv := &admin.Server{Interval: 10 * time.Millisecond, Now: func() time.Time { return time.Unix(0, nowNanos.Load()) }, MaxInstances: 100}
+	r := newAdminRouter(srv, tokenGuard())
+	if err := srv.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+		return
+	}
+	defer func() {
+		if err := srv.Stop(t.Context()); err != nil {
+			t.Fatalf("Stop: %v", err)
+			return
+		}
+	}()
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+	up := fixedHealth(http.StatusOK, "ok")
+	defer up.Close()
+	var flakyCode atomic.Int64
+	flakyCode.Store(http.StatusServiceUnavailable)
+	flaky := flakyHealth(t, &flakyCode)
+	defer flaky.Close()
+	registerInstances(t, ts, up.URL, flaky.URL)
+	waitForPage(t, ts, "/admin", []string{"shop", "billing", "up", "down"})
+	stream := openEvents(t, ts)
+	if stream == nil {
+		t.Fatal("events stream did not open")
+		return
+	}
+	tap := newSseTap()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	flip := func() {
+		flakyCode.Store(http.StatusOK)
+		nowNanos.Store(nowNanos.Load() + int64(time.Minute))
+	}
+	if gerr := func() error {
+		go group (ctx) {
+			go { tap.read(ctx, stream.Body)? }
+			go { driveRecovery(ctx, tap, stream, flip)? }
+		}
+		return nil
+	}(); gerr != nil {
+		t.Fatalf("go group: %v", gerr)
+		return
+	}
+}
+
+type call struct {
+	method string
+	target string
+	body   []byte
+	token  bool
+}
+
+func directCall(r *web.Router, c call) *httptest.ResponseRecorder {
+	var reader io.Reader
+	if c.body != nil {
+		reader = bytes.NewReader(c.body)
+	}
+	req := httptest.NewRequest(c.method, c.target, reader)
+	if c.token {
+		req.Header.Set("Authorization", "Bearer "+testToken)
+	}
+	if c.body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func instanceBody(t *testing.T, name string, opsURL string) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"name": name, "opsUrl": opsURL})
+	if err != nil {
+		t.Fatalf("marshal instance: %v", err)
+		return nil
+	}
+	return payload
+}
+
+func TestAdminGuardRefusesWithoutCredentials(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, tokenGuard())
+	targets := []call{
+		{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example")},
+		{method: http.MethodDelete, target: "/admin/instances/shop"},
+		{method: http.MethodGet, target: "/admin"},
+		{method: http.MethodGet, target: "/admin/events"},
+	}
+	for _, tc := range targets {
+		rec := directCall(r, tc)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s without credentials status = %d, want 401", tc.method, tc.target, rec.Code)
+			return
+		}
+	}
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example"), token: true})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST with credentials status = %d, want 201", rec.Code)
+		return
+	}
+}
+
+func TestAdminRejectsBadOpsURL(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, tokenGuard())
+	bad := []struct {
+		name   string
+		opsURL string
+	}{
+		{"ftp", "ftp://files.example/ops"},
+		{"creds", "http://user:pass@shop.example/"},
+		{"nohost", "http:///ops"},
+		{"relative", "/ops/health"},
+		{"blank", ""},
+		{"", "http://shop.example/"},
+	}
+	for _, tc := range bad {
+		rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, tc.name, tc.opsURL), token: true})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("POST %q %q status = %d, want 422", tc.name, tc.opsURL, rec.Code)
+			return
+		}
+		if !strings.Contains(rec.Body.String(), "ops URL") && !strings.Contains(rec.Body.String(), "instance name") {
+			t.Fatalf("POST %q %q body %q must name the bad field", tc.name, tc.opsURL, rec.Body.String())
+			return
+		}
+	}
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: []byte("{broken"), token: true})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST malformed JSON status = %d, want 400", rec.Code)
+		return
+	}
+	good := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "https://shop.example:8443/base"), token: true})
+	if good.Code != http.StatusCreated {
+		t.Fatalf("POST valid instance status = %d, want 201: %s", good.Code, good.Body.String())
+		return
+	}
+}
+
+func TestAdminRegistryBound(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 1}
+	r := newAdminRouter(srv, tokenGuard())
+	first := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "a", "http://a.example"), token: true})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first POST status = %d, want 201", first.Code)
+		return
+	}
+	second := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "b", "http://b.example"), token: true})
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second POST status = %d, want 429", second.Code)
+		return
+	}
+	if !strings.Contains(second.Body.String(), "registry full") {
+		t.Fatalf("second POST body %q must name the full registry", second.Body.String())
+		return
+	}
+	remove := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/a", token: true})
+	if remove.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want 204", remove.Code)
+		return
+	}
+	retry := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "b", "http://b.example"), token: true})
+	if retry.Code != http.StatusCreated {
+		t.Fatalf("POST after DELETE status = %d, want 201", retry.Code)
+		return
+	}
+	missing := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/gone", token: true})
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("DELETE missing status = %d, want 404", missing.Code)
+		return
+	}
+}
+
+func TestAdminClientRegistersAndDeregisters(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, openGuard())
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+	c := &admin.Client{Server: ts.URL, Self: admin.Instance{Name: "shop", OpsURL: "http://shop.example"}}
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Client.Start: %v", err)
+		return
+	}
+	code, body := getPage(t, ts, "/admin")
+	if code != http.StatusOK {
+		t.Fatalf("GET /admin status = %d, want 200", code)
+		return
+	}
+	if !strings.Contains(body, "shop") {
+		t.Fatalf("console page %q must list the registered shop", body)
+		return
+	}
+	if err := c.Stop(t.Context()); err != nil {
+		t.Fatalf("Client.Stop: %v", err)
+		return
+	}
+	_, after := getPage(t, ts, "/admin")
+	if strings.Contains(after, "shop") {
+		t.Fatalf("console page %q must not list the deregistered shop", after)
+		return
+	}
+	if err := c.Stop(t.Context()); err != nil {
+		t.Fatalf("second Client.Stop: %v", err)
+		return
+	}
+}
+
+func TestAdminMountRequiresGuard(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Mount accepted a nil guard")
+			return
+		}
+	}()
+	srv := &admin.Server{}
+	srv.Mount(web.NewRouter(), nil)
+}
+
+func mustPanicOnMount(t *testing.T, srv *admin.Server, what string) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("Mount accepted %s", what)
+			return
+		}
+	}()
+	srv.Mount(web.NewRouter(), openGuard())
+}
+
+func TestAdminRejectsBadConfig(t *testing.T) {
+	bad := []struct {
+		name string
+		srv  *admin.Server
+	}{
+		{"interval", &admin.Server{Interval: 0}},
+		{"bound", &admin.Server{Interval: time.Second, MaxInstances: 0}},
+	}
+	for _, tc := range bad {
+		mustPanicOnMount(t, tc.srv, tc.name)
+	}
+}
+
+func TestAdminReRegisterSameURLKeepsStatus(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, tokenGuard())
+	first := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example"), token: true})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first POST status = %d, want 201", first.Code)
+		return
+	}
+	again := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example"), token: true})
+	if again.Code != http.StatusOK {
+		t.Fatalf("repeat POST status = %d, want 200", again.Code)
+		return
+	}
+	moved := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://other.example"), token: true})
+	if moved.Code != http.StatusOK {
+		t.Fatalf("changed URL POST status = %d, want 200", moved.Code)
+		return
+	}
+}

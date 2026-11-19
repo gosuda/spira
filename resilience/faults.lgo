@@ -1,0 +1,13 @@
+package resilience
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrCircuitOpen = fault.New("resilience.circuit_open", fault.Unavailable, "The upstream is unavailable.")
+
+var ErrTimeout = fault.New("resilience.timeout", fault.Timeout, "The upstream timed out.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrCircuitOpen, ErrTimeout}
+}

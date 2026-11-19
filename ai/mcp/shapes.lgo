@@ -81,10 +81,10 @@ func callArguments(name string, arguments string) (jsontext.Value, error) {
 	}
 	var probe map[string]jsontext.Value
 	if err := json.Unmarshal(jsontext.Value(arguments), &probe); err != nil {
-		return nil, fmt.Errorf("mcp: tools/call %s arguments: %w", name, err)
+		return nil, ErrProtocolError.Wrap(fmt.Errorf("mcp: tools/call %s arguments: %w", name, err))
 	}
 	if probe == nil {
-		return nil, fmt.Errorf("mcp: tools/call %s arguments: not a JSON object", name)
+		return nil, ErrProtocolError.Wrap(fmt.Errorf("mcp: tools/call %s arguments: not a JSON object", name))
 	}
 	return jsontext.Value(arguments), nil
 }
@@ -102,10 +102,10 @@ func argumentsObject(raw jsontext.Value) bool {
 
 func matchReply(sent Envelope, reply Envelope) (Envelope, error) {
 	if !isResponse(reply) {
-		return Envelope{}, fmt.Errorf("mcp: reply is not a response")
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: reply is not a response"))
 	}
 	if idKey(reply.ID) != idKey(sent.ID) {
-		return Envelope{}, fmt.Errorf("mcp: reply id %s does not match request id %s", reply.ID, sent.ID)
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: reply id %s does not match request id %s", reply.ID, sent.ID))
 	}
 	return reply, nil
 }
@@ -113,13 +113,13 @@ func matchReply(sent Envelope, reply Envelope) (Envelope, error) {
 func resultOf[T any](reply Envelope) (T, error) {
 	var out T
 	if e := reply.Error; e != nil {
-		return out, e
+		return out, ErrProtocolError.Wrap(e)
 	}
 	if len(reply.Result) == 0 {
-		return out, fmt.Errorf("mcp: reply holds no result")
+		return out, ErrProtocolError.Wrap(fmt.Errorf("mcp: reply holds no result"))
 	}
 	if err := json.Unmarshal(reply.Result, &out); err != nil {
-		return out, fmt.Errorf("mcp: decode result: %w", err)
+		return out, ErrProtocolError.Wrap(fmt.Errorf("mcp: decode result: %w", err))
 	}
 	return out, nil
 }

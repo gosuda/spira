@@ -12,6 +12,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -75,7 +76,7 @@ func (Array) filter() {}
 
 func ParseFilter(text string) (Filter, error) {
 	if strings.TrimSpace(text) == "" {
-		return nil, errors.New("ai/rag: parse filter: expression is empty")
+		return nil, ErrInvalidFilter.Wrap(errors.New("ai/rag: parse filter: expression is empty"))
 	}
 	p := &filterParser{src: text}
 	p.next()
@@ -84,10 +85,10 @@ func ParseFilter(text string) (Filter, error) {
 	}
 	f, err := p.parseOr()
 	if err != nil {
-		return nil, fmt.Errorf("ai/rag: parse filter: %w", err)
+		return nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: parse filter: %w", err))
 	}
 	if p.tok.kind != tokEOF {
-		return nil, fmt.Errorf("ai/rag: parse filter: unexpected %q after the expression", p.tok.text)
+		return nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: parse filter: position %d: trailing text after the expression", p.tok.pos))
 	}
 	if g, ok := f.(Group); ok {
 		return g.Inner, nil
@@ -155,6 +156,7 @@ var compareOps = map[tokenKind]Op{
 type token struct {
 	kind tokenKind
 	text string
+	pos int
 }
 
 type filterParser struct {
@@ -224,7 +226,7 @@ func (p *filterParser) parseOperand() (Filter, error) {
 
 func (p *filterParser) expect(kind tokenKind, want string) error {
 	if p.tok.kind != kind {
-		return fmt.Errorf("expected %s, found %q", want, p.tok.text)
+		return fmt.Errorf("position %d: expected %s", p.tok.pos, want)
 	}
 	p.next()
 	return nil
@@ -248,7 +250,7 @@ func (p *filterParser) parseKey() (Key, error) {
 		}
 		return Key{Name: first.text + "." + second.text}, nil
 	}
-	return Key{}, fmt.Errorf("expected a key, found %q", first.text)
+	return Key{}, fmt.Errorf("position %d: expected a key", first.pos)
 }
 
 func (p *filterParser) parseComparison(key Key) (Filter, error) {
@@ -274,7 +276,7 @@ func (p *filterParser) parseComparison(key Key) (Filter, error) {
 	case tokIs:
 		return p.parseNullTest(key)
 	}
-	return nil, fmt.Errorf("expected an operator after the key %q", key.Name)
+	return nil, fmt.Errorf("position %d: expected an operator after the key", p.tok.pos)
 }
 
 func (p *filterParser) parseNullTest(key Key) (Filter, error) {
@@ -324,7 +326,7 @@ func (p *filterParser) parseConst() (Const, error) {
 	case tokInt:
 		n, err := strconv.ParseInt(tok.text, 10, 64)
 		if err != nil {
-			return Const{}, fmt.Errorf("integer %s: %w", tok.text, err)
+			return Const{}, fmt.Errorf("position %d: bad integer", tok.pos)
 		}
 		if p.tok.kind == tokLong {
 			p.next()
@@ -333,11 +335,11 @@ func (p *filterParser) parseConst() (Const, error) {
 	case tokDecimal:
 		d, err := strconv.ParseFloat(tok.text, 64)
 		if err != nil {
-			return Const{}, fmt.Errorf("decimal %s: %w", tok.text, err)
+			return Const{}, fmt.Errorf("position %d: bad decimal", tok.pos)
 		}
 		return Const{Decimal: d}, nil
 	}
-	return Const{}, fmt.Errorf("expected a constant, found %q", tok.text)
+	return Const{}, fmt.Errorf("position %d: expected a constant", tok.pos)
 }
 
 func unquote(quoted string) string {
@@ -349,9 +351,10 @@ func unquote(quoted string) string {
 func (p *filterParser) next() {
 	p.skipSpace()
 	if p.pos == len(p.src) {
-		p.tok = token{kind: tokEOF, text: "the end of the expression"}
+		p.tok = token{kind: tokEOF, text: "the end of the expression", pos: p.pos}
 		return
 	}
+	start := p.pos
 	c := p.src[p.pos]
 	switch {
 	case isDigit(c) || c == '+' || c == '-' || (c == '.' && p.digitAt(p.pos+1)):
@@ -363,6 +366,7 @@ func (p *filterParser) next() {
 	default:
 		p.tok = p.lexSymbol()
 	}
+	p.tok.pos = start
 }
 
 func (p *filterParser) skipSpace() {
@@ -521,6 +525,9 @@ func evalComparison(e Expression, meta map[string]Value) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("%s needs a constant on the right", e.Type)
 	}
+	if isNaNValue(meta[key.Name]) {
+		return e.Type == OpNe, nil
+	}
 	n, err := compareConst(meta[key.Name], c)
 	if err != nil {
 		return false, fmt.Errorf("key %q: %w", key.Name, err)
@@ -546,6 +553,9 @@ func evalInclusion(e Expression, meta map[string]Value) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("%s needs a list on the right", e.Type)
 	}
+	if isNaNValue(meta[key.Name]) {
+		return e.Type == OpNin, nil
+	}
 	for _, item := range list.Items {
 		n, err := compareConst(meta[key.Name], item)
 		if err != nil {
@@ -568,6 +578,23 @@ func operands(e Expression) (Key, Filter, error) {
 		return Key{}, Key{}, fmt.Errorf("%s needs a right operand", e.Type)
 	}
 	return key, right, nil
+}
+
+func isNaNValue(held Value?) bool {
+	if held == nil {
+		return false
+	}
+	switch have := held.(type) {
+	case Number:
+		return math.IsNaN(have.Number)
+	case Text:
+		return false
+	case Flag:
+		return false
+	case nil:
+		return false
+	}
+	return false
 }
 
 func compareConst(held Value?, want Const) (int, error) {

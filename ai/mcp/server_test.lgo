@@ -257,8 +257,8 @@ func TestMountCallToolError(t *testing.T) {
 	if !result.IsError {
 		t.Error("isError false, want true")
 	}
-	if len(result.Content) != 1 || result.Content[0].Text != "upstream exploded" {
-		t.Errorf("content %+v", result.Content)
+	if len(result.Content) != 1 || result.Content[0].Text != "The tool call failed." {
+		t.Errorf("content %+v, want the constant mcp.tool_failed text", result.Content)
 	}
 	if env.Error != nil {
 		t.Errorf("protocol error %+v, want result", env.Error)
@@ -282,8 +282,11 @@ func TestMountUnknownTool(t *testing.T) {
 	if e.Code != -32602 {
 		t.Errorf("code %d, want -32602", e.Code)
 	}
-	if e.Message != "Unknown tool: invalid_tool_name" {
-		t.Errorf("message %q", e.Message)
+	if e.Message != "Unknown tool" {
+		t.Errorf("message %q, want the constant text with no tool name", e.Message)
+	}
+	if string(e.Data) != `{"code":"mcp.unknown_tool"}` {
+		t.Errorf("data %s, want the mcp.unknown_tool fault code", e.Data)
 	}
 	if string(env.ID) != "9" {
 		t.Errorf("id %s, want 9", env.ID)

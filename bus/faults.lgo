@@ -1,0 +1,9 @@
+package bus
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+func Faults() []*fault.Error {
+	return nil
+}

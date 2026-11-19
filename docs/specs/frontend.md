@@ -10,8 +10,9 @@ File layout:
 - `vite.config.ts`, `vitest.config.ts`
 - `src/entry.ts`, `src/island.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
- - `test/island.test.ts`, `test/island-dispose.test.ts`, `test/island-move.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`, `test/production-build.test.ts`
+ - `test/island.test.ts`, `test/island-dispose.test.ts`, `test/island-move.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`, `test/production-build.test.ts`
  - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`, `test/fixtures/Disposable.react.tsx`, `test/fixtures/Disposable.solid.tsx`, `test/fixtures/Disposable.svelte`, `test/fixtures/disposable-svelte.ts`, `test/fixtures/build-entry.react.ts`, `test/fixtures/build-entry.solid.ts`, `test/fixtures/build-entry.svelte.ts`
+- `test/fixtures/wasm/ticker/main.lgo`, `test/fixtures/wasm/ticker/go.mod`
 
 Scripts in `package.json`:
 
@@ -24,6 +25,7 @@ Exported TypeScript names:
 ```ts
 export type IslandModule = { default: unknown }
 export type IslandLoader = () => Promise<IslandModule>
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export type IslandTable = Record<string, IslandLoader>
  export type IslandCleanup = () => void
  export type IslandMount = (
@@ -33,7 +35,6 @@ export type IslandTable = Record<string, IslandLoader>
  ) => IslandCleanup | undefined
  export class SpiraIslandElement extends HTMLElement
  export function defineIslands(table: IslandTable): void
-export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export function installSlotMover(root?: ParentNode): void
  // src/adapters/react.ts, src/adapters/svelte.ts and src/adapters/solid.ts
  export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
@@ -61,6 +62,7 @@ export function installSlotMover(root?: ParentNode): void
 - The Solid plugin MUST apply only to `*.solid.tsx`.
 - TypeScript MUST set `strict`, `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`.
 - Tests MUST run under happy-dom.
+- `test/wasm-runtime.test.ts` MUST run in the Node environment with a happy-dom `Window`, because `WebAssembly.instantiateStreaming` accepts only Node's `Response`.
 
 ### Islands and slots
 
@@ -109,6 +111,7 @@ export function installSlotMover(root?: ParentNode): void
  - `test/production-build.test.ts` proves each island table ships its component and registration key, the compiled bodies with their runtimes, production output, and the application entry that owns the island glob.
  - It also proves a glob result derives repo relative island keys.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
+- `test/wasm-runtime.test.ts` proves the real toolchain runtime mounts the built ticker module through `spira-island` and writes the props value into its host.
 - `test/entry.test.ts` proves `spira-island` is defined and the `sse` extension is registered after `entry.ts` loads.
 - `test/corpus.test.ts` checks the slot and island lines of `wire/corpus.jsonl` against the client.
 

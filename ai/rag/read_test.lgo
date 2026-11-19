@@ -1,0 +1,398 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-commons/src/test/java/org/springframework/ai/reader/TextReaderTests.java
+// and spring-ai-commons/src/test/java/org/springframework/ai/reader/JsonReaderTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json/v2"
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/rag"
+)
+
+func readMetaText(docs []rag.Document, key string) (string, bool) {
+	if len(docs) != 1 {
+		return "", false
+	}
+	v, ok := docs[0].Metadata[key]
+	if !ok {
+		return "", false
+	}
+	t, ok := v.(rag.Text)
+	if !ok {
+		return "", false
+	}
+	return t.Text, true
+}
+
+func TestReadTextKeepsTheWholeText(t *testing.T) {
+	content := "Line 1\n\n\nLine 4\r\nLine 5\r\n\r\nLine 7"
+	docs, err := rag.ReadText(strings.NewReader(content), "text_source.txt")
+	if err != nil {
+		t.Fatalf("ReadText returns an error: %v", err)
+		return
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ReadText returns %d documents, want 1", len(docs))
+		return
+	}
+	if docs[0].Text != content {
+		t.Errorf("ReadText returns text %q, want %q", docs[0].Text, content)
+	}
+	source, ok := readMetaText(docs, "source")
+	if !ok {
+		t.Fatalf("the document holds no source metadata")
+		return
+	}
+	if source != "text_source.txt" {
+		t.Errorf("source metadata is %q, want text_source.txt", source)
+	}
+	charset, ok := readMetaText(docs, "charset")
+	if !ok {
+		t.Fatalf("the document holds no charset metadata")
+		return
+	}
+	if charset != "UTF-8" {
+		t.Errorf("charset metadata is %q, want UTF-8", charset)
+	}
+	sum := sha256.Sum256([]byte(content))
+	if docs[0].ID != hex.EncodeToString(sum[:]) {
+		t.Errorf("document id is %q, want the SHA-256 of the text", docs[0].ID)
+	}
+}
+
+func TestReadTextPinsTheIDVector(t *testing.T) {
+	docs, err := rag.ReadText(strings.NewReader("Test content"), "id.txt")
+	if err != nil {
+		t.Fatalf("ReadText returns an error: %v", err)
+		return
+	}
+	if docs[0].ID != "9d9595c5d94fb65b824f56e9999527dba9542481580d69feb89056aabaa0aa87" {
+		t.Errorf("document id is %q, want the SHA-256 of the text", docs[0].ID)
+	}
+}
+
+func TestReadTextKeepsEmptyAndWhitespace(t *testing.T) {
+	for _, content := range []string{"", "   \n\t\r\n   "} {
+		docs, err := rag.ReadText(strings.NewReader(content), "empty.txt")
+		if err != nil {
+			t.Fatalf("ReadText(%q) returns an error: %v", content, err)
+			return
+		}
+		if len(docs) != 1 {
+			t.Fatalf("ReadText(%q) returns %d documents, want 1", content, len(docs))
+			return
+		}
+		if docs[0].Text != content {
+			t.Errorf("ReadText(%q) returns text %q", content, docs[0].Text)
+		}
+	}
+}
+
+func TestReadTextPassesTheSourceThrough(t *testing.T) {
+	for _, source := range []string{"test-file.txt", "no-extension-file"} {
+		docs, err := rag.ReadText(strings.NewReader("content"), source)
+		if err != nil {
+			t.Fatalf("ReadText with source %q returns an error: %v", source, err)
+			return
+		}
+		v, ok := readMetaText(docs, "source")
+		if !ok {
+			t.Fatalf("the document holds no source metadata")
+			return
+		}
+		if v != source {
+			t.Errorf("source metadata is %q, want %q", v, source)
+		}
+	}
+}
+
+func TestReadTextReadsTwiceWithTheSameID(t *testing.T) {
+	first, err := rag.ReadText(strings.NewReader("Consistent content"), "a.txt")
+	if err != nil {
+		t.Fatalf("first ReadText returns an error: %v", err)
+		return
+	}
+	second, err := rag.ReadText(strings.NewReader("Consistent content"), "a.txt")
+	if err != nil {
+		t.Fatalf("second ReadText returns an error: %v", err)
+		return
+	}
+	if first[0].Text != second[0].Text {
+		t.Errorf("two reads return different texts %q and %q", first[0].Text, second[0].Text)
+	}
+	if first[0].ID != second[0].ID {
+		t.Errorf("two reads return different ids %q and %q", first[0].ID, second[0].ID)
+	}
+}
+
+func TestReadersRefuseInputAboveTheLimit(t *testing.T) {
+	big := strings.Repeat("a", (1<<20)+1)
+	if len(big) != (1<<20)+1 {
+		t.Fatalf("above-limit text is %d bytes, want %d", len(big), (1<<20)+1)
+		return
+	}
+	if _, err := rag.ReadText(strings.NewReader(big), "big.txt"); !isSizeError(err) {
+		t.Errorf("ReadText above the limit returns %v, want the size error", err)
+	}
+	edge := strings.Repeat("b", 1<<20)
+	if len(edge) != 1<<20 {
+		t.Fatalf("at-limit text is %d bytes, want %d", len(edge), 1<<20)
+		return
+	}
+	if _, err := rag.ReadText(strings.NewReader(edge), "edge.txt"); err != nil {
+		t.Errorf("ReadText refuses exactly the limit: %v", err)
+	}
+	pre := `[{"k":"`
+	post := `"}]`
+	overhead := len(pre) + len(post)
+	over := pre + strings.Repeat("a", (1<<20)-overhead+1) + post
+	if len(over) != (1<<20)+1 {
+		t.Fatalf("above-limit JSON is %d bytes, want %d", len(over), (1<<20)+1)
+		return
+	}
+	if _, err := rag.ReadJSON(strings.NewReader(over)); !isSizeError(err) {
+		t.Errorf("ReadJSON above the limit returns %v, want the size error", err)
+	}
+	full := pre + strings.Repeat("a", (1<<20)-overhead) + post
+	if len(full) != 1<<20 {
+		t.Fatalf("at-limit JSON is %d bytes, want %d", len(full), 1<<20)
+		return
+	}
+	docs, err := rag.ReadJSON(strings.NewReader(full))
+	if err != nil {
+		t.Fatalf("ReadJSON refuses exactly the limit: %v", err)
+		return
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ReadJSON at the limit returns %d documents, want 1", len(docs))
+		return
+	}
+}
+
+func isSizeError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "exceeds the size limit")
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func TestReadTextOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	_, err := rag.ReadText(&cutReader{left: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}, "cut.txt")
+	if err == nil || !strings.Contains(err.Error(), "ai/rag: input exceeds the size limit of 1048576 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
+	}
+}
+
+func TestReadJSONOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	_, err := rag.ReadJSON(&cutReader{left: (1 << 20) + 1, cut: io.ErrUnexpectedEOF})
+	if err == nil || !strings.Contains(err.Error(), "ai/rag: input exceeds the size limit of 1048576 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
+	}
+}
+
+func TestReadJSONRefusesDeepNesting(t *testing.T) {
+	deep := strings.Repeat("[", 10001) + strings.Repeat("]", 10001)
+	_, err := rag.ReadJSON(strings.NewReader(deep))
+	if err == nil || !strings.Contains(err.Error(), "max depth") {
+		t.Errorf("ReadJSON at depth 10001 returns %v, want the depth error", err)
+	}
+	shallow, err := rag.ReadJSON(strings.NewReader(`{"a": [[["x"]]]}`))
+	if err != nil {
+		t.Fatalf("ReadJSON refuses shallow nesting: %v", err)
+		return
+	}
+	if len(shallow) != 1 {
+		t.Fatalf("ReadJSON returns %d documents, want 1", len(shallow))
+		return
+	}
+}
+
+const readBikes = `[
+	{"name": "E-Adrenaline 8.0 EX1", "description": "A versatile e-MTB.", "price": 999.99},
+	{"name": "Avant SLR 6 Disc Pro", "description": "A carbon road bike.", "price": 1299.5}
+]`
+
+const readPerson = `{
+	"name": "Avant SLR 6 Disc Pro",
+	"description": "A carbon road bike.",
+	"price": 999.99,
+	"store": {"name": "Bike Shop"}
+}`
+
+func TestReadJSONReadsAnArrayWithKeys(t *testing.T) {
+	docs, err := rag.ReadJSON(strings.NewReader(readBikes), "description")
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if len(docs) != 2 {
+		t.Fatalf("ReadJSON returns %d documents, want 2", len(docs))
+		return
+	}
+	for _, doc := range docs {
+		if doc.Text == "" {
+			t.Errorf("a document holds an empty text")
+		}
+		if !strings.HasPrefix(doc.Text, "description: ") {
+			t.Errorf("document text %q holds no description line", doc.Text)
+		}
+		if len(doc.Metadata) != 0 {
+			t.Errorf("document metadata is %v, want empty", doc.Metadata)
+		}
+	}
+	if docs[0].Text != "description: A versatile e-MTB.\n" {
+		t.Errorf("first document text is %q", docs[0].Text)
+	}
+	if docs[1].Text != "description: A carbon road bike.\n" {
+		t.Errorf("second document text is %q", docs[1].Text)
+	}
+}
+
+func TestReadJSONReadsAnObjectWithKeys(t *testing.T) {
+	docs, err := rag.ReadJSON(strings.NewReader(readPerson), "description")
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ReadJSON returns %d documents, want 1", len(docs))
+		return
+	}
+	if docs[0].Text != "description: A carbon road bike.\n" {
+		t.Errorf("document text is %q", docs[0].Text)
+	}
+}
+
+func TestReadJSONRendersKeyLinesInKeyOrder(t *testing.T) {
+	docs, err := rag.ReadJSON(strings.NewReader(readPerson), "price", "name")
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ReadJSON returns %d documents, want 1", len(docs))
+		return
+	}
+	if docs[0].Text != "price: 999.99\nname: Avant SLR 6 Disc Pro\n" {
+		t.Errorf("document text is %q, want price before name", docs[0].Text)
+	}
+}
+
+func TestReadJSONRendersScalarsAndNull(t *testing.T) {
+	docs, err := rag.ReadJSON(strings.NewReader(`{"hit": true, "miss": null, "tags": ["a"]}`), "hit", "miss", "tags")
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if docs[0].Text != "hit: true\nmiss: null\ntags: [\"a\"]\n" {
+		t.Errorf("document text is %q", docs[0].Text)
+	}
+}
+
+func TestReadJSONSkipsKeysThatAnElementLacks(t *testing.T) {
+	docs, err := rag.ReadJSON(strings.NewReader(readBikes), "description", "absent")
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if len(docs) != 2 {
+		t.Fatalf("ReadJSON returns %d documents, want 2", len(docs))
+		return
+	}
+	if docs[0].Text != "description: A versatile e-MTB.\n" {
+		t.Errorf("first document text is %q", docs[0].Text)
+	}
+	only, err := rag.ReadJSON(strings.NewReader(`[{"name": "x"}]`), "absent")
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if len(only) != 1 {
+		t.Fatalf("ReadJSON returns %d documents, want 1", len(only))
+		return
+	}
+
+	var back struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(only[0].Text), &back); err != nil {
+		t.Fatalf("fallback text is no JSON object: %v", err)
+		return
+	}
+	if back.Name != "x" {
+		t.Errorf("fallback text is %q", only[0].Text)
+	}
+}
+
+func TestReadJSONWithoutKeysKeepsTheElementJSON(t *testing.T) {
+	docs, err := rag.ReadJSON(strings.NewReader(readBikes))
+	if err != nil {
+		t.Fatalf("ReadJSON returns an error: %v", err)
+		return
+	}
+	if len(docs) != 2 {
+		t.Fatalf("ReadJSON returns %d documents, want 2", len(docs))
+		return
+	}
+	for i, doc := range docs {
+		var back struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(doc.Text), &back); err != nil {
+			t.Fatalf("document %d text is no JSON object: %v", i, err)
+			return
+		}
+		if back.Name == "" {
+			t.Errorf("document %d text %q holds no name", i, doc.Text)
+		}
+	}
+	if docs[0].ID == docs[1].ID {
+		t.Errorf("two different texts share the id %q", docs[0].ID)
+	}
+}
+
+func TestReadJSONRefusesWhatIsNoObject(t *testing.T) {
+	for _, input := range []string{"{broken", "5", `"text"`, "[1]", "[{}x]"} {
+		if _, err := rag.ReadJSON(strings.NewReader(input)); err == nil {
+			t.Errorf("ReadJSON accepts %q", input)
+		}
+	}
+}
+
+func TestReadJSONRefusesEmptyInput(t *testing.T) {
+	for _, input := range []string{"", "   ", "\n\t "} {
+		_, err := rag.ReadJSON(strings.NewReader(input))
+		if err == nil {
+			t.Errorf("ReadJSON accepts %q", input)
+			continue
+		}
+		if !strings.Contains(err.Error(), "empty input") {
+			t.Errorf("ReadJSON(%q) error = %v, want the empty input error", input, err)
+		}
+	}
+}

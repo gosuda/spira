@@ -1,0 +1,13 @@
+package websocket
+
+func ExposedCloseParse(payload []byte) (uint16, string, error) {
+	return parseClose(payload)
+}
+
+func ExposedCloseValid(code uint16) bool {
+	return validCloseCode(code)
+}
+
+func ExposedCloseAppend(dst []byte, code uint16, reason string) ([]byte, error) {
+	return appendClose(dst, code, reason)
+}

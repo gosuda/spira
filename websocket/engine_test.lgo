@@ -1,0 +1,201 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"io"
+	"testing"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func maskedFrame(fin bool, opcode uint8, payload []byte) []byte {
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	h := websocket.ExposedHeader{
+		Fin:    fin,
+		Opcode: opcode,
+		Masked: true,
+		Key:    key,
+		Length: int64(len(payload)),
+	}
+	out := websocket.ExposedAppendHeader(nil, h)
+	scrambled := append([]byte(nil), payload...)
+	websocket.ExposedMask(key, 0, scrambled)
+	return append(out, scrambled...)
+}
+
+func plainFrame(fin bool, opcode uint8, payload []byte) []byte {
+	h := websocket.ExposedHeader{
+		Fin:    fin,
+		Opcode: opcode,
+		Length: int64(len(payload)),
+	}
+	out := websocket.ExposedAppendHeader(nil, h)
+	return append(out, payload...)
+}
+
+func engineOver(t *testing.T, data []byte, limit int64, server bool) (*websocket.ExposedEngine, *bufio.Reader) {
+	t.Helper()
+	r := bufio.NewReader(bytes.NewReader(data))
+	return websocket.ExposedNewEngine(r, limit, server), r
+}
+
+func mustNext(t *testing.T, e *websocket.ExposedEngine) (websocket.ExposedKind, []byte) {
+	t.Helper()
+	k, payload, err := e.ExposedNext()
+	if err != nil {
+		t.Fatalf("next: %v", err)
+		return 0, nil
+	}
+	return k, payload
+}
+
+func mustRefuse(t *testing.T, e *websocket.ExposedEngine, target error) {
+	t.Helper()
+	_, _, err := e.ExposedNext()
+	if err == nil {
+		t.Fatalf("next: want error, got event")
+		return
+	}
+	if !errors.Is(err, target) {
+		t.Fatalf("error = %v, want %v", err, target)
+	}
+}
+
+func TestEngineFragmentedHelloWithPing(t *testing.T) {
+	var stream []byte
+	stream = append(stream, maskedFrame(false, 0x1, []byte("Hel"))...)
+	stream = append(stream, maskedFrame(true, 0x9, []byte("Hi"))...)
+	stream = append(stream, maskedFrame(true, 0x0, []byte("lo"))...)
+	e, _ := engineOver(t, stream, 64, true)
+	k, payload := mustNext(t, e)
+	if k != websocket.ExposedPing {
+		t.Fatalf("first kind = %v, want ping", k)
+		return
+	}
+	if string(payload) != "Hi" {
+		t.Fatalf("ping payload = %q, want %q", payload, "Hi")
+	}
+	k, payload = mustNext(t, e)
+	if k != websocket.ExposedText {
+		t.Fatalf("second kind = %v, want text", k)
+		return
+	}
+	if string(payload) != "Hello" {
+		t.Fatalf("text payload = %q, want %q", payload, "Hello")
+	}
+}
+
+func TestEngineRefusesStrayContinuation(t *testing.T) {
+	e, _ := engineOver(t, maskedFrame(true, 0x0, []byte("lo")), 64, true)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+}
+
+func TestEngineRefusesNewDataWhileOpen(t *testing.T) {
+	var stream []byte
+	stream = append(stream, maskedFrame(false, 0x1, []byte("Hel"))...)
+	stream = append(stream, maskedFrame(true, 0x1, []byte("lo"))...)
+	e, _ := engineOver(t, stream, 64, true)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+}
+
+func TestEngineRefusesUnmaskedInServerRole(t *testing.T) {
+	e, _ := engineOver(t, plainFrame(true, 0x1, []byte("Hello")), 64, true)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+}
+
+func TestEngineRefusesMaskedInClientRole(t *testing.T) {
+	e, _ := engineOver(t, maskedFrame(true, 0x1, []byte("Hello")), 64, false)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+}
+
+func TestEngineRefusesMessageOverLimit(t *testing.T) {
+	e, r := engineOver(t, maskedFrame(true, 0x2, []byte("Hello")), 4, true)
+	mustRefuse(t, e, websocket.ErrTooLarge)
+	if r.Buffered() != 5 {
+		t.Fatalf("buffered = %d, want 5 unread payload bytes", r.Buffered())
+	}
+}
+
+func TestEngineRefusesFragmentedTotalOverLimit(t *testing.T) {
+	var stream []byte
+	stream = append(stream, maskedFrame(false, 0x2, []byte("Hel"))...)
+	stream = append(stream, maskedFrame(true, 0x0, []byte("lo!"))...)
+	e, _ := engineOver(t, stream, 4, true)
+	mustRefuse(t, e, websocket.ErrTooLarge)
+}
+
+func TestEngineAcceptsControlOverMessageLimit(t *testing.T) {
+	e, _ := engineOver(t, maskedFrame(true, 0x9, []byte("Hello")), 4, true)
+	k, payload := mustNext(t, e)
+	if k != websocket.ExposedPing {
+		t.Fatalf("kind = %v, want ping", k)
+		return
+	}
+	if string(payload) != "Hello" {
+		t.Fatalf("ping payload = %q, want %q", payload, "Hello")
+	}
+}
+
+func TestEngineRefusesInvalidPrefixBeforeLastFragment(t *testing.T) {
+	var stream []byte
+	stream = append(stream, maskedFrame(false, 0x1, []byte{0xff})...)
+	stream = append(stream, maskedFrame(true, 0x0, []byte("lo"))...)
+	e, r := engineOver(t, stream, 64, true)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+	if r.Buffered() != 8 {
+		t.Fatalf("buffered = %d, want 8 unread second-frame bytes", r.Buffered())
+	}
+}
+
+func TestEngineRefusesOverlongEncoding(t *testing.T) {
+	e, _ := engineOver(t, maskedFrame(true, 0x1, []byte{0xc0, 0xaf}), 64, true)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+}
+
+func TestEngineRefusesLoneSurrogate(t *testing.T) {
+	e, _ := engineOver(t, maskedFrame(true, 0x1, []byte{0xed, 0xa0, 0x80}), 64, true)
+	mustRefuse(t, e, websocket.ErrProtocolError)
+}
+
+func TestEngineAcceptsSplitFourByteRune(t *testing.T) {
+	smile := []byte{0xf0, 0x9f, 0x98, 0x80}
+	var stream []byte
+	stream = append(stream, maskedFrame(false, 0x1, smile[:1])...)
+	stream = append(stream, maskedFrame(false, 0x0, smile[1:3])...)
+	stream = append(stream, maskedFrame(true, 0x0, smile[3:])...)
+	e, _ := engineOver(t, stream, 64, true)
+	k, payload := mustNext(t, e)
+	if k != websocket.ExposedText {
+		t.Fatalf("kind = %v, want text", k)
+		return
+	}
+	if !bytes.Equal(payload, smile) {
+		t.Fatalf("payload = %v, want %v", payload, smile)
+	}
+}
+
+func TestEngineNextZeroAllocs(t *testing.T) {
+	raw := maskedFrame(true, 0x1, []byte("Hello"))
+	stream := bytes.NewReader(raw)
+	r := bufio.NewReader(stream)
+	e := websocket.ExposedNewEngine(r, 64, true)
+	if _, _, err := e.ExposedNext(); err != nil {
+		t.Fatalf("warm next: %v", err)
+		return
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		if _, err := stream.Seek(0, io.SeekStart); err != nil {
+			t.Errorf("seek: %v", err)
+			return
+		}
+		r.Reset(stream)
+		if _, _, err := e.ExposedNext(); err != nil {
+			t.Errorf("next: %v", err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("AllocsPerRun = %v, want 0", allocs)
+	}
+}

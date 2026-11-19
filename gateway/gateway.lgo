@@ -64,6 +64,9 @@ func requirePrefix(prefix string) {
 	if !strings.HasPrefix(prefix, "/") {
 		panic($"gateway: route {prefix}: path prefix must start with /")
 	}
+	if strings.ContainsAny(prefix, "{}*") {
+		panic($"gateway: route {prefix}: path prefix must not contain wildcards")
+	}
 }
 
 func parseUpstream(raw string, prefix string) *url.URL {
@@ -188,19 +191,19 @@ func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, err
 	if err != nil {
 		cancel()
 		if missed {
-			return nil, fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout)
+			return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 		}
-		return nil, err
+		return nil, ErrBadGateway.Wrap(err)
 	}
 	if missed {
 		cancel()
 		resp.Body.Close()?
-		return nil, fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout)
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 	}
 	if upstreamFailed(resp.StatusCode) {
 		cancel()
 		resp.Body.Close()?
-		return nil, fmt.Errorf("gateway: upstream answered %d", resp.StatusCode)
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered %d", resp.StatusCode))
 	}
 	resp.Body = &releasingBody{inner: resp.Body, cancel: cancel}
 	return resp, nil
@@ -225,8 +228,9 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	target := *req.URL
 	target.Scheme = base.Scheme
 	target.Host = base.Host
-	target.Path = targetPath(base.Path, rl.tail(req.URL.Path, req.Pattern))
-	target.RawPath = targetPath(base.EscapedPath(), rl.tail(req.URL.EscapedPath(), req.Pattern))
+	joined := targetPath(base.EscapedPath(), rl.escapedTail(req.URL.EscapedPath(), req.Pattern))
+	target.Path = unescaped(joined)
+	target.RawPath = joined
 	target.RawQuery = joinedQuery(base.RawQuery, req.URL.RawQuery)
 	out := req.WithContext(actx)
 	out.URL = &target
@@ -234,15 +238,50 @@ func (rl *relay) outbound(req *http.Request, base *url.URL, actx context.Context
 	return out
 }
 
-func (rl *relay) tail(path string, pattern string) string {
+func (rl *relay) escapedTail(path string, pattern string) string {
 	if !rl.strip {
 		return path
 	}
-	t := strings.TrimPrefix(path, rl.mounted(pattern))
-	if !strings.HasPrefix(t, "/") {
-		return "/" + t
+	return cutEscapedSuffix(path, rl.mounted(pattern))
+}
+
+func cutEscapedSuffix(path string, mounted string) string {
+	segs := strings.Split(path, "/")
+	want := strings.Split(mounted, "/")
+	end := len(want)
+	if strings.HasSuffix(mounted, "/") {
+		end = end - 1
 	}
-	return t
+	for i := 1; i < end; i++ {
+		if i >= len(segs) {
+			return path
+		}
+		if !segmentMatches(segs[i], want[i]) {
+			return path
+		}
+	}
+	rest := segs[end:]
+	joined := strings.Join(rest, "/")
+	if strings.HasPrefix(joined, "/") {
+		return joined
+	}
+	return "/" + joined
+}
+
+func segmentMatches(raw string, want string) bool {
+	dec, err := url.PathUnescape(raw)
+	if err != nil {
+		return raw == want
+	}
+	return dec == want
+}
+
+func unescaped(joined string) string {
+	dec, err := url.PathUnescape(joined)
+	if err != nil {
+		panic($"gateway: escaped join {joined} is not a valid escaped path")
+	}
+	return dec
 }
 
 func (rl *relay) mounted(pattern string) string {

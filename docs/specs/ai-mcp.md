@@ -24,6 +24,19 @@ type RPCError struct {
 
 func (e *RPCError) Error() string
 
+var ErrForbiddenOrigin = fault.New("mcp.forbidden_origin", fault.Forbidden, "The origin is forbidden.")
+var ErrUnsupportedVersion = fault.New("mcp.unsupported_version", fault.Invalid, "The protocol version is unsupported.")
+var ErrParseError = fault.New("mcp.parse_error", fault.Invalid, "The request could not be parsed.")
+var ErrMethodNotFound = fault.New("mcp.method_not_found", fault.Invalid, "The method was not found.")
+var ErrInvalidParams = fault.New("mcp.invalid_params", fault.Invalid, "The tool call parameters are invalid.")
+var ErrUnknownTool = fault.New("mcp.unknown_tool", fault.Invalid, "The tool was not found.")
+var ErrToolFailed = fault.New("mcp.tool_failed", fault.Unprocessable, "The tool call failed.")
+var ErrProtocolError = fault.New("mcp.protocol_error", fault.Invalid, "The protocol request failed.")
+var ErrUpstreamFailed = fault.New("mcp.upstream_failed", fault.Unavailable, "The MCP server returned an error.")
+var ErrTransportFailed = fault.New("mcp.transport_failed", fault.Internal, "The MCP transport failed.")
+
+func Faults() []*fault.Error
+
 type Implementation struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
@@ -37,14 +50,15 @@ type Transport interface {
 
 func NewStdio(r io.Reader, w io.Writer) *Stdio
 type Stdio struct {
-	source io.Reader
-	sink   io.Writer
-	reader *bufio.Reader
+	source  io.Reader
+	sink    io.Writer
+	reader  *bufio.Reader
+	pending []byte
+	broken  bool
 }
 func (s *Stdio) Notify(ctx context.Context, msg Envelope) error
 func (s *Stdio) Request(ctx context.Context, msg Envelope) (Envelope, error)
 func (s *Stdio) Close() error
-
 func NewHTTP(endpoint string, client *http.Client) *HTTP
 type HTTP struct {
 	endpoint string
@@ -105,14 +119,15 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `Mount` MUST serve every tool in one `tools/list` page and no `nextCursor`.
 - Each `tools/list` item MUST carry `name`, `description` and the tool's `Schema` as `inputSchema`.
 - A blank `Schema` MUST become `{"type":"object"}` in `inputSchema`.
-- `Mount` MUST answer an unknown `tools/call` name with protocol error `-32602` `Unknown tool: <name>`.
+- `Mount` MUST answer an unknown `tools/call` name with protocol error `-32602` `Unknown tool`.
 - `Mount` MUST answer malformed params with `-32602` `Invalid params`.
 - `Mount` MUST answer an unknown method with `-32601` `Method not found`.
+- Each protocol error MUST carry the fault code in `data.code`.
 - Each protocol error MUST echo the request id at HTTP 200.
 - `tools/call` MUST run the tool's `Call` with the arguments object.
 - Blank arguments MUST become `{}` for `tools/call`.
-- A `Call` error MUST become a result whose `isError` is true and whose text is the error text.
-- Blank error text MUST become `tool <name> failed` in the result text.
+- A `Call` error MUST become an `isError` result with the `mcp.tool_failed` message.
+- A `Call` error MUST never echo its text on the wire.
 - A result MUST be one `text` content item.
 - The `text` member MUST be present on the wire, also for an empty result.
 - `text` content items MUST be joined with `\n` in arrival order.
@@ -130,6 +145,28 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - An HTTP request MUST return the matching response while the server keeps its event stream open.
 - A stdio read or write on a pipe that carries a deadline MUST end at the context deadline.
 - A pipe without deadline support MAY block a read or a write until the peer writes or closes its end.
+- A stdio write that sends part of a line MUST poison the transport; later sends MUST fail without writing.
+- A stdio read that ends at the deadline MUST keep its bytes; the next request MUST finish the line.
+- A stdio line held past a deadline MUST fit in 4 MiB; beyond that later sends MUST fail without writing.
+- Deadline setup that answers `os.ErrNoDeadline` MUST fall back to blocking I/O.
+- A failing HTTP status with a cut body MUST keep the status with the read cause.
+- A failing HTTP status with a cut RPC error body MUST keep the status, the read cause and the error.
+- A stdio line over 4 MiB cut by a read error MUST report the size limit and poison the transport.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `mcp.forbidden_origin` | forbidden | The origin is forbidden. |
+| `mcp.invalid_params` | invalid | The tool call parameters are invalid. |
+| `mcp.method_not_found` | invalid | The method was not found. |
+| `mcp.parse_error` | invalid | The request could not be parsed. |
+| `mcp.protocol_error` | invalid | The protocol request failed. |
+| `mcp.tool_failed` | unprocessable | The tool call failed. |
+| `mcp.transport_failed` | internal | The MCP transport failed. |
+| `mcp.unknown_tool` | invalid | The tool was not found. |
+| `mcp.unsupported_version` | invalid | The protocol version is unsupported. |
+| `mcp.upstream_failed` | unavailable | The MCP server returned an error. |
 
 ## Errors
 
@@ -154,6 +191,10 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountCallNonObjectArguments` and `TestClientCallNonObjectArguments` pin the object shape of `arguments` on the server and on the client.
 - `TestMountCallEmptyText` pins the `text` member of an empty result.
 - `TestStdioDeadlineWithoutReply` pins a read that ends at the context deadline on a pipe, with both ends open.
+- `TestStdioPartialWritePoisonsTransport` pins the poisoned transport and the missing second frame.
+- `TestStdioSplitReplyAcrossDeadline` pins a reply split across a deadline.
+- `TestStdioWithoutDeadlineSupport` pins requests over descriptors without deadline support.
+- `TestStdioPendingBound` pins the refusal after an overlong newline-less peer.
 - `TestMountInitialize`, `TestMountToolsList` and `TestMountCall` replay the specification's example requests (`lifecycle/initialize-request.json`, `tools/tools-call-request.json`) at the server and check the response members the seam can carry.
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
@@ -162,6 +203,10 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - They also pin the 400 for an unparseable body and the 202 for a notification.
 - `TestMountClientServer` runs the client of this package against `Mount` over `net/http/httptest`.
 - `TestMountClientServer` covers initialize, list and call.
+- `TestHTTPRequestKeepsTheStatusOfACutBody` proves the kept status and the read cause.
+- `TestHTTPNotifyKeepsTheStatusOfACutBody` proves the kept status and the read cause.
+- `TestHTTPKeepsStatusOnCutJSONRPCError` proves the kept status, the read cause and the RPC error.
+- `TestStdioOverlongLineWithReadErrorPoisonsTransport` proves the over-limit report and the unusable transport.
 
 ## Not in scope
 

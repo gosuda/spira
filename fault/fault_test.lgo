@@ -1,0 +1,373 @@
+package fault_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func mustWire(t *testing.T, bs []byte) map[string]any {
+	t.Helper()
+	var wire map[string]any
+	if err := json.Unmarshal(bs, &wire); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+		return nil
+	}
+	return wire
+}
+
+func expectNewPanic(t *testing.T, code fault.Code, kind fault.Kind) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("New(%q) did not panic", code)
+			return
+		}
+	}()
+	fault.New(code, kind, "message")
+}
+
+func TestPublicWithoutFaultReturnsFixedInternal(t *testing.T) {
+	cause := errors.New("db: connect 10.0.0.5: password=hunter2 key=/etc/passwd")
+	got := fault.Public(cause)
+	if got.Code != "internal" {
+		t.Fatalf("Code = %q, want internal", got.Code)
+		return
+	}
+	if got.Message != "internal error" {
+		t.Fatalf("Message = %q, want internal error", got.Message)
+		return
+	}
+	bs := faulttest.PublicJSON(t, cause)
+	faulttest.RefuseLeak(t, bs, "hunter2", "10.0.0.5", "passwd", "connect")
+}
+
+func TestPublicInternalKindReturnsFixedInternal(t *testing.T) {
+	declared := fault.New("db.io_failed", fault.Internal, "database shard unavailable")
+	wrapped := declared.Wrap(errors.New("disk /dev/sda1 full"))
+	got := fault.Public(wrapped)
+	if got.Code != "internal" {
+		t.Fatalf("Code = %q, want internal", got.Code)
+		return
+	}
+	if got.Message != "internal error" {
+		t.Fatalf("Message = %q, want internal error", got.Message)
+		return
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, wrapped), "shard", "sda1")
+}
+func TestPublicNeverReturnsCauseText(t *testing.T) {
+	secret := errors.New("token abc123 path /secret/x")
+	cases := []struct {
+		name string
+		err  error
+		code fault.Code
+	}{
+		{"invalid", fault.New("web.invalid_input", fault.Invalid, "invalid request").Wrap(secret), "web.invalid_input"},
+		{"notfound", fault.New("web.not_found", fault.NotFound, "no such page").Wrap(secret), "web.not_found"},
+	}
+	for _, tc := range cases {
+		got := fault.Public(tc.err)
+		if got.Code != tc.code {
+			t.Fatalf("%s: Code = %q, want %q", tc.name, got.Code, tc.code)
+			return
+		}
+		faulttest.RefuseLeak(t, faulttest.PublicJSON(t, tc.err), "abc123", "/secret/x")
+	}
+}
+
+func TestPublicTimeoutAndUnavailableNeedDeclaration(t *testing.T) {
+	declared := fault.New("db.query_timeout", fault.Timeout, "query took too long")
+	got := fault.Public(declared.Wrap(context.DeadlineExceeded))
+	if got.Code != "db.query_timeout" {
+		t.Fatalf("Code = %q, want db.query_timeout", got.Code)
+		return
+	}
+	if got.Message != "query took too long" {
+		t.Fatalf("Message = %q, want the declared constant", got.Message)
+		return
+	}
+	raw := fault.Public(context.DeadlineExceeded)
+	if raw.Code != "internal" {
+		t.Fatalf("raw timeout Code = %q, want internal", raw.Code)
+		return
+	}
+	if raw.Message != "internal error" {
+		t.Fatalf("raw timeout Message = %q, want internal error", raw.Message)
+		return
+	}
+	down := fault.New("db.node_down", fault.Unavailable, "database temporarily unavailable")
+	held := fault.Public(down.Wrap(errors.New("dial tcp: refused")))
+	if held.Code != "db.node_down" {
+		t.Fatalf("Code = %q, want db.node_down", held.Code)
+		return
+	}
+	plain := fault.Public(errors.New("dial tcp: refused"))
+	if plain.Code != "internal" {
+		t.Fatalf("plain failure Code = %q, want internal", plain.Code)
+		return
+	}
+}
+
+func TestCredentialFaultsShareOneCode(t *testing.T) {
+	message := "invalid username or password"
+	unknown := fault.New("auth.invalid_credentials", fault.Unauthenticated, message).Wrap(errors.New("no such user eve"))
+	wrong := fault.New("auth.invalid_credentials", fault.Unauthenticated, message).Wrap(errors.New("password mismatch"))
+	locked := fault.New("auth.invalid_credentials", fault.Unauthenticated, message).Wrap(errors.New("account locked"))
+	a := faulttest.PublicJSON(t, unknown)
+	b := faulttest.PublicJSON(t, wrong)
+	c := faulttest.PublicJSON(t, locked)
+	if !bytes.Equal(a, b) || !bytes.Equal(b, c) {
+		t.Fatalf("credential Views differ: %s %s %s", a, b, c)
+		return
+	}
+	faulttest.RefuseLeak(t, a, "eve")
+	if unknown.Error() == wrong.Error() {
+		t.Fatalf("operator texts match, the log cannot tell the cases apart")
+		return
+	}
+}
+
+func TestFieldsCarryNoSubmittedValue(t *testing.T) {
+	bad := fault.New("web.invalid_input", fault.Invalid, "invalid request").WithFields(
+		fault.Field{Name: "email", Rule: "format", Message: "email is not valid"},
+		fault.Field{Name: "age", Rule: "min", Message: "age must be at least 1"},
+	)
+	got := fault.Public(bad)
+	if len(got.Fields) != 2 {
+		t.Fatalf("Fields = %d, want 2", len(got.Fields))
+		return
+	}
+	bs := faulttest.PublicJSON(t, bad)
+	for _, keep := range []string{"email", "format", "email is not valid", "min"} {
+		if !strings.Contains(string(bs), keep) {
+			t.Fatalf("Public JSON lacks %q: %s", keep, bs)
+			return
+		}
+	}
+	faulttest.RefuseLeak(t, bs, "eve@")
+	missing := fault.New("db.not_found", fault.NotFound, "no such row").WithFields(
+		fault.Field{Name: "id", Rule: "exists", Message: "constant"},
+	)
+	dropped := fault.Public(missing)
+	if len(dropped.Fields) != 0 {
+		t.Fatalf("NotFound kept %d fields, want none", len(dropped.Fields))
+		return
+	}
+	flat := faulttest.PublicJSON(t, missing)
+	if strings.Contains(string(flat), "errors") {
+		t.Fatalf("NotFound JSON carries errors: %s", flat)
+		return
+	}
+}
+
+func TestCodesAreStableAndUnique(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/fault.md", fault.Faults())
+}
+
+func TestViewCarriesNoStatus(t *testing.T) {
+	bs := faulttest.PublicJSON(t, fault.New("web.not_found", fault.NotFound, "no such page"))
+	wire := mustWire(t, bs)
+	if _, ok := wire["status"]; ok {
+		t.Fatalf("View JSON carries status: %v", wire)
+		return
+	}
+	if len(wire) != 2 {
+		t.Fatalf("View JSON keys = %v, want code and message", wire)
+		return
+	}
+}
+
+func TestOperatorTextCarriesCodeMessageAndCause(t *testing.T) {
+	root := errors.New("connection reset")
+	mid := fmt.Errorf("db: read rows: %w", root)
+	top := fault.New("db.io_failed", fault.Unavailable, "database temporarily unavailable").Wrap(mid)
+	want := "db.io_failed: database temporarily unavailable: db: read rows: connection reset"
+	if top.Error() != want {
+		t.Fatalf("Error() = %q, want %q", top.Error(), want)
+		return
+	}
+	plain := fault.New("web.invalid_input", fault.Invalid, "invalid request")
+	if plain.Error() != "web.invalid_input: invalid request" {
+		t.Fatalf("Error() = %q", plain.Error())
+		return
+	}
+}
+
+func TestIsMatchesCodeAcrossWraps(t *testing.T) {
+	decl := fault.New("db.stale_version", fault.Conflict, "row was modified")
+	same := fault.New("db.stale_version", fault.Conflict, "row was modified")
+	other := fault.New("db.missing_row", fault.NotFound, "no such row")
+	err := fmt.Errorf("a: %w", fmt.Errorf("b: %w", fmt.Errorf("c: %w", decl.Wrap(errors.New("v=2")))))
+	if !errors.Is(err, decl) {
+		t.Fatalf("Is missed the declared fault through three wraps")
+		return
+	}
+	if !errors.Is(err, same) {
+		t.Fatalf("Is missed an equal code from another pointer")
+		return
+	}
+	if errors.Is(err, other) {
+		t.Fatalf("Is matched a different code")
+		return
+	}
+}
+
+func TestAsFindsFaultThroughWraps(t *testing.T) {
+	inner := fault.New("db.stale_version", fault.Conflict, "row was modified")
+	err := fmt.Errorf("a: %w", fmt.Errorf("b: %w", fmt.Errorf("c: %w", inner)))
+	var got *fault.Error?
+	if !errors.As(err, &got) {
+		t.Fatalf("As found no fault through three wraps")
+		return
+	}
+	found := got
+	if found == nil {
+		t.Fatalf("As left a nil fault")
+		return
+	}
+	if found.Code != "db.stale_version" {
+		t.Fatalf("Code = %q, want db.stale_version", found.Code)
+		return
+	}
+}
+
+func TestOfReturnsOutermostFault(t *testing.T) {
+	inner := fault.New("db.stale_version", fault.Conflict, "row was modified").Wrap(errors.New("v=2"))
+	outer := fault.New("web.invalid_input", fault.Invalid, "invalid request").Wrap(inner)
+	got := fault.Of(outer)
+	if got == nil {
+		t.Fatalf("Of found no fault")
+		return
+	}
+	first := got ?? &fault.Error{}
+	if first.Code != "web.invalid_input" {
+		t.Fatalf("Of = %q, want the outermost web.invalid_input", first.Code)
+		return
+	}
+	if fault.Of(errors.New("boom")) != nil {
+		t.Fatalf("Of found a fault in a plain error")
+		return
+	}
+	if fault.Of(nil) != nil {
+		t.Fatalf("Of found a fault in a nil error")
+		return
+	}
+}
+
+func TestKindStringIsLowerSnake(t *testing.T) {
+	cases := []struct {
+		kind fault.Kind
+		text string
+	}{
+		{fault.Invalid, "invalid"},
+		{fault.Unprocessable, "unprocessable"},
+		{fault.Unauthenticated, "unauthenticated"},
+		{fault.Forbidden, "forbidden"},
+		{fault.NotFound, "not_found"},
+		{fault.Conflict, "conflict"},
+		{fault.TooLarge, "too_large"},
+		{fault.RateLimited, "rate_limited"},
+		{fault.Canceled, "canceled"},
+		{fault.Timeout, "timeout"},
+		{fault.Unavailable, "unavailable"},
+		{fault.Internal, "internal"},
+		{fault.Kind(0), "unknown"},
+		{fault.Kind(13), "unknown"},
+	}
+	for _, tc := range cases {
+		if tc.kind.String() != tc.text {
+			t.Fatalf("Kind(%d) = %q, want %q", uint8(tc.kind), tc.kind.String(), tc.text)
+			return
+		}
+	}
+}
+
+func TestViewUsesWireNames(t *testing.T) {
+	wire := mustWire(t, faulttest.PublicJSON(t, fault.New("web.invalid_input", fault.Invalid, "invalid request").WithFields(
+		fault.Field{Name: "email", Rule: "format", Message: "email is not valid"},
+	)))
+	for _, key := range []string{"code", "message", "errors"} {
+		if _, ok := wire[key]; !ok {
+			t.Fatalf("View JSON lacks %q: %v", key, wire)
+			return
+		}
+	}
+	raw, ok := wire["errors"]
+	if !ok {
+		t.Fatalf("View JSON lacks errors: %v", wire)
+		return
+	}
+	items, ok := raw.([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("errors = %v, want one entry", raw)
+		return
+	}
+	first, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("errors[0] = %v, want an object", items[0])
+		return
+	}
+	for _, key := range []string{"field", "rule", "message"} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("field JSON lacks %q: %v", key, first)
+			return
+		}
+	}
+}
+
+func TestNewRejectsMalformedCodes(t *testing.T) {
+	for _, code := range []fault.Code{"", "db", "Internal", "DB.x", "9db.x", ".db.x", "db..x", "db.x.", "db.X", "db.x!", "db x.y", "db.x-y", "DB"} {
+		expectNewPanic(t, code, fault.Invalid)
+	}
+	expectNewPanic(t, "internal", fault.Invalid)
+	expectNewPanic(t, "db.ok", fault.Kind(0))
+	expectNewPanic(t, "db.ok", fault.Kind(13))
+}
+
+func TestNewAcceptsCodeGrammar(t *testing.T) {
+	for _, code := range []fault.Code{"a.b", "db.stale_version", "auth.invalid_credentials", "web.invalid_input", "a.b2_c"} {
+		made := fault.New(code, fault.Invalid, "message")
+		if made.Code != code {
+			t.Fatalf("Code = %q, want %q", made.Code, code)
+			return
+		}
+		if made.Kind != fault.Invalid {
+			t.Fatalf("Kind = %v, want invalid", made.Kind)
+			return
+		}
+	}
+	only := fault.New("internal", fault.Internal, "message")
+	if only.Code != "internal" || only.Kind != fault.Internal {
+		t.Fatalf("reserved code = %q kind = %v", only.Code, only.Kind)
+		return
+	}
+}
+
+func TestErrAndWrapReturnErrors(t *testing.T) {
+	decl := fault.New("db.io_failed", fault.Unavailable, "database temporarily unavailable")
+	if !errors.Is(decl.Err(), decl) {
+		t.Fatalf("Is missed Err of the declared fault")
+		return
+	}
+	wrapped := decl.Wrap(errors.New("password=hunter2"))
+	got := fault.Of(wrapped)
+	if got == nil {
+		t.Fatalf("Of found no fault in the wrapped error")
+		return
+	}
+	first := got ?? &fault.Error{}
+	if first.Code != "db.io_failed" {
+		t.Fatalf("Of = %q, want db.io_failed", first.Code)
+		return
+	}
+	bs := faulttest.PublicJSON(t, wrapped)
+	faulttest.RefuseLeak(t, bs, "hunter2")
+}

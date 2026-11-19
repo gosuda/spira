@@ -3,6 +3,7 @@ package live_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,7 +20,6 @@ import (
 	"github.com/gosuda/spira/view"
 	"github.com/gosuda/spira/web"
 
-	"logos/rt"
 	"logos/sync"
 )
 
@@ -116,63 +116,85 @@ func closeBody(t *testing.T, body io.ReadCloser) {
 	}
 }
 
-func openStream(t *testing.T, ts *httptest.Server) *http.Response {
+func openStream(t *testing.T, ts *httptest.Server) (*http.Response?, error) {
 	t.Helper()
 	resp, err := ts.Client().Get(ts.URL + "/events")
 	if err != nil {
-		t.Fatalf("open stream: %v", err)
+		return nil, fmt.Errorf("open stream: %w", err)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
-		t.Fatalf("content type %q, want text/event-stream", ct)
+		return nil, fmt.Errorf("content type %q, want text/event-stream", ct)
 	}
-	return resp
+	return resp, nil
 }
 
-func startTap(t *testing.T, body io.Reader) (*streamTap, *rt.Group) {
-	t.Helper()
-	tap := newStreamTap()
-	g, _ := rt.NewGroup(t.Context(), 2)
-	g.Go(func(ctx context.Context) error {
-		return tap.read(ctx, body)
-	})
-	return tap, g
+type streamDrive struct {
+	body           io.ReadCloser
+	tap            *streamTap
+	topic          *bus.Topic[live.Event]?
+	pub            *checkedPublisher?
+	sub            <-chan live.Event
+	serveDone      <-chan struct{}
+	gate           chan struct{}
+	resolveStarted chan struct{}
+	events         chan live.Event
+	messages       []string
 }
 
-func nextMessage(t *testing.T, tap *streamTap, wait time.Duration) string {
-	t.Helper()
+func tapMessages(ctx context.Context, tap *streamTap, wait time.Duration) (string, error) {
 	select {
 	case m := <-tap.msgs:
-		return m
+		return m, nil
 	case err := <-tap.ended:
-		t.Fatalf("stream ended before the next message: %v", err)
+		return "", fmt.Errorf("stream ended before the next message: %w", err)
 	case <-time.After(wait):
-		t.Fatalf("no message within %v", wait)
-	}
-	return ""
-}
-
-func expectHeartbeat(t *testing.T, tap *streamTap) {
-	t.Helper()
-	if got := nextMessage(t, tap, 3*time.Second); got != ": live\n\n" {
-		t.Fatalf("first message %q, want the heartbeat comment", got)
+		return "", fmt.Errorf("no message within %v", wait)
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
 }
 
-func awaitEnd(t *testing.T, tap *streamTap, wait time.Duration) {
-	t.Helper()
+func expectHeartbeatErr(ctx context.Context, tap *streamTap) error {
+	got, err := tapMessages(ctx, tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if got != ": live\n\n" {
+		return fmt.Errorf("first message %q, want the heartbeat comment", got)
+	}
+	return nil
+}
+
+func awaitEndErr(ctx context.Context, tap *streamTap, wait time.Duration) error {
 	select {
 	case <-tap.ended:
+		return nil
 	case <-time.After(wait):
-		t.Fatalf("stream did not end within %v", wait)
+		return fmt.Errorf("stream did not end within %v", wait)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-func awaitServe(t *testing.T, serveDone <-chan struct{}) {
-	t.Helper()
+func awaitServeErr(ctx context.Context, serveDone <-chan struct{}) error {
 	select {
 	case <-serveDone:
+		return nil
 	case <-time.After(5 * time.Second):
-		t.Fatal("the server did not finish the stream within 5s")
+		return fmt.Errorf("the server did not finish the stream within 5s")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func subscribedChannel(ctx context.Context, subscribed <-chan (<-chan live.Event)) (<-chan live.Event, error) {
+	select {
+	case ch := <-subscribed:
+		return ch, nil
+	case <-time.After(3 * time.Second):
+		return nil, fmt.Errorf("the handler did not subscribe")
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -185,71 +207,190 @@ func awaitSubscribe(t *testing.T, subscribed <-chan (<-chan live.Event)) {
 	}
 }
 
+func (c *streamDrive) emit(ctx context.Context, ev live.Event) error {
+	select {
+	case c.events <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func rejectBadNames() error {
+	if err := checkBadName("bad\nname"); err != nil {
+		return err
+	}
+	return checkBadName("bad\rname")
+}
+
+func checkBadName(name string) error {
+	_, err := live.NewEvent(name, view.T("x"))
+	if err == nil {
+		return fmt.Errorf("newline name accepted, want a line break rejection")
+	}
+	if !errors.Is(err, live.ErrInvalidEventName) {
+		return fmt.Errorf("newline name error = %w, want invalid_event_name", err)
+	}
+	return nil
+}
+
+func drainTap(tap *streamTap) error {
+	for {
+		select {
+		case m := <-tap.msgs:
+			if strings.Contains(m, "event:") {
+				return fmt.Errorf("a malformed name produced a message %q", m)
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 func TestEventMessageWireForm(t *testing.T) {
 	topic := bus.NewTopic[live.Event](2)
 	subscribed := make(chan (<-chan live.Event), 1)
 	ts, _ := serveEvents(t, topicHandler(topic, subscribed))
-	resp := openStream(t, ts)
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
 	defer closeBody(t, resp.Body)
 	awaitSubscribe(t, subscribed)
-	tap, g := startTap(t, resp.Body)
-	expectHeartbeat(t, tap)
-	price := mustEvent(t, "price", view.T("first\nsecond"))
-	topic.Publish(price)
-	want := "event: price\ndata: first\ndata: second\n\n"
-	if got := nextMessage(t, tap, 3*time.Second); got != want {
-		t.Fatalf("multi-line message %q, want %q", got, want)
-	}
-	plain := mustEvent(t, "plain", view.T("single"))
-	topic.Publish(plain)
-	if got := nextMessage(t, tap, 3*time.Second); got != "event: plain\ndata: single\n\n" {
-		t.Fatalf("single-line message %q", got)
-	}
-	returns := mustEvent(t, "returns", view.T("one\r\ntwo\rthree"))
-	topic.Publish(returns)
-	if got := nextMessage(t, tap, 3*time.Second); got != "event: returns\ndata: one\ndata: two\ndata: three\n\n" {
-		t.Fatalf("message with carriage returns %q", got)
-	}
-	closeBody(t, resp.Body)
-	if err := g.Wait(); err != nil {
+	tap := newStreamTap()
+	drive := &streamDrive{body: resp.Body, tap: tap, topic: topic}
+	if err := drive.wireForm(t.Context()); err != nil {
 		t.Fatalf("client group: %v", err)
 	}
+}
+
+func (c *streamDrive) wireForm(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.wireFormSteps(ctx)
+	}
+	return nil
+}
+
+func (c *streamDrive) wireFormSteps(ctx context.Context) error {
+	topic := c.topic
+	if topic == nil {
+		return fmt.Errorf("live_test: wire form needs a topic")
+	}
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	price, err := live.NewEvent("price", view.T("first\nsecond"))
+	if err != nil {
+		return fmt.Errorf("NewEvent(price): %w", err)
+	}
+	topic.Publish(price)
+	want := "event: price\ndata: first\ndata: second\n\n"
+	got, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("multi-line message %q, want %q", got, want)
+	}
+	plain, err := live.NewEvent("plain", view.T("single"))
+	if err != nil {
+		return fmt.Errorf("NewEvent(plain): %w", err)
+	}
+	topic.Publish(plain)
+	got, err = tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if got != "event: plain\ndata: single\n\n" {
+		return fmt.Errorf("single-line message %q", got)
+	}
+	returns, err := live.NewEvent("returns", view.T("one\r\ntwo\rthree"))
+	if err != nil {
+		return fmt.Errorf("NewEvent(returns): %w", err)
+	}
+	topic.Publish(returns)
+	got, err = tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if got != "event: returns\ndata: one\ndata: two\ndata: three\n\n" {
+		return fmt.Errorf("message with carriage returns %q", got)
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return nil
 }
 
 func TestClientDisconnectEndsStreamAndSubscription(t *testing.T) {
 	topic := bus.NewTopic[live.Event](2)
 	subscribed := make(chan (<-chan live.Event), 1)
 	ts, serveDone := serveEvents(t, topicHandler(topic, subscribed))
-	resp := openStream(t, ts)
-	defer closeBody(t, resp.Body)
-	var subCh <-chan live.Event
-	select {
-	case subCh = <-subscribed:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the handler did not subscribe")
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
 	}
-	tap, g := startTap(t, resp.Body)
-	expectHeartbeat(t, tap)
-	closeBody(t, resp.Body)
-	g.Go(func(ctx context.Context) error {
-		select {
-		case <-serveDone:
-			return nil
-		case <-time.After(5 * time.Second):
-			return fmt.Errorf("the stream did not end within 5s of the client disconnect")
-		}
-	})
-	if err := g.Wait(); err != nil {
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
+	defer closeBody(t, resp.Body)
+	sub, err := subscribedChannel(t.Context(), subscribed)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	tap := newStreamTap()
+	drive := &streamDrive{body: resp.Body, tap: tap, sub: sub, serveDone: serveDone}
+	if err := drive.disconnect(t.Context()); err != nil {
 		t.Fatalf("group join after the disconnect: %v", err)
 	}
+}
+
+func (c *streamDrive) disconnect(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.disconnectSteps(ctx)
+	}
+	return nil
+}
+
+func (c *streamDrive) disconnectSteps(ctx context.Context) error {
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
 	select {
-	case v, ok := <-subCh:
+	case <-c.serveDone:
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("the stream did not end within 5s of the client disconnect")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return checkSubClosed(ctx, c.sub)
+}
+
+func checkSubClosed(ctx context.Context, sub <-chan live.Event) error {
+	select {
+	case v, ok := <-sub:
 		if ok {
-			t.Fatalf("the subscription delivered %q after the client disconnected", v.Name)
+			return fmt.Errorf("the subscription delivered %q after the client disconnected", v.Name)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("the subscription channel did not close after the client disconnected")
+		return fmt.Errorf("the subscription channel did not close after the client disconnected")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+	return nil
 }
 
 type checkedPublisher struct {
@@ -257,18 +398,21 @@ type checkedPublisher struct {
 	fast  <-chan live.Event
 }
 
-func (p *checkedPublisher) publish(t *testing.T, name string, body view.Node) {
-	t.Helper()
-	ev := mustEvent(t, name, body)
+func (p *checkedPublisher) publish(name string, body view.Node) error {
+	ev, err := live.NewEvent(name, body)
+	if err != nil {
+		return fmt.Errorf("NewEvent(%q): %w", name, err)
+	}
 	p.topic.Publish(ev)
 	select {
 	case got := <-p.fast:
 		if got.Name != name {
-			t.Fatalf("the fast subscriber got %q, want %q", got.Name, name)
+			return fmt.Errorf("the fast subscriber got %q, want %q", got.Name, name)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("the fast subscriber did not receive %q", name)
+		return fmt.Errorf("the fast subscriber did not receive %q", name)
 	}
+	return nil
 }
 
 func TestSlowStreamSubscriberLosesEventsFastKeepsAll(t *testing.T) {
@@ -278,12 +422,41 @@ func TestSlowStreamSubscriberLosesEventsFastKeepsAll(t *testing.T) {
 	gate := make(chan struct{})
 	ts, serveDone := serveEvents(t, topicHandler(topic, subscribed))
 	fast := topic.Subscribe(t.Context())
-	resp := openStream(t, ts)
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
 	defer closeBody(t, resp.Body)
 	awaitSubscribe(t, subscribed)
-	tap, g := startTap(t, resp.Body)
-	expectHeartbeat(t, tap)
-	blocked := mustEvent(t, "e1", &view.Later{
+	tap := newStreamTap()
+	drive := &streamDrive{
+		body:           resp.Body,
+		tap:            tap,
+		pub:            &checkedPublisher{topic: topic, fast: fast},
+		gate:           gate,
+		resolveStarted: resolveStarted,
+		serveDone:      serveDone,
+	}
+	if err := drive.slowStream(t.Context()); err != nil {
+		t.Fatalf("client group: %v", err)
+	}
+}
+
+func (c *streamDrive) slowStream(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.slowStreamSteps(ctx)
+	}
+	return nil
+}
+
+func blockedEvent(resolveStarted chan struct{}, gate chan struct{}) (live.Event, error) {
+	return live.NewEvent("e1", &view.Later{
 		Fallback: view.T("pending"),
 		Resolve: func(ctx context.Context) (view.Node, error) {
 			select {
@@ -299,77 +472,171 @@ func TestSlowStreamSubscriberLosesEventsFastKeepsAll(t *testing.T) {
 			}
 		},
 	})
-	pub := &checkedPublisher{topic: topic, fast: fast}
-	pub.publish(t, "e1", blocked.Body)
+}
+
+func (c *streamDrive) slowStreamSteps(ctx context.Context) error {
+	pub := c.pub
+	if pub == nil {
+		return fmt.Errorf("live_test: slow stream needs a publisher")
+	}
+	if err := c.publishBlocked(ctx, pub); err != nil {
+		return err
+	}
+	if err := c.publishOverflow(ctx, pub); err != nil {
+		return err
+	}
+	if err := c.checkSlowTap(ctx); err != nil {
+		return err
+	}
+	if err := c.checkFastTap(ctx); err != nil {
+		return err
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return awaitServeErr(ctx, c.serveDone)
+}
+
+func (c *streamDrive) publishBlocked(ctx context.Context, pub *checkedPublisher) error {
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	blocked, err := blockedEvent(c.resolveStarted, c.gate)
+	if err != nil {
+		return fmt.Errorf("NewEvent(%q): %w", "e1", err)
+	}
+	if err := pub.publish("e1", blocked.Body); err != nil {
+		return err
+	}
 	select {
-	case <-resolveStarted:
+	case <-c.resolveStarted:
 	case <-time.After(3 * time.Second):
-		t.Fatal("the stream never started rendering the first event")
+		return fmt.Errorf("the stream never started rendering the first event")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	pub.publish(t, "e2", view.T("second"))
-	pub.publish(t, "e3", view.T("third"))
-	pub.publish(t, "e4", view.T("fourth"))
-	pub.publish(t, "e5", view.T("fifth"))
-	if got := topic.Dropped(); got != 3 {
-		t.Fatalf("Dropped = %d, want 3 events dropped for the blocked stream subscriber", got)
+	return nil
+}
+
+func (c *streamDrive) publishOverflow(ctx context.Context, pub *checkedPublisher) error {
+	if err := pub.publish("e2", view.T("second")); err != nil {
+		return err
 	}
-	close(gate)
-	first := nextMessage(t, tap, 3*time.Second)
+	if err := pub.publish("e3", view.T("third")); err != nil {
+		return err
+	}
+	if err := pub.publish("e4", view.T("fourth")); err != nil {
+		return err
+	}
+	if err := pub.publish("e5", view.T("fifth")); err != nil {
+		return err
+	}
+	if got := pub.topic.Dropped(); got != 3 {
+		return fmt.Errorf("Dropped = %d, want 3 events dropped for the blocked stream subscriber", got)
+	}
+	close(c.gate)
+	return nil
+}
+
+func (c *streamDrive) checkSlowTap(ctx context.Context) error {
+	first, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
 	if !strings.HasPrefix(first, "event: e1\ndata: ") || !strings.Contains(first, ">resolved<") || !strings.HasSuffix(first, "\n\n") {
-		t.Fatalf("first event message %q", first)
+		return fmt.Errorf("first event message %q", first)
 	}
-	if got := nextMessage(t, tap, 3*time.Second); got != "event: e2\ndata: second\n\n" {
-		t.Fatalf("second event message %q", got)
+	return nil
+}
+
+func (c *streamDrive) checkFastTap(ctx context.Context) error {
+	second, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
 	}
-	closeBody(t, resp.Body)
-	awaitServe(t, serveDone)
-	if err := g.Wait(); err != nil {
+	if second != "event: e2\ndata: second\n\n" {
+		return fmt.Errorf("second event message %q", second)
+	}
+	return nil
+}
+
+func TestEventTextEscapedAndNameRejected(t *testing.T) {
+	events := make(chan live.Event, 2)
+	ts, serveDone := serveEvents(t, rawHandler(events))
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
+	defer closeBody(t, resp.Body)
+	tap := newStreamTap()
+	drive := &streamDrive{body: resp.Body, tap: tap, events: events, serveDone: serveDone}
+	if err := drive.escaped(t.Context()); err != nil {
 		t.Fatalf("client group: %v", err)
 	}
 }
 
-func TestEventTextEscapedAndNameRejected(t *testing.T) {
-	_, err := live.NewEvent("bad\nname", view.T("x"))
-	if err == nil || !strings.Contains(err.Error(), "line break") {
-		t.Fatalf("newline name error = %v, want a line break rejection", err)
+func (c *streamDrive) escaped(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.escapedSteps(ctx)
 	}
-	_, err = live.NewEvent("bad\rname", view.T("x"))
-	if err == nil || !strings.Contains(err.Error(), "line break") {
-		t.Fatalf("carriage return name error = %v, want a line break rejection", err)
+	return nil
+}
+
+func (c *streamDrive) escapedSteps(ctx context.Context) error {
+	if err := rejectBadNames(); err != nil {
+		return err
 	}
-	made := mustEvent(t, "price", view.T("x"))
+	made, err := live.NewEvent("price", view.T("x"))
+	if err != nil {
+		return fmt.Errorf("NewEvent(price): %w", err)
+	}
 	if made.Name != "price" {
-		t.Fatalf("NewEvent(price) = %v", made)
+		return fmt.Errorf("NewEvent(price) = %v", made)
 	}
-	events := make(chan live.Event, 2)
-	ts, serveDone := serveEvents(t, rawHandler(events))
-	resp := openStream(t, ts)
-	defer closeBody(t, resp.Body)
-	tap, g := startTap(t, resp.Body)
-	expectHeartbeat(t, tap)
-	quoted := mustEvent(t, "quote", view.T(`<b>&'"</b>`))
-	events <- quoted
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	quoted, err := live.NewEvent("quote", view.T(`<b>&'"</b>`))
+	if err != nil {
+		return fmt.Errorf("NewEvent(quote): %w", err)
+	}
+	if err := c.emit(ctx, quoted); err != nil {
+		return err
+	}
 	want := "event: quote\ndata: &lt;b&gt;&amp;&#39;&#34;&lt;/b&gt;\n\n"
-	if got := nextMessage(t, tap, 3*time.Second); got != want {
-		t.Fatalf("escaped message %q, want %q", got, want)
+	got, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
 	}
-	events <- live.Event{Name: "a\nb", Body: view.T("x")}
-	awaitEnd(t, tap, 3*time.Second)
-	for pending := true; pending; {
-		select {
-		case m := <-tap.msgs:
-			if strings.Contains(m, "event:") {
-				t.Fatalf("a malformed name produced a message %q", m)
-			}
-		default:
-			pending = false
-		}
+	if got != want {
+		return fmt.Errorf("escaped message %q, want %q", got, want)
 	}
-	awaitServe(t, serveDone)
-	closeBody(t, resp.Body)
-	if err := g.Wait(); err != nil {
-		t.Fatalf("client group: %v", err)
+	if err := c.emit(ctx, live.Event{Name: "a\nb", Body: view.T("x")}); err != nil {
+		return err
 	}
+	if err := awaitEndErr(ctx, c.tap, 3*time.Second); err != nil {
+		return err
+	}
+	return c.finishStream(ctx)
+}
+
+func (c *streamDrive) finishStream(ctx context.Context) error {
+	if err := drainTap(c.tap); err != nil {
+		return err
+	}
+	if err := awaitServeErr(ctx, c.serveDone); err != nil {
+		return err
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return nil
 }
 
 type slogTap struct {
@@ -410,15 +677,19 @@ func TestRenderErrorEndsStreamLoggedOnce(t *testing.T) {
 	previous := slog.Default()
 	slog.SetDefault(slog.New(logs))
 	defer slog.SetDefault(previous)
-	resp := openStream(t, ts)
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
 	defer closeBody(t, resp.Body)
-	tap, g := startTap(t, resp.Body)
-	expectHeartbeat(t, tap)
-	events <- live.Event{Name: "boom", Body: &view.Island{Entry: "e.js", When: "hover"}}
-	awaitEnd(t, tap, 3*time.Second)
-	awaitServe(t, serveDone)
-	closeBody(t, resp.Body)
-	if err := g.Wait(); err != nil {
+	tap := newStreamTap()
+	drive := &streamDrive{body: resp.Body, tap: tap, events: events, serveDone: serveDone}
+	if err := drive.renderError(t.Context()); err != nil {
 		t.Fatalf("client group: %v", err)
 	}
 	hits := countRecords(logs, "render event")
@@ -429,6 +700,33 @@ func TestRenderErrorEndsStreamLoggedOnce(t *testing.T) {
 		})
 		t.Fatalf("the render error was logged %d times, want exactly once: %v", hits, all)
 	}
+}
+
+func (c *streamDrive) renderError(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.renderErrorSteps(ctx)
+	}
+	return nil
+}
+
+func (c *streamDrive) renderErrorSteps(ctx context.Context) error {
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	if err := c.emit(ctx, live.Event{Name: "boom", Body: &view.Island{Entry: "e.js", When: "hover"}}); err != nil {
+		return err
+	}
+	if err := awaitEndErr(ctx, c.tap, 3*time.Second); err != nil {
+		return err
+	}
+	if err := awaitServeErr(ctx, c.serveDone); err != nil {
+		return err
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return nil
 }
 
 func countRecords(logs *slogTap, part string) int {
@@ -531,29 +829,38 @@ func TestHeartbeatRepeatsEveryFifteenSeconds(t *testing.T) {
 		r := web.NewRouter()
 		r.Handle("GET", "/events", rawHandler(make(chan live.Event)))
 		out := &beatCounter{header: http.Header{}}
-		req := httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx)
-		g, _ := rt.NewGroup(t.Context(), 1)
-		g.Go(func(_ context.Context) error {
-			r.ServeHTTP(out, req)
-			return nil
-		})
-		for want := int64(1); want <= 3; want++ {
-			synctest.Wait()
-			if got := out.beats.Load(); got != want {
-				t.Fatalf("%d heartbeats at the start of period %d, want %d", got, want, want)
-			}
-			time.Sleep(14 * time.Second)
-			synctest.Wait()
-			if got := out.beats.Load(); got != want {
-				t.Fatalf("%d heartbeats 14 seconds into period %d, want %d", got, want, want)
-			}
-			time.Sleep(time.Second)
-		}
-		cancel()
-		if err := g.Wait(); err != nil {
+		if err := driveHeartbeatCount(ctx, cancel, r, out); err != nil {
 			t.Fatalf("stream group: %v", err)
 		}
 	})
+}
+
+func driveHeartbeatCount(ctx context.Context, cancel context.CancelFunc, r *web.Router, out *beatCounter) error {
+	req := httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx)
+	go group (ctx) {
+		go {
+			r.ServeHTTP(out, req)
+		}
+		go countBeats(cancel, out)
+	}
+	return nil
+}
+
+func countBeats(cancel context.CancelFunc, out *beatCounter) error {
+	for want := int64(1); want <= 3; want++ {
+		synctest.Wait()
+		if got := out.beats.Load(); got != want {
+			return fmt.Errorf("%d heartbeats at the start of period %d, want %d", got, want, want)
+		}
+		time.Sleep(14 * time.Second)
+		synctest.Wait()
+		if got := out.beats.Load(); got != want {
+			return fmt.Errorf("%d heartbeats 14 seconds into period %d, want %d", got, want, want)
+		}
+		time.Sleep(time.Second)
+	}
+	cancel()
+	return nil
 }
 
 func serveUntilWatched(ctx context.Context, r *web.Router, out *beatCounter, watch func() error) error {

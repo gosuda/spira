@@ -13,6 +13,8 @@ type Options struct {
 }
 
 func Mount(r *web.Router, guard web.Stage, o Options)
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -38,9 +40,10 @@ func Mount(r *web.Router, guard web.Stage, o Options)
 - An omitted `CheckTimeout` MUST be 5 seconds.
 - A check that returns a nil error MUST have status `ok`.
 - A check that returns an error MUST have status `fail`.
-- The fail member `error` MUST be that error text.
+- The fail member `error` MUST be the constant message of the `ops.check_failed` fault.
 - A check that panics MUST have status `fail`.
 - A check that returns nil after its context ended MUST have status `fail`.
+- The full cause of a failed check MUST be logged with the check name.
 - The report MUST list checks in name order.
 - The report JSON MUST use the member names `status` and `checks`.
 - Each check JSON MUST use the member names `name`, `status` and `error`.
@@ -66,18 +69,23 @@ func Mount(r *web.Router, guard web.Stage, o Options)
 ### Metrics and routes
 
 - `GET /ops/metrics` MUST answer 200.
-- The metrics `Content-Type` MUST be `text/plain; version=0.0.4; charset=utf-8`.
+- The routes body MUST be the JSON form of the method and pattern of each route from [web](web.md) `Routes`.
 - The metrics body MUST be the text from `Registry.Handler`, as [meter](meter.md) defines it.
 - `GET /ops/routes` MUST answer 200.
 - The routes body MUST be the JSON form of the slice from [web](web.md) `Routes`.
 - Each route object MUST use the member names `Method` and `Pattern`.
 
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `ops.check_failed` | unavailable | "A health check failed." |
+
 ## Errors
 
 - `ops: Options.Registry is required` when `Registry` is nil.
 - `ops: Options.CheckTimeout must be positive` when `CheckTimeout` is not positive.
-- `ops: check panicked: <value>` is the check error text when a check panics. `<value>` is the panic value.
-- `ops: check outlived its context: <cause>` is the check error text when a check returns nil after its context ended.
+- A failed check is the `ops.check_failed` fault. The report carries the constant message; the full cause goes to the log with the check name.
 
 ## Proof
 
@@ -88,10 +96,13 @@ func Mount(r *web.Router, guard web.Stage, o Options)
 - `TestMetricsServesRegistryTextWithRouteLabel` proves the metrics text and its content type.
 - `TestRoutesEndpointListsRoutes` proves the `Method` and `Pattern` members.
 - `TestInfoEndpointReportsBuildInfo` proves the Go version and the `info` map.
-- `TestPanickingCheckFails` proves that a panic becomes a failed check and that the body holds the panic value.
+- `TestPanickingCheckFails` proves that a panic becomes a failed check with the constant message, and that the body holds no panic value.
 - `TestTimedOutCheckFails` proves that the check context ends at `CheckTimeout`.
 - `TestExpiredCheckReturningNilFails` proves that a nil result after the timeout answers 503 and names the check.
 - `TestMountRefusesNonPositiveCheckTimeout` proves the panic for a zero `CheckTimeout`.
+- `TestCheckFailedThroughReady` proves that a failed check answers 503, names the check, and carries the constant fault message without the cause text.
+- `TestCheckOutputHidesSecretsAndHostileInput` proves that secrets and hostile input in a check error reach neither the report body nor the public view.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 
 ## Not in scope
 

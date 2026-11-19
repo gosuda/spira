@@ -42,26 +42,26 @@ func (c Chunk[In, Out]) Run(ctx context.Context) (Stats, error) {
 	}
 	for in, readErr := range read {
 		if readErr != nil {
-			return Stats{}, &ChunkError{Stats: stats, Err: readErr}
+			return Stats{}, ErrChunkFailed.Wrap(&ChunkError{Stats: stats, Err: readErr})
 		}
 		if err := ctx.Err(); err != nil {
-			return Stats{}, &ChunkError{Stats: stats, Err: err}
+			return Stats{}, ErrChunkFailed.Wrap(&ChunkError{Stats: stats, Err: err})
 		}
 		out, err := c.Process(in)
 		if err != nil {
-			return Stats{}, &ChunkError{Stats: stats, Err: err}
+			return Stats{}, ErrChunkFailed.Wrap(&ChunkError{Stats: stats, Err: err})
 		}
 		batch = append(batch, out)
 		if len(batch) < size {
 			continue
 		}
 		if err := c.writeBatch(ctx, batch, &stats); err != nil {
-			return Stats{}, &ChunkError{Stats: stats, Err: err}
+			return Stats{}, ErrChunkFailed.Wrap(&ChunkError{Stats: stats, Err: err})
 		}
 		batch = batch[:0]
 	}
 	if err := c.writeBatch(ctx, batch, &stats); err != nil {
-		return Stats{}, &ChunkError{Stats: stats, Err: err}
+		return Stats{}, ErrChunkFailed.Wrap(&ChunkError{Stats: stats, Err: err})
 	}
 	return stats, nil
 }

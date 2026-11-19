@@ -3,7 +3,6 @@ package mcp
 import (
 	"encoding/json"
 	"encoding/json/jsontext"
-	"errors"
 	"fmt"
 	"strconv"
 )
@@ -35,7 +34,7 @@ func encodeEnvelope(msg Envelope) ([]byte, error) {
 	}
 	line, err := json.Marshal(msg)
 	if err != nil {
-		return nil, fmt.Errorf("mcp: encode message: %w", err)
+		return nil, ErrTransportFailed.Wrap(fmt.Errorf("mcp: encode message: %w", err))
 	}
 	return line, nil
 }
@@ -43,10 +42,10 @@ func encodeEnvelope(msg Envelope) ([]byte, error) {
 func decodeEnvelope(line []byte) (Envelope, error) {
 	var msg Envelope
 	if err := json.Unmarshal(line, &msg); err != nil {
-		return Envelope{}, fmt.Errorf("mcp: decode message: %w", err)
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: decode message: %w", err))
 	}
 	if msg.JSONRPC == "" {
-		return Envelope{}, errors.New("mcp: message holds no jsonrpc member")
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: message holds no jsonrpc member"))
 	}
 	return msg, nil
 }
@@ -78,7 +77,7 @@ func marshalParams(method string, params any) (jsontext.Value, error) {
 	}
 	raw, err := json.Marshal(params)
 	if err != nil {
-		return nil, fmt.Errorf("mcp: encode %s params: %w", method, err)
+		return nil, ErrProtocolError.Wrap(fmt.Errorf("mcp: encode %s params: %w", method, err))
 	}
 	return raw, nil
 }

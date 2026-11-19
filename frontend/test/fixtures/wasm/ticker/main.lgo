@@ -1,0 +1,30 @@
+//go:build js && wasm
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"strconv"
+	"syscall/js"
+)
+
+func main() {
+	contract := js.Global().Get("__spiraIsland")
+	hostID := contract.Get("hostId").String()
+	text := "ticker: no props"
+	var props struct {
+		Initial int64 `json:"initial"`
+	}
+	if err := json.Unmarshal([]byte(contract.Get("props").String()), &props); err == nil {
+		text = "ticker:" + strconv.FormatInt(props.Initial, 10)
+	}
+	if host := js.Global().Get("document").Call("getElementById", hostID); !host.IsNull() && !host.IsUndefined() {
+		host.Set("textContent", text)
+	}
+	ctx := context.Background()
+	select {
+	case <-ctx.Done():
+		return
+	}
+}

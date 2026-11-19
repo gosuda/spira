@@ -151,6 +151,8 @@ func (s *Server) Stop(ctx context.Context) error
 - `next` MUST return `nil, nil`.
 - A stage MUST read the written status from `Context.Status`.
 - `Context.Wrote` MUST report whether the status is written.
+- A `Flush` on the response MUST mark the status as written with status 200 when the writer supports Flush.
+- A successful `Hijack` MUST mark the response as written.
 - A stage that does not call `next` MUST NOT run the inner handler.
 - A stage reply MUST be written when no status has been written yet.
 - The router MUST drop a second reply when the response is already written.
@@ -163,6 +165,8 @@ func (s *Server) Stop(ctx context.Context) error
 - An unmatched request MUST NOT wrap a stage again.
 - A request whose target is `*` and that matches no route MUST get the mux answer 400.
 - That request MUST NOT get a redirect.
+- An asterisk request MUST run the root stages.
+- The router MUST answer an unmatched request with the handler chosen before the stages ran, except an asterisk target.
 - A group stage MUST NOT run for a request that misses that group.
 - `Delegate` MUST call `To.ServeHTTP` after the stages of that route.
 - `Delegate` MUST pass a writer that unwraps to the response writer.
@@ -222,6 +226,7 @@ func (s *Server) Stop(ctx context.Context) error
 
 - `Defaults` MUST be `Recover` and then `RequestID`.
 - `Recover` MUST turn a handler panic into the internal problem.
+- `Recover` MUST re-panic `http.ErrAbortHandler` without a log line or a problem answer.
 - `Recover` MUST turn a `Layout` panic into the internal problem.
 - The internal problem MUST use title `Internal Server Error` and status 500.
 - The internal problem MUST NOT include the panic text or the error text.
@@ -234,10 +239,12 @@ func (s *Server) Stop(ctx context.Context) error
 - `RequestID` MUST store that id under `RequestIDKey`.
 - `CacheControl` MUST set the directive only when the status is 200 to 299.
 - `AccessLog` MUST log the method, the route, the status, the duration and the request id.
+- `AccessLog` MUST log the request when the handler aborts the stream.
 - The logged route MUST be the mux pattern, or the URL path when the pattern is empty.
 - `Start` and `Stop` MUST be usable as an [app](app.md) part.
 - `Start` MUST listen before it returns.
 - A cancelled start context MUST NOT stop the server.
+- The server MUST pass `OPTIONS *` to the router.
 - `Stop` MUST wait for an in-flight request until `ShutdownGrace` ends.
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
 - `Stop` MUST close open connections when shutdown times out.
@@ -245,6 +252,7 @@ func (s *Server) Stop(ctx context.Context) error
 - `Stop` MUST close those connections after `Shutdown` returns, also when shutdown times out.
 - After that, a `Hijack` MUST fail and MUST close its connection.
 - When a handler closes its upgraded connection, the server MUST forget that connection.
+- A hijacked connection MUST support TCP half-close.
 - `Stop` of a server that is not started MUST return a nil error.
 
 ## Errors
@@ -264,6 +272,7 @@ func (s *Server) Stop(ctx context.Context) error
 - `web: shutdown: <cause>` when `Shutdown` fails. `Stop` then closes the listener and joins that error.
 - `web: server is stopping` when a handler calls `Hijack` after `Stop` closed the upgraded connections.
 - `web: close upgraded connection: <cause>` when `Stop` cannot close an upgraded connection.
+- `web: CloseRead not supported by the underlying connection` when the taken-over connection lacks a read half-close, and the same text with `CloseWrite` for the write side. Callers MUST check the returned error: the methods exist on every hijacked connection, so a type assertion alone reports support.
 - `ProblemError.Error` returns `web: ` plus `Problem.Title`.
 - A dropped second reply is logged as `web: reply dropped, the response is already written`.
 - An encode or write failure of a reply is logged once as `web: reply write failed`, and the client gets the internal problem.
@@ -276,6 +285,8 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestRedirectUnderHtmxAndPlain` proves `HX-Redirect` and `Location`.
 - `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped `Fail`.
 - `TestUnknownErrorAndPanicStayHidden` proves that an unknown error and a panic omit their text.
+- `TestErrAbortHandlerAbortsACutStream` proves that a cut stream ends in a body read error.
+- `TestAccessLogRecordsAnAbortedStream` proves the log record for an aborted stream.
 - `TestPageWithoutLayoutIs500` proves the missing-layout detail.
 - `TestProblemViewOnlyWhenAcceptPrefersHTML`, `TestProblemNegotiationTable` and `TestProblemVaryAcceptOnlyWithView` prove the Accept rules.
 - `TestSetAndGetIsolatedPerRequest` and `TestGetOfUnsetKeyIsAbsent` prove per-request values.
@@ -291,21 +302,29 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestDelegateHandsEveryMethodToTheHandlerBehindTheStages` and `TestDelegateHijackUpgrade` prove `Delegate`, including a raw 101 upgrade.
 - `TestStageSetsResponseHeaderOnEveryReply`, `TestStageReadsTheWrittenStatus`, `TestStageReplyWithoutNextIsWritten` and `TestStageProblemSetsStatusForOuterStages` prove the stage boundary.
 - `TestWroteTurnsTrueWhenTheStatusIsWritten` proves `Context.Wrote` before and after `next`.
+- `TestWroteTurnsTrueAfterADelegatedFlush` proves `Wrote` and `Status` after a delegated `Flush`.
+- `TestWroteStaysFalseWhenTheWriterLacksFlush` proves `Wrote` stays false without Flush support.
+- `TestWroteTurnsTrueAfterADelegatedHijack` proves `Wrote` after a delegated raw 101 upgrade.
 - `TestProblemWithoutStatusAnswers500` and `TestInvalidReplyStatusBecomesProblemUnderRecover` prove status 0 and an invalid status.
 - `TestLayoutPanicUnderRecoverIsProblem` proves a `Layout` panic.
 - `TestBannedSlotAnswersProblemBeforeAnyPageByte` proves the slot check for a page, a page body and a fragment.
 - `TestUnmatchedRequestsRunRootStages` proves the 404 and 405 path.
+- `TestUnmatchedRequestKeepsTheHandlerChosenBeforeStages` proves that a stage rewrite keeps the unmatched handler.
+- `TestAsteriskRequestURIUsesTheLiveMuxAnswer` proves the asterisk exception to the frozen classification.
 - `TestUnmatchedChainWrapsAStageOnlyAtUse` proves that an unmatched request wraps no stage and that a later `Use` still applies.
-- `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*`.
+- `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*` and the root stage header.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
 - `TestServerServesAfterStartContextCancel` proves that a cancelled start context does not stop the server.
+- `TestServerAnswersOptionsAsteriskWith400` proves that `OPTIONS *` reaches the router.
 - `TestServerStopReturnsWithinGraceWhenHandlerNeverReturns` proves the grace deadline.
 - `TestServerStopReturnsByTheCallerDeadline` proves the caller deadline.
 - `TestServerStopClosesOpenConnectionsWhenShutdownTimesOut` proves that a timed-out shutdown closes the request.
 - `TestServerStopClosesAnUpgradedConnection` proves that `Stop` closes a connection that a handler took over.
-- `TestServerStopClosesAnUpgradedConnectionAfterTheGrace` proves the same after a shutdown timeout, and the `Hijack` error after `Stop`.
+- `TestServerStopClosesAnUpgradedConnectionAfterTheGrace` proves the same after a shutdown timeout, the `Hijack` error after `Stop`, and that the late socket ends closed.
 - `TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses` proves that a connection closed by its handler leaves the set.
+- `TestUpgradedConnectionKeepsTCPHalfClose` proves the half-close of a hijacked connection.
+- `TestUpgradedConnectionWithoutHalfCloseReportsNamedError` proves the named half-close errors when the peer lacks them.
 
 ## Not in scope
 

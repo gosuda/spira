@@ -1,6 +1,7 @@
 // Translated and changed by spira from Spring AI,
 // models/spring-ai-anthropic/src/main/java/org/springframework/ai/anthropic/AnthropicChatModel.java
 // (chat call, stream pump and retry classification).
+// Revision 4cce4caa9653092624b20ae1113633b3ad97d256.
 // Copyright 2023-present the original author or authors.
 // Licensed under the Apache License, Version 2.0.
 
@@ -16,7 +17,10 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/resilience"
@@ -59,18 +63,31 @@ func (c *Client) payload(req ai.Request, stream bool) ([]byte, error) {
 	}
 	return payload, nil
 }
-
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	payload, err := c.payload(req, false)
 	if err != nil {
-		return ai.Reply{}, err
+		return ai.Reply{}, ErrInvalidRequest.Wrap(err)
+	}
+	var hold time.Time
+	budget := time.Duration(0)
+	if retry := c.Policy.Retry; retry != nil {
+		budget = retry.Max
 	}
 	out, err := resilience.Do[chatResponse](ctx, c.Policy, func(actx context.Context) (chatResponse, error) {
-		value, err := c.post(actx, payload)
+		if err := holdUntil(ctx, hold); err != nil {
+			return chatResponse{}, ErrProviderError.Wrap(err)
+		}
+		value, err := c.post(actx, payload, budget)
 		if err == nil {
 			return value, nil
 		}
-		if callerFault(err) || errors.Is(err, errOversize) {
+		if wait := deferredWait(err); wait > 0 {
+			when := time.Now().Add(wait)
+			if when.After(hold) {
+				hold = when
+			}
+		}
+		if callerFault(err) || errors.Is(err, ErrProviderTooLarge) || errors.Is(err, ErrInvalidRequest) {
 			return chatResponse{}, resilience.Ignored(err)
 		}
 		return chatResponse{}, err
@@ -84,33 +101,57 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
 	payload, err := c.payload(req, true)
 	if err != nil {
-		yield ai.Chunk{}, err
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(err)
 		return
 	}
-	status, body, err := c.do(ctx, payload)
+	budget := time.Duration(0)
+	if retry := c.Policy.Retry; retry != nil {
+		budget = retry.Max
+	}
+	var hold time.Time
+	head, err := resilience.Do[streamHead](ctx, c.Policy, func(actx context.Context) (streamHead, error) {
+		if err := holdUntil(ctx, hold); err != nil {
+			return streamHead{}, ErrProviderError.Wrap(err)
+		}
+		status, header, body, derr := c.do(actx, payload)
+		if derr != nil {
+			return streamHead{}, transportFault(derr)
+		}
+		if status >= 200 && status <= 299 {
+			return streamHead{body: body}, nil
+		}
+		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
+		failure := classifyStatus(status, statusDetailOf(status, data))
+		closeBody(body)
+		if rerr != nil {
+			failure = classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", statusDetailOf(status, data), rerr))
+		}
+		if wait := retryWait(header, budget); wait > 0 {
+			failure = &deferred{cause: failure, wait: wait}
+		}
+		if wait := deferredWait(failure); wait > 0 {
+			when := time.Now().Add(wait)
+			if when.After(hold) {
+				hold = when
+			}
+		}
+		if callerFault(failure) {
+			return streamHead{}, resilience.Ignored(failure)
+		}
+		return streamHead{}, failure
+	})
 	if err != nil {
 		yield ai.Chunk{}, err
 		return
 	}
-	if status < 200 || status > 299 {
-		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
-		if rerr != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/anthropic: read response: %w", rerr)
-			closeBody(body)
-			return
-		}
-		yield ai.Chunk{}, statusError(status, data)
-		closeBody(body)
-		return
-	}
-	defer func() {
-		if cerr := body.Close(); cerr != nil {
-			return
-		}
-	}()
-	for chunk, cerr := range streamEvents(ctx, body) {
+	defer closeBody(head.body)
+	for chunk, cerr := range streamEvents(ctx, head.body) {
 		yield chunk, cerr
 	}
+}
+
+type streamHead struct {
+	body io.ReadCloser
 }
 
 func closeBody(body io.Closer) {
@@ -119,68 +160,144 @@ func closeBody(body io.Closer) {
 	}
 }
 
-var errOversize = errors.New("ai/anthropic: response exceeds the size limit")
-
 func callerFault(err error) bool {
-	answer := &statusAnswer{}
-	if !errors.As(err, &answer) {
-		return false
-	}
-	s := answer.status
-	return s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests
+	return errors.Is(err, ErrProviderRejected)
 }
 
-func (c *Client) post(ctx context.Context, payload []byte) (chatResponse, error) {
-	status, body, err := c.do(ctx, payload)
+func (c *Client) post(ctx context.Context, payload []byte, budget time.Duration) (chatResponse, error) {
+	status, header, body, err := c.do(ctx, payload)
 	if err != nil {
-		return chatResponse{}, err
+		return chatResponse{}, transportFault(err)
 	}
 	defer body.Close()?
-	data, err := io.ReadAll(io.LimitReader(body, replyLimit+1))
-	if err != nil {
-		return chatResponse{}, fmt.Errorf("ai/anthropic: read response: %w", err)
-	}
+	data, rerr := io.ReadAll(io.LimitReader(body, replyLimit+1))
 	if status < 200 || status > 299 {
-		return chatResponse{}, statusError(status, data[:min(len(data), replyLimit)])
+		if len(data) > replyLimit {
+			data = data[:replyLimit]
+		}
+		failure := classifyStatus(status, statusDetailOf(status, data))
+		if rerr != nil {
+			failure = classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", statusDetailOf(status, data), rerr))
+		}
+		if wait := retryWait(header, budget); wait > 0 {
+			return chatResponse{}, &deferred{cause: failure, wait: wait}
+		}
+		return chatResponse{}, failure
 	}
 	if len(data) > replyLimit {
-		return chatResponse{}, fmt.Errorf("%w of %d bytes", errOversize, replyLimit)
+		return chatResponse{}, ErrProviderTooLarge.Wrap(fmt.Errorf("response size %d exceeds the limit %d", len(data), replyLimit))
+	}
+	if rerr != nil {
+		return chatResponse{}, ErrProviderError.Wrap(fmt.Errorf("read response: %w", rerr))
 	}
 	var out chatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		return chatResponse{}, fmt.Errorf("ai/anthropic: decode response: %w", err)
+		return chatResponse{}, ErrProviderError.Wrap(fmt.Errorf("decode response: %w", err))
 	}
 	return out, nil
 }
 
-func (c *Client) do(ctx context.Context, payload []byte) (int, io.ReadCloser, error) {
+func (c *Client) do(ctx context.Context, payload []byte) (int, http.Header, io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+apiPath, bytes.NewReader(payload))
 	if err != nil {
-		return 0, nil, fmt.Errorf("ai/anthropic: build request: %w", err)
+		return 0, nil, nil, fmt.Errorf("ai/anthropic: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", apiVersion)
 	if c.Key != "" {
 		req.Header.Set("x-api-key", c.Key)
 	}
-	resp, err := c.http().Do(req)
+	resp, err := c.guarded().Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("ai/anthropic: %s: %w", apiPath, err)
+		return 0, nil, nil, fmt.Errorf("ai/anthropic: %s: %w", apiPath, err)
 	}
-	return resp.StatusCode, resp.Body, nil
+	return resp.StatusCode, resp.Header, resp.Body, nil
 }
 
-type statusAnswer struct {
-	status int
-	body   string
+func (c *Client) guarded() *http.Client {
+	base := c.http()
+	if c.Key == "" {
+		return base
+	}
+	next := base.CheckRedirect
+	clone := *base
+	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) > 0 && !sameOrigin(req.URL, via[0].URL) {
+			req.Header.Del("x-api-key")
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		if len(via) >= 10 {
+			return errRedirects
+		}
+		return nil
+	}
+	return &clone
 }
 
-func (a *statusAnswer) Error() string {
-	return fmt.Sprintf("ai/anthropic: %d: %s", a.status, a.body)
+func sameOrigin(a *url.URL, b *url.URL) bool {
+	return a.Scheme == b.Scheme && a.Host == b.Host
 }
 
-func statusError(status int, body []byte) error {
-	return &statusAnswer{status: status, body: string(body)}
+var errRedirects = errors.New("ai/anthropic: stopped after 10 redirects")
+
+func holdUntil(ctx context.Context, at time.Time) error {
+	wait := time.Until(at)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func retryWait(header http.Header, budget time.Duration) time.Duration {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	wait := time.Duration(0)
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil && secs >= 0 {
+		if secs > int64(maxWait)/int64(time.Second) {
+			wait = maxWait
+		} else {
+			wait = time.Duration(secs) * time.Second
+		}
+	} else if at, err := http.ParseTime(raw); err == nil {
+		wait = max(time.Until(at), 0)
+	}
+	if budget > 0 && wait > budget {
+		return budget
+	}
+	return wait
+}
+
+const maxWait = 24 * time.Hour
+
+type deferred struct {
+	cause error
+	wait  time.Duration
+}
+
+func (d *deferred) Error() string {
+	return d.cause.Error()
+}
+
+func (d *deferred) Unwrap() error {
+	return d.cause
+}
+func deferredWait(err error) time.Duration {
+	noted := &deferred{}
+	if errors.As(err, &noted) {
+		return noted.wait
+	}
+	return 0
 }
 
 func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
@@ -195,11 +312,15 @@ func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error
 			return
 		}
 		if rerr != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream ended before message_stop")
+			if err := ctx.Err(); err != nil {
+				yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
+				return
+			}
+			yield ai.Chunk{}, ErrProviderStreamCut.Err()
 			return
 		}
 		if err := ctx.Err(); err != nil {
-			yield ai.Chunk{}, err
+			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
 			return
 		}
 	}
@@ -208,18 +329,21 @@ func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error
 type toolBlock struct {
 	id        string
 	name      string
+	seed      string
 	arguments strings.Builder
 }
 
 type streamState struct {
-	ended  bool
-	data   strings.Builder
-	id     string
-	model  string
-	input  int32
-	output int32
-	finish string
-	tools  map[int32]*toolBlock
+	ended    bool
+	data     strings.Builder
+	id       string
+	model    string
+	uncached int32
+	output   int32
+	read     int32
+	created  int32
+	finish   string
+	tools    map[int32]*toolBlock
 }
 
 func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
@@ -243,7 +367,7 @@ func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
 	var ev wireEvent
 	if err := json.Unmarshal([]byte(data), &ev); err != nil {
 		s.ended = true
-		yield ai.Chunk{}, fmt.Errorf("ai/anthropic: decode stream event: %w", err)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(fmt.Errorf("decode stream event: %w", err))
 		return
 	}
 	for chunk, err := range s.event(ev) {
@@ -256,12 +380,14 @@ func (s *streamState) event(ev wireEvent) iter.Seq2[ai.Chunk, error] {
 	case "message_start":
 		s.id = ev.Message.ID
 		s.model = ev.Message.Model
-		s.input = inputTokens(ev.Message.Usage)
+		s.uncached = ev.Message.Usage.InputTokens
 		s.output = ev.Message.Usage.OutputTokens
+		s.read = ev.Message.Usage.CacheReadInputTokens
+		s.created = ev.Message.Usage.CacheCreationInputTokens
 		yield ai.Chunk{ID: s.id, Model: s.model, Usage: s.usage()}, nil
 	case "content_block_start":
 		if ev.ContentBlock.Type == "tool_use" {
-			s.tools[ev.Index] = &toolBlock{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+			s.tools[ev.Index] = &toolBlock{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name, seed: string(ev.ContentBlock.Input)}
 		}
 	case "content_block_delta":
 		for chunk, err := range s.delta(ev) {
@@ -278,7 +404,7 @@ func (s *streamState) event(ev wireEvent) iter.Seq2[ai.Chunk, error] {
 		yield s.final(), nil
 	case "error":
 		s.ended = true
-		yield ai.Chunk{}, fmt.Errorf("ai/anthropic: stream: %s: %s", ev.Error.Type, ev.Error.Message)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(&statusDetail{status: 200, errType: ev.Error.Type, length: len(ev.Error.Message)})
 	}
 }
 
@@ -301,25 +427,39 @@ func (s *streamState) blockStop(index int32) iter.Seq2[ai.Chunk, error] {
 		return
 	}
 	delete(s.tools, index)
-	yield ai.Chunk{Part: ai.Part(ai.ToolCall{ID: tool.id, Name: tool.name, Arguments: tool.arguments.String()}), Index: int(index)}, nil
+	args := tool.arguments.String()
+	if strings.TrimSpace(args) == "" {
+		args = "{}"
+		if checked, cerr := rawJSON(tool.seed, "{}"); cerr == nil {
+			args = string(checked)
+		}
+	}
+	yield ai.Chunk{Part: ai.Part(ai.ToolCall{ID: tool.id, Name: tool.name, Arguments: args}), Index: int(index)}, nil
 }
 
 func (s *streamState) messageDelta(ev wireEvent) {
 	if ev.Delta.StopReason != "" {
 		s.finish = ev.Delta.StopReason
 	}
-	if ev.Usage.InputTokens > 0 {
-		s.input = inputTokens(ev.Usage)
+	if ev.Usage.seenIn {
+		s.uncached = ev.Usage.input
 	}
-	if ev.Usage.OutputTokens > 0 {
-		s.output = ev.Usage.OutputTokens
+	if ev.Usage.seenOut {
+		s.output = ev.Usage.output
+	}
+	if ev.Usage.seenRd {
+		s.read = ev.Usage.read
+	}
+	if ev.Usage.seenMk {
+		s.created = ev.Usage.created
 	}
 }
 
 func (s *streamState) usage() ai.Usage {
-	return ai.Usage{Input: int(s.input), Output: int(s.output), Total: int(s.input + s.output)}
+	input := int(s.uncached + s.read + s.created)
+	output := int(s.output)
+	return ai.Usage{Input: input, Output: output, Total: input + output}
 }
-
 func (s *streamState) final() ai.Chunk {
 	finish := ai.FinishOther
 	if s.finish != "" {

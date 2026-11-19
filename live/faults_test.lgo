@@ -1,0 +1,164 @@
+package live_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/view"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/live.md", live.Faults())
+}
+
+func TestInvalidEventNameThroughNewEvent(t *testing.T) {
+	name := "bad<script>alert(1)</script>\nname"
+	_, err := live.NewEvent(name, view.T("x"))
+	if !errors.Is(err, live.ErrInvalidEventName) {
+		t.Fatalf("NewEvent error = %v, want invalid_event_name", err)
+	}
+	if got := err.Error(); got != "live.invalid_event_name: The event name is invalid.: live: event name holds a line break" {
+		t.Fatalf("NewEvent error text = %q, want the invalid-name form", got)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), "<script>", "alert")
+}
+
+func TestInvalidEventNameEndsStream(t *testing.T) {
+	events := make(chan live.Event, 1)
+	ts, _ := serveEvents(t, rawHandler(events))
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
+	defer closeBody(t, resp.Body)
+	tap := newStreamTap()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	drive := &streamDrive{body: resp.Body, tap: tap, events: events}
+	if err := drive.invalidName(ctx); err != nil {
+		t.Fatalf("client group: %v", err)
+	}
+}
+
+func TestRenderFailedHidesSecrets(t *testing.T) {
+	cause := errors.New("view: render password=hunter2 <script>alert(1)</script>")
+	wrapped := live.ErrRenderFailed.Wrap(cause)
+	if !errors.Is(wrapped, live.ErrRenderFailed) {
+		t.Fatalf("wrapped render failure = %v, want render_failed", wrapped)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, wrapped), "hunter2", "<script>")
+}
+
+func TestRenderFailedEndsStream(t *testing.T) {
+	events := make(chan live.Event, 1)
+	ts, serveDone := serveEvents(t, rawHandler(events))
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
+	defer closeBody(t, resp.Body)
+	tap := newStreamTap()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	drive := &streamDrive{body: resp.Body, tap: tap, events: events, serveDone: serveDone}
+	if err := drive.renderError(ctx); err != nil {
+		t.Fatalf("client group: %v", err)
+	}
+}
+
+func TestStreamOutputEscapesHostileBody(t *testing.T) {
+	events := make(chan live.Event, 1)
+	ts, _ := serveEvents(t, rawHandler(events))
+	resp, err := openStream(t, ts)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if resp == nil {
+		t.Fatal("no response")
+		return
+	}
+	defer closeBody(t, resp.Body)
+	tap := newStreamTap()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	drive := &streamDrive{body: resp.Body, tap: tap, events: events}
+	if err := drive.hostileBody(ctx); err != nil {
+		t.Fatalf("client group: %v", err)
+	}
+}
+
+func (c *streamDrive) invalidName(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.invalidNameSteps(ctx)
+	}
+	return nil
+}
+
+func (c *streamDrive) invalidNameSteps(ctx context.Context) error {
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	if err := c.emit(ctx, live.Event{Name: "bad\nname", Body: view.T("x")}); err != nil {
+		return err
+	}
+	if err := awaitEndErr(ctx, c.tap, 3*time.Second); err != nil {
+		return err
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return nil
+}
+
+func (c *streamDrive) hostileBody(ctx context.Context) error {
+	go group (ctx) {
+		go { c.tap.read(ctx, c.body)? }
+		go c.hostileBodySteps(ctx)
+	}
+	return nil
+}
+
+func (c *streamDrive) hostileBodySteps(ctx context.Context) error {
+	if err := expectHeartbeatErr(ctx, c.tap); err != nil {
+		return err
+	}
+	ev, err := live.NewEvent("tick", view.T("<script>alert(1)</script> '; DROP TABLE x; -- /etc/passwd hunter2"))
+	if err != nil {
+		return err
+	}
+	if err := c.emit(ctx, ev); err != nil {
+		return err
+	}
+	got, err := tapMessages(ctx, c.tap, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(got, "<script>") {
+		return fmt.Errorf("stream data holds a raw script tag: %q", got)
+	}
+	if !strings.Contains(got, "&lt;script&gt;") {
+		return fmt.Errorf("stream data %q lacks the escaped script tag", got)
+	}
+	if cerr := c.body.Close(); cerr != nil {
+		return fmt.Errorf("close stream body: %w", cerr)
+	}
+	return nil
+}

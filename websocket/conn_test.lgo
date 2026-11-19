@@ -1,0 +1,673 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+type exchangePlan struct {
+	conn *websocket.Conn
+	peer net.Conn
+	server func(context.Context, *websocket.Conn) error
+	client func(net.Conn) error
+}
+
+func runExchange(ctx context.Context, plan *exchangePlan) error {
+	go group (ctx) {
+		go { plan.server(ctx, plan.conn)? }
+		go { plan.client(plan.peer)? }
+	}
+	return nil
+}
+
+func exchange(t *testing.T, ctx context.Context, plan *exchangePlan) {
+	t.Helper()
+	if err := runExchange(ctx, plan); err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+}
+
+func openPair(t *testing.T, limit int64) (*websocket.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+		panic("listen failed")
+	}
+	client, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		panic("dial failed")
+	}
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+		panic("accept failed")
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("listener close: %v", err)
+	}
+	mustSetDeadline(t, client)
+	mustSetDeadline(t, server)
+	rw := bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server))
+	return websocket.ServeHijacked(server, rw, "", limit), client
+}
+
+func mustSetDeadline(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+}
+
+func closePipe(t *testing.T, c *websocket.Conn, peer net.Conn) {
+	t.Helper()
+	if err := c.Close(); err != nil {
+		t.Fatalf("conn close: %v", err)
+		return
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatalf("peer close: %v", err)
+	}
+}
+
+func writeClientBytes(conn net.Conn, b0 uint8, payload []byte) error {
+	head := frameHead(b0, len(payload))
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	scrambled := make([]byte, len(payload))
+	for i := range payload {
+		scrambled[i] = payload[i] ^ key[i%4]
+	}
+	buf := make([]byte, 0, len(head)+4+len(payload))
+	buf = append(buf, head...)
+	buf = append(buf, key[0], key[1], key[2], key[3])
+	buf = append(buf, scrambled...)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("write frame: %w", err)
+	}
+	return nil
+}
+
+func frameHead(b0 uint8, length int) []byte {
+	if length < 126 {
+		return []byte{b0, 0x80 | uint8(length)}
+	}
+	if length < 65536 {
+		return []byte{b0, 0x80 | 126, byte(length >> 8), byte(length)}
+	}
+	wide := uint64(length)
+	return []byte{b0, 0x80 | 127, byte(wide >> 56), byte(wide >> 48), byte(wide >> 40), byte(wide >> 32), byte(wide >> 24), byte(wide >> 16), byte(wide >> 8), byte(wide)}
+}
+
+func readServerBytes(r *bufio.Reader) (uint8, []byte, error) {
+	b0, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	b1, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	if b1&0x80 != 0 {
+		return 0, nil, errors.New("server frame is masked")
+	}
+	length := int64(b1 & 0x7f)
+	if length == 126 {
+		length, err = readUint16(r)
+		if err != nil {
+			return 0, nil, err
+		}
+	} else if length == 127 {
+		length, err = readUint64(r)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	return b0 & 0x0f, payload, nil
+}
+
+func readUint16(r *bufio.Reader) (int64, error) {
+	raw := make([]byte, 2)
+	if _, err := io.ReadFull(r, raw); err != nil {
+		return 0, err
+	}
+	return int64(raw[0])<<8 | int64(raw[1]), nil
+}
+
+func readUint64(r *bufio.Reader) (int64, error) {
+	raw := make([]byte, 8)
+	if _, err := io.ReadFull(r, raw); err != nil {
+		return 0, err
+	}
+	var length uint64
+	for _, b := range raw {
+		length = length<<8 | uint64(b)
+	}
+	if length>>63 != 0 {
+		return 0, errors.New("length top bit set")
+	}
+	return int64(length), nil
+}
+
+func expectCloseCode(peer net.Conn, want uint16, wantReason string) error {
+	r := bufio.NewReader(peer)
+	opcode, payload, err := readServerBytes(r)
+	if err != nil {
+		return fmt.Errorf("read close: %w", err)
+	}
+	if opcode != 0x8 {
+		return fmt.Errorf("opcode = %d, want 8", opcode)
+	}
+	code, reason, err := websocket.ParseClose(payload)
+	if err != nil {
+		return fmt.Errorf("parse close: %w", err)
+	}
+	if code != want {
+		return fmt.Errorf("close code = %d, want %d", code, want)
+	}
+	if reason != wantReason {
+		return fmt.Errorf("close reason = %q, want %q", reason, wantReason)
+	}
+	return nil
+}
+
+func awaitCloseThenEnd(ctx context.Context, c *websocket.Conn) error {
+	k, payload, err := c.Next(ctx)
+	if err != nil {
+		return fmt.Errorf("first next: %w", err)
+	}
+	if k != websocket.Close {
+		return fmt.Errorf("first kind = %d, want close", uint8(k))
+	}
+	code, reason, err := websocket.ParseClose(payload)
+	if err != nil {
+		return fmt.Errorf("parse close: %w", err)
+	}
+	if code != 1000 || reason != "bye" {
+		return fmt.Errorf("close = %d %q, want 1000 bye", code, reason)
+	}
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrClosed) {
+		return fmt.Errorf("second next error = %w, want ErrClosed", err)
+	}
+	return nil
+}
+
+func sendCloseExpectEcho(peer net.Conn) error {
+	payload := []byte{0x03, 0xe8, 'b', 'y', 'e'}
+	if err := writeClientBytes(peer, 0x88, payload); err != nil {
+		return err
+	}
+	r := bufio.NewReader(peer)
+	opcode, echo, err := readServerBytes(r)
+	if err != nil {
+		return fmt.Errorf("read echo: %w", err)
+	}
+	if opcode != 0x8 {
+		return fmt.Errorf("echo opcode = %d, want 8", opcode)
+	}
+	if !bytes.Equal(echo, payload) {
+		return fmt.Errorf("echo = %v, want %v", echo, payload)
+	}
+	if _, _, err := readServerBytes(r); err == nil {
+		return errors.New("second server frame: want connection end, got a frame")
+	}
+	return nil
+}
+
+func TestPeerCloseEchoedOnceThenEnds(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: awaitCloseThenEnd, client: sendCloseExpectEcho})
+	closePipe(t, c, peer)
+}
+
+func awaitTooLarge(ctx context.Context, c *websocket.Conn) error {
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrTooLarge) {
+		return fmt.Errorf("next error = %w, want ErrTooLarge", err)
+	}
+	return nil
+}
+
+func sendBigExpectClose(peer net.Conn) error {
+	if err := writeClientBytes(peer, 0x82, []byte("Hello")); err != nil {
+		return err
+	}
+	return expectCloseCode(peer, 1009, "")
+}
+
+func TestFaultFrameOverLimitSends1009(t *testing.T) {
+	c, peer := openPair(t, 4)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: awaitTooLarge, client: sendBigExpectClose})
+	closePipe(t, c, peer)
+}
+
+func awaitInvalidUTF8(ctx context.Context, c *websocket.Conn) error {
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrProtocolError) {
+		return fmt.Errorf("next error = %w, want ErrProtocolError", err)
+	}
+	return nil
+}
+
+func sendBadTextExpectClose(peer net.Conn) error {
+	if err := writeClientBytes(peer, 0x81, []byte{0xff}); err != nil {
+		return err
+	}
+	return expectCloseCode(peer, 1007, "")
+}
+
+func TestFaultInvalidUTF8Sends1007(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: awaitInvalidUTF8, client: sendBadTextExpectClose})
+	closePipe(t, c, peer)
+}
+
+func awaitReservedBits(ctx context.Context, c *websocket.Conn) error {
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrProtocolError) {
+		return fmt.Errorf("next error = %w, want ErrProtocolError", err)
+	}
+	return nil
+}
+
+func sendReservedExpectClose(peer net.Conn) error {
+	if err := writeClientBytes(peer, 0xc1, []byte("Hello")); err != nil {
+		return err
+	}
+	return expectCloseCode(peer, 1002, "")
+}
+
+func TestFaultReservedBitSends1002(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: awaitReservedBits, client: sendReservedExpectClose})
+	closePipe(t, c, peer)
+}
+
+func awaitPing(ctx context.Context, c *websocket.Conn) error {
+	k, payload, err := c.Next(ctx)
+	if err != nil {
+		return fmt.Errorf("ping next: %w", err)
+	}
+	if k != websocket.Ping {
+		return fmt.Errorf("kind = %d, want ping", uint8(k))
+	}
+	if string(payload) != "Hi" {
+		return fmt.Errorf("ping = %q, want Hi", string(payload))
+	}
+	return nil
+}
+
+func sendPingExpectPong(peer net.Conn) error {
+	if err := writeClientBytes(peer, 0x89, []byte("Hi")); err != nil {
+		return err
+	}
+	r := bufio.NewReader(peer)
+	opcode, payload, err := readServerBytes(r)
+	if err != nil {
+		return fmt.Errorf("read pong: %w", err)
+	}
+	if opcode != 0xa {
+		return fmt.Errorf("pong opcode = %d, want 10", opcode)
+	}
+	if string(payload) != "Hi" {
+		return fmt.Errorf("pong = %q, want Hi", string(payload))
+	}
+	return nil
+}
+
+func TestPingAnsweredWithPong(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: awaitPing, client: sendPingExpectPong})
+	closePipe(t, c, peer)
+}
+
+func echoOnce(ctx context.Context, c *websocket.Conn) error {
+	k, payload, err := c.Next(ctx)
+	if err != nil {
+		return fmt.Errorf("echo next: %w", err)
+	}
+	if k == websocket.Text {
+		if werr := c.WriteText(ctx, payload); werr != nil {
+			return fmt.Errorf("echo text: %w", werr)
+		}
+		return nil
+	}
+	if k != websocket.Binary {
+		return fmt.Errorf("echo kind = %d, want text or binary", uint8(k))
+	}
+	if werr := c.WriteBinary(ctx, payload); werr != nil {
+		return fmt.Errorf("echo binary: %w", werr)
+	}
+	return nil
+}
+
+func frameBytes1024() []byte {
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	return payload
+}
+
+func sendEcho1024(peer net.Conn) error {
+	want := frameBytes1024()
+	if err := writeClientBytes(peer, 0x82, want); err != nil {
+		return err
+	}
+	r := bufio.NewReader(peer)
+	opcode, got, err := readServerBytes(r)
+	if err != nil {
+		return fmt.Errorf("read echo: %w", err)
+	}
+	if opcode != 0x2 {
+		return fmt.Errorf("echo opcode = %d, want 2", opcode)
+	}
+	if !bytes.Equal(got, want) {
+		return errors.New("echo payload differs from sent payload")
+	}
+	return nil
+}
+
+func TestBinaryEchoRoundTrip1KiB(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: echoOnce, client: sendEcho1024})
+	closePipe(t, c, peer)
+}
+
+func TestExpiredContextFailsFast(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	past, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, _, err := c.Next(past); err == nil {
+		t.Fatal("Next with expired context: want error, got nil")
+	} else if errors.Is(err, websocket.ErrClosed) {
+		t.Fatalf("Next with expired context = %v, want deadline, not ErrClosed", err)
+	}
+	if err := c.WriteBinary(past, []byte("Hi")); err == nil {
+		t.Fatal("Write with expired context: want error, got nil")
+	}
+	closePipe(t, c, peer)
+}
+
+func closeThenEnd(ctx context.Context, c *websocket.Conn) error {
+	if err := c.CloseWithCode(ctx, 1000, "bye"); err != nil {
+		return fmt.Errorf("close with code: %w", err)
+	}
+	if _, _, err := c.Next(ctx); !errors.Is(err, websocket.ErrClosed) {
+		return fmt.Errorf("next after close = %w, want ErrClosed", err)
+	}
+	if err := c.WriteBinary(ctx, []byte("Hi")); !errors.Is(err, websocket.ErrClosed) {
+		return fmt.Errorf("write after close = %w, want ErrClosed", err)
+	}
+	return nil
+}
+
+func TestCloseWithCodeEndsConnection(t *testing.T) {
+	c, peer := openPair(t, 1<<20)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	plan := &exchangePlan{conn: c, peer: peer, server: closeThenEnd, client: awaitCloseBye}
+	exchange(t, ctx, plan)
+	closePipe(t, c, peer)
+}
+
+func awaitCloseBye(peer net.Conn) error {
+	return expectCloseCode(peer, 1000, "bye")
+}
+
+type upgraded struct {
+	conn *websocket.Conn?
+	err error
+}
+
+func deliver(r *http.Request, out chan upgraded, v upgraded) {
+	select {
+	case out <- v:
+	case <-r.Context().Done():
+	}
+}
+
+func awaitUpgrade(t *testing.T, out chan upgraded) (upgraded, bool) {
+	t.Helper()
+	select {
+	case u := <-out:
+		return u, true
+	case <-t.Context().Done():
+		t.Fatalf("no upgrade result")
+		return upgraded{}, false
+	}
+}
+
+func serveUpgradeCase(t *testing.T, cfg websocket.Config) (*httptest.Server, chan upgraded) {
+	t.Helper()
+	out := make(chan upgraded, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Upgrade(w, r, cfg)
+		if err != nil {
+			deliver(r, out, upgraded{err: err})
+			return
+		}
+		deliver(r, out, upgraded{conn: c})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, out
+}
+
+func dialRaw(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		panic("dial failed")
+	}
+	mustSetDeadline(t, conn)
+	return conn, bufio.NewReader(conn)
+}
+
+func sendHandshake(t *testing.T, conn net.Conn, addr string, extra string) {
+	t.Helper()
+	req := "GET /chat HTTP/1.1\r\nHost: " + addr + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" + extra + "\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+}
+
+func readResponse(t *testing.T, r *bufio.Reader) (int, http.Header) {
+	t.Helper()
+	line, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+		return 0, nil
+	}
+	parts := strings.Split(strings.TrimSpace(line), " ")
+	if len(parts) < 2 {
+		t.Fatalf("status line %q has no code", strings.TrimSpace(line))
+		return 0, nil
+	}
+	code, err := strconv.Atoi(parts[1])
+	if err != nil {
+		t.Fatalf("status code %q: %v", parts[1], err)
+		return 0, nil
+	}
+	header := http.Header{}
+	for {
+		hline, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read header: %v", err)
+			return 0, nil
+		}
+		hline = strings.TrimSpace(hline)
+		if hline == "" {
+			return code, header
+		}
+		name, value, _ := strings.Cut(hline, ":")
+		header.Add(strings.TrimSpace(name), strings.TrimSpace(value))
+	}
+}
+
+func TestUpgradeAnswers101WithRFCVector(t *testing.T) {
+	srv, out := serveUpgradeCase(t, websocket.Config{})
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, r := dialRaw(t, addr)
+	sendHandshake(t, conn, addr, "")
+	code, header := readResponse(t, r)
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d, want 101", code)
+		return
+	}
+	if got := header.Get("Sec-WebSocket-Accept"); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("accept = %q, want RFC 6455 vector", got)
+		return
+	}
+	u, ok := awaitUpgrade(t, out)
+	if !ok {
+		return
+	}
+	if u.err != nil {
+		t.Fatalf("Upgrade: %v", u.err)
+		return
+	}
+	c := u.conn
+	if c == nil {
+		t.Fatal("Upgrade gave no connection")
+		return
+	}
+	if got := c.Subprotocol(); got != "" {
+		t.Fatalf("subprotocol = %q, want empty", got)
+	}
+	closePipe(t, c, conn)
+}
+
+type originCase struct {
+	name string
+	origin string
+	allowed []string
+	want int
+}
+
+func checkOriginCase(t *testing.T, tc originCase) {
+	t.Helper()
+	srv, out := serveUpgradeCase(t, websocket.Config{AllowedOrigins: tc.allowed})
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	origin := tc.origin
+	if origin == "same" {
+		origin = "http://" + addr
+	}
+	extra := ""
+	if tc.origin != "" {
+		extra = "Origin: " + origin + "\r\n"
+	}
+	conn, r := dialRaw(t, addr)
+	sendHandshake(t, conn, addr, extra)
+	code, _ := readResponse(t, r)
+	if code != tc.want {
+		t.Fatalf("origin %s: status = %d, want %d", tc.name, code, tc.want)
+		return
+	}
+	if code == http.StatusSwitchingProtocols {
+		u, ok := awaitUpgrade(t, out)
+		if !ok {
+			return
+		}
+		if u.err != nil {
+			t.Fatalf("origin %s: Upgrade: %v", tc.name, u.err)
+			return
+		}
+		c := u.conn
+		if c == nil {
+			t.Fatal("Upgrade gave no connection")
+			return
+		}
+		closePipe(t, c, conn)
+		return
+	}
+	u, ok := awaitUpgrade(t, out)
+	if !ok {
+		return
+	}
+	if u.err == nil {
+		t.Fatalf("origin %s: want Upgrade error, got nil", tc.name)
+		return
+	}
+	if u.conn != nil {
+		t.Fatalf("origin %s: want no connection", tc.name)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("origin %s: peer close: %v", tc.name, err)
+	}
+}
+
+func TestUpgradeOriginPolicy(t *testing.T) {
+	cases := []originCase{
+		{name: "absent", origin: "", allowed: nil, want: http.StatusSwitchingProtocols},
+		{name: "same", origin: "same", allowed: nil, want: http.StatusSwitchingProtocols},
+		{name: "listed", origin: "https://app.example", allowed: []string{"https://app.example"}, want: http.StatusSwitchingProtocols},
+		{name: "foreign", origin: "https://evil.example", allowed: nil, want: http.StatusForbidden},
+		{name: "unlisted", origin: "https://evil.example", allowed: []string{"https://app.example"}, want: http.StatusForbidden},
+		{name: "unparsable", origin: "::::", allowed: nil, want: http.StatusForbidden},
+		{name: "null", origin: "null", allowed: nil, want: http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		checkOriginCase(t, tc)
+	}
+}
+
+func TestUpgradeSelectsSubprotocolInServerOrder(t *testing.T) {
+	srv, out := serveUpgradeCase(t, websocket.Config{Subprotocols: []string{"super", "chat"}})
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, r := dialRaw(t, addr)
+	sendHandshake(t, conn, addr, "Sec-WebSocket-Protocol: chat, super\r\n")
+	code, header := readResponse(t, r)
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d, want 101", code)
+		return
+	}
+	if got := header.Get("Sec-WebSocket-Protocol"); got != "super" {
+		t.Fatalf("subprotocol = %q, want super", got)
+		return
+	}
+	u, ok := awaitUpgrade(t, out)
+	if !ok {
+		return
+	}
+	if u.err != nil {
+		t.Fatalf("Upgrade: %v", u.err)
+		return
+	}
+	c := u.conn
+	if c == nil {
+		t.Fatal("Upgrade gave no connection")
+		return
+	}
+	if got := c.Subprotocol(); got != "super" {
+		t.Fatalf("conn subprotocol = %q, want super", got)
+	}
+	closePipe(t, c, conn)
+}

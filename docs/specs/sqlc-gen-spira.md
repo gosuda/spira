@@ -1,6 +1,6 @@
 # cmd/sqlc-gen-spira
 
-Status: specified; the package is not in the tree yet.
+Status: implemented.
 
 Package `sqlc-gen-spira` is a sqlc process plugin. It reads one `GenerateRequest` as JSON and writes LoGOs source files. The application author gets checked query functions and table types.
 
@@ -45,8 +45,11 @@ The plugin reads one JSON object from standard input. The object has these field
   "plugin_options": {}
 }
 ```
-
 The plugin writes one JSON object to standard output. The object has one field `files`. Each file has `name` and `contents`.
+
+- sqlc starts the plugin with the full gRPC method path `/plugin.CodegenService/Generate` as its one argument. A bare `generate` argument also runs the plugin for manual use.
+- `plugin_options` arrives as base64 JSON with the keys `package`, `tables`, `refs` and `overrides`. Unknown keys are an error.
+- The output holds `models.sql.lgo` and one `<topic>.sql.lgo` file for each query file, where `<topic>` is the query file name without `.sql`.
 
 ## Requirements
 
@@ -95,7 +98,7 @@ PostgreSQL:
 - `integer`, `int`, `int4` and `serial` MUST map to `int32`.
 - `int2` MUST map to `int16`.
 - `uuid` MUST map to `string`.
-- `real` and `float4` MUST map to `float32`.
+- `bpchar` MUST map to `string` because a fixed `CHAR(n)` arrives as `bpchar`.
 - `float8` MUST map to `float64`.
 - `bytea` and `jsonb` MUST map to `[]byte`.
 - `timestamptz` MUST map to `time.Time`.
@@ -132,6 +135,7 @@ SQL Server:
 - For each table with `key_type`, the plugin MUST emit `type <key_type> <underlying>`.
 - The key column MUST use `<key_type>`.
 - Each column that `refs` points at that table MUST use `<key_type>`.
+- A nullable key column MUST use the underlying option type; an option of a named type cannot be dispatched.
 - For each PostgreSQL enum, the plugin MUST emit a named string type, its constants, and `Valid() bool`.
 - For each table with `key`, the plugin MUST emit `var <Type>Table = orm.Table[<Type>, <key_type>]` with `Name`, `Key` and `Version`.
 - The plugin MUST emit `func PrepareAll(ctx context.Context, p *db.Pool) error`.
@@ -147,12 +151,19 @@ SQL Server:
 - A `:execlastid` query MUST return `(int64, error)`.
 - Up to two parameters MUST be positional and typed.
 - Three or more parameters MUST become one `<Name>Args` struct.
+- An `Args` field MUST carry the entity field name and its column type.
 - A one-column result MUST return that column type.
 - A result whose columns are one table's columns in order MUST return that table struct.
 - Any other result MUST return a `<Name>Row` struct.
 - `sqlc.embed` MUST become a nested field of the table struct.
-- A `sqlc.slice` parameter MUST be a `[]T` expanded with `db.In`.
+- The nested field MUST use the embedded table struct name.
+- A nullable key parameter MUST use the underlying option type.
+- An embed column MUST resolve to the nested field without a type lookup.
 - An output column with no name MUST be the error `<Name>: column <i> needs an alias`.
+- Function, constant, row and argument names MUST derive from the query name in Pascal-case.
+- Two parameters with one name MUST differ by the parameter number suffix.
+- Each slice marker in the query text MUST pair with the slice parameter of that name.
+- A slice parameter without a marker MUST pass as one argument.
 
 ### Refusals
 
@@ -160,25 +171,38 @@ SQL Server:
 - The error MUST be `<Name>: writes versioned table <table> without <version column>`.
 - `:execresult`, `:copyfrom` and batch commands MUST be the error `<Name>: command <cmd> is not supported`.
 - The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
+- Two queries with one name MUST be the error `duplicate query "<Name>"`.
+- A slice marker without a slice parameter MUST name the marker.
 
 ## Errors
 
 - `<Name>: command <cmd> is not supported` for `:execresult`, `:copyfrom` and batch commands.
 - `<Name>: column <i> needs an alias` for an output column with no name.
 - `<Name>: writes versioned table <table> without <version column>` for a versioned write that omits the version column.
-- An unmapped type, an array column and an unsigned MySQL integer each produce an error that names the table and the column.
+- `duplicate query "<Name>"` for two queries with one name.
+- A slice marker without a slice parameter names the marker and the query.
+- An unknown embed table MUST be the error naming the query and the table.
+- An unmapped type and an array column each produce an error.
+- An unsigned MySQL integer produces an error.
+- Each error names the table and the column.
 - Any engine other than `sqlite`, `postgresql`, `mysql` and `mssql` produces an error.
 
 ## Proof
 
-- The end-to-end test runs `sqlc generate` in a temporary directory with fixture migrations and queries.
-- It builds the output with `logos build` and runs each generated function against SQLite.
-- The oracle is the result of the same query through `database/sql` directly.
-- Each negative case requires a nonzero exit and the named message.
-- The cases are an unmapped column type and a versioned write without the version column.
-- Other cases are an `UPDATE` without `WHERE` from `sqlc vet` and a query that selects a missing column.
-- The type-safety proof changes one fixture column from `INTEGER` to `TEXT`, regenerates, and requires that a caller that passes an `int64` no longer compiles.
-- The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports. The `mssql` file has `settings.engine` equal to `mssql`.
+- Each test builds the request model from a captured fixture.
+- The model asserts entity types and fields, key types, query names, commands and row types.
+- `TestEngineQueryModels` proves four fixtures give one `Items` entity and a `:one` `GetItem` over it.
+- It also proves a three-parameter `UpdateItem` with one `UpdateItemArgs` struct.
+- `TestSliceQuery` proves a `sqlc.slice` parameter becomes a `[]T` expanded with `db.In`, and a marker-less slice passes as one argument.
+- `TestEmbedQuery` proves a `sqlc.embed` table becomes a nested field of the row struct.
+- `TestSingleColumnEmbed` proves one embed column with no type becomes the same nested field.
+- Each negative case requires the named message.
+- The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
+- The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
+- `TestGenerateJSONRoundTrip` proves one request decodes from JSON and encodes to a two-file response.
+- The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
+- The `mssql` file has `settings.engine` equal to `mssql`.
+- The parent compiles the generated text and runs the end-to-end proof against `database/sql`: that proof is not in this package.
 
 ## Not in scope
 

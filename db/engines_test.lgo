@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,4 +183,111 @@ func TestEngineMySQL(t *testing.T) {
 
 func TestEngineMSSQL(t *testing.T) {
 	runEngineSuite(t, engineCase{Driver: "sqlserver", DSNVar: "SPIRA_TEST_MSSQL_DSN", Table: "engine_things_ms", Mark: "@p1"})
+}
+
+func engineOpenPool(t *testing.T, c engineCase) (*db.Pool, context.Context, context.CancelFunc) {
+	t.Helper()
+	dsn := engineDSN(t, c.DSNVar)
+	pool, err := db.Open(c.Driver, dsn)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: db.Open(%s): %v", c.Driver, err))
+	}
+	if pool == nil {
+		panic(fmt.Sprintf("db_test: db.Open(%s) returned no pool", c.Driver))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), engineCallTimeout)
+	if serr := pool.Start(ctx); serr != nil {
+		cancel()
+		panic(fmt.Sprintf("db_test: pool.Start: %v", serr))
+	}
+	return pool, ctx, cancel
+}
+
+func engineDuplicateKey(t *testing.T, ctx context.Context, pool *db.Pool, c engineCase) error {
+	t.Helper()
+	table := c.Table + "_uniq"
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE "+table+" (n integer not null unique)"); err != nil {
+		t.Fatalf("create %s: %v", table, err)
+		return err
+	}
+	if _, err := db.Exec(ctx, pool, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(7)); err != nil {
+		t.Fatalf("seed %s: %v", table, err)
+		return err
+	}
+	_, err := db.Exec(ctx, pool, "INSERT INTO "+table+" (n) VALUES ("+c.Mark+")", int64(7))
+	if err == nil {
+		t.Fatalf("duplicate insert into %s succeeded", table)
+		return nil
+	}
+	return err
+}
+
+func innermostText(err error) string {
+	text := err.Error()
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		text = current.Error()
+	}
+	return text
+}
+
+func checkEngineConstraint(t *testing.T, c engineCase, inner string, prefix bool) {
+	t.Helper()
+	pool, ctx, cancel := engineOpenPool(t, c)
+	defer cancel()
+	t.Cleanup(func() {
+		if serr := pool.Stop(context.Background()); serr != nil {
+			t.Errorf("pool.Stop: %v", serr)
+		}
+	})
+	err := engineDuplicateKey(t, ctx, pool, c)
+	if !errors.Is(err, db.ErrConstraintViolation) {
+		t.Fatalf("%s duplicate insert error = %v, want db.ErrConstraintViolation", c.Driver, err)
+		return
+	}
+	innerText := innermostText(err)
+	matched := strings.Contains(innerText, inner)
+	if prefix {
+		matched = strings.HasPrefix(innerText, inner)
+	}
+	if !matched {
+		t.Fatalf("%s innermost error = %q, want it to hold %q", c.Driver, innerText, inner)
+		return
+	}
+	if _, derr := db.Exec(ctx, pool, "DROP TABLE "+c.Table+"_uniq"); derr != nil {
+		t.Fatalf("drop %s_uniq: %v", c.Table, derr)
+		return
+	}
+}
+
+func TestEnginePostgresConstraintViolation(t *testing.T) {
+	checkEngineConstraint(t, engineCase{Driver: "pgx", DSNVar: "SPIRA_TEST_POSTGRES_DSN", Table: "engine_things_pg", Mark: "$1"}, "(SQLSTATE 23505)", false)
+}
+
+func TestEngineMySQLConstraintViolation(t *testing.T) {
+	checkEngineConstraint(t, engineCase{Driver: "mysql", DSNVar: "SPIRA_TEST_MYSQL_DSN", Table: "engine_things_my", Mark: "?"}, "Error 1062", true)
+}
+
+func TestEngineMSSQLConstraintViolation(t *testing.T) {
+	checkEngineConstraint(t, engineCase{Driver: "sqlserver", DSNVar: "SPIRA_TEST_MSSQL_DSN", Table: "engine_things_ms", Mark: "@p1"}, "(2627)", false)
+}
+
+func TestEngineMySQLRefusedPort(t *testing.T) {
+	pool, err := db.Open("mysql", "spira:spira@tcp(127.0.0.1:1)/spira?parseTime=true&timeout=2s")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatal("Open returned no pool")
+		return
+	}
+	t.Cleanup(func() {
+		if serr := pool.Stop(context.Background()); serr != nil {
+			t.Errorf("Stop: %v", serr)
+		}
+	})
+	if serr := pool.Start(t.Context()); !errors.Is(serr, db.ErrUnavailable) {
+		t.Fatalf("Start error = %v, want db.ErrUnavailable", serr)
+		return
+	}
 }

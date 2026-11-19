@@ -14,6 +14,8 @@ type Route struct {
 }
 
 func Mount(r *web.Router, routes []Route, policy resilience.Policy)
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -28,6 +30,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - A request for another host MUST NOT select that route.
 - A route with no `Host` MUST be registered with no host constraint.
 - A path that continues the prefix without a slash, such as `/shopping` for `/shop`, MUST NOT select the route.
+- A `PathPrefix` with `{`, `}` or `*` MUST be refused at registration.
 
 ### Forward
 
@@ -47,9 +50,11 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - When `StripPrefix` is true, the tail MUST be the request path without the mounted prefix.
 - When that remainder is empty, the tail MUST be `/`.
 - Otherwise the stripped tail MUST start with `/`.
+- When the stripped remainder starts with a slash, the tail MUST be that remainder.
 - When the upstream base path is empty or `/`, the upstream path MUST be the tail.
-- Otherwise the join MUST place one `/` between the base path and the tail.
-- The upstream path MUST keep the percent-encoding of the request path.
+- The proxy MUST join base and tail in escaped form and MUST derive the path from that join.
+- The escaped join MUST always unescape; a failure panics as a programmer error.
+- The proxy MUST cut the stripped suffix from the escaped request path and MUST match the prefix on decoded segments.
 - The proxy MUST send the request to the upstream scheme and host.
 - Each request MUST start at the next upstream in list order.
 - After the last upstream, the next request MUST start at the first.
@@ -84,23 +89,32 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.
 - The body MUST NOT contain an upstream address.
 - A refusal MUST carry a fresh body for each client.
+- Each failure that ends the upstream chain MUST be the `gateway.upstream_unavailable` fault.
+- The 502 answer MUST carry the constant problem, not the cause text.
 - Breaker admission and open duration MUST follow [resilience](resilience.md).
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `gateway.upstream_unavailable` | unavailable | "The gateway could not reach an upstream." |
 
 ## Errors
 
+- `gateway: upstream answered <status>` is the cause of the `gateway.upstream_unavailable` fault for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
+- `gateway: upstream headers exceeded <timeout>` is the cause of the `gateway.upstream_unavailable` fault when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
 - `gateway: route <prefix>: path prefix must start with /` when `PathPrefix` does not start with `/`.
+- `gateway: route <prefix>: path prefix must not contain wildcards` when `PathPrefix` holds `{`, `}` or `*`.
 - `gateway: route <prefix>: no upstream` when `To` is empty.
 - `gateway: route <prefix>: upstream <raw> is not an absolute http or https URL` when an upstream is not an absolute `http` or `https` URL with a host.
 - `gateway: encode bad gateway problem: <cause>` when the 502 problem body cannot be encoded.
-- `gateway: upstream answered <status>` is the failure cause for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
-- `gateway: upstream headers exceeded <timeout>` when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
 
 ## Proof
 
 - `TestMethodBodyQueryAndHeaderArriveUnchanged` proves that method, body, query and a caller header arrive unchanged.
 - `TestPrefixStrippedOrKeptByFlagAndShoppingNotRouted` proves strip, a kept prefix, and that `/shopping` does not select `/shop`.
 - `TestUpstreamBasePathIsJoinedBeforeTheStrippedTail` proves the base-path join.
-- `TestPercentEncodedPathArrivesEncoded` proves that an encoded slash stays encoded, with and without strip.
+- `TestPercentEncodedPathArrivesEncoded` proves that an encoded slash stays encoded at a stripped tail start, at a base path end, and under an encoded prefix.
 - `TestUpstreamQueryLeadsTheRequestQuery` proves the upstream query alone and joined with a request query.
 - `TestForwardedHeadersHoldInboundValuesAndDropForgedOnes` proves the three forwarded headers and that a forged value is dropped.
 - `TestUpstreamsTakeTurns` proves the rotation across the upstream list.
@@ -110,6 +124,7 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestStageAnswerKeepsTheRequestFromTheUpstream` proves that a stage reply does not reach an upstream.
 - `TestSettledStagesLetTheProxyAnswer` proves that `web.Recover` and `web.AccessLog` as route stages let the upstream answer.
 - `TestMountPanicsOnBadRoutes` proves the three registration panics.
+- `TestMountRefusesWildcardPrefixButStripsLiteralNeighbor` proves that a wildcard prefix is refused and a literal neighbor still strips.
 - `TestDeadUpstreamFailsOverForGetAndNeverReplaysPost` proves failover for a bodyless request and no second try for a body.
 - `TestOpenBreakerSkipsItsUpstreamAndKeepsTheLiveOne` proves that an open breaker skips only its upstream.
 - `TestBreakerRecoversThroughProbeWithSharedClock` proves probe recovery from the copied `Now`.
@@ -128,6 +143,10 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestClientForwardedHeaderNeverReachesTheUpstream` proves that a client `Forwarded` header does not ride along.
 - `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
 - `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
+- `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
+- `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.
+- `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 
 ## Not in scope
 

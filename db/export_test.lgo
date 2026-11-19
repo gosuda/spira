@@ -22,3 +22,11 @@ func (p *Pool) RetiredStatementsEmpty() bool {
 	})
 	return empty
 }
+
+func ParseMySQLPrefixForTest(text string) (int, bool) {
+	return parseMySQLErrorPrefix(text)
+}
+
+func ConstraintViolationForTest(d Dialect, err error) bool {
+	return isConstraintViolation(d, err)
+}

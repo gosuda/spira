@@ -13,6 +13,8 @@ func NewTopic[T any](buffer int) *Topic[T]
 func (t *Topic[T]) Publish(v T)
 func (t *Topic[T]) Subscribe(ctx context.Context) <-chan T
 func (t *Topic[T]) Dropped() uint64
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -27,6 +29,12 @@ func (t *Topic[T]) Dropped() uint64
 - `Subscribe` MUST remove the subscriber when `ctx` ends.
 - `Subscribe` MUST close the channel after that removal.
 - A later `Publish` MUST NOT send on the closed channel.
+- The package MUST declare no fault: no error crosses its boundary.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
 
 ## Errors
 
@@ -39,6 +47,8 @@ func (t *Topic[T]) Dropped() uint64
 - `TestPublishNeverBlocksWithFullSubscriber` proves that 1000 publishes to a full channel of capacity 0 return without a wait and set `Dropped` to 1000.
 - `TestConcurrentPublishersDeliverEveryEvent` proves that four publishers of 250 values each are all delivered once when the buffer holds them.
 - `TestChannelClosesWhenContextEnds` proves that the channel closes after `ctx` ends and a later publish does not panic.
+- `TestPublishSubscribePreservesHostileValues` proves that hostile values pass through unchanged and reach no public view.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` is empty and equals the code table.
 
 ## Not in scope
 

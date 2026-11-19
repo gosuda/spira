@@ -1,0 +1,31 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"testing"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func FuzzFrame(f *testing.F) {
+	f.Add([]byte{0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f})
+	f.Add([]byte{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58})
+	f.Add([]byte{0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f})
+	f.Add([]byte{0x82, 0x7e, 0x01, 0x00})
+	f.Add([]byte{0x82, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00})
+	f.Add([]byte{0x82, 0x7e, 0x00, 0x7e})
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		stream := bytes.NewReader(raw)
+		r := bufio.NewReader(stream)
+		h, err := websocket.ExposedReadHeader(r, frameLimit)
+		if err != nil {
+			return
+		}
+		consumed := len(raw) - r.Buffered() - stream.Len()
+		enc := websocket.ExposedAppendHeader(nil, h)
+		if !bytes.Equal(enc, raw[:consumed]) {
+			t.Fatalf("round trip: encoded %v, consumed %v", enc, raw[:consumed])
+		}
+	})
+}

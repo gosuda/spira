@@ -1,0 +1,19 @@
+package websocket
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrClosed = fault.New("websocket.closed", fault.Canceled, "The connection is closed.")
+
+var ErrHandshakeFailed = fault.New("websocket.handshake_failed", fault.Invalid, "The websocket handshake failed.")
+
+var ErrForbiddenOrigin = fault.New("websocket.forbidden_origin", fault.Forbidden, "The websocket origin is forbidden.")
+
+var ErrProtocolError = fault.New("websocket.protocol_error", fault.Invalid, "The websocket protocol was violated.")
+
+var ErrTooLarge = fault.New("websocket.too_large", fault.TooLarge, "The websocket message is too large.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrClosed, ErrHandshakeFailed, ErrForbiddenOrigin, ErrProtocolError, ErrTooLarge}
+}

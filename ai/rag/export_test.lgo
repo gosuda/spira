@@ -1,0 +1,37 @@
+package rag
+
+import "fmt"
+
+func LiveDocuments(m *Memory) int {
+	n := 0
+	m.state.WithLock(func(s *memory) { n = len(s.entries) })
+	return n
+}
+
+func FirstHeldSlot(m *Memory) int {
+	at := -1
+	m.state.WithLock(func(s *memory) {
+		full := s.entries[:cap(s.entries)]
+		for i, held := range full {
+			if held.id != "" || held.text != "" || held.meta != nil {
+				at = i
+				break
+			}
+		}
+	})
+	return at
+}
+
+func EncodeTextForTest(enc *Encoder?, text string) ([]int, error) {
+	if enc == nil {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encoder is nil"))
+	}
+	return enc.encode(text)
+}
+
+func DecodeTokensForTest(enc *Encoder?, tokens []int) (string, error) {
+	if enc == nil {
+		return "", ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encoder is nil"))
+	}
+	return enc.decode(tokens)
+}

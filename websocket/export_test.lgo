@@ -1,0 +1,68 @@
+package websocket
+
+import "bufio"
+
+type ExposedHeader struct {
+	Fin    bool
+	Rsv1   bool
+	Rsv2   bool
+	Rsv3   bool
+	Opcode uint8
+	Masked bool
+	Key    [4]byte
+	Length int64
+}
+
+func ExposedReadHeader(r *bufio.Reader, limit int64) (ExposedHeader, error) {
+	h := readHeader(r, limit)?
+	return ExposedHeader{
+		Fin:    h.fin,
+		Rsv1:   h.rsv1,
+		Rsv2:   h.rsv2,
+		Rsv3:   h.rsv3,
+		Opcode: h.opcode,
+		Masked: h.masked,
+		Key:    h.key,
+		Length: h.length,
+	}, nil
+}
+
+func ExposedAppendHeader(dst []byte, h ExposedHeader) []byte {
+	return appendHeader(dst, header{
+		fin:    h.Fin,
+		rsv1:   h.Rsv1,
+		rsv2:   h.Rsv2,
+		rsv3:   h.Rsv3,
+		opcode: h.Opcode,
+		masked: h.Masked,
+		key:    h.Key,
+		length: h.Length,
+	})
+}
+
+func ExposedMask(key [4]byte, offset int, data []byte) int {
+	return mask(key, offset, data)
+}
+
+type ExposedKind uint8
+
+const (
+	ExposedText ExposedKind = 1
+	ExposedBinary ExposedKind = 2
+	ExposedPing ExposedKind = 3
+	ExposedPong ExposedKind = 4
+	ExposedClose ExposedKind = 5
+)
+
+type ExposedEngine struct {
+	inner *engine
+}
+
+func ExposedNewEngine(r *bufio.Reader, limit int64, server bool) *ExposedEngine {
+	return &ExposedEngine{inner: newEngine(r, limit, server)}
+}
+
+func (e *ExposedEngine) ExposedNext() (ExposedKind, []byte, error) {
+	k, payload := e.inner.next()?
+	return ExposedKind(k), payload, nil
+}

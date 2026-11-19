@@ -1,0 +1,27 @@
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE things (
+    id         BIGSERIAL PRIMARY KEY,
+    mood       mood NOT NULL,
+    maybe_mood mood,
+    flags      BOOLEAN NOT NULL,
+    ratio      DOUBLE PRECISION,
+    price      NUMERIC(10, 2) NOT NULL,
+    uid        UUID NOT NULL,
+    payload    JSONB,
+    blob       BYTEA NOT NULL,
+    day        DATE NOT NULL,
+    stamp      TIMESTAMP NOT NULL,
+    small      SMALLINT NOT NULL,
+    medium     INTEGER,
+    big        BIGINT NOT NULL,
+    short_txt  VARCHAR(20) NOT NULL,
+    fixed_txt  CHAR(2),
+    real_num   REAL NOT NULL,
+    dbl        FLOAT8 NOT NULL,
+    f4         FLOAT4,
+    i8         INT8,
+    i2         INT2,
+    serial_col SERIAL,
+    bigserial_col BIGSERIAL,
+    note       TEXT
+);

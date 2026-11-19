@@ -1,0 +1,14 @@
+package ollama
+
+import "errors"
+
+func FaultDetail(err error) (status int, length int, ok bool) {
+	detail := &statusDetail{}
+	if !errors.As(err, &detail) {
+		return 0, 0, false
+	}
+	if detail == nil {
+		return 0, 0, false
+	}
+	return detail.status, detail.length, true
+}

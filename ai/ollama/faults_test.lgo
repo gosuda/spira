@@ -1,0 +1,98 @@
+package ollama_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/ollama"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../../docs/specs/ai-ollama.md", ollama.Faults())
+}
+
+func assertHidesSecrets(t *testing.T, err error, secrets []string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected the provider error")
+	}
+	public := faulttest.PublicJSON(t, err)
+	faulttest.RefuseLeak(t, public, secrets...)
+	for _, secret := range secrets {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error exposes %q in %v", secret, err)
+		}
+	}
+}
+
+func TestAdversarialSecretsStayOutOfPublicView(t *testing.T) {
+	hostile := "<script>alert('x')</script>"
+	injection := "'; DROP TABLE sessions; --"
+	secretPath := "/etc/passwd"
+	token := "bearer-test-secret-7f3a9c1e5b"
+	prompt := hostile + " " + injection + " " + secretPath + " " + token
+	body := `{"error":"request from ` + hostile + ` at ` + secretPath + ` refused"}`
+	srv := httptest.NewServer(serveBody(t, http.StatusUnauthorized, "application/json", body))
+	defer srv.Close()
+	req := ai.Request{Model: "llama3.2", Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: prompt}}}}}
+	secrets := []string{hostile, injection, secretPath, token}
+	_, chatErr := testClient(srv).Chat(context.Background(), req)
+	if !errors.Is(chatErr, ollama.ErrProviderRejected) {
+		t.Fatalf("chat err = %v, want the provider rejection", chatErr)
+	}
+	assertHidesSecrets(t, chatErr, secrets)
+	chunks := collectAll(testClient(srv).Stream(context.Background(), req))
+	if len(chunks) == 0 {
+		t.Fatal("no chunks")
+	}
+	last := chunks[len(chunks)-1]
+	if !errors.Is(last.err, ollama.ErrProviderRejected) {
+		t.Fatalf("stream err = %v, want the provider rejection", last.err)
+	}
+	assertHidesSecrets(t, last.err, secrets)
+}
+
+func TestBadToolSchemaIsAnInvalidRequest(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "application/json", `{"model":"llama3.2","message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}`)
+	c := testClient(srv)
+	_, err := c.Chat(context.Background(), ai.Request{
+		Model:    "llama3.2",
+		Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "hi"}}}},
+		Tools:    []ai.Tool{{Name: "broken", Description: "broken", Schema: `{"type":`}},
+	})
+	if err == nil || !errors.Is(err, ollama.ErrInvalidRequest) {
+		t.Fatalf("err = %v, want the invalid request fault", err)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("a bad tool schema reached the provider: %d requests", rec.count())
+	}
+}
+
+func TestProviderErrorFieldIsAProviderError(t *testing.T) {
+	srv := httptest.NewServer(serveBody(t, http.StatusOK, "application/json", `{"model":"llama3.2","error":"model gone"}`))
+	defer srv.Close()
+	_, err := testClient(srv).Chat(context.Background(), ai.Request{Model: "llama3.2"})
+	if err == nil || !errors.Is(err, ollama.ErrProviderError) {
+		t.Fatalf("err = %v, want the provider error for the error field", err)
+	}
+	streamed := collectAll(testClient(srv).Stream(context.Background(), ai.Request{Model: "llama3.2"}))
+	if len(streamed) == 0 {
+		t.Fatal("no chunks")
+	}
+	var errs []error
+	for _, chunk := range streamed {
+		if chunk.err != nil {
+			errs = append(errs, chunk.err)
+		}
+	}
+	if len(errs) != 1 || !errors.Is(errs[0], ollama.ErrProviderError) {
+		t.Fatalf("stream errs = %v, want exactly one provider error and no stream cut after it", errs)
+	}
+}

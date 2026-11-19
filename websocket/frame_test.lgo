@@ -1,0 +1,311 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"io"
+	"testing"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+const frameLimit = 1 << 20
+
+type rfcFrame struct {
+	name      string
+	raw       []byte
+	headerLen int
+	fin       bool
+	opcode    uint8
+	masked    bool
+	key       [4]byte
+	length    int64
+	payload   []byte
+}
+
+func rfcDataFrames() []rfcFrame {
+	return []rfcFrame{
+		{
+			name:      "unmasked text",
+			raw:       []byte{0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f},
+			headerLen: 2,
+			fin:       true,
+			opcode:    0x1,
+			length:    5,
+			payload:   []byte("Hello"),
+		},
+		{
+			name:      "masked text",
+			raw:       []byte{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58},
+			headerLen: 6,
+			fin:       true,
+			opcode:    0x1,
+			masked:    true,
+			key:       [4]byte{0x37, 0xfa, 0x21, 0x3d},
+			length:    5,
+			payload:   []byte("Hello"),
+		},
+		{
+			name:      "fragment head",
+			raw:       []byte{0x01, 0x03, 0x48, 0x65, 0x6c},
+			headerLen: 2,
+			opcode:    0x1,
+			length:    3,
+			payload:   []byte("Hel"),
+		},
+		{
+			name:      "fragment tail",
+			raw:       []byte{0x80, 0x02, 0x6c, 0x6f},
+			headerLen: 2,
+			fin:       true,
+			length:    2,
+			payload:   []byte("lo"),
+		},
+	}
+}
+
+func rfcControlFrames() []rfcFrame {
+	return []rfcFrame{
+		{
+			name:      "unmasked ping",
+			raw:       []byte{0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f},
+			headerLen: 2,
+			fin:       true,
+			opcode:    0x9,
+			length:    5,
+			payload:   []byte("Hello"),
+		},
+		{
+			name:      "masked pong",
+			raw:       []byte{0x8a, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58},
+			headerLen: 6,
+			fin:       true,
+			opcode:    0xa,
+			masked:    true,
+			key:       [4]byte{0x37, 0xfa, 0x21, 0x3d},
+			length:    5,
+			payload:   []byte("Hello"),
+		},
+	}
+}
+
+type binarySpec struct {
+	name   string
+	header []byte
+	masked bool
+	key    [4]byte
+	length int
+}
+
+func sizedBinary(s binarySpec) rfcFrame {
+	want := make([]byte, s.length)
+	for i := range want {
+		want[i] = byte(i % 251)
+	}
+	raw := make([]byte, 0, len(s.header)+s.length)
+	raw = append(raw, s.header...)
+	raw = append(raw, want...)
+	if s.masked {
+		for i := len(s.header); i < len(raw); i++ {
+			raw[i] ^= s.key[(i-len(s.header))%4]
+		}
+	}
+	return rfcFrame{
+		name:      s.name,
+		raw:       raw,
+		headerLen: len(s.header),
+		fin:       true,
+		opcode:    0x2,
+		masked:    s.masked,
+		key:       s.key,
+		length:    int64(s.length),
+		payload:   want,
+	}
+}
+
+func rfcLargeFrames() []rfcFrame {
+	return []rfcFrame{
+		sizedBinary(binarySpec{name: "126-byte binary", header: []byte{0x82, 0x7e, 0x00, 0x7e}, length: 126}),
+		sizedBinary(binarySpec{name: "256-byte binary", header: []byte{0x82, 0x7e, 0x01, 0x00}, length: 256}),
+		sizedBinary(binarySpec{name: "65536-byte binary", header: []byte{0x82, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}, length: 65536}),
+		sizedBinary(binarySpec{name: "masked 64-bit binary", header: []byte{0x82, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04}, masked: true, key: [4]byte{0x01, 0x02, 0x03, 0x04}, length: 65536}),
+	}
+}
+
+func checkFrame(t *testing.T, c rfcFrame) {
+	t.Helper()
+	stream := bytes.NewReader(c.raw)
+	r := bufio.NewReader(stream)
+	h, err := websocket.ExposedReadHeader(r, frameLimit)
+	if err != nil {
+		t.Fatalf("%s: read: %v", c.name, err)
+		return
+	}
+	if h.Fin != c.fin || h.Opcode != c.opcode || h.Masked != c.masked || h.Key != c.key || h.Length != c.length {
+		t.Fatalf("%s: header = %+v, want fin=%v opcode=%d masked=%v length=%d", c.name, h, c.fin, c.opcode, c.masked, c.length)
+	}
+	if h.Rsv1 || h.Rsv2 || h.Rsv3 {
+		t.Fatalf("%s: reserved bits set in %+v", c.name, h)
+	}
+	if got := len(c.raw) - r.Buffered() - stream.Len(); got != c.headerLen {
+		t.Fatalf("%s: consumed %d header bytes, want %d", c.name, got, c.headerLen)
+	}
+	rest, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("%s: read payload: %v", c.name, err)
+		return
+	}
+	if !bytes.Equal(rest, c.raw[c.headerLen:]) {
+		t.Fatalf("%s: payload bytes differ from frame tail", c.name)
+	}
+	if h.Masked {
+		websocket.ExposedMask(h.Key, 0, rest)
+	}
+	if !bytes.Equal(rest, c.payload) {
+		t.Fatalf("%s: payload = %q, want %q", c.name, rest, c.payload)
+	}
+	enc := websocket.ExposedAppendHeader(nil, h)
+	if !bytes.Equal(enc, c.raw[:c.headerLen]) {
+		t.Fatalf("%s: encoded header = %v, want %v", c.name, enc, c.raw[:c.headerLen])
+	}
+}
+
+func TestRFCDataFrames(t *testing.T) {
+	for _, c := range rfcDataFrames() {
+		t.Run(c.name, func(t *testing.T) {
+			checkFrame(t, c)
+		})
+	}
+}
+
+func TestRFCControlFrames(t *testing.T) {
+	for _, c := range rfcControlFrames() {
+		t.Run(c.name, func(t *testing.T) {
+			checkFrame(t, c)
+		})
+	}
+}
+
+func TestRFCLargeFrames(t *testing.T) {
+	for _, c := range rfcLargeFrames() {
+		t.Run(c.name, func(t *testing.T) {
+			checkFrame(t, c)
+		})
+	}
+}
+
+func refuse(t *testing.T, raw []byte, limit int64) error {
+	t.Helper()
+	r := bufio.NewReader(bytes.NewReader(raw))
+	_, err := websocket.ExposedReadHeader(r, limit)
+	if err == nil {
+		t.Fatalf("read %v: want error, got header", raw)
+	}
+	return err
+}
+
+func TestRefuseReservedBits(t *testing.T) {
+	err := refuse(t, []byte{0xc1, 0x00}, frameLimit)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
+	}
+}
+
+func TestRefuseUnknownOpcode(t *testing.T) {
+	for _, opcode := range []uint8{0x3, 0x4, 0x5, 0x6, 0x7, 0xb, 0xc, 0xd, 0xe, 0xf} {
+		err := refuse(t, []byte{0x80 | opcode, 0x00}, frameLimit)
+		if !errors.Is(err, websocket.ErrProtocolError) {
+			t.Fatalf("opcode 0x%x: error = %v, want ErrProtocolError", opcode, err)
+		}
+	}
+}
+
+func TestRefuseControlTooLarge(t *testing.T) {
+	err := refuse(t, []byte{0x89, 0x7e, 0x00, 0x7e}, frameLimit)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
+	}
+}
+func TestRefuseControlTooLarge64(t *testing.T) {
+	err := refuse(t, []byte{0x89, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}, frameLimit)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
+	}
+}
+func TestRefuseFragmentedControl(t *testing.T) {
+	err := refuse(t, []byte{0x09, 0x00}, frameLimit)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
+	}
+}
+
+func TestRefuseLengthTopBit(t *testing.T) {
+	err := refuse(t, []byte{0x82, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, frameLimit)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
+	}
+}
+func TestRefuseShortLength16(t *testing.T) {
+	for _, length := range []int{5, 125} {
+		err := refuse(t, []byte{0x82, 0x7e, byte(length >> 8), byte(length)}, frameLimit)
+		if !errors.Is(err, websocket.ErrProtocolError) {
+			t.Fatalf("length %d: error = %v, want ErrProtocolError", length, err)
+		}
+	}
+}
+
+func TestRefuseShortLength64(t *testing.T) {
+	err := refuse(t, []byte{0x82, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00}, frameLimit)
+	if !errors.Is(err, websocket.ErrProtocolError) {
+		t.Fatalf("error = %v, want ErrProtocolError", err)
+	}
+}
+func TestRefusePayloadOverLimit(t *testing.T) {
+	err := refuse(t, []byte{0x82, 0x05}, 4)
+	if !errors.Is(err, websocket.ErrTooLarge) {
+		t.Fatalf("error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestMaskMatchesByteLoop(t *testing.T) {
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	for length := range 41 {
+		for offset := range 4 {
+			data := make([]byte, length)
+			want := make([]byte, length)
+			for i := range data {
+				data[i] = byte(i*7 + 1)
+				want[i] = data[i] ^ key[(offset+i)%4]
+			}
+			if got := websocket.ExposedMask(key, offset, data); got != (offset+length)%4 {
+				t.Fatalf("mask(%d, len %d): next offset = %d, want %d", offset, length, got, (offset+length)%4)
+			}
+			if !bytes.Equal(data, want) {
+				t.Fatalf("mask(%d, len %d): bytes differ from byte loop", offset, length)
+			}
+		}
+	}
+}
+
+func TestReadHeaderZeroAllocs(t *testing.T) {
+	raw := []byte{0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f}
+	stream := bytes.NewReader(raw)
+	r := bufio.NewReader(stream)
+	if _, err := websocket.ExposedReadHeader(r, frameLimit); err != nil {
+		t.Fatalf("warm read: %v", err)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		if _, err := stream.Seek(0, io.SeekStart); err != nil {
+			t.Errorf("seek: %v", err)
+			return
+		}
+		r.Reset(stream)
+		if _, err := websocket.ExposedReadHeader(r, frameLimit); err != nil {
+			t.Errorf("read: %v", err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("AllocsPerRun = %v, want 0", allocs)
+	}
+}

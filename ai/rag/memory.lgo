@@ -79,33 +79,33 @@ type hit struct {
 
 func (m *Memory) Add(ctx context.Context, docs []Document) error {
 	if m.Embed == nil {
-		return errors.New("ai/rag: memory needs an embedder")
+		return ErrInvalidRequest.Wrap(errors.New("ai/rag: memory needs an embedder"))
 	}
 	if len(docs) == 0 {
-		return errors.New("ai/rag: add needs a document")
+		return ErrInvalidRequest.Wrap(errors.New("ai/rag: add needs a document"))
 	}
 	texts := make([]string, len(docs))
 	for i, d := range docs {
 		if strings.TrimSpace(d.ID) == "" {
-			return errors.New("ai/rag: document needs an id")
+			return ErrInvalidRequest.Wrap(errors.New("ai/rag: document needs an id"))
 		}
 		texts[i] = d.Text
 	}
 	vectors, err := m.Embed.Embed(ctx, texts)
 	if err != nil {
-		return fmt.Errorf("ai/rag: embed documents: %w", err)
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed documents: %w", err))
 	}
 	if len(vectors) != len(docs) {
-		return fmt.Errorf("ai/rag: embedder returned %d vectors for %d documents", len(vectors), len(docs))
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for %d documents", len(vectors), len(docs)))
 	}
 	squares, err := squaredLengths(docs, vectors)
 	if err != nil {
-		return err
+		return ErrInvalidRequest.Wrap(err)
 	}
 	var refused error
 	m.state.WithLock(func(s *memory) {
 		if s.dims != 0 && len(vectors[0]) != s.dims {
-			refused = fmt.Errorf("ai/rag: document %s has %d dimensions, the store holds %d", docs[0].ID, len(vectors[0]), s.dims)
+			refused = ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: document %s has %d dimensions, the store holds %d", docs[0].ID, len(vectors[0]), s.dims))
 			return
 		}
 		s.dims = len(vectors[0])
@@ -164,7 +164,7 @@ func (s *memory) put(d Document, vector []float32, square float64) {
 
 func (m *Memory) Delete(ctx context.Context, ids const []string) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return ErrStoreFailed.Wrap(err)
 	}
 	m.state.WithLock(func(s *memory) {
 		for _, id := range ids {
@@ -195,24 +195,24 @@ func (s *memory) drop(id string) {
 
 func (m *Memory) Search(ctx context.Context, q Search) ([]Document, error) {
 	if m.Embed == nil {
-		return nil, errors.New("ai/rag: memory needs an embedder")
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: memory needs an embedder"))
 	}
 	if q.TopK < 0 {
-		return nil, fmt.Errorf("ai/rag: topK must not be negative, got %d", q.TopK)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: topK must not be negative, got %d", q.TopK))
 	}
 	if q.Threshold < 0 || q.Threshold > 1 {
-		return nil, fmt.Errorf("ai/rag: similarity threshold must be in [0, 1], got %v", q.Threshold)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: similarity threshold must be in [0, 1], got %v", q.Threshold))
 	}
 	vectors, err := m.Embed.Embed(ctx, []string{q.Query})
 	if err != nil {
-		return nil, fmt.Errorf("ai/rag: embed query: %w", err)
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed query: %w", err))
 	}
 	if len(vectors) != 1 {
-		return nil, fmt.Errorf("ai/rag: embedder returned %d vectors for the query", len(vectors))
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for the query", len(vectors)))
 	}
 	square, err := squaredLength(vectors[0])
 	if err != nil {
-		return nil, fmt.Errorf("ai/rag: query: %w", err)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query: %w", err))
 	}
 	var found []Document
 	var refused error
@@ -235,14 +235,14 @@ func (s *memory) nearest(query []float32, square float64, q Search) ([]Document,
 		return []Document{}, nil
 	}
 	if len(query) != s.dims {
-		return nil, fmt.Errorf("ai/rag: query vector has %d dimensions, the store holds %d", len(query), s.dims)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query vector has %d dimensions, the store holds %d", len(query), s.dims))
 	}
 	hits := make([]hit, 0, len(s.entries))
 	for at := range s.entries {
 		if f := q.Filter; f != nil {
 			keep, err := evalFilter(f, s.entries[at].meta)
 			if err != nil {
-				return nil, fmt.Errorf("ai/rag: filter: %w", err)
+				return nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: filter: %w", err))
 			}
 			if !keep {
 				continue

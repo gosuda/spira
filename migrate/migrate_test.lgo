@@ -3,6 +3,7 @@ package migrate_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -171,7 +172,7 @@ func TestLoadRefusesDownWithoutUp(t *testing.T) {
 		t.Fatal("Load accepted a .down.sql without .up.sql")
 		return
 	}
-	if !strings.Contains(err.Error(), "0001_orphan.down.sql") {
+	if !errors.Is(err, migrate.ErrMissingDown) || !strings.Contains(err.Error(), "0001_orphan.down.sql") {
 		t.Fatalf("Load error = %q, want it to name the file", err.Error())
 	}
 }
@@ -185,7 +186,7 @@ func TestLoadRefusesUpWithoutDown(t *testing.T) {
 		t.Fatal("Load accepted an .up.sql without .down.sql")
 		return
 	}
-	if !strings.Contains(err.Error(), "0001_only.up.sql") {
+	if !errors.Is(err, migrate.ErrMissingDown) || !strings.Contains(err.Error(), "0001_only.up.sql") {
 		t.Fatalf("Load error = %q, want it to name the file", err.Error())
 	}
 }
@@ -231,7 +232,7 @@ func TestApplyRefusesReorderedSteps(t *testing.T) {
 		t.Fatal("Apply accepted reordered steps")
 		return
 	}
-	if !strings.Contains(err.Error(), `applied step 0 is "0001_create_users", expected "0002_add_email"`) {
+	if !errors.Is(err, migrate.ErrOrderMismatch) || !strings.Contains(err.Error(), `applied step 0 is "0001_create_users", expected "0002_add_email"`) {
 		t.Fatalf("Apply error = %q", err.Error())
 		return
 	}
@@ -254,7 +255,7 @@ func TestApplyRefusesMissingMiddleStep(t *testing.T) {
 		t.Fatal("Apply accepted a missing middle step")
 		return
 	}
-	if !strings.Contains(err.Error(), `applied step 1 is "0002_add_email", expected "0099_other"`) {
+	if !errors.Is(err, migrate.ErrOrderMismatch) || !strings.Contains(err.Error(), `applied step 1 is "0002_add_email", expected "0099_other"`) {
 		t.Fatalf("Apply error = %q", err.Error())
 		return
 	}
@@ -271,7 +272,7 @@ func TestApplyFailingStepLeavesNothing(t *testing.T) {
 		t.Fatal("Apply accepted a failing step")
 		return
 	}
-	if !strings.Contains(err.Error(), "migrate: 0001_broken up:") {
+	if !errors.Is(err, db.ErrStatementFailed) || !strings.Contains(err.Error(), "migrate: 0001_broken up:") {
 		t.Fatalf("Apply error = %q", err.Error())
 		return
 	}
@@ -337,6 +338,10 @@ func TestRollbackOneAndAll(t *testing.T) {
 	}
 	if err := migrate.Rollback(t.Context(), pool, steps, 5); err == nil {
 		t.Fatal("Rollback accepted count larger than applied")
+		return
+	} else if !errors.Is(err, migrate.ErrOrderMismatch) {
+		t.Fatalf("Rollback error = %v, want migrate.ErrOrderMismatch", err)
+		return
 	}
 }
 
@@ -364,7 +369,7 @@ func TestCheckReversibleFailsOnLeftoverColumn(t *testing.T) {
 		t.Fatal("CheckReversible accepted a down that leaves a column")
 		return
 	}
-	if !strings.Contains(err.Error(), "migrate: 0001_thing down does not restore the schema") {
+	if !errors.Is(err, migrate.ErrNotReversible) || !strings.Contains(err.Error(), "migrate: 0001_thing down does not restore the schema") {
 		t.Fatalf("CheckReversible error = %q", err.Error())
 	}
 }
@@ -381,7 +386,7 @@ func TestCheckReversibleRefusesNonEmpty(t *testing.T) {
 		t.Fatal("CheckReversible accepted a non-empty database")
 		return
 	}
-	if !strings.Contains(err.Error(), "migrate: scratch database is not empty") {
+	if !errors.Is(err, migrate.ErrScratchNotEmpty) || !strings.Contains(err.Error(), "migrate: scratch database is not empty") {
 		t.Fatalf("CheckReversible error = %q", err.Error())
 	}
 }

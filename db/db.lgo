@@ -37,13 +37,13 @@ func DialectOf(driver string, dsn string) (Dialect, error) {
 	case "mysql":
 		value, found := dsnParam(mysqlQueryPart(dsn), "parseTime")
 		if !found || !parseTimeOn(value) {
-			return nil, errors.New("db: mysql DSN needs parseTime=true")
+			return nil, ErrMissingParseTime.Wrap(errors.New("db: mysql DSN needs parseTime=true"))
 		}
 		return MySQL{}, nil
 	case "sqlserver":
 		return MSSQL{}, nil
 	default:
-		return nil, fmt.Errorf("db: unknown driver %q", driver)
+		return nil, ErrUnknownDriver.Wrap(fmt.Errorf("db: unknown driver %q", driver))
 	}
 }
 
@@ -78,7 +78,7 @@ func Open(driver string, dsn string) (*Pool?, error) {
 	}
 	handle, err := sql.Open(driver, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("db: open %s: %w", driver, err)
+		return nil, ClassifyDriverError(dialect, fmt.Errorf("db: open %s: %w", driver, err))
 	}
 	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}}, nil
 }
@@ -100,18 +100,18 @@ func (p *Pool) Prepared() int {
 func (p *Pool) Prepare(ctx context.Context, query string) error {
 	q, skip := unmarked(query)
 	if skip {
-		return prepareDirect(ctx, p.handle, q)
+		return ClassifyDriverError(p.dialect, prepareDirect(ctx, p.handle, q))
 	}
 	if _, cached := p.stmts.acquire(q); cached {
 		p.stmts.release(q)
-		return prepareDirect(ctx, p.handle, q)
+		return ClassifyDriverError(p.dialect, prepareDirect(ctx, p.handle, q))
 	}
 	stmt, err := p.stmts.prepare(ctx, p.handle, q)
 	if err != nil {
-		return err
+		return ClassifyDriverError(p.dialect, err)
 	}
 	if stmt == nil {
-		return errors.New("db: prepared statement missing")
+		return ErrStatementFailed.Wrap(errors.New("db: prepared statement missing"))
 	}
 	p.stmts.release(q)
 	return nil
@@ -130,7 +130,7 @@ func prepareDirect(ctx context.Context, handle *sql.DB, q string) error {
 
 func (p *Pool) Start(ctx context.Context) error {
 	if err := p.handle.PingContext(ctx); err != nil {
-		return fmt.Errorf("db: ping: %w", err)
+		return ClassifyDriverError(p.dialect, fmt.Errorf("db: ping: %w", err))
 	}
 	return nil
 }
@@ -145,7 +145,7 @@ func (p *Pool) Stop(ctx context.Context) error {
 	select {
 	case <-run.done:
 	case <-ctx.Done():
-		return fmt.Errorf("db: stop: %w", ctx.Err())
+		return ClassifyDriverError(p.dialect, fmt.Errorf("db: stop: %w", ctx.Err()))
 	}
 	var err error
 	run.err.WithLock(func(e *error) {
@@ -164,9 +164,9 @@ func (p *Pool) closeAll(run *poolClose) {
 	handleErr := p.handle.Close()
 	var result error
 	if handleErr != nil {
-		result = fmt.Errorf("db: close: %w", errors.Join(stmtErr, handleErr))
+		result = ClassifyDriverError(p.dialect, fmt.Errorf("db: close: %w", errors.Join(stmtErr, handleErr)))
 	} else {
-		result = stmtErr
+		result = ClassifyDriverError(p.dialect, stmtErr)
 	}
 	run.err.WithLock(func(e *error) {
 		*e = result
@@ -179,24 +179,24 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*sq
 	if skip {
 		rows, err := p.handle.QueryContext(ctx, q, args...)
 		if err != nil {
-			return nil, fmt.Errorf("db: query: %w", err)
+			return nil, ClassifyDriverError(p.dialect, fmt.Errorf("db: query: %w", err))
 		}
 		return rows, nil
 	}
 	prepared, err := p.stmts.prepare(ctx, p.handle, q)
 	if err != nil {
-		return nil, err
+		return nil, ClassifyDriverError(p.dialect, err)
 	}
 	if prepared == nil {
-		return nil, errors.New("db: prepared statement missing")
+		return nil, ErrStatementFailed.Wrap(errors.New("db: prepared statement missing"))
 	}
 	rows, err := prepared.QueryContext(ctx, args...)
 	p.stmts.release(q)
 	if err != nil {
-		return nil, fmt.Errorf("db: query: %w", err)
+		return nil, ClassifyDriverError(p.dialect, fmt.Errorf("db: query: %w", err))
 	}
 	if rows == nil {
-		return nil, errors.New("db: query returned no rows")
+		return nil, ErrStatementFailed.Wrap(errors.New("db: query returned no rows"))
 	}
 	return rows, nil
 }
@@ -206,21 +206,21 @@ func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (sql.
 	if skip {
 		res, err := p.handle.ExecContext(ctx, q, args...)
 		if err != nil {
-			return nil, fmt.Errorf("db: exec: %w", err)
+			return nil, ClassifyDriverError(p.dialect, fmt.Errorf("db: exec: %w", err))
 		}
 		return res, nil
 	}
 	prepared, err := p.stmts.prepare(ctx, p.handle, q)
 	if err != nil {
-		return nil, err
+		return nil, ClassifyDriverError(p.dialect, err)
 	}
 	if prepared == nil {
-		return nil, errors.New("db: prepared statement missing")
+		return nil, ErrStatementFailed.Wrap(errors.New("db: prepared statement missing"))
 	}
 	res, err := prepared.ExecContext(ctx, args...)
 	p.stmts.release(q)
 	if err != nil {
-		return nil, fmt.Errorf("db: exec: %w", err)
+		return nil, ClassifyDriverError(p.dialect, fmt.Errorf("db: exec: %w", err))
 	}
 	return res, nil
 }
@@ -235,7 +235,7 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 	if skip {
 		rows, err := t.tx.QueryContext(ctx, q, args...)
 		if err != nil {
-			return nil, fmt.Errorf("db: query: %w", err)
+			return nil, ClassifyDriverError(t.pool.dialect, fmt.Errorf("db: query: %w", err))
 		}
 		return rows, nil
 	}
@@ -243,19 +243,19 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 		rows, err := t.tx.StmtContext(ctx, stmt).QueryContext(ctx, args...)
 		t.pool.stmts.release(q)
 		if err != nil {
-			return nil, fmt.Errorf("db: query: %w", err)
+			return nil, ClassifyDriverError(t.pool.dialect, fmt.Errorf("db: query: %w", err))
 		}
 		if rows == nil {
-			return nil, errors.New("db: query returned no rows")
+			return nil, ErrStatementFailed.Wrap(errors.New("db: query returned no rows"))
 		}
 		return rows, nil
 	}
 	rows, err := t.tx.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("db: query: %w", err)
+		return nil, ClassifyDriverError(t.pool.dialect, fmt.Errorf("db: query: %w", err))
 	}
 	if rows == nil {
-		return nil, errors.New("db: query returned no rows")
+		return nil, ErrStatementFailed.Wrap(errors.New("db: query returned no rows"))
 	}
 	return rows, nil
 }
@@ -265,7 +265,7 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 	if skip {
 		res, err := t.tx.ExecContext(ctx, q, args...)
 		if err != nil {
-			return nil, fmt.Errorf("db: exec: %w", err)
+			return nil, ClassifyDriverError(t.pool.dialect, fmt.Errorf("db: exec: %w", err))
 		}
 		return res, nil
 	}
@@ -273,13 +273,13 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 		res, err := t.tx.StmtContext(ctx, stmt).ExecContext(ctx, args...)
 		t.pool.stmts.release(q)
 		if err != nil {
-			return nil, fmt.Errorf("db: exec: %w", err)
+			return nil, ClassifyDriverError(t.pool.dialect, fmt.Errorf("db: exec: %w", err))
 		}
 		return res, nil
 	}
 	res, err := t.tx.ExecContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("db: exec: %w", err)
+		return nil, ClassifyDriverError(t.pool.dialect, fmt.Errorf("db: exec: %w", err))
 	}
 	return res, nil
 }
@@ -288,14 +288,14 @@ func InTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (T,
 	var zero T
 	tx, err := p.handle.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return zero, fmt.Errorf("db: begin: %w", err)
+		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: begin: %w", err))
 	}
 	v, workErr := runTxWork(&Tx{tx: tx, pool: p}, work)
 	if workErr != nil {
 		return zero, workErr
 	}
 	if err := tx.Commit(); err != nil {
-		return zero, fmt.Errorf("db: commit: %w", err)
+		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: commit: %w", err))
 	}
 	return v, nil
 }

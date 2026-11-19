@@ -1,0 +1,400 @@
+package websocket
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+	"unicode/utf8"
+
+	"logos/sync"
+)
+
+type Kind uint8
+
+const (
+	Text Kind = 1
+	Binary Kind = 2
+	Ping Kind = 3
+	Pong Kind = 4
+	Close Kind = 5
+)
+
+type Config struct {
+	Limit int64 = 1 << 20
+	Subprotocols []string
+	AllowedOrigins []string
+}
+
+type Conn struct {
+	conn net.Conn
+	reader *bufio.Reader
+	writer *bufio.Writer
+	engine *engine
+	subprotocol string
+	guard sync.Locked[connGuard]
+}
+
+type connGuard struct {
+	closed bool
+}
+
+func (c *Conn) isClosed() bool {
+	var closed bool
+	c.guard.WithLock(func(g *connGuard) {
+		closed = g.closed
+	})
+	return closed
+}
+
+func closedErr(err error) error {
+	if errors.Is(err, net.ErrClosed) {
+		return ErrClosed.Wrap(err)
+	}
+	return err
+}
+
+func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error) {
+	if err := checkUpgrade(r); err != nil {
+		writeHandshakeError(w, err)
+		return nil, ErrHandshakeFailed.Wrap(err)
+	}
+	if err := checkOrigin(r, cfg.AllowedOrigins); err != nil {
+		writeHandshakeError(w, err)
+		return nil, ErrForbiddenOrigin.Wrap(err)
+	}
+	sub, err := pickSubprotocol(r.Header.Values("Sec-WebSocket-Protocol"), cfg.Subprotocols)
+	if err != nil {
+		writeHandshakeError(w, err)
+		return nil, ErrHandshakeFailed.Wrap(err)
+	}
+	return serveUpgrade(w, r, sub, limitOf(cfg))
+}
+
+func limitOf(cfg Config) int64 {
+	if cfg.Limit == 0 {
+		return 1 << 20
+	}
+	if cfg.Limit < 0 {
+		panic("websocket: limit must not be negative")
+	}
+	return cfg.Limit
+}
+
+func serveUpgrade(w http.ResponseWriter, r *http.Request, subprotocol string, limit int64) (*Conn?, error) {
+	headers, err := upgradeHeaders(r.Header.Get("Sec-WebSocket-Key"), subprotocol)
+	if err != nil {
+		writeHandshakeError(w, err)
+		return nil, ErrHandshakeFailed.Wrap(err)
+	}
+	conn, rw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return nil, fmt.Errorf("websocket: hijack: %w", err)
+	}
+	if werr := writeSwitchingProtocols(rw, headers); werr != nil {
+		if cerr := conn.Close(); cerr != nil {
+			return nil, errors.Join(werr, fmt.Errorf("websocket: close after failed upgrade: %w", cerr))
+		}
+		return nil, werr
+	}
+	return ServeHijacked(conn, rw, subprotocol, limit), nil
+}
+
+func writeHandshakeError(w http.ResponseWriter, err error) {
+	for k, vs := range handshakeFailureHeaders(err) {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(upgradeStatus(err))
+}
+
+func writeSwitchingProtocols(rw *bufio.ReadWriter, headers http.Header) error {
+	if _, err := rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
+		return fmt.Errorf("websocket: write upgrade status: %w", err)
+	}
+	if err := writeOrderedHeaders(rw, headers); err != nil {
+		return err
+	}
+	if _, err := rw.WriteString("\r\n"); err != nil {
+		return fmt.Errorf("websocket: write upgrade end: %w", err)
+	}
+	if err := rw.Flush(); err != nil {
+		return fmt.Errorf("websocket: flush upgrade: %w", err)
+	}
+	return nil
+}
+
+func writeOrderedHeaders(rw *bufio.ReadWriter, headers http.Header) error {
+	ordered := [4]string{"Upgrade", "Connection", "Sec-WebSocket-Accept", "Sec-WebSocket-Protocol"}
+	for _, k := range ordered {
+		value := headers.Get(k)
+		if value == "" {
+			continue
+		}
+		if _, err := rw.WriteString(k + ": " + value + "\r\n"); err != nil {
+			return fmt.Errorf("websocket: write upgrade header: %w", err)
+		}
+	}
+	return nil
+}
+
+func ServeHijacked(conn net.Conn, rw *bufio.ReadWriter, subprotocol string, limit int64) *Conn {
+	if conn == nil {
+		panic("websocket: ServeHijacked needs a connection")
+	}
+	if rw == nil {
+		panic("websocket: ServeHijacked needs a buffered reader and writer")
+	}
+	if limit == 0 {
+		limit = 1 << 20
+	}
+	if limit < 0 {
+		panic("websocket: ServeHijacked needs a positive limit")
+	}
+	c := &Conn{conn: conn, reader: rw.Reader, writer: rw.Writer, subprotocol: subprotocol, engine: newEngine(rw.Reader, limit, true)}
+	return c
+}
+
+func (c *Conn) NetConn() net.Conn {
+	return c.conn
+}
+
+func (c *Conn) Subprotocol() string {
+	return c.subprotocol
+}
+
+func ParseClose(payload []byte) (uint16, string, error) {
+	return parseClose(payload)
+}
+
+func (c *Conn) Next(ctx context.Context) (Kind, []byte, error) {
+	if c.isClosed() {
+		return 0, nil, ErrClosed.Err()
+	}
+	if err := c.readDeadline(ctx); err != nil {
+		return 0, nil, err
+	}
+	for {
+		k, payload, err := c.engine.next()
+		if err != nil {
+			return 0, nil, c.failClosed(ctx, err)
+		}
+		if k == kindClose {
+			return c.receiveClose(ctx, payload)
+		}
+		done, kind, perr := c.dispatch(ctx, k, payload)
+		if perr != nil {
+			return 0, nil, perr
+		}
+		if done {
+			return kind, payload, nil
+		}
+	}
+}
+
+func (c *Conn) dispatch(ctx context.Context, k kind, payload []byte) (bool, Kind, error) {
+	if k == kindText {
+		return true, Text, nil
+	}
+	if k == kindBinary {
+		return true, Binary, nil
+	}
+	if k == kindPong {
+		return true, Pong, nil
+	}
+	if perr := c.answerPing(ctx, payload); perr != nil {
+		return false, 0, perr
+	}
+	return true, Ping, nil
+}
+
+func (c *Conn) answerPing(ctx context.Context, payload []byte) error {
+	return c.sendControl(ctx, 0xa, payload)
+}
+
+func (c *Conn) receiveClose(ctx context.Context, payload []byte) (Kind, []byte, error) {
+	code, _, err := parseClose(payload)
+	if err != nil {
+		return 0, nil, c.failClosed(ctx, err)
+	}
+	if code != 1005 && !validCloseCode(code) {
+		return 0, nil, c.failClosed(ctx, ErrProtocolError.Wrap(errCloseCode))
+	}
+	if serr := c.sendFrame(ctx, 0x8, payload); serr != nil {
+		return 0, nil, errors.Join(serr, c.closeConn())
+	}
+	return Close, payload, c.closeConn()
+}
+
+func (c *Conn) failClosed(ctx context.Context, cause error) error {
+	if c.isClosed() {
+		if cerr := c.closeConn(); cerr != nil {
+			return errors.Join(ErrClosed, cerr)
+		}
+		return ErrClosed.Err()
+	}
+	if code, ok := closeCodeFor(cause); ok {
+		if serr := c.sendFrame(ctx, 0x8, closePayload(code)); serr != nil {
+			return errors.Join(cause, c.closeConn(), serr)
+		}
+	}
+	return errors.Join(cause, c.closeConn())
+}
+
+func closeCodeFor(err error) (uint16, bool) {
+	if isTooLarge(err) {
+		return 1009, true
+	}
+	if isBadEncoding(err) {
+		return 1007, true
+	}
+	if isFrameFault(err) {
+		return 1002, true
+	}
+	if isSessionFault(err) {
+		return 1002, true
+	}
+	return 0, false
+}
+
+func isTooLarge(err error) bool {
+	return errors.Is(err, errMessageTooLarge) || errors.Is(err, errPayloadTooLarge)
+}
+
+func isBadEncoding(err error) bool {
+	return errors.Is(err, errInvalidUTF8) || errors.Is(err, errCloseUTF8)
+}
+
+func isFrameFault(err error) bool {
+	return errors.Is(err, errReservedBits) || errors.Is(err, errUnknownOpcode) || errors.Is(err, errControlTooLarge) || errors.Is(err, errFragmentedControl) || errors.Is(err, errLengthTopBit) || errors.Is(err, errNonMinimalLength)
+}
+
+func isSessionFault(err error) bool {
+	return errors.Is(err, errStrayContinuation) || errors.Is(err, errFragmentInProgress) || errors.Is(err, errMaskMismatch) || errors.Is(err, errClosePayload) || errors.Is(err, errCloseCode)
+}
+
+func closePayload(code uint16) []byte {
+	return []byte{byte(code >> 8), byte(code)}
+}
+
+func (c *Conn) WriteText(ctx context.Context, payload []byte) error {
+	return c.sendFrame(ctx, 0x1, payload)
+}
+
+func (c *Conn) WriteBinary(ctx context.Context, payload []byte) error {
+	return c.sendFrame(ctx, 0x2, payload)
+}
+
+func (c *Conn) Ping(ctx context.Context, payload []byte) error {
+	return c.sendControl(ctx, 0x9, payload)
+}
+
+func (c *Conn) sendControl(ctx context.Context, opcode uint8, payload []byte) error {
+	if len(payload) > 125 {
+		return ErrProtocolError.Wrap(errControlTooLarge)
+	}
+	return c.sendFrame(ctx, opcode, payload)
+}
+
+func (c *Conn) sendFrame(ctx context.Context, opcode uint8, payload []byte) error {
+	if c.isClosed() {
+		return ErrClosed.Err()
+	}
+	if err := c.writeDeadline(ctx); err != nil {
+		return err
+	}
+	var werr error
+	c.guard.WithLock(func(g *connGuard) {
+		if g.closed {
+			werr = ErrClosed.Err()
+			return
+		}
+		werr = c.writeLocked(opcode, payload)
+	})
+	if werr != nil {
+		return closedErr(werr)
+	}
+	return nil
+}
+
+func (c *Conn) writeLocked(opcode uint8, payload []byte) error {
+	out := appendHeader(nil, header{fin: true, opcode: opcode, length: int64(len(payload))})
+	if _, err := c.writer.Write(out); err != nil {
+		return fmt.Errorf("websocket: write frame header: %w", err)
+	}
+	if _, err := c.writer.Write(payload); err != nil {
+		return fmt.Errorf("websocket: write frame payload: %w", err)
+	}
+	if err := c.writer.Flush(); err != nil {
+		return fmt.Errorf("websocket: flush frame: %w", err)
+	}
+	return nil
+}
+
+func (c *Conn) CloseWithCode(ctx context.Context, code uint16, reason string) error {
+	if !validCloseCode(code) {
+		return ErrProtocolError.Wrap(errCloseCode)
+	}
+	if !utf8.ValidString(reason) {
+		return ErrProtocolError.Wrap(errCloseUTF8)
+	}
+	payload, err := appendClose(nil, code, reason)
+	if err != nil {
+		return err
+	}
+	if serr := c.sendFrame(ctx, 0x8, payload); serr != nil {
+		return errors.Join(serr, c.closeConn())
+	}
+	return c.closeConn()
+}
+
+func (c *Conn) Close() error {
+	return c.closeConn()
+}
+
+func (c *Conn) closeConn() error {
+	sealed := false
+	c.guard.WithLock(func(g *connGuard) {
+		sealed = g.closed
+		g.closed = true
+	})
+	if sealed {
+		return nil
+	}
+	if err := c.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return fmt.Errorf("websocket: close: %w", err)
+	}
+	return nil
+}
+
+func (c *Conn) readDeadline(ctx context.Context) error {
+	if c.isClosed() {
+		return ErrClosed.Err()
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Time{}
+	}
+	if err := c.conn.SetReadDeadline(deadline); err != nil {
+		return closedErr(fmt.Errorf("websocket: set read deadline: %w", err))
+	}
+	return nil
+}
+
+func (c *Conn) writeDeadline(ctx context.Context) error {
+	if c.isClosed() {
+		return ErrClosed.Err()
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Time{}
+	}
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
+		return closedErr(fmt.Errorf("websocket: set write deadline: %w", err))
+	}
+	return nil
+}

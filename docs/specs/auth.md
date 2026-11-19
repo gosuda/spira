@@ -2,6 +2,8 @@
 
 Package `auth` holds password hashes, sessions and the stages that guard a route. The application author writes the login page and the session store.
 
+Password hashing follows Spring Security (revision c12aef9c6c427ee55e95021705678e777bfa11d5) and Django (revision 102c3c327d4974a58883b47a68f8d85da0be3648). Spira keeps Argon2id, the PHC shape, unpadded base64, the 16-byte salt, the 32-byte key, re-derivation with stored parameters, and constant-time comparison. Spira copies the PHC field order from the Spring encoder utils and the re-derive-then-compare shape from both clones. Spira drops the Bouncy Castle and argon2-cffi dependencies, algorithm agility, upgrade checks, and silent false on malformed input. A malformed hash returns false with an error that names the cause.
+
 ## Interface
 
 ```lgo
@@ -90,6 +92,7 @@ func (s *memoryStore) Delete(ctx context.Context, id string) error
 - `VerifyPassword` MUST use the parameters in the PHC string.
 - `VerifyPassword` MUST accept memory 1 to 1048576 KiB, time 1 to 16 and parallelism 1 to 16.
 - `VerifyPassword` MUST accept a salt of 1 to 64 bytes and a key of 16 to 64 bytes.
+- `VerifyPassword` MUST return false with an error that names the cause for a malformed hash.
 
 ### Sessions
 
@@ -193,3 +196,4 @@ malformed key: <cause>
 - The database session store is application code. [sqlc-gen-spira](sqlc-gen-spira.md) emits the query functions it uses.
 - The package does not verify JWT, OAuth2, SAML or WebAuthn. `Bearer` is the seam for an application verifier.
 - `auth` contains no SQL, so it needs no per-engine variant.
+- The package offers no password-upgrade check.

@@ -1,0 +1,125 @@
+// Test cases translated and changed by spira from Spring AI,
+// spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/transformation/RewriteQueryTransformerTests.java,
+// spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/transformation/TranslationQueryTransformerTests.java,
+// spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/transformation/CompressionQueryTransformerTests.java
+// and spring-ai-rag/src/test/java/org/springframework/ai/rag/preretrieval/query/expansion/MultiQueryExpanderTests.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag_test
+
+import (
+	"slices"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/rag"
+)
+
+func TestRewriteSendsTheReferencePrompt(t *testing.T) {
+	catcher, client := chatPair(t, "a concise rewrite")
+	got, err := rag.Rewrite(t.Context(), client, "a long rambling question")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+		return
+	}
+	if got != "a concise rewrite" {
+		t.Fatalf("rewrite = %q, want the model answer", got)
+	}
+	want := "Given a user query, rewrite it to provide better results when querying a vector store.\nRemove any irrelevant information, and ensure the query is concise and specific.\n\nOriginal query:\na long rambling question\n\nRewritten query:\n"
+	if prompt := recordedPrompt(t, catcher); prompt != want {
+		t.Fatalf("rewrite prompt:\n got %q\nwant %q", prompt, want)
+	}
+}
+
+func TestRewriteWithABlankAnswerKeepsTheQuery(t *testing.T) {
+	_, client := chatPair(t, "")
+	got, err := rag.Rewrite(t.Context(), client, "a long rambling question")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+		return
+	}
+	if got != "a long rambling question" {
+		t.Fatalf("rewrite = %q, want the input query", got)
+	}
+}
+
+func TestTranslateSendsTheReferencePrompt(t *testing.T) {
+	catcher, client := chatPair(t, "What is the capital of Denmark?")
+	got, err := rag.Translate(t.Context(), client, "Hvad er Danmarks hovedstad?", "english")
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+		return
+	}
+	if got != "What is the capital of Denmark?" {
+		t.Fatalf("translate = %q, want the model answer", got)
+	}
+	want := "Given a user query, translate it to english.\nIf the query is already in english, return it unchanged.\nIf you don't know the language of the query, return it unchanged.\nDo not add explanations nor any other text.\n\nOriginal query: Hvad er Danmarks hovedstad?\n\nTranslated query:\n"
+	if prompt := recordedPrompt(t, catcher); prompt != want {
+		t.Fatalf("translate prompt:\n got %q\nwant %q", prompt, want)
+	}
+}
+
+func TestCompressSendsHistoryAndTheFollowUpQuery(t *testing.T) {
+	catcher, client := chatPair(t, "What is a vector store and how does it rank?")
+	history := []ai.Message{
+		{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: "be helpful"}}},
+		{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "What is a vector store?"}}},
+		{Role: ai.RoleAssistant, Parts: []ai.Part{ai.Text{Text: "It stores embeddings."}}},
+	}
+	got, err := rag.Compress(t.Context(), client, history, "How does it rank?")
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+		return
+	}
+	if got != "What is a vector store and how does it rank?" {
+		t.Fatalf("compress = %q, want the model answer", got)
+	}
+	want := "Given the following conversation history and a follow-up query, your task is to synthesize\na concise, standalone query that incorporates the context from the history.\nEnsure the standalone query is clear, specific, and maintains the user's intent.\n\nConversation history:\nUSER: What is a vector store?\nASSISTANT: It stores embeddings.\n\nFollow-up query:\nHow does it rank?\n\nStandalone query:\n"
+	if prompt := recordedPrompt(t, catcher); prompt != want {
+		t.Fatalf("compress prompt:\n got %q\nwant %q", prompt, want)
+	}
+}
+
+func TestExpandReturnsOneQueryPerLine(t *testing.T) {
+	catcher, client := chatPair(t, "first variant\nsecond variant\nthird variant")
+	got, err := rag.Expand(t.Context(), client, "original", 3)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+		return
+	}
+	want := []string{"original", "first variant", "second variant", "third variant"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("expand = %q, want %q", got, want)
+	}
+	prompt := recordedPrompt(t, catcher)
+	wantPrompt := "You are an expert at information retrieval and search optimization.\nYour task is to generate 3 different versions of the given query.\n\nEach variant must cover different perspectives or aspects of the topic,\nwhile maintaining the core intent of the original query. The goal is to\nexpand the search space and improve the chances of finding relevant information.\n\nDo not explain your choices or add any other text.\nProvide the query variants separated by newlines.\n\nOriginal query: original\n\nQuery variants:\n"
+	if prompt != wantPrompt {
+		t.Fatalf("expand prompt:\n got %q\nwant %q", prompt, wantPrompt)
+	}
+}
+
+func TestExpandWithFewerLinesKeepsTheQuery(t *testing.T) {
+	_, client := chatPair(t, "only one\nsecond")
+	got, err := rag.Expand(t.Context(), client, "original", 3)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+		return
+	}
+	if !slices.Equal(got, []string{"original"}) {
+		t.Fatalf("expand = %q, want the original query alone", got)
+	}
+}
+
+func TestExpandWithATrailingNewlineKeepsTheVariants(t *testing.T) {
+	_, client := chatPair(t, "a\nb\nc\n")
+	got, err := rag.Expand(t.Context(), client, "original", 3)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+		return
+	}
+	want := []string{"original", "a", "b", "c"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("expand = %q, want %q", got, want)
+	}
+}

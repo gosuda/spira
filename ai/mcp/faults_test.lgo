@@ -1,0 +1,251 @@
+package mcp_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/mcp"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestMCPFaultsMatchSpecTable(t *testing.T) {
+	faulttest.CheckTable(t, "../../docs/specs/ai-mcp.md", mcp.Faults())
+}
+
+func wireError(t *testing.T, raw []byte) *mcp.RPCError? {
+	t.Helper()
+	env := decodeEnvelope(t, raw)
+	if env.Error == nil {
+		t.Fatalf("no protocol error in %s", raw)
+		return nil
+	}
+	return env.Error
+}
+
+func TestMCPFaultForbiddenOrigin(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	_, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, map[string]string{"Origin": "https://evil.example"})
+	e := wireError(t, raw)
+	if e == nil {
+		return
+	}
+	if e.Code != -32000 {
+		t.Errorf("code %d, want -32000", e.Code)
+	}
+	if string(e.Data) != `{"code":"mcp.forbidden_origin"}` {
+		t.Errorf("data %s, want the mcp.forbidden_origin fault code", e.Data)
+	}
+	if calls != 0 {
+		t.Errorf("tool ran %d times, want none", calls)
+	}
+}
+
+func TestMCPFaultUnsupportedVersion(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	_, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, map[string]string{"MCP-Protocol-Version": "2024-11-05"})
+	e := wireError(t, raw)
+	if e == nil {
+		return
+	}
+	if e.Code != -32600 {
+		t.Errorf("code %d, want -32600", e.Code)
+	}
+	if string(e.Data) != `{"code":"mcp.unsupported_version"}` {
+		t.Errorf("data %s, want the mcp.unsupported_version fault code", e.Data)
+	}
+}
+
+func TestMCPFaultParseError(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	status, raw := postRaw(t, ts, `{"jsonrpc":`, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status %d, body %s", status, raw)
+		return
+	}
+	e := wireError(t, raw)
+	if e == nil {
+		return
+	}
+	if e.Code != -32700 {
+		t.Errorf("code %d, want -32700", e.Code)
+	}
+	if string(e.Data) != `{"code":"mcp.parse_error"}` {
+		t.Errorf("data %s, want the mcp.parse_error fault code", e.Data)
+	}
+}
+
+func TestMCPFaultMethodNotFound(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	_, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":2,"method":"resources/list"}`, nil)
+	e := wireError(t, raw)
+	if e == nil {
+		return
+	}
+	if e.Code != -32601 {
+		t.Errorf("code %d, want -32601", e.Code)
+	}
+	if string(e.Data) != `{"code":"mcp.method_not_found"}` {
+		t.Errorf("data %s, want the mcp.method_not_found fault code", e.Data)
+	}
+}
+
+func TestMCPFaultInvalidParams(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	_, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"get_weather","arguments":5}}`, nil)
+	e := wireError(t, raw)
+	if e == nil {
+		return
+	}
+	if e.Code != -32602 {
+		t.Errorf("code %d, want -32602", e.Code)
+	}
+	if string(e.Data) != `{"code":"mcp.invalid_params"}` {
+		t.Errorf("data %s, want the mcp.invalid_params fault code", e.Data)
+	}
+	if calls != 0 {
+		t.Errorf("tool ran %d times, want none", calls)
+	}
+}
+
+func TestMCPFaultUnknownTool(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	hostile := "<script>alert(1)</script>"
+	_, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"`+hostile+`","arguments":{}}}`, nil)
+	e := wireError(t, raw)
+	if e == nil {
+		return
+	}
+	if e.Code != -32602 {
+		t.Errorf("code %d, want -32602", e.Code)
+	}
+	if e.Message != "Unknown tool" {
+		t.Errorf("message %q, want the constant text with no tool name", e.Message)
+	}
+	if string(e.Data) != `{"code":"mcp.unknown_tool"}` {
+		t.Errorf("data %s, want the mcp.unknown_tool fault code", e.Data)
+	}
+	faulttest.RefuseLeak(t, raw, hostile)
+}
+
+func TestMCPFaultToolFailed(t *testing.T) {
+	secret := "sk-live-9f2secret"
+	tools := []ai.Tool{
+		{
+			Name:   "broken",
+			Schema: `{"type":"object"}`,
+			Call: func(_ context.Context, _ string) (string, error) {
+				return "", errors.New("provider said no: " + secret)
+			},
+		},
+	}
+	ts := mountServer(t, tools, (&countingGuard{}).stage())
+	_, raw := postRaw(t, ts, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"broken","arguments":{}}}`, nil)
+	env := decodeEnvelope(t, raw)
+	if env.Error != nil {
+		t.Fatalf("protocol error %+v, want result", env.Error)
+		return
+	}
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(env.Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+		return
+	}
+	if !result.IsError {
+		t.Error("isError false, want true")
+	}
+	if len(result.Content) != 1 || result.Content[0].Text != "The tool call failed." {
+		t.Errorf("content %+v, want the constant mcp.tool_failed text", result.Content)
+	}
+	faulttest.RefuseLeak(t, raw, secret)
+}
+
+func TestMCPFaultProtocolError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Unknown tool: x"}}`)); err != nil {
+			return
+		}
+	}))
+	defer ts.Close()
+	c := mcp.NewClient(mcp.NewHTTP(ts.URL, ts.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	_, err := c.Call(context.Background(), "x", "{}")
+	if !errors.Is(err, mcp.ErrProtocolError) {
+		t.Fatalf("error = %v, want the mcp.protocol_error fault", err)
+		return
+	}
+	rpcErr := &mcp.RPCError{}
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 {
+		t.Fatalf("error = %v, want the wire code behind errors.As", err)
+	}
+}
+
+func TestMCPFaultUpstreamFailed(t *testing.T) {
+	secret := "sk-live-7q1secret"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "provider said no: "+secret, http.StatusBadGateway)
+	}))
+	defer ts.Close()
+	c := mcp.NewClient(mcp.NewHTTP(ts.URL, ts.Client()))
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	_, err := c.Call(context.Background(), "get_weather", "{}")
+	if !errors.Is(err, mcp.ErrUpstreamFailed) {
+		t.Fatalf("error = %v, want the mcp.upstream_failed fault", err)
+		return
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), secret)
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the operator chain carries the upstream body: %v", err)
+	}
+}
+
+func TestMCPFaultTransportFailed(t *testing.T) {
+	r, w := io.Pipe()
+	s := mcp.NewStdio(r, io.Discard)
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close stdio: %v", err)
+		}
+	}()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close pipe write: %v", err)
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.Request(ctx, mcp.Envelope{JSONRPC: "2.0", Method: "tools/list"})
+	if !errors.Is(err, mcp.ErrTransportFailed) {
+		t.Fatalf("error = %v, want the mcp.transport_failed fault", err)
+		return
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want the context cause behind errors.Is", err)
+	}
+}

@@ -1,0 +1,49 @@
+package main
+
+import (
+	"encoding/json/v2"
+	"fmt"
+	"io"
+	"os"
+)
+
+func main() {
+	if len(os.Args) != 2 || !methodOK(os.Args[1]) {
+		fmt.Fprintln(os.Stderr, "usage: sqlc-gen-spira generate")
+		os.Exit(2)
+	}
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func methodOK(arg string) bool {
+	if arg == "generate" {
+		return true
+	}
+	return arg == "/plugin.CodegenService/Generate"
+}
+
+func run() error {
+	input := io.ReadAll(os.Stdin)?
+	out := GenerateJSON(input)?
+	os.Stdout.Write(out)?
+	return nil
+}
+
+func GenerateJSON(input []byte) ([]byte, error) {
+	var req Request
+	if err := json.Unmarshal(input, &req); err != nil {
+		return nil, fmt.Errorf("sqlc-gen-spira: decode request: %w", err)
+	}
+	_, files, err := Generate(&req)
+	if err != nil {
+		return nil, err
+	}
+	out, err := json.Marshal(Response{Files: files})
+	if err != nil {
+		return nil, fmt.Errorf("sqlc-gen-spira: encode response: %w", err)
+	}
+	return out, nil
+}

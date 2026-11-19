@@ -1,0 +1,223 @@
+package fault
+
+import (
+	"errors"
+	"strconv"
+)
+
+type Kind uint8
+
+const (
+	Invalid Kind = iota + 1
+	Unprocessable
+	Unauthenticated
+	Forbidden
+	NotFound
+	Conflict
+	TooLarge
+	RateLimited
+	Canceled
+	Timeout
+	Unavailable
+	Internal
+)
+
+func (k Kind) String() string {
+	switch k {
+	case Invalid:
+		return "invalid"
+	case Unprocessable:
+		return "unprocessable"
+	case Unauthenticated:
+		return "unauthenticated"
+	case Forbidden:
+		return "forbidden"
+	case NotFound:
+		return "not_found"
+	case Conflict:
+		return "conflict"
+	case TooLarge:
+		return "too_large"
+	case RateLimited:
+		return "rate_limited"
+	case Canceled:
+		return "canceled"
+	case Timeout:
+		return "timeout"
+	case Unavailable:
+		return "unavailable"
+	case Internal:
+		return "internal"
+	}
+	return "unknown"
+}
+
+type Code string
+
+type Field struct {
+	Name    string `json:"field"`
+	Rule    string `json:"rule"`
+	Message string `json:"message"`
+}
+
+type Error struct {
+	Code    Code
+	Kind    Kind
+	Message string
+	Fields  []Field
+	cause   error
+}
+
+const (
+	internalCode    Code   = "internal"
+	internalMessage string = "internal error"
+)
+
+func New(code Code, kind Kind, message string) *Error {
+	if !validCode(string(code)) {
+		panic("fault: malformed code " + string(code))
+	}
+	if kind < Invalid || kind > Internal {
+		panic("fault: unknown kind " + strconv.FormatUint(uint64(kind), 10))
+	}
+	if code == internalCode && kind != Internal {
+		panic("fault: code internal needs kind internal")
+	}
+	return &Error{Code: code, Kind: kind, Message: message}
+}
+
+func validCode(code string) bool {
+	if code == string(internalCode) {
+		return true
+	}
+	dots := 0
+	fresh := true
+	first := true
+	for i := 0; i < len(code); i++ {
+		c := code[i]
+		if c == '.' {
+			if fresh {
+				return false
+			}
+			dots++
+			fresh = true
+			first = false
+			continue
+		}
+		if fresh {
+			if !validLead(c) {
+				return false
+			}
+			fresh = false
+			continue
+		}
+		if !validRest(c, first) {
+			return false
+		}
+	}
+	if fresh {
+		return false
+	}
+	return dots > 0
+}
+
+func validLead(c byte) bool {
+	return c >= 'a' && c <= 'z'
+}
+
+func validRest(c byte, first bool) bool {
+	if validLead(c) {
+		return true
+	}
+	if c >= '0' && c <= '9' {
+		return true
+	}
+	return c == '_' && !first
+}
+
+func (e *Error) Wrap(cause error) error {
+	cp := *e
+	cp.cause = cause
+	return &cp
+}
+
+func (e *Error) Err() error {
+	if e == nil {
+		return nil
+	}
+	return e
+}
+
+func (e *Error) WithFields(fields ...Field) *Error {
+	cp := *e
+	cp.Fields = append([]Field(nil), fields...)
+	return &cp
+}
+
+func (e *Error) Error() string {
+	if e == nil {
+		return string(internalCode) + ": " + internalMessage
+	}
+	if e.cause == nil {
+		return string(e.Code) + ": " + e.Message
+	}
+	return string(e.Code) + ": " + e.Message + ": " + e.cause.Error()
+}
+
+func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *Error) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	t, ok := target.(*Error)
+	if !ok {
+		return false
+	}
+	if t == nil {
+		return false
+	}
+	return e.Code == t.Code
+}
+
+func Of(err error) *Error? {
+	var f *Error?
+	if !errors.As(err, &f) {
+		return nil
+	}
+	return f
+}
+
+func Public(err error) View {
+	f := Of(err)
+	if f == nil {
+		return View{Code: internalCode, Message: internalMessage}
+	}
+	if f.Kind == Internal {
+		return View{Code: internalCode, Message: internalMessage}
+	}
+	return View{Code: f.Code, Message: f.Message, Fields: publicFields(f)}
+}
+
+func publicFields(f *Error) []Field {
+	if f.Kind != Invalid && f.Kind != Unprocessable {
+		return nil
+	}
+	return f.Fields
+}
+
+type View struct {
+	Code    Code    `json:"code"`
+	Kind    Kind    `json:"-"`
+	Message string  `json:"message"`
+	Fields  []Field `json:"errors,omitzero"`
+}
+
+func Faults() []*Error {
+	return []*Error{New(internalCode, Internal, internalMessage)}
+}

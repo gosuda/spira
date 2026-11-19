@@ -1,0 +1,199 @@
+// Translated and changed by spira from Spring AI,
+// spring-ai-commons/src/main/java/org/springframework/ai/transformer/splitter/TokenTextSplitter.java.
+// Copyright 2023-present the original author or authors.
+// Licensed under the Apache License, Version 2.0.
+
+package rag
+
+import (
+	"fmt"
+	"strings"
+)
+
+type SplitOptions struct {
+	ChunkSize             int        = 800
+	ChunkOverlap          int        = 0
+	MinChunkSizeChars     int        = 350
+	MinChunkLengthToEmbed int        = 5
+	MaxNumChunks          int        = 10000
+	KeepSeparator         bool       = true
+	Punctuation           string     = ".?!\n"
+	Encoder               *Encoder?
+}
+
+func Split(text string, o SplitOptions) ([]string, error) {
+	if err := checkSplitOptions(o); err != nil {
+		return nil, ErrInvalidRequest.Wrap(err)
+	}
+	encoder := o.Encoder
+	if encoder == nil {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encoder is nil"))
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	tokens, err := encoder.encode(text)
+	if err != nil {
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encode: %w", err))
+	}
+	if len(tokens) <= o.ChunkSize {
+		return splitSingle(text, o), nil
+	}
+	s := &splitter{options: o, tokens: tokens, encoder: encoder}
+	if err := s.run(); err != nil {
+		return nil, err
+	}
+	return s.chunks, nil
+}
+
+func checkSplitOptions(o SplitOptions) error {
+	if o.ChunkSize <= 0 {
+		return fmt.Errorf("ai/rag: split: chunkSize must be greater than zero")
+	}
+	if o.ChunkOverlap < 0 {
+		return fmt.Errorf("ai/rag: split: chunk overlap must not be negative")
+	}
+	if o.ChunkOverlap >= o.ChunkSize {
+		return fmt.Errorf("ai/rag: split: chunk overlap must be less than chunk size")
+	}
+	if o.MaxNumChunks <= 0 {
+		return fmt.Errorf("ai/rag: split: maxNumChunks must be greater than zero")
+	}
+	if o.MinChunkSizeChars < 0 {
+		return fmt.Errorf("ai/rag: split: minChunkSizeChars must not be negative")
+	}
+	if o.MinChunkLengthToEmbed < 0 {
+		return fmt.Errorf("ai/rag: split: minChunkLengthToEmbed must not be negative")
+	}
+	if o.Punctuation == "" {
+		return fmt.Errorf("ai/rag: split: punctuation must not be empty")
+	}
+	return nil
+}
+
+func splitSingle(text string, o SplitOptions) []string {
+	formatted := formatChunk(text, o)
+	if runeCount(formatted) > o.MinChunkLengthToEmbed {
+		return []string{formatted}
+	}
+	return nil
+}
+
+type splitter struct {
+	options  SplitOptions
+	tokens   []int
+	chunks   []string
+	position int
+	count    int
+	encoder  *Encoder
+}
+
+func (s *splitter) run() error {
+	for s.position < len(s.tokens) && s.count < s.options.MaxNumChunks {
+		if err := s.step(); err != nil {
+			return err
+		}
+	}
+	return s.finish()
+}
+
+func (s *splitter) step() error {
+	end := min(s.position+s.options.ChunkSize, len(s.tokens))
+	chunk, err := s.encoder.decode(s.tokens[s.position:end])
+	if err != nil {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: decode: %w", err))
+	}
+	if strings.TrimSpace(chunk) == "" {
+		s.position = end
+		return nil
+	}
+	optimized := chunk
+	if end < len(s.tokens) {
+		optimized = optimizeBoundary(chunk, s.options)
+	}
+	optimizedTokens, err := s.encoder.encode(optimized)
+	if err != nil {
+		return ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encode: %w", err))
+	}
+	next, err := s.nextPosition(len(optimizedTokens))
+	if err != nil {
+		return err
+	}
+	formatted := formatChunk(optimized, s.options)
+	if runeCount(formatted) > s.options.MinChunkLengthToEmbed {
+		s.chunks = append(s.chunks, formatted)
+	}
+	s.position = next
+	s.count++
+	return nil
+}
+
+func (s *splitter) nextPosition(count int) (int, error) {
+	stop := s.position + count
+	rest := len(s.tokens) - stop
+	if rest <= 0 {
+		return len(s.tokens), nil
+	}
+	if rest <= s.options.ChunkSize {
+		tail, err := s.encoder.decode(s.tokens[stop:])
+		if err != nil {
+			return 0, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: decode: %w", err))
+		}
+		if strings.TrimSpace(tail) == "" {
+			return len(s.tokens), nil
+		}
+	}
+	return s.position + max(1, count-s.options.ChunkOverlap), nil
+}
+
+func (s *splitter) finish() error {
+	if s.position >= len(s.tokens) {
+		return nil
+	}
+	rest, err := s.encoder.decode(s.tokens[s.position:])
+	if err != nil {
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: decode: %w", err))
+	}
+	formatted := strings.TrimSpace(strings.ReplaceAll(rest, "\n", " "))
+	if runeCount(formatted) > s.options.MinChunkLengthToEmbed {
+		s.chunks = append(s.chunks, formatted)
+	}
+	return nil
+}
+
+func optimizeBoundary(chunk string, o SplitOptions) string {
+	runes := []rune(chunk)
+	if len(runes) <= o.MinChunkSizeChars {
+		return chunk
+	}
+	at := lastPunctuation(chunk, o.Punctuation)
+	if at >= 0 && at > o.MinChunkSizeChars {
+		return string(runes[:at+1])
+	}
+	return chunk
+}
+
+func lastPunctuation(chunk string, marks string) int {
+	best := -1
+	for _, mark := range marks {
+		at := strings.LastIndex(chunk, string(mark))
+		if at < 0 {
+			continue
+		}
+		if n := len([]rune(chunk[:at])); n > best {
+			best = n
+		}
+	}
+	return best
+}
+
+func formatChunk(text string, o SplitOptions) string {
+	if o.KeepSeparator {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
+}
+
+func runeCount(text string) int {
+	return len([]rune(text))
+}

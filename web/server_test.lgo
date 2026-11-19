@@ -16,17 +16,15 @@ import (
 	"logos/sync"
 )
 
-func freeAddr(t *testing.T) string {
+func stopServer(t *testing.T, s *web.Server) {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := l.Addr().String()
-	if err := l.Close(); err != nil {
-		t.Fatalf("probe close: %v", err)
-	}
-	return addr
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.Stop(cctx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
 }
 
 type slowProbe struct {
@@ -100,11 +98,13 @@ func TestServerStopWaitsForInFlightRequest(t *testing.T) {
 	r := web.NewRouter()
 	p := &slowProbe{entered: make(chan struct{}), release: make(chan struct{})}
 	r.Handle("GET", "/slow", slowHandler(p))
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 5 * time.Second}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 5 * time.Second}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	if err := driveSlow(context.Background(), s, "http://"+addr+"/slow", p); err != nil {
 		t.Fatalf("drive: %v", err)
 	}
@@ -131,13 +131,17 @@ func TestServerStopWaitsForInFlightRequest(t *testing.T) {
 }
 
 func TestSecondStartOnTakenPortFails(t *testing.T) {
-	addr := freeAddr(t)
-	s1 := &web.Server{Addr: addr, Router: web.NewRouter(), ShutdownGrace: 2 * time.Second}
+	s1 := &web.Server{Addr: "127.0.0.1:0", Router: web.NewRouter(), ShutdownGrace: 2 * time.Second}
 	if err := s1.Start(context.Background()); err != nil {
 		t.Fatalf("first start: %v", err)
 	}
+	stopServer(t, s1)
+	addr := s1.BoundAddrForTest()
+
 	s2 := &web.Server{Addr: addr, Router: web.NewRouter()}
 	err := s2.Start(context.Background())
+	stopServer(t, s2)
+
 	if err == nil {
 		if serr := s1.Stop(context.Background()); serr != nil {
 			t.Fatalf("stop first server: %v", serr)
@@ -196,14 +200,16 @@ func TestServerServesAfterStartContextCancel(t *testing.T) {
 		cancelled: make(chan struct{}),
 	}
 	r.Handle("GET", "/slow", watchedHandler(p))
-	addr := freeAddr(t)
-	p.url = "http://" + addr + "/slow"
 	startCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 5 * time.Second}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 5 * time.Second}
 	if err := s.Start(startCtx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+	p.url = "http://" + addr + "/slow"
+
 	if err := driveContextCancel(context.Background(), s, cancel, p); err != nil {
 		t.Fatalf("drive: %v", err)
 	}
@@ -315,11 +321,13 @@ func TestServerStopReturnsWithinGraceWhenHandlerNeverReturns(t *testing.T) {
 	r := web.NewRouter()
 	p := &stuckProbe{entered: make(chan struct{}), release: make(chan struct{})}
 	r.Handle("GET", "/stuck", stuckHandler(p))
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 500 * time.Millisecond}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 500 * time.Millisecond}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	if err := driveStuck(context.Background(), s, "http://"+addr+"/stuck", p); err != nil {
 		t.Fatalf("drive: %v", err)
 	}
@@ -345,11 +353,13 @@ func TestServerStopReturnsByTheCallerDeadline(t *testing.T) {
 	r := web.NewRouter()
 	p := &stuckProbe{entered: make(chan struct{}), release: make(chan struct{}), stopWithin: 300 * time.Millisecond}
 	r.Handle("GET", "/stuck", stuckHandler(p))
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 5 * time.Second}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 5 * time.Second}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	if err := driveStuck(context.Background(), s, "http://"+addr+"/stuck", p); err != nil {
 		t.Fatalf("drive: %v", err)
 	}
@@ -412,11 +422,13 @@ func TestServerStopClosesOpenConnectionsWhenShutdownTimesOut(t *testing.T) {
 	r := web.NewRouter()
 	p := &closeProbe{entered: make(chan struct{}), ended: make(chan struct{})}
 	r.Handle("GET", "/stream", closeWatchingHandler(p))
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 200 * time.Millisecond}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 200 * time.Millisecond}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	if err := driveClose(context.Background(), s, "http://"+addr+"/stream", p); err != nil {
 		t.Fatalf("drive: %v", err)
 	}
@@ -481,6 +493,15 @@ func dialUpgraded(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 	if got := strings.TrimSpace(line); got != "HTTP/1.1 101 Switching Protocols" {
 		t.Fatalf("status line %q want the raw 101 upgrade", got)
 	}
+	for {
+		head, herr := reader.ReadString('\n')
+		if herr != nil {
+			t.Fatalf("read upgrade headers: %v", herr)
+		}
+		if strings.TrimSpace(head) == "" {
+			break
+		}
+	}
 	return conn, reader
 }
 
@@ -499,11 +520,13 @@ func TestServerStopClosesAnUpgradedConnection(t *testing.T) {
 	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
 		return web.Delegate{To: holdUpgraded(t)}, nil
 	})
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 2 * time.Second}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	conn, reader := dialUpgraded(t, addr)
 	if err := s.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -530,11 +553,13 @@ func TestServerStopClosesAnUpgradedConnectionAfterTheGrace(t *testing.T) {
 	r.Handle("GET", "/stuck", func(ctx *web.Context) (web.Reply, error) {
 		return web.Delegate{To: lateUpgrade}, nil
 	})
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 200 * time.Millisecond}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 200 * time.Millisecond}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	conn, reader := dialUpgraded(t, addr)
 	stuck, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -567,6 +592,7 @@ func TestServerStopClosesAnUpgradedConnectionAfterTheGrace(t *testing.T) {
 	if lerr == nil || !strings.Contains(lerr.Error(), "web: server is stopping") {
 		t.Fatalf("Hijack after Stop = %v, want web: server is stopping", lerr)
 	}
+	wantClosedByServer(t, stuck, bufio.NewReader(stuck))
 }
 
 func TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses(t *testing.T) {
@@ -574,11 +600,13 @@ func TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses(t *testing.T) {
 	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
 		return web.Delegate{To: holdUpgraded(t)}, nil
 	})
-	addr := freeAddr(t)
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: 2 * time.Second}
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
 	conn, _ := dialUpgraded(t, addr)
 	if open := s.UpgradedConnections(); open != 1 {
 		t.Fatalf("the server tracks %d upgraded connections, want 1", open)
@@ -595,5 +623,194 @@ func TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses(t *testing.T) {
 	}
 	if err := s.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestServerAnswersOptionsAsteriskWith400(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/users", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("client close: %v", cerr)
+		}
+	}()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+		return
+	}
+	if _, err := fmt.Fprintf(conn, "OPTIONS * HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", addr); err != nil {
+		t.Fatalf("write request: %v", err)
+		return
+	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+		return
+	}
+	if got := strings.TrimSpace(line); got != "HTTP/1.1 400 Bad Request" {
+		t.Fatalf("OPTIONS * status %q want %q", got, "HTTP/1.1 400 Bad Request")
+	}
+}
+
+type tunnelProbe struct {
+	half    chan bool
+	gotPing chan struct{}
+}
+
+func readTunnel(t *testing.T, p *tunnelProbe, conn net.Conn) {
+	t.Helper()
+	cw, cwOk := conn.(interface{ CloseWrite() error })
+	_, crOk := conn.(interface{ CloseRead() error })
+	ok := cwOk && crOk
+	if ok {
+		if err := cw.CloseWrite(); err != nil {
+			t.Errorf("tunnel CloseWrite: %v", err)
+			return
+		}
+	}
+	select {
+	case p.half <- ok:
+	default:
+	}
+	if !ok {
+		return
+	}
+	tmp := make([]byte, 4)
+	if _, rerr := io.ReadFull(conn, tmp); rerr != nil {
+		if !errors.Is(rerr, io.EOF) && !errors.Is(rerr, net.ErrClosed) {
+			t.Errorf("tunnel read: %v", rerr)
+		}
+		return
+	}
+	close(p.gotPing)
+	if _, err := io.Copy(io.Discard, conn); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("tunnel drain: %v", err)
+	}
+}
+
+func halfCloseTunnel(t *testing.T, p *tunnelProbe) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			http.Error(w, "hijack unavailable: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+				t.Errorf("tunnel close: %v", cerr)
+			}
+		}()
+		if _, err := buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n\r\nready"); err != nil {
+			return
+		}
+		if err := buf.Flush(); err != nil {
+			return
+		}
+		readTunnel(t, p, conn)
+	})
+}
+
+func TestUpgradedConnectionKeepsTCPHalfClose(t *testing.T) {
+	p := &tunnelProbe{half: make(chan bool, 1), gotPing: make(chan struct{})}
+	r := web.NewRouter()
+	r.Handle("GET", "/ws", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: halfCloseTunnel(t, p)}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+
+	conn, reader := dialUpgraded(t, addr)
+	ready := make([]byte, 5)
+	if _, err := io.ReadFull(reader, ready); err != nil || string(ready) != "ready" {
+		t.Fatalf("tunnel opened with %q: %v", string(ready), err)
+		return
+	}
+	select {
+	case ok := <-p.half:
+		if !ok {
+			t.Fatal("hijacked connection lacks CloseWrite, want TCP half-close")
+			return
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel handler did not reach half-close")
+		return
+	}
+	if n, rerr := reader.Read(make([]byte, 1)); !errors.Is(rerr, io.EOF) {
+		t.Fatalf("read after half-close = %d bytes %v, want EOF", n, rerr)
+		return
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write after half-close: %v", err)
+		return
+	}
+	select {
+	case <-p.gotPing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel handler did not read the ping")
+		return
+	}
+	if open := s.UpgradedConnections(); open != 1 {
+		t.Fatalf("the server tracks %d upgraded connections after a half-close, want 1", open)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+		return
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestUpgradedConnectionWithoutHalfCloseReportsNamedError(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		if cerr := a.Close(); cerr != nil {
+			t.Errorf("pipe close: %v", cerr)
+		}
+	}()
+	defer func() {
+		if cerr := b.Close(); cerr != nil {
+			t.Errorf("pipe close: %v", cerr)
+		}
+	}()
+	w := web.WrapConnForTest(a)
+	cw, ok := w.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("wrapped connection lost CloseWrite")
+		return
+	}
+	if err := cw.CloseWrite(); err == nil || !strings.Contains(err.Error(), "CloseWrite not supported") {
+		t.Fatalf("CloseWrite error = %v, want the named error", err)
+		return
+	}
+	cr, ok := w.(interface{ CloseRead() error })
+	if !ok {
+		t.Fatal("wrapped connection lost CloseRead")
+		return
+	}
+	if err := cr.CloseRead(); err == nil || !strings.Contains(err.Error(), "CloseRead not supported") {
+		t.Fatalf("CloseRead error = %v, want the named error", err)
 	}
 }

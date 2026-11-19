@@ -1,0 +1,11 @@
+package gateway
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrBadGateway = fault.New("gateway.upstream_unavailable", fault.Unavailable, "The gateway could not reach an upstream.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrBadGateway}
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly POSTGRES_IMAGE='postgres@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc' # postgres:18
+readonly POSTGRES_IMAGE='pgvector/pgvector@sha256:38681dc6eaf55308e2a4c6de392d131652dcfac70e1263e35cd9b5ea3fe39782' # pgvector/pgvector:pg18 (PostgreSQL 18.7, vector 0.8.7)
 readonly MYSQL_IMAGE='mysql@sha256:df90258da46f6e7ff8574ff84f17618aba0765cac749928299c69fd4e7cb8ad8'     # mysql:9.7.4
 readonly MSSQL_IMAGE_DEFAULT='mcr.microsoft.com/mssql/server@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f' # 2022-latest; 2025-latest crashes on this kernel, see scripts report
 readonly MSSQL_IMAGE="${SPIRA_ENGINES_MSSQL_IMAGE:-$MSSQL_IMAGE_DEFAULT}"

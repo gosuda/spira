@@ -1,6 +1,7 @@
 package job
 
 import (
+	"context"
 	"time"
 )
 
@@ -32,4 +33,30 @@ func ReleaseAsEarlierStart(s *Scheduler, name string) {
 			s.release(jobLoop{entry: &s.jobs[i], start: earlier})
 		}
 	}
+}
+
+func DeliverTick(s *Scheduler, name string, ctx context.Context, start uint64) bool {
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			s.deliver(ctx, jobLoop{entry: &s.jobs[i], tick: make(chan struct{}, 1), start: start})
+			return true
+		}
+	}
+	return false
+}
+
+func DeliverTickBlocked(s *Scheduler, name string, ctx context.Context, start uint64) bool {
+	for i := range s.jobs {
+		if s.jobs[i].name == name {
+			tick := make(chan struct{}, 1)
+			select {
+			case tick <- struct{}{}:
+			case <-ctx.Done():
+				return false
+			}
+			s.deliver(ctx, jobLoop{entry: &s.jobs[i], tick: tick, start: start})
+			return true
+		}
+	}
+	return false
 }

@@ -10,11 +10,13 @@ package openai_test
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"iter"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -418,7 +420,7 @@ func TestCutStreamYieldsErrorChunkAndNoReply(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error chunk")
 	}
-	if !strings.Contains(err.Error(), "[DONE]") {
+	if !errors.Is(err, openai.ErrProviderStreamCut) {
 		t.Fatalf("error: %v", err)
 	}
 	if _, cerr := ai.Collect(c.Stream(context.Background(), ai.Request{
@@ -460,8 +462,8 @@ func TestEmbeddingIndexOutsideTheAnswerIsAnError(t *testing.T) {
 	rec := &recorder{}
 	srv := rec.serve(t, http.StatusOK, "application/json", `{"object":"list","data":[{"object":"embedding","index":2,"embedding":[1,2,3]},{"object":"embedding","index":0,"embedding":[4,5,6]}]}`)
 	_, err := testClient(srv).Embed(context.Background(), []string{"first", "second"})
-	if err == nil || err.Error() != "ai/openai: embedding index 2 is outside the 2 vectors of the answer" {
-		t.Fatalf("err = %v, want the error that names index 2 and the 2 vectors", err)
+	if err == nil || !errors.Is(err, openai.ErrProviderError) {
+		t.Fatalf("err = %v, want the provider error for an index outside the answer", err)
 	}
 }
 
@@ -494,7 +496,7 @@ func TestEmbedBodyOverItsLimitIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the size limit error")
 	}
-	if !strings.Contains(err.Error(), "ai/openai: response exceeds the size limit of 1179648 bytes") {
+	if !errors.Is(err, openai.ErrProviderTooLarge) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -600,8 +602,8 @@ func TestFormatGoesOutAsJSONObjectOrSchema(t *testing.T) {
 			Model:    "gpt-6-astra",
 			Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "hi"}}}},
 			Format:   bad,
-		}); err == nil || !strings.Contains(err.Error(), "ai/openai: format is not json") {
-			t.Fatalf("chat with format %s: err = %v, want the format error", bad, err)
+		}); err == nil || !errors.Is(err, openai.ErrInvalidRequest) {
+			t.Fatalf("chat with format %s: err = %v, want the invalid request fault", bad, err)
 		}
 	}
 	if rec.count() != sent {
@@ -633,8 +635,11 @@ func TestUnauthorizedIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if got, want := err.Error(), `ai/openai: 401: {"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}`; got != want {
-		t.Fatalf("error:\n got %s\nwant %s", got, want)
+	if !errors.Is(err, openai.ErrProviderRejected) {
+		t.Fatalf("error: %v, want the provider rejection for a 401 answer", err)
+	}
+	if status, errType, length, ok := openai.FaultDetail(err); !ok || status != 401 || errType != "invalid_request_error" {
+		t.Fatalf("detail = %d %q %d, want status 401 with the parsed error type", status, errType, length)
 	}
 	if rec.count() != 1 {
 		t.Fatalf("401 was retried: %d requests", rec.count())
@@ -759,7 +764,7 @@ func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
 }
 
 func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
-	body := strings.Repeat("x", (1<<20)+(512<<10))
+	body := strings.Repeat("x", (1<<20)+8)
 	rec := &recorder{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
@@ -780,11 +785,11 @@ func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want a failing status")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/openai: 500: ") {
-		t.Fatalf("error does not classify the status: %q", err.Error()[:64])
+	if !errors.Is(err, openai.ErrProviderError) {
+		t.Fatalf("error: %v, want the provider error for a 500 answer", err)
 	}
-	if len(err.Error()) > (1<<20)+64 {
-		t.Fatalf("error holds %d bytes, want at most one mebibyte of body: the limit of this call is two mebibytes", len(err.Error()))
+	if status, _, length, ok := openai.FaultDetail(err); !ok || status != 500 || length != 1<<20 {
+		t.Fatalf("detail = %d %d, want status 500 with the body cut at one mebibyte", status, length)
 	}
 	if rec.count() != 2 {
 		t.Fatalf("server saw %d calls, want 2: the 500 is retried, not a caller fault", rec.count())
@@ -801,7 +806,7 @@ func TestBadRequestIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/openai: 400: ") {
+	if !errors.Is(err, openai.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -839,61 +844,70 @@ func askHello() ai.Request {
 }
 
 func TestStreamOfAStalledProviderEndsAtThePolicyTimeout(t *testing.T) {
+	ready := make(chan *openai.IdleProbe, 1)
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		if _, err := io.WriteString(w, sseFirstEvent); err != nil {
-			t.Errorf("server write: %v", err)
+			return
 		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		<-r.Context().Done()
+		probe := <-ready
+		probe.Fire()
+		<-release
 	}))
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
 	c := testClient(srv)
 	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	start := time.Now()
-
 	_, err := ai.Collect(c.Stream(ctx, askHello()))
 
-	if err == nil || !strings.Contains(err.Error(), "ai/openai: no stream event for 200ms") {
-		t.Fatalf("collect error after %v = %v, want the stall error", time.Since(start), err)
+	if err == nil || !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("collect error = %v, want the stream cut fault", err)
 	}
-	if waited := time.Since(start); waited > 3*time.Second {
-		t.Errorf("Collect returned after %v, want an end near the timeout of 200ms", waited)
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("stall error = %v, want the named stall error, not a cancel", err)
 	}
 }
 
 func TestStreamKeepsAProviderWhoseEventsStayInsideTheTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		for range 8 {
+		for range 12 {
 			if _, err := io.WriteString(w, sseFirstEvent); err != nil {
-				t.Errorf("server write: %v", err)
+				return
 			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			time.Sleep(250 * time.Millisecond)
 		}
 		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-			t.Errorf("server write: %v", err)
+			return
 		}
 	}))
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
-	c.Policy = resilience.Policy{Timeout: time.Second}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
 
 	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
 
 	if err != nil {
-		t.Fatalf("a stream of 2s with an event each 250ms failed under a timeout of 1s: %v", err)
+		t.Fatalf("collect: %v", err)
 		return
 	}
-	if got := textOf(reply); got != strings.Repeat("Hel", 8) {
-		t.Errorf("stream text = %q, want eight events", got)
+	if got := textOf(reply); got != strings.Repeat("Hel", 12) {
+		t.Errorf("stream text = %q, want twelve events", got)
+	}
+	if probe.Fired {
+		t.Errorf("the idle timer fired although every line arrived")
+	}
+	if probe.Resets < 25 {
+		t.Errorf("the idle timer reset %d times, want at least one reset per line read (25)", probe.Resets)
 	}
 }
 
@@ -925,8 +939,8 @@ func TestStreamClosesTheBodyOfAFailingAnswer(t *testing.T) {
 
 	_, err := ai.Collect(c.Stream(context.Background(), askHello()))
 
-	if err == nil || !strings.Contains(err.Error(), "ai/openai: 502") {
-		t.Fatalf("collect error = %v, want the 502 answer", err)
+	if err == nil || !errors.Is(err, openai.ErrProviderError) {
+		t.Fatalf("collect error = %v, want the 502 answer as a provider error", err)
 	}
 	select {
 	case <-released:
@@ -991,5 +1005,525 @@ func TestTopKGoesOutWhenTheCallerSetsIt(t *testing.T) {
 	}
 	if strings.Contains(plain.body(0), "top_k") {
 		t.Errorf("request body %s, want no top_k without a caller value", plain.body(0))
+	}
+}
+
+func serveToolFragments(t *testing.T) *httptest.Server {
+	t.Helper()
+	pieces := []string{`{\"`, `ci`, `ty`, `\":`, `\"S`, `eo`, `ul`, `\"}`}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		record := func(delta string, finish string) string {
+			return `data: {"id":"chatcmpl-123","model":"gpt-6-astra","choices":[{"index":0,"delta":{` + delta + `},"finish_reason":` + finish + `}]}` + "\n\n"
+		}
+		head := record(`"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]`, `null`)
+		records := []string{head}
+		for _, piece := range pieces {
+			records = append(records, record(`"tool_calls":[{"index":0,"function":{"arguments":"`+piece+`"}}]`, `null`))
+		}
+		records = append(records, record(``, `"tool_calls"`), "data: [DONE]\n\n")
+		for _, text := range records {
+			if _, err := io.WriteString(w, text); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestStreamKeepsReceivingToolFragments(t *testing.T) {
+	srv := serveToolFragments(t)
+	c := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	if calls[0].ID != "call_abc" || calls[0].Name != "get_weather" || calls[0].Arguments != `{"city":"Seoul"}` {
+		t.Fatalf("assembled call: %+v", calls[0])
+	}
+	if probe.Fired {
+		t.Errorf("the idle timer fired although every line arrived")
+	}
+	if probe.Resets < 21 {
+		t.Errorf("the idle timer reset %d times, want at least one reset per line read (21)", probe.Resets)
+	}
+}
+
+func TestStreamResetsBeforeTheFirstChunk(t *testing.T) {
+	srv := serveToolFragments(t)
+	c := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+
+	resetsAtFirst := -1
+	for chunk, err := range c.Stream(context.Background(), askHello()) {
+		if err != nil {
+			t.Fatalf("stream: %v", err)
+			return
+		}
+		if resetsAtFirst < 0 {
+			resetsAtFirst = probe.Resets
+		}
+		_ = chunk
+	}
+	if resetsAtFirst < 19 {
+		t.Fatalf("first chunk arrived after %d resets, want at least the 19 fragment lines before it", resetsAtFirst)
+	}
+}
+
+func TestStreamCanceledBeforeHeadersKeepsThePackagePrefix(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	c := testClient(srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := gather(c.Stream(ctx, askHello()))
+
+	if err == nil {
+		t.Fatal("expected an error from a canceled context")
+	}
+	if !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("canceled stream error = %v, want the stream cut fault", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled stream error = %v, want it to match context.Canceled", err)
+	}
+}
+
+func TestStreamCancelBetweenChunksKeepsThePackagePrefix(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, sseFirstEvent); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cancelErr error
+	canceled := false
+	for chunk, err := range c.Stream(ctx, askHello()) {
+		if err != nil {
+			cancelErr = err
+			break
+		}
+		_ = chunk
+		canceled = true
+		cancel()
+	}
+	if !canceled {
+		t.Fatal("no chunk arrived before the cancel")
+	}
+	if cancelErr == nil {
+		t.Fatal("expected an error after the cancel")
+	}
+	if !errors.Is(cancelErr, openai.ErrProviderStreamCut) {
+		t.Fatalf("cancel error = %v, want the stream cut fault", cancelErr)
+	}
+	if !errors.Is(cancelErr, context.Canceled) {
+		t.Fatalf("cancel error = %v, want it to match context.Canceled", cancelErr)
+	}
+}
+
+func TestStreamCancelBetweenBufferedChunksKeepsThePackagePrefix(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	c := testClient(srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cancelErr error
+	canceled := false
+	for chunk, err := range c.Stream(ctx, askHello()) {
+		if err != nil {
+			cancelErr = err
+			break
+		}
+		_ = chunk
+		if !canceled {
+			canceled = true
+			cancel()
+		}
+	}
+	if !canceled {
+		t.Fatal("no chunk arrived before the cancel")
+	}
+	if cancelErr == nil {
+		t.Fatal("expected an error after the cancel of a buffered stream")
+	}
+	if !errors.Is(cancelErr, openai.ErrProviderStreamCut) {
+		t.Fatalf("cancel error = %v, want the stream cut fault", cancelErr)
+	}
+	if !errors.Is(cancelErr, context.Canceled) {
+		t.Fatalf("cancel error = %v, want it to match context.Canceled", cancelErr)
+	}
+}
+
+func TestStreamStallBeforeHeadersNamesTheStall(t *testing.T) {
+	ready := make(chan *openai.IdleProbe, 1)
+	release := make(chan struct{})
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.add(r, "")
+		probe := <-ready
+		probe.Fire()
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := ai.Collect(c.Stream(ctx, askHello()))
+	if err == nil {
+		t.Fatal("expected the stall error")
+	}
+	if !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("stall error = %v, want the stream cut fault", err)
+	}
+	if !openai.IsStall(err) {
+		t.Fatalf("stall error = %v, want the named stall error", err)
+	}
+	if n := rec.count(); n != 1 {
+		t.Fatalf("the stalled headers cost %d requests, want 1", n)
+	}
+}
+
+func TestChatReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
+	stalled := strings.Repeat("e", 100)
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.add(r, "")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := io.WriteString(w, stalled); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	httpClient := srv.Client()
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpClient.Transport = &cancelOnHeaders{next: transport, cancel: cancel}
+	c := testClient(srv)
+	c.HTTP = httpClient
+
+	_, err := c.Chat(ctx, askHello())
+
+	if err == nil {
+		t.Fatal("expected the 400 answer")
+	}
+	if !errors.Is(err, openai.ErrProviderRejected) {
+		t.Fatalf("chat error = %v, want the 400 status error", err)
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("chat error = %v, want the read cause beside the status", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("chat error = %v, want the cancel as the read cause", err)
+	}
+	if n := rec.count(); n != 1 {
+		t.Fatalf("the stalled 400 body cost %d requests, want 1", n)
+	}
+}
+type headerSignal struct {
+	next http.RoundTripper
+	seen chan struct{}
+}
+
+func (s *headerSignal) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := s.next.RoundTrip(r)
+	close(s.seen)
+	return resp, err
+}
+
+type cancelOnHeaders struct {
+	next   http.RoundTripper
+	cancel context.CancelFunc
+}
+
+func (s *cancelOnHeaders) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := s.next.RoundTrip(r)
+	if err != nil {
+		return resp, err
+	}
+	s.cancel()
+	return resp, nil
+}
+
+func TestStreamReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
+	stalled := strings.Repeat("e", 100)
+	ready := make(chan *openai.IdleProbe, 1)
+	release := make(chan struct{})
+	seen := make(chan struct{})
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.add(r, "")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := io.WriteString(w, stalled); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-seen
+		probe := <-ready
+		probe.Fire()
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	httpClient := srv.Client()
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &headerSignal{next: transport, seen: seen}
+	c := &openai.Client{
+		BaseURL: srv.URL,
+		Model:   "gpt-6-astra",
+		HTTP:    httpClient,
+		Policy:  resilience.Policy{Timeout: 2 * time.Second},
+	}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := ai.Collect(c.Stream(ctx, askHello()))
+
+	if err == nil {
+		t.Fatal("expected the 400 answer")
+	}
+	if !errors.Is(err, openai.ErrProviderRejected) {
+		t.Fatalf("stream error = %v, want the 400 status error", err)
+	}
+	if !strings.Contains(err.Error(), "body read ended early") {
+		t.Fatalf("stream error = %v, want the read cause beside the status", err)
+	}
+	if !openai.IsStall(err) {
+		t.Fatalf("stream error = %v, want the named stall error as the read cause", err)
+	}
+	if n := rec.count(); n != 1 {
+		t.Fatalf("the stalled 400 body cost %d requests, want 1", n)
+	}
+}
+
+func TestZeroTimeoutStreamsWithoutAnIdleBound(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 0}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("a stream with a zero timeout failed: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if got := textOf(reply); got != "Hello" {
+		t.Fatalf("stream text = %q, want the replayed answer", got)
+	}
+	if probe.Limit() <= 0 {
+		t.Errorf("the idle bound for a zero timeout is %s, want a positive fallback bound", probe.Limit())
+	}
+}
+
+func TestStreamEndsWhenDoneHasNoTrailingNewline(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", strings.TrimSuffix(ssePlain, "\n\n"))
+	c := testClient(srv)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("a stream whose last line has no newline failed: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishCompleted {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	if got := textOf(reply); got != "Hello" {
+		t.Fatalf("stream text = %q, want the replayed answer", got)
+	}
+}
+
+type byteAtATime struct {
+	body io.ReadCloser
+}
+
+func (b *byteAtATime) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return b.body.Read(p)
+}
+
+func (b *byteAtATime) Close() error {
+	return b.body.Close()
+}
+
+type chunkTransport struct {
+	next http.RoundTripper
+}
+
+func (s *chunkTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := s.next.RoundTrip(r)
+	if err != nil {
+		return resp, err
+	}
+	resp.Body = &byteAtATime{body: resp.Body}
+	return resp, nil
+}
+
+func TestStreamTouchesTheTimerOnPartialReads(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	httpClient := srv.Client()
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &chunkTransport{next: transport}
+	c := &openai.Client{
+		BaseURL: srv.URL,
+		Model:   "gpt-6-astra",
+		HTTP:    httpClient,
+		Policy:  resilience.Policy{Timeout: 2 * time.Second},
+	}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if got := textOf(reply); got != "Hello" {
+		t.Fatalf("stream text = %q, want the replayed answer", got)
+	}
+	if probe.Fired {
+		t.Errorf("the idle timer fired although every byte arrived")
+	}
+	if probe.Resets < len(ssePlain) {
+		t.Errorf("the idle timer reset %d times for %d body bytes, want at least one reset per byte read", probe.Resets, len(ssePlain))
+	}
+}
+
+func TestIdleProbeAffectsOnlyItsOwnClient(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	first := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(first)
+	t.Cleanup(restore)
+
+	if _, err := ai.Collect(first.Stream(context.Background(), askHello())); err != nil {
+		t.Fatalf("collect on the probed client: %v", err)
+		return
+	}
+	resets := probe.Resets
+	second := testClient(srv)
+
+	if _, err := ai.Collect(second.Stream(context.Background(), askHello())); err != nil {
+		t.Fatalf("collect on the unprobed client: %v", err)
+		return
+	}
+	if probe.Resets != resets {
+		t.Fatalf("the probe counted %d resets after another client streamed, want %d", probe.Resets, resets)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls *atomic.Int64
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestEmbedBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	transport := &cutTransport{calls: &calls, total: (1 << 20) + (128 << 10) + 1, cut: io.ErrUnexpectedEOF}
+	c := &openai.Client{BaseURL: "http://openai.invalid", Model: "text-embedding-3-small", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
+	_, err := c.Embed(context.Background(), []string{"one"})
+	if err == nil || !errors.Is(err, openai.ErrProviderTooLarge) {
+		t.Fatalf("err = %v, want the size limit of 1179648 bytes", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
 	}
 }

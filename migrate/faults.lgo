@@ -1,0 +1,21 @@
+package migrate
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrMissingDown = fault.New("migrate.missing_down", fault.Internal, "A migration is missing its down file.")
+
+var ErrOrderMismatch = fault.New("migrate.order_mismatch", fault.Internal, "The applied migrations do not match the given steps.")
+
+var ErrNotReversible = fault.New("migrate.not_reversible", fault.Internal, "A migration does not restore the schema.")
+
+var ErrScratchNotEmpty = fault.New("migrate.scratch_not_empty", fault.Internal, "The scratch database is not empty.")
+
+var ErrPartialDDL = fault.New("migrate.partial_ddl", fault.Internal, "A migration failed and may have left its schema changes.")
+
+var ErrUnavailable = fault.New("migrate.unavailable", fault.Unavailable, "The migration store is unavailable.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrMissingDown, ErrOrderMismatch, ErrNotReversible, ErrScratchNotEmpty, ErrPartialDDL, ErrUnavailable}
+}
