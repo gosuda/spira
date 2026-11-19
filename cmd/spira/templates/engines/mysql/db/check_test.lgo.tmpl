@@ -1,0 +1,29 @@
+package appdb_test
+
+import (
+	"testing"
+
+	"github.com/gosuda/spira/migrate"
+
+	appdb "{{MODULE}}/db"
+)
+
+func TestMigrationsLoad(t *testing.T) {
+	steps, err := migrate.Load(appdb.FS())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+		return
+	}
+	if len(steps) != 2 {
+		t.Fatalf("steps = %d, want 2", len(steps))
+		return
+	}
+	if steps[0].Name != "0001_create_users" {
+		t.Fatalf("first step = %q, want 0001_create_users", steps[0].Name)
+		return
+	}
+	if steps[1].Name != "0002_create_sessions" {
+		t.Fatalf("second step = %q, want 0002_create_sessions", steps[1].Name)
+		return
+	}
+}

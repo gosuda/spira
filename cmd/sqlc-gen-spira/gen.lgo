@@ -170,21 +170,29 @@ func modelExtImports(m Model) []string {
 	return ext
 }
 
-func queryStdImports(queries []QueryDef) []string {
-	for i := range queries {
-		qd := &queries[i]
-		if strings.Contains(qd.RowGoType, "time.Time") {
-			return []string{"context", "fmt", "time"}
-		}
+func queryNeedsTime(qd *QueryDef) bool {
+	if strings.Contains(qd.RowGoType, "time.Time") {
+		return true
+	}
+	if qd.RowGoType == goName(qd.Name)+"Row" {
 		for j := range qd.Fields {
 			if strings.Contains(qd.Fields[j].GoType, "time.Time") {
-				return []string{"context", "fmt", "time"}
+				return true
 			}
 		}
-		for j := range qd.Params {
-			if strings.Contains(qd.Params[j].GoType, "time.Time") {
-				return []string{"context", "fmt", "time"}
-			}
+	}
+	for j := range qd.Params {
+		if strings.Contains(qd.Params[j].GoType, "time.Time") {
+			return true
+		}
+	}
+	return false
+}
+
+func queryStdImports(queries []QueryDef) []string {
+	for i := range queries {
+		if queryNeedsTime(&queries[i]) {
+			return []string{"context", "fmt", "time"}
 		}
 	}
 	return []string{"context", "fmt"}
@@ -405,7 +413,7 @@ func callPrelude(qd *QueryDef) []string {
 	for i := range qd.Params {
 		p := &qd.Params[i]
 		if spreadParam(qd, p) {
-			pre = append(pre, "\targs = append(args, "+argRef(qd, p)+"...)\n")
+			pre = append(pre, "\tfor _, v := range "+argRef(qd, p)+" {\n\t\targs = append(args, v)\n\t}\n")
 		} else {
 			pre = append(pre, "\targs = append(args, "+argRef(qd, p)+")\n")
 		}

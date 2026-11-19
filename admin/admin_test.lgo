@@ -766,8 +766,8 @@ func TestAdminPollConcurrent(t *testing.T) {
 	}))
 	defer black.Close()
 	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, black.URL), hostOf(t, ok.URL)}}
-	ts := servePolled(t, srv)
-	defer stopServer(t, srv)
+	ts := httptest.NewServer(newAdminRouter(srv, tokenGuard()))
+	t.Cleanup(ts.Close)
 	if code := postInstance(t, ts, "slow-a", black.URL); code != http.StatusCreated {
 		t.Fatalf("slow-a POST status = %d, want 201", code)
 		return
@@ -780,6 +780,11 @@ func TestAdminPollConcurrent(t *testing.T) {
 		t.Fatalf("fast POST status = %d, want 201", code)
 		return
 	}
+	if err := srv.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+		return
+	}
+	defer stopServer(t, srv)
 	waitForRow(t, ts, []string{"fast", "up"}, 2*time.Second)
 }
 

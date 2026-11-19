@@ -1,0 +1,71 @@
+package account
+
+import (
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/validate"
+	"github.com/gosuda/spira/web"
+
+	"{{MODULE}}/db/store"
+)
+type Account struct {
+	DB       *db.Pool
+	Sessions *auth.Sessions
+}
+
+func (f *Account) Mount(r *web.Router) {
+	r.Handle("GET", "/account/login", func(ctx *web.Context) (web.Reply, error) {
+		return web.Page{Title: "Log in", Body: loginPage()}, nil
+	})
+	web.Route(r, "POST", "/account/login", func(ctx *web.Context, in LoginForm) (web.Reply, error) {
+		return f.login(ctx, in)
+	})
+	r.Handle("POST", "/account/logout", func(ctx *web.Context) (web.Reply, error) {
+		return f.logout(ctx)
+	})
+	r.Group("", func(g *web.Router) {
+		g.Use(auth.Require(auth.Authenticated()))
+		g.Handle("GET", "/account", func(ctx *web.Context) (web.Reply, error) {
+			return web.Page{Title: "Account", Body: accountPage(ctx)}, nil
+		})
+	})
+}
+
+type LoginForm struct {
+	Username string `form:"username"`
+	Password string `form:"password"`
+}
+
+func (f LoginForm) Check() validate.Errors {
+	var errs validate.Errors
+	errs.Require(f.Username != "", "username", "required", "Enter your name.")
+	errs.Require(f.Password != "", "password", "required", "Enter your password.")
+	return errs
+}
+
+func (f *Account) login(ctx *web.Context, in LoginForm) (web.Reply, error) {
+	found := store.GetUserByName(ctx.Ctx(), f.DB, in.Username)?
+	if found == nil {
+		auth.VerifyAgainstDummy(in.Password)
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	user := found ?? store.User{}
+	if ok := auth.VerifyPassword(user.PasswordHash, in.Password)?; !ok {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	cookie := f.Sessions.Login(ctx, auth.Principal{ID: principalID(user.ID)})?
+	if cookie == nil {
+		return nil, ErrAccountFailed.Err()
+	}
+	ctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+	return web.Redirect{To: "/account"}, nil
+}
+
+func (f *Account) logout(ctx *web.Context) (web.Reply, error) {
+	cookie := f.Sessions.Logout(ctx)?
+	if cookie == nil {
+		return nil, ErrAccountFailed.Err()
+	}
+	ctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+	return web.Redirect{To: "/"}, nil
+}

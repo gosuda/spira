@@ -64,7 +64,7 @@ func SearchTools(all const []Tool) (Tool, Layer) {
 func searchCall(all const []Tool, arguments string) (string, error) {
 	var in searchInput
 	if err := json.Unmarshal([]byte(arguments), &in); err != nil {
-		return "", fmt.Errorf("ai: search tools: arguments: %w", err)
+		return "", ErrInvalidToolArguments.Wrap(fmt.Errorf("ai: search tools: arguments: %w", err))
 	}
 	limit := searchDefaultResults
 	if in.MaxResults >= 1 {
@@ -76,7 +76,7 @@ func searchCall(all const []Tool, arguments string) (string, error) {
 	}
 	out, err := json.Marshal(names)
 	if err != nil {
-		return "", fmt.Errorf("ai: search tools: result: %w", err)
+		return "", ErrInvalidToolArguments.Wrap(fmt.Errorf("ai: search tools: result: %w", err))
 	}
 	return string(out), nil
 }
@@ -89,7 +89,7 @@ type scoredTool struct {
 func findTools(all const []Tool, query string, limit int) ([]string, error) {
 	pattern, err := regexp.Compile(searchPattern(query))
 	if err != nil {
-		return nil, fmt.Errorf("ai: search tools: pattern: %w", err)
+		return nil, ErrInvalidToolArguments.Wrap(fmt.Errorf("ai: search tools: pattern: %w", err))
 	}
 	var found []scoredTool
 	for _, tool := range all {

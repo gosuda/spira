@@ -949,12 +949,42 @@ func TestSliceQuery(t *testing.T) {
 		"type FindDocsRow struct",
 		"func FindDocs(ctx context.Context, q db.Querier, Kind string, Ids []int64) ([]FindDocsRow, error)",
 		`db.In(FindDocsQuery, "ids", len(Ids))`,
-		"args = append(args, Ids...)",
+		"for _, v := range Ids {",
+		"args = append(args, v)",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("query file holds no %q:\n%s", want, src)
 			return
 		}
+	}
+}
+
+func TestQueryFileOmitsTimeImportForEntityRows(t *testing.T) {
+	entity := []QueryDef{{
+		Name: "ListProducts", Cmd: ":many",
+		RowGoType: "Product",
+		Fields: []Field{{Name: "created_at", GoName: "CreatedAt", GoType: "time.Time"}},
+		Params: []ParamDef{{GoName: "ID", GoType: "ProductID"}},
+	}}
+	for _, imp := range queryStdImports(entity) {
+		if imp == "time" {
+			t.Fatalf("entity row imports = %q, want no time import", queryStdImports(entity))
+			return
+		}
+	}
+	declared := []QueryDef{{
+		Name: "GetSession", Cmd: ":one",
+		RowGoType: goName("GetSession") + "Row",
+		Fields: []Field{{Name: "expires_at", GoName: "ExpiresAt", GoType: "time.Time"}},
+	}}
+	found := false
+	for _, imp := range queryStdImports(declared) {
+		if imp == "time" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("declared row imports = %q, want the time import", queryStdImports(declared))
 	}
 }
 

@@ -1,0 +1,29 @@
+package ai
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrConfirmationRequired = fault.New("ai.confirmation_required", fault.Unprocessable, "Tool calls wait for a decision.")
+
+var ErrToolLimitExceeded = fault.New("ai.tool_limit_exceeded", fault.Unprocessable, "The tool call limit was exceeded.")
+
+var ErrInvalidDecision = fault.New("ai.invalid_decision", fault.Unprocessable, "The tool call decision is invalid.")
+
+var ErrUnknownTool = fault.New("ai.unknown_tool", fault.Invalid, "The tool is unknown.")
+
+var ErrModelFailed = fault.New("ai.model_failed", fault.Unavailable, "The model request failed.")
+
+var ErrInvalidToolArguments = fault.New("ai.invalid_tool_arguments", fault.Invalid, "The tool arguments are invalid.")
+
+var ErrEmptyAnswer = fault.New("ai.empty_answer", fault.Unprocessable, "The answer is empty.")
+
+var ErrAnswerTooLarge = fault.New("ai.answer_too_large", fault.TooLarge, "The answer is too large.")
+
+var ErrUnterminatedFence = fault.New("ai.unterminated_fence", fault.Unprocessable, "The answer format is invalid.")
+
+var ErrInvalidAnswer = fault.New("ai.invalid_answer", fault.Unprocessable, "The answer is not valid JSON.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrConfirmationRequired, ErrToolLimitExceeded, ErrInvalidDecision, ErrUnknownTool, ErrModelFailed, ErrInvalidToolArguments, ErrEmptyAnswer, ErrAnswerTooLarge, ErrUnterminatedFence, ErrInvalidAnswer}
+}
