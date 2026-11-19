@@ -17,6 +17,8 @@ test:
     logos test -race -count=1 ./...
 
 web:
+    cd frontend/test/fixtures/wasm/ticker && GOOS=js GOARCH=wasm logos build -o ../ticker.wasm ./
+    cp "{{logos_root}}/lib/wasm/wasm_exec.js" frontend/test/fixtures/wasm/wasm_exec.js
     pnpm --dir frontend install --frozen-lockfile
     pnpm --dir frontend run check
     pnpm --dir frontend run build

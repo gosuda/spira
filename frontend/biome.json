@@ -30,6 +30,13 @@
 		}
 	],
 	"files": {
-		"includes": ["**", "!**/node_modules", "!**/dist", "!**/*.svelte"]
+		"includes": [
+			"**",
+			"!**/node_modules",
+			"!**/dist",
+			"!**/*.svelte",
+			"!test/fixtures/wasm/wasm_exec.js",
+			"!test/fixtures/wasm/*.mjs"
+		]
 	}
 }
