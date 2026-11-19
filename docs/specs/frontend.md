@@ -10,7 +10,7 @@ File layout:
 - `vite.config.ts`, `vitest.config.ts`
 - `src/entry.ts`, `src/island.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
-- `test/island.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`
+- `test/island.test.ts`, `test/island-glob.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`
 - `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`
 - `test/fixtures/wasm/ticker/main.lgo`, `test/fixtures/wasm/ticker/go.mod`
 
@@ -33,6 +33,7 @@ export type IslandMount = (
 ) => void
 export class SpiraIslandElement extends HTMLElement
 export function defineIslands(table: IslandTable): void
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export function installSlotMover(root?: ParentNode): void
 // src/adapters/react.ts and src/adapters/svelte.ts
 export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): void
@@ -102,6 +103,7 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - `moves template content into the matching spira-slot` proves the slot mover.
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
 - `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
+- `test/island-glob.test.ts` proves glob paths derive repository-relative island keys.
 - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.
 - `test/wasm-runtime.test.ts` proves the real toolchain runtime mounts the built ticker module through `spira-island` and writes the props value into its host.
