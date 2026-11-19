@@ -12,6 +12,8 @@ type Event struct {
 
 func NewEvent(name string, body view.Node) (Event, error)
 func Events(ctx *web.Context, events <-chan Event) web.Reply
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -34,14 +36,23 @@ func Events(ctx *web.Context, events <-chan Event) web.Reply
 - A write failure while the client is present MUST be returned.
 - An event name with a line break MUST end the stream.
 - That failure MUST write no `event:` line.
+- A refused name MUST be the `live.invalid_event_name` fault.
+- A render failure MUST be the `live.render_failed` fault.
+- A write failure while the client is present MUST be the `live.write_failed` fault.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `live.invalid_event_name` | invalid | "The event name is invalid." |
+| `live.render_failed` | internal | "The live event could not be rendered." |
+| `live.write_failed` | internal | "The live event could not be written." |
 
 ## Errors
 
-- `live: event name %q contains a line break` when the name holds a line feed or a carriage return.
-- `live: heartbeat: <cause>` when the heartbeat write fails while the client is present.
-- `live: write heartbeat: <cause>` is the cause of that heartbeat error.
-- `live: render event %q: <cause>` when `view.Render` fails for the body.
-- `live: write event %q: <cause>` when the event write fails while the client is present.
+- `live.invalid_event_name` when the name holds a line feed or a carriage return. The cause holds no part of the name.
+- `live.render_failed` when `view.Render` fails for the body. The cause holds the render error.
+- `live.write_failed` when the heartbeat write or the event write fails while the client is present.
 - A write failure after the request context has ended is not returned.
 
 ## Proof
@@ -54,6 +65,12 @@ func Events(ctx *web.Context, events <-chan Event) web.Reply
 - `TestSlowStreamSubscriberLosesEventsFastKeepsAll` proves that a slow subscriber drops events and a fast subscriber keeps them.
 - `TestRenderErrorEndsStreamLoggedOnce` proves that a render failure ends the stream and is logged once.
 - `TestWriteFailureIsLoggedOnlyWhileTheClientIsPresent` proves the two write-failure rules.
+- `TestInvalidEventNameThroughNewEvent` proves the fault match, the constant message, and that a hostile name reaches no public view.
+- `TestInvalidEventNameEndsStream` proves that a queued event with a line break name ends the stream.
+- `TestRenderFailedHidesSecrets` proves that a render cause with secrets reaches no public view.
+- `TestRenderFailedEndsStream` proves that an unrenderable event ends the stream.
+- `TestStreamOutputEscapesHostileBody` proves that a hostile body is escaped in the written data fields.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 - `TestWireCorpus` in `corpus_test.lgo` checks the event lines against `wire/corpus.jsonl`.
 
 ## Not in scope

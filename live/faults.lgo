@@ -1,0 +1,15 @@
+package live
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrInvalidEventName = fault.New("live.invalid_event_name", fault.Invalid, "The event name is invalid.")
+
+var ErrRenderFailed = fault.New("live.render_failed", fault.Internal, "The live event could not be rendered.")
+
+var ErrWriteFailed = fault.New("live.write_failed", fault.Internal, "The live event could not be written.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrInvalidEventName, ErrRenderFailed, ErrWriteFailed}
+}

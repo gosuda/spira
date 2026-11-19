@@ -3,6 +3,7 @@ package live_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -216,15 +217,19 @@ func (c *streamDrive) emit(ctx context.Context, ev live.Event) error {
 }
 
 func rejectBadNames() error {
-	if _, err := live.NewEvent("bad\nname", view.T("x")); err == nil {
-		return fmt.Errorf("newline name accepted, want a line break rejection")
-	} else if !strings.Contains(err.Error(), "line break") {
-		return fmt.Errorf("newline name error = %w, want a line break rejection", err)
+	if err := checkBadName("bad\nname"); err != nil {
+		return err
 	}
-	if _, err := live.NewEvent("bad\rname", view.T("x")); err == nil {
-		return fmt.Errorf("carriage return name accepted, want a line break rejection")
-	} else if !strings.Contains(err.Error(), "line break") {
-		return fmt.Errorf("carriage return name error = %w, want a line break rejection", err)
+	return checkBadName("bad\rname")
+}
+
+func checkBadName(name string) error {
+	_, err := live.NewEvent(name, view.T("x"))
+	if err == nil {
+		return fmt.Errorf("newline name accepted, want a line break rejection")
+	}
+	if !errors.Is(err, live.ErrInvalidEventName) {
+		return fmt.Errorf("newline name error = %w, want invalid_event_name", err)
 	}
 	return nil
 }

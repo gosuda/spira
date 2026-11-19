@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -20,7 +21,7 @@ type Event struct {
 
 func NewEvent(name string, body view.Node) (Event, error) {
 	if badName(name) {
-		return Event{}, fmt.Errorf("live: event name %q contains a line break", name)
+		return Event{}, ErrInvalidEventName.Wrap(errors.New("live: event name holds a line break"))
 	}
 	return Event{Name: name, Body: body}, nil
 }
@@ -87,7 +88,7 @@ func (s stream) relay(ctx context.Context, open bool, ev Event) (bool, error) {
 
 func beat(ctx context.Context, w io.Writer) error {
 	if err := writeHeartbeat(w); err != nil {
-		return endIfDone(ctx, fmt.Errorf("live: heartbeat: %w", err))
+		return endIfDone(ctx, ErrWriteFailed.Wrap(fmt.Errorf("live: heartbeat: %w", err)))
 	}
 	return nil
 }
@@ -101,7 +102,7 @@ func writeHeartbeat(w io.Writer) error {
 
 func (s stream) writeMessage(ctx context.Context, ev Event) error {
 	if badName(ev.Name) {
-		return fmt.Errorf("live: event name %q contains a line break", ev.Name)
+		return ErrInvalidEventName.Wrap(errors.New("live: event name holds a line break"))
 	}
 	var body strings.Builder
 	if err := s.render(ctx, &body, ev); err != nil {
@@ -114,7 +115,7 @@ func (s stream) writeMessage(ctx context.Context, ev Event) error {
 	}
 	msg.WriteString("\n")
 	if _, err := io.WriteString(s.w, msg.String()); err != nil {
-		return fmt.Errorf("live: write event %q: %w", ev.Name, err)
+		return ErrWriteFailed.Wrap(fmt.Errorf("live: write event: %w", err))
 	}
 	return nil
 }
@@ -131,7 +132,7 @@ func (s stream) render(ctx context.Context, body *strings.Builder, ev Event) err
 func renderBody(ctx context.Context, body *strings.Builder, ev Event, rendered chan<- struct{}) error {
 	defer close(rendered)
 	if err := view.Render(ctx, body, ev.Body); err != nil {
-		return fmt.Errorf("live: render event %q: %w", ev.Name, err)
+		return ErrRenderFailed.Wrap(fmt.Errorf("live: render event: %w", err))
 	}
 	return nil
 }
