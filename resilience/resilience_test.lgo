@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
 	"github.com/gosuda/spira/resilience"
 )
 
@@ -74,8 +76,8 @@ func (r *runner) run(t *testing.T, s step) {
 		}
 		return
 	}
-	if !errors.Is(err, resilience.ErrOpen) || took != 0 {
-		t.Fatalf("%s: err=%v calls=%d, want ErrOpen with no call", s.want, err, took)
+	if !errors.Is(err, resilience.ErrCircuitOpen) || took != 0 {
+		t.Fatalf("%s: err=%v calls=%d, want ErrCircuitOpen with no call", s.want, err, took)
 	}
 }
 
@@ -139,7 +141,7 @@ func TestHalfOpenAdmitsExactlyOneProbe(t *testing.T) {
 		t.Fatalf("probe error = %v, want nil", probeErr)
 	}
 	if rejected != 16 {
-		t.Fatalf("rejected = %d, want 16 concurrent ErrOpen during the probe", rejected)
+		t.Fatalf("rejected = %d, want 16 concurrent ErrCircuitOpen during the probe", rejected)
 	}
 	if _, err := resilience.Do(t.Context(), pol, succeeding); err != nil {
 		t.Fatalf("after a good probe: %v, want the breaker closed", err)
@@ -172,7 +174,7 @@ func probeWhileOthersCall(ctx context.Context, pol resilience.Policy, callers in
 				go {
 					<-gate
 					_, err := resilience.Do(ctx, pol, failing)
-					if errors.Is(err, resilience.ErrOpen) {
+					if errors.Is(err, resilience.ErrCircuitOpen) {
 						rejected.Add(1)
 					}
 					if rejected.Load() == int64(callers) && drainedOnce.CompareAndSwap(false, true) {
@@ -205,8 +207,8 @@ func TestBreakerSharedByPointerAcrossPolicies(t *testing.T) {
 		calls.Add(1)
 		return 7, nil
 	}
-	if _, err := resilience.Do(t.Context(), second, call); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("second policy err = %v, want ErrOpen from the shared breaker", err)
+	if _, err := resilience.Do(t.Context(), second, call); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("second policy err = %v, want ErrCircuitOpen from the shared breaker", err)
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("calls = %d, want 0 while open", calls.Load())
@@ -259,7 +261,7 @@ func TestDoReturnsTheFirstSuccess(t *testing.T) {
 	t.Fatalf("err = %v, want nil", err)
 }
 
-func TestDoStopsRetryingAfterErrOpen(t *testing.T) {
+func TestDoStopsRetryingAfterErrCircuitOpen(t *testing.T) {
 	var calls atomic.Int64
 	call := func(ctx context.Context) (int, error) {
 		calls.Add(1)
@@ -271,8 +273,8 @@ func TestDoStopsRetryingAfterErrOpen(t *testing.T) {
 		Breaker: &resilience.Breaker{Window: 1, FailureRate: 0.5, OpenFor: time.Hour},
 	}
 	_, err := resilience.Do(t.Context(), pol, call)
-	if !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err = %v, want ErrOpen", err)
+	if !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen", err)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("calls = %d, want 1: one failing attempt trips the breaker and no retry runs", calls.Load())
@@ -281,11 +283,11 @@ func TestDoStopsRetryingAfterErrOpen(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	_, err = resilience.Do(ctx, pol, call)
-	if !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("refused call err = %v, want ErrOpen", err)
+	if !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("refused call err = %v, want ErrCircuitOpen", err)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("refused call err = %v: a backoff started after ErrOpen", err)
+		t.Fatalf("refused call err = %v: a backoff started after ErrCircuitOpen", err)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("calls = %d, want 1: a refused call must not run", calls.Load())
@@ -340,8 +342,8 @@ func TestCallerCancellationIsNotCountedAsFailure(t *testing.T) {
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2: cancellation must not trip the breaker", calls.Load())
 	}
-	if _, err := resilience.Do(t.Context(), pol, call); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("third call err = %v, want ErrOpen after one real failure", err)
+	if _, err := resilience.Do(t.Context(), pol, call); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("third call err = %v, want ErrCircuitOpen after one real failure", err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2", calls.Load())
@@ -386,8 +388,8 @@ func TestCancelledProbeReleasesTheSlot(t *testing.T) {
 			t.Fatalf("post-close failure err = %v, want boom", err)
 		}
 	}
-	if _, err := resilience.Do(ctx, pol, succeeding); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err = %v, want ErrOpen: the window refilled after the close", err)
+	if _, err := resilience.Do(ctx, pol, succeeding); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen: the window refilled after the close", err)
 	}
 }
 
@@ -442,8 +444,8 @@ func TestIgnoredErrorIsNoResultInTheWindow(t *testing.T) {
 	if _, err := resilience.Do(t.Context(), pol, failing); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want boom: two failures and an ignored error must not fill a window of three", err)
 	}
-	if _, err := resilience.Do(t.Context(), pol, succeeding); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err = %v, want ErrOpen after the third failure", err)
+	if _, err := resilience.Do(t.Context(), pol, succeeding); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen after the third failure", err)
 	}
 }
 
@@ -463,8 +465,8 @@ func TestIgnoredProbeLeavesTheBreakerHalfOpen(t *testing.T) {
 	if _, err := resilience.Do(t.Context(), pol, failing); !errors.Is(err, boom) {
 		t.Fatalf("next call err = %v, want boom: the ignored probe must release its slot", err)
 	}
-	if _, err := resilience.Do(t.Context(), pol, succeeding); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err = %v, want ErrOpen: the failed probe opens the breaker, so the ignored probe did not close it", err)
+	if _, err := resilience.Do(t.Context(), pol, succeeding); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen: the failed probe opens the breaker, so the ignored probe did not close it", err)
 	}
 }
 
@@ -480,8 +482,8 @@ func TestAttemptTimeoutCountsAsFailure(t *testing.T) {
 	if _, err := resilience.Do(t.Context(), pol, call); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timed attempt err = %v, want context.DeadlineExceeded", err)
 	}
-	if _, err := resilience.Do(t.Context(), pol, call); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("second call err = %v, want ErrOpen: an attempt timeout must count", err)
+	if _, err := resilience.Do(t.Context(), pol, call); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("second call err = %v, want ErrCircuitOpen: an attempt timeout must count", err)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("calls = %d, want 1", calls.Load())
@@ -526,8 +528,8 @@ func TestStaleFailureCannotStealTheProbe(t *testing.T) {
 	if !errors.Is(got.a, boom) {
 		t.Fatalf("stale call err = %v, want boom", got.a)
 	}
-	if !errors.Is(got.third, resilience.ErrOpen) {
-		t.Fatalf("third call err = %v, want ErrOpen: B must still be the probe", got.third)
+	if !errors.Is(got.third, resilience.ErrCircuitOpen) {
+		t.Fatalf("third call err = %v, want ErrCircuitOpen: B must still be the probe", got.third)
 	}
 	if got.b != nil {
 		t.Fatalf("probe err = %v, want nil", got.b)
@@ -549,14 +551,14 @@ func TestStaleSuccessCannotCloseTheBreaker(t *testing.T) {
 	if got.a != nil {
 		t.Fatalf("stale call err = %v, want nil", got.a)
 	}
-	if !errors.Is(got.third, resilience.ErrOpen) {
-		t.Fatalf("third call err = %v, want ErrOpen: the stale success must not close", got.third)
+	if !errors.Is(got.third, resilience.ErrCircuitOpen) {
+		t.Fatalf("third call err = %v, want ErrCircuitOpen: the stale success must not close", got.third)
 	}
 	if !errors.Is(got.b, boom) {
 		t.Fatalf("probe err = %v, want boom", got.b)
 	}
-	if _, err := resilience.Do(scene.ctx, pol, scene.succeed); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("fourth call err = %v, want ErrOpen: the failed probe reopened the breaker", err)
+	if _, err := resilience.Do(scene.ctx, pol, scene.succeed); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("fourth call err = %v, want ErrCircuitOpen: the failed probe reopened the breaker", err)
 	}
 }
 
@@ -717,11 +719,70 @@ func TestPanickingProbeDoesNotHoldTheSlot(t *testing.T) {
 	if got != "resilience test: probe exploded" {
 		t.Fatalf("panic value = %v, want the probe's panic", got)
 	}
-	if _, err := resilience.Do(ctx, pol, succeeding); !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err = %v, want ErrOpen: a probe that panics is a failed probe", err)
+	if _, err := resilience.Do(ctx, pol, succeeding); !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen: a probe that panics is a failed probe", err)
 	}
 	clk.Advance(time.Hour)
 	if _, err := resilience.Do(ctx, pol, succeeding); err != nil {
 		t.Fatalf("err = %v, want a new probe admitted after OpenFor", err)
 	}
+}
+
+func TestCircuitOpenIsFault(t *testing.T) {
+	pol := resilience.Policy{Timeout: time.Second, Breaker: &resilience.Breaker{Window: 1, FailureRate: 0.5, OpenFor: time.Hour}}
+	if _, err := resilience.Do(t.Context(), pol, failing); !errors.Is(err, boom) {
+		t.Fatalf("warm-up err = %v, want boom", err)
+		return
+	}
+	_, err := resilience.Do(t.Context(), pol, succeeding)
+	if !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen", err)
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "resilience.circuit_open" {
+		t.Fatalf("code = %q, want resilience.circuit_open", got.Code)
+	}
+	if got.Message != "The upstream is unavailable." {
+		t.Fatalf("message = %q, want the constant", got.Message)
+	}
+}
+
+func TestTimeoutIsFault(t *testing.T) {
+	pol := resilience.Policy{Timeout: 5 * time.Millisecond}
+	call := func(ctx context.Context) (int, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	_, err := resilience.Do(t.Context(), pol, call)
+	if !errors.Is(err, resilience.ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout", err)
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "resilience.timeout" {
+		t.Fatalf("code = %q, want resilience.timeout", got.Code)
+	}
+	if got.Message != "The upstream timed out." {
+		t.Fatalf("message = %q, want the constant", got.Message)
+	}
+}
+
+func TestFaultPublicHidesSecret(t *testing.T) {
+	secret := "password=hunter2"
+	hostile := "<script>alert(1)</script>"
+	inject := secret + " " + hostile + " /etc/passwd '; DROP TABLE x; --"
+	call := func(context.Context) (int, error) {
+		return 0, errors.New(inject)
+	}
+	_, err := resilience.Do(t.Context(), resilience.Policy{Timeout: time.Second}, call)
+	got := fault.Public(err)
+	if got.Code != "internal" {
+		t.Fatalf("code = %q, want internal for an undeclared error", got.Code)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), secret, hostile, "/etc/passwd", "DROP TABLE")
+}
+
+func TestFaultsMatchCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/resilience.md", resilience.Faults())
 }

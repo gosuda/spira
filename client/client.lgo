@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -14,19 +15,17 @@ import (
 	"github.com/gosuda/spira/web"
 )
 
-const prefixBound = 256
-
 type StatusError struct {
-	Status  int
-	Problem web.Problem?
-	Prefix  string
+	Status      int
+	ProblemType string
+	BodyLen     int
 }
 
 func (e *StatusError) Error() string {
-	if p := e.Problem; p != nil {
-		return $"client: {e.Status} {p.Title}: {p.Detail}"
+	if e.ProblemType != "" {
+		return $"client: upstream status {e.Status} type {e.ProblemType}"
 	}
-	return $"client: status {e.Status}: {e.Prefix}"
+	return $"client: upstream status {e.Status}"
 }
 
 type Request[In any] struct {
@@ -52,21 +51,21 @@ func Get[Out any](ctx context.Context, c *Client, path string) (Out, error) {
 }
 
 func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out, error) {
-	p, err := prepare(req)
-	if err != nil {
+	p, perr := prepare(req)
+	if perr != nil {
 		var zero Out
-		return zero, err
+		return zero, perr
 	}
 	pol := c.Policy
 	if !retriable(p.method) {
 		pol.Retry = nil
 	}
-	out, err := resilience.Do(ctx, pol, func(actx context.Context) (Out, error) {
+	out, derr := resilience.Do(ctx, pol, func(actx context.Context) (Out, error) {
 		return call[Out](actx, c, p)
 	})
-	if err != nil {
+	if derr != nil {
 		var zero Out
-		return zero, fmt.Errorf("client: %s %s: %w", p.method, p.path, err)
+		return zero, fmt.Errorf("client: %s %s: %w", p.method, p.path, derr)
 	}
 	return out, nil
 }
@@ -90,9 +89,9 @@ type prepared struct {
 func prepare[In any](req Request[In]) (prepared, error) {
 	p := prepared{method: strings.ToUpper(req.Method), path: req.Path, header: req.Header}
 	if b := req.Body; b != nil {
-		data, err := json.Marshal(b)
-		if err != nil {
-			return p, fmt.Errorf("client: encode body for %s %s: %w", p.method, p.path, err)
+		data, merr := json.Marshal(b)
+		if merr != nil {
+			return p, ErrRequestFailed.Wrap(fmt.Errorf("client: encode body for %s %s: %w", p.method, p.path, merr))
 		}
 		p.payload = data
 	}
@@ -113,20 +112,20 @@ func call[Out any](ctx context.Context, c *Client, p prepared) (Out, error) {
 	if p.payload != nil {
 		body = bytes.NewReader(p.payload)
 	}
-	hreq, err := http.NewRequestWithContext(ctx, p.method, c.Base+p.path, body)
-	if err != nil {
-		return none, err
+	hreq, nerr := http.NewRequestWithContext(ctx, p.method, c.Base+p.path, body)
+	if nerr != nil {
+		return none, ErrRequestFailed.Wrap(fmt.Errorf("client: new request %s %s: %w", p.method, p.path, nerr))
 	}
 	applyHeader(hreq, p.header, p.payload != nil)
-	resp, err := c.HTTP.Do(hreq)
-	if err != nil {
-		return none, err
+	resp, derr := c.HTTP.Do(hreq)
+	if derr != nil {
+		return none, ErrUpstreamFailed.Wrap(fmt.Errorf("client: %s %s: %w", p.method, p.path, derr))
 	}
 	defer resp.Body.Close()?
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		data, rerr := io.ReadAll(io.LimitReader(resp.Body, c.MaxBody))
 		if rerr != nil {
-			return none, fmt.Errorf("read response: %w", rerr)
+			return none, ErrUpstreamFailed.Wrap(fmt.Errorf("client: %s %s read error body: %w", p.method, p.path, rerr))
 		}
 		serr := statusError(resp.StatusCode, resp.Header.Get("Content-Type"), data)
 		if callerFault(resp.StatusCode) {
@@ -136,14 +135,17 @@ func call[Out any](ctx context.Context, c *Client, p prepared) (Out, error) {
 	}
 	data, rerr := readLimited(resp.Body, c.MaxBody)
 	if rerr != nil {
-		return none, fmt.Errorf("read response: %w", rerr)
+		if errors.Is(rerr, ErrResponseTooLarge) {
+			return none, fmt.Errorf("client: %s %s: %w", p.method, p.path, rerr)
+		}
+		return none, ErrUpstreamFailed.Wrap(fmt.Errorf("client: %s %s read response: %w", p.method, p.path, rerr))
 	}
 	var out Out
 	if bodyless(p.method, resp.StatusCode) {
 		return out, nil
 	}
 	if uerr := json.Unmarshal(data, &out); uerr != nil {
-		return none, fmt.Errorf("decode: %w", uerr)
+		return none, ErrUpstreamFailed.Wrap(fmt.Errorf("client: %s %s decode: %w", p.method, p.path, uerr))
 	}
 	return out, nil
 }
@@ -168,30 +170,33 @@ func applyHeader(hreq *http.Request, header http.Header, jsonBody bool) {
 }
 
 func readLimited(body io.Reader, limit int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(body, limit+1))
-	if err != nil {
-		return nil, err
+	data, rerr := io.ReadAll(io.LimitReader(body, limit+1))
+	if rerr != nil {
+		return nil, rerr
 	}
 	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("body exceeds %d bytes", limit)
+		return nil, ErrResponseTooLarge.Wrap(fmt.Errorf("body exceeds %d bytes", limit))
 	}
 	return data, nil
 }
 
 func statusError(status int, contentType string, data []byte) error {
-	se := &StatusError{Status: status, Prefix: bodyPrefix(data)}
-	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil && mediaType == "application/problem+json" {
+	problemType := ""
+	if mediaType, _, merr := mime.ParseMediaType(contentType); merr == nil && mediaType == "application/problem+json" {
 		p := web.Problem{}
 		if uerr := json.Unmarshal(data, &p); uerr == nil {
-			se.Problem = p
+			problemType = p.Type
 		}
 	}
-	return se
-}
-
-func bodyPrefix(data []byte) string {
-	if len(data) > prefixBound {
-		data = data[:prefixBound]
+	se := &StatusError{Status: status, ProblemType: problemType, BodyLen: len(data)}
+	if status == http.StatusRequestTimeout {
+		return ErrUpstreamTimeout.Wrap(se)
 	}
-	return string(data)
+	if status == http.StatusTooManyRequests {
+		return ErrUpstreamRateLimited.Wrap(se)
+	}
+	if callerFault(status) {
+		return ErrUpstreamRejected.Wrap(se)
+	}
+	return ErrUpstreamFailed.Wrap(se)
 }

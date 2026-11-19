@@ -15,8 +15,9 @@ import (
 	"logos/sync"
 
 	"github.com/gosuda/spira/client"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
 	"github.com/gosuda/spira/resilience"
-	"github.com/gosuda/spira/web"
 )
 
 type probe struct {
@@ -281,6 +282,9 @@ func TestProblemAnswerBecomesStatusErrorWithProblem(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want the problem answer as an error")
 	}
+	if !errors.Is(err, client.ErrUpstreamFailed) {
+		t.Fatalf("err=%v, want client.ErrUpstreamFailed", err)
+	}
 	se := &client.StatusError{}
 	if !errors.As(err, &se) {
 		t.Fatalf("err=%v (%T), want *client.StatusError", err, err)
@@ -288,15 +292,14 @@ func TestProblemAnswerBecomesStatusErrorWithProblem(t *testing.T) {
 	if se.Status != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d, want 503", se.Status)
 	}
-	if p := se.Problem; p != nil {
-		if p.Title != "Stock mismatch" || p.Detail != "two left" || p.Status != 503 {
-			t.Fatalf("problem=%+v, want the server problem", p)
-		}
-		if p.Type != "https://example.com/probs/stock" {
-			t.Fatalf("problem type=%q", p.Type)
-		}
-	} else {
-		t.Fatal("StatusError carries no problem")
+	if se.ProblemType != "https://example.com/probs/stock" {
+		t.Fatalf("problem type=%q, want the server problem type", se.ProblemType)
+	}
+	if se.BodyLen != len(body) {
+		t.Fatalf("body len=%d, want %d", se.BodyLen, len(body))
+	}
+	if strings.Contains(err.Error(), "two left") {
+		t.Fatalf("error %q carries the downstream detail", err.Error())
 	}
 }
 
@@ -309,6 +312,9 @@ func TestPlainErrorStatusNamesStatusAndBoundsBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want the failing answer as an error")
 	}
+	if !errors.Is(err, client.ErrUpstreamFailed) {
+		t.Fatalf("err=%v, want client.ErrUpstreamFailed", err)
+	}
 	se := &client.StatusError{}
 	if !errors.As(err, &se) {
 		t.Fatalf("err=%v (%T), want *client.StatusError", err, err)
@@ -316,15 +322,15 @@ func TestPlainErrorStatusNamesStatusAndBoundsBody(t *testing.T) {
 	if se.Status != http.StatusBadGateway {
 		t.Fatalf("status=%d, want 502", se.Status)
 	}
-	if se.Problem != nil {
-		t.Fatal("a text/plain answer must not carry a problem")
+	if se.ProblemType != "" {
+		t.Fatalf("problem type=%q, want empty for text/plain", se.ProblemType)
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "502") {
 		t.Fatalf("error %q lacks the status", msg)
 	}
-	if !strings.Contains(msg, "upstream fell over") {
-		t.Fatalf("error %q lacks the body prefix", msg)
+	if strings.Contains(msg, "upstream fell over") {
+		t.Fatalf("error %q carries the downstream body", msg)
 	}
 	if strings.Contains(msg, tail) {
 		t.Fatal("error leaks the whole body")
@@ -379,8 +385,8 @@ func TestOpenBreakerStopsRequestsBeforeTheWire(t *testing.T) {
 		t.Fatalf("warm-up made %d calls, want 2\n%s", calls.Load(), grd.report())
 	}
 	_, err := client.Get[probe](t.Context(), c, "/x")
-	if !errors.Is(err, resilience.ErrOpen) {
-		t.Fatalf("err=%v, want resilience.ErrOpen", err)
+	if !errors.Is(err, resilience.ErrCircuitOpen) {
+		t.Fatalf("err=%v, want resilience.ErrCircuitOpen", err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("the open breaker let %d calls through in total\n%s", calls.Load(), grd.report())
@@ -595,10 +601,10 @@ func TestErrorTextStaysUsable(t *testing.T) {
 	if msg := se.Error(); !strings.Contains(msg, "503") {
 		t.Fatalf("Error()=%q, lacks the status", msg)
 	}
-	withProblem := &client.StatusError{Status: 503, Problem: web.Problem{Title: "Stock mismatch", Status: 503, Detail: "two left"}}
+	withProblem := &client.StatusError{Status: 503, ProblemType: "https://example.com/probs/stock", BodyLen: 41}
 	msg := withProblem.Error()
-	if !strings.Contains(msg, "Stock mismatch") || !strings.Contains(msg, "two left") {
-		t.Fatalf("Error()=%q, lacks the problem title and detail", msg)
+	if !strings.Contains(msg, "503") || !strings.Contains(msg, "https://example.com/probs/stock") {
+		t.Fatalf("Error()=%q, lacks the status and problem type", msg)
 	}
 }
 
@@ -635,8 +641,8 @@ func TestOversizedCallerFaultStaysCallerFault(t *testing.T) {
 			t.Fatalf("call %d status = %d, want 404", i, se.Status)
 			return
 		}
-		if len(se.Prefix) != 64 {
-			t.Fatalf("call %d prefix is %d bytes, want the %d bytes MaxBody allows", i, len(se.Prefix), 64)
+		if se.BodyLen != 64 {
+			t.Fatalf("call %d body len is %d bytes, want 64", i, se.BodyLen)
 			return
 		}
 	}
@@ -753,4 +759,134 @@ func TestMaxBodyLimitIsExact(t *testing.T) {
 	if !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "client: GET /over") {
 		t.Fatalf("err = %v, want the exceeds error naming method and path", err)
 	}
+}
+
+func TestUpstreamRejectedIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, http.StatusNotFound, "text/plain", "no such item"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/missing")
+	if err == nil {
+		t.Fatal("err=nil, want the 404 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamRejected) {
+		t.Fatalf("err=%v, want ErrUpstreamRejected", err)
+		return
+	}
+	se := &client.StatusError{}
+	if !errors.As(err, &se) {
+		t.Fatalf("err=%v (%T), want *StatusError", err, err)
+		return
+	}
+	if se.Status != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", se.Status)
+	}
+}
+
+func TestUpstreamFailedIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, http.StatusBadGateway, "text/plain", "boom"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/relay")
+	if err == nil {
+		t.Fatal("err=nil, want the 502 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamFailed) {
+		t.Fatalf("err=%v, want ErrUpstreamFailed", err)
+		return
+	}
+}
+
+func TestUpstreamTimeoutIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, http.StatusRequestTimeout, "text/plain", "slow"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/slow")
+	if err == nil {
+		t.Fatal("err=nil, want the 408 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamTimeout) {
+		t.Fatalf("err=%v, want ErrUpstreamTimeout", err)
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "client.upstream_timeout" {
+		t.Fatalf("code=%q, want client.upstream_timeout", got.Code)
+	}
+}
+
+func TestUpstreamRateLimitedIsFault(t *testing.T) {
+	srv := httptest.NewServer(serve(t, 429, "text/plain", "busy"))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/busy")
+	if err == nil {
+		t.Fatal("err=nil, want the 429 as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrUpstreamRateLimited) {
+		t.Fatalf("err=%v, want ErrUpstreamRateLimited", err)
+		return
+	}
+}
+
+func TestResponseTooLargeIsFault(t *testing.T) {
+	big := `{"ok":true,"pad":"` + strings.Repeat("b", 4096) + `"}`
+	srv := httptest.NewServer(serveJSON(t, http.StatusOK, big))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	c.MaxBody = 64
+	_, err := client.Get[probe](t.Context(), c, "/big")
+	if err == nil {
+		t.Fatal("err=nil, want the oversize body as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrResponseTooLarge) {
+		t.Fatalf("err=%v, want ErrResponseTooLarge", err)
+		return
+	}
+}
+
+func TestRequestFailedIsFault(t *testing.T) {
+	c := client.New("http://example.invalid", resilience.Policy{Timeout: time.Second})
+	_, err := client.Send[func(), probe](t.Context(), c, client.Request[func()]{Method: http.MethodPost, Path: "/x", Body: func() {}})
+	if err == nil {
+		t.Fatal("err=nil, want the encode failure as an error")
+		return
+	}
+	if !errors.Is(err, client.ErrRequestFailed) {
+		t.Fatalf("err=%v, want ErrRequestFailed", err)
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "internal" {
+		t.Fatalf("code=%q, want internal for an Internal fault", got.Code)
+	}
+}
+
+func TestFaultPublicHidesSecret(t *testing.T) {
+	secret := "api-key=hunter2-secret"
+	hostile := "<script>alert(1)</script>"
+	leak := secret + " " + hostile + " /etc/passwd '; DROP TABLE x; --"
+	srv := httptest.NewServer(serve(t, http.StatusInternalServerError, "text/plain", leak))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/secret")
+	if err == nil {
+		t.Fatal("err=nil, want the 500 as an error")
+		return
+	}
+	got := fault.Public(err)
+	if got.Code != "client.upstream_failed" {
+		t.Fatalf("code=%q, want client.upstream_failed", got.Code)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), secret, hostile, "/etc/passwd", "DROP TABLE")
+	faulttest.RefuseLeak(t, []byte(err.Error()), secret, hostile, "/etc/passwd", "DROP TABLE")
+}
+
+func TestFaultsMatchCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/client.md", client.Faults())
 }

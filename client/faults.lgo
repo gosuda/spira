@@ -1,0 +1,21 @@
+package client
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrUpstreamRejected = fault.New("client.upstream_rejected", fault.Unavailable, "The upstream rejected the request.")
+
+var ErrUpstreamFailed = fault.New("client.upstream_failed", fault.Unavailable, "The upstream request failed.")
+
+var ErrUpstreamTimeout = fault.New("client.upstream_timeout", fault.Timeout, "The upstream timed out.")
+
+var ErrUpstreamRateLimited = fault.New("client.upstream_rate_limited", fault.RateLimited, "The upstream is rate limited.")
+
+var ErrResponseTooLarge = fault.New("client.response_too_large", fault.TooLarge, "The upstream response is too large.")
+
+var ErrRequestFailed = fault.New("client.request_failed", fault.Internal, "The outbound request failed.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrUpstreamRejected, ErrUpstreamFailed, ErrUpstreamTimeout, ErrUpstreamRateLimited, ErrResponseTooLarge, ErrRequestFailed}
+}

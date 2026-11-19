@@ -6,9 +6,9 @@ Package `client` sends a JSON request and decodes a JSON answer. A status outsid
 
 ```lgo
 type StatusError struct {
-	Status  int
-	Problem web.Problem?
-	Prefix  string
+	Status      int
+	ProblemType string
+	BodyLen     int
 }
 
 func (e *StatusError) Error() string
@@ -30,6 +30,7 @@ type Client struct {
 func New(base string, policy resilience.Policy) *Client
 func Get[Out any](ctx context.Context, c *Client, path string) (Out, error)
 func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out, error)
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -57,14 +58,12 @@ func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out
 - `HEAD`, status 204 and status 205 MUST return the zero value of `Out`.
 - Those three successes MUST NOT decode the body as JSON.
 - Every other success MUST decode the body as JSON into `Out`.
-- A status outside 200 to 299 MUST produce a `*StatusError`.
+- A status outside 200 to 299 MUST produce a fault that wraps a `*StatusError`.
 - `StatusError.Status` MUST be that response status.
-- `Problem` MUST be set when the media type is `application/problem+json` and the body decodes as a [web](web.md) problem.
-- Any other error body MUST leave `Problem` nil.
-- An error-status body longer than `MaxBody` MUST be cut at `MaxBody`.
-- That cut MUST NOT by itself be an error.
-- `Prefix` MUST hold at most 256 bytes of the error body.
-
+- `ProblemType` MUST be the problem `type` when the media type is `application/problem+json` and the body decodes as a [web](web.md) problem.
+- Any other error body MUST leave `ProblemType` empty.
+- `BodyLen` MUST be the number of error body bytes read, at most `MaxBody`.
+- `StatusError.Error` MUST name only the status and the problem type and MUST NOT carry any body text.
 ### Retry and breaker
 
 - `Send` MUST apply `Policy.Retry` only for `GET`, `HEAD`, `PUT` and `DELETE`.
@@ -79,24 +78,51 @@ func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out
 - A decode failure MUST be an attempt error, so [resilience](resilience.md) may retry it.
 - An encode failure MUST be returned before any attempt.
 - An open breaker MUST stop the request before a network call.
-- That error MUST be one that `errors.Is` reports as `ErrOpen`.
+- An open breaker error MUST match `ErrCircuitOpen` with `errors.Is`.
+- An attempt timeout MUST match `ErrTimeout` with `errors.Is`.
+- Each MUST propagate without another client fault.
+- `Send` MUST add the method and path to the cause.
+- `Send` MUST NOT create a second fault over it.
+
+### Code table
+
+| code | kind | message |
+|---|---|---|
+| `client.upstream_rejected` | unavailable | The upstream rejected the request. |
+| `client.upstream_failed` | unavailable | The upstream request failed. |
+| `client.upstream_timeout` | timeout | The upstream timed out. |
+| `client.upstream_rate_limited` | rate_limited | The upstream is rate limited. |
+| `client.response_too_large` | too_large | The upstream response is too large. |
+| `client.request_failed` | internal | The outbound request failed. |
 
 ## Errors
 
-- `client: encode body for <METHOD> <PATH>: <cause>` when the JSON encode fails.
-- `client: <METHOD> <PATH>: <cause>` when the attempt fails or the answer is refused.
-- `(*StatusError).Error` with a problem is `client: <Status> <Title>: <Detail>`.
-- `(*StatusError).Error` without a problem is `client: status <Status>: <Prefix>`.
-- `read response: <cause>` when a body read fails. `Send` wraps this text in the method-and-path error.
-- `decode: <cause>` when JSON decode fails. `Send` wraps this text the same way.
-- `body exceeds <limit> bytes` when a success body is longer than `MaxBody`. `Send` wraps it as `read response: <that text>`.
+- A 408 answer is `ErrUpstreamTimeout`; match it with `errors.Is`.
+- A 429 answer is `ErrUpstreamRateLimited`; match it with `errors.Is`.
+- A 400 to 499 answer except 408 and 429 is `ErrUpstreamRejected` wrapping a `*StatusError`; match it with `errors.Is` and read the status with `errors.As`.
+- Any other status outside 200 to 299 is `ErrUpstreamFailed` wrapping a `*StatusError`.
+- A transport, error-body read, success-body read or decode failure is `ErrUpstreamFailed` wrapping the cause.
+- A success body longer than `MaxBody` is `ErrResponseTooLarge` wrapping the limit cause.
+- A JSON encode or request construction failure is `ErrRequestFailed` wrapping the cause.
+- No fault message, field or client-visible text MUST carry a downstream body.
+- No client-visible text MUST carry a key, token, cookie, name or path.
+- The method and path MUST ride only in the cause.
 
+### Owner rulings
+
+- An upstream 4xx answer except 408 and 429 MUST map to `ErrUpstreamRejected`.
+- That fault MUST keep kind Unavailable.
+- A 408 answer MUST map to `ErrUpstreamTimeout`.
+- A 429 answer MUST map to `ErrUpstreamRateLimited`.
+- Transport, read and decode failures MUST share `ErrUpstreamFailed`.
+- Encode and request-construction failures MUST share `ErrRequestFailed`.
+- `ErrRequestFailed` MUST keep kind Internal.
 ## Proof
 
 - `TestRetriesApplyOnlyToIdempotentMethods` proves the method list against a server that counts calls.
 - `TestSendEncodesJSONBodyAndCallerHeaders` proves the JSON body, the content type and a caller header.
-- `TestProblemAnswerBecomesStatusErrorWithProblem` proves the problem fields on a 503 answer.
-- `TestPlainErrorStatusNamesStatusAndBoundsBody` proves a text error, the status and the bounded prefix.
+- `TestProblemAnswerBecomesStatusErrorWithProblem` proves the problem type on a 503 answer without the detail.
+- `TestPlainErrorStatusNamesStatusAndBoundsBody` proves a text error carries the status and no body text.
 - `TestBodyReadUnderSizeLimit` and `TestMaxBodyLimitIsExact` prove the `MaxBody` bound, including an equal length.
 - `TestOpenBreakerStopsRequestsBeforeTheWire` proves that an open breaker sends no further request.
 - `TestClientErrorIsNotRetriedAndDoesNotOpenTheBreaker` proves that a 404 is not retried and does not open the breaker.
@@ -106,8 +132,16 @@ func Send[In any, Out any](ctx context.Context, c *Client, req Request[In]) (Out
 - `TestAttemptTimeoutEndsSlowAttempt` proves the per-attempt timeout.
 - `TestResponseBodyClosedOnEveryPath` proves that each response body is closed.
 - `TestInvalidJSONForResultTypeNamesPath` proves that a decode error names the path.
-- `TestErrorTextStaysUsable` proves both `Error` texts.
-- `TestOversizedCallerFaultStaysCallerFault` proves that a long 404 body stays a caller fault and bounds the prefix.
+- `TestErrorTextStaysUsable` proves both `Error` texts carry no body.
+- `TestOversizedCallerFaultStaysCallerFault` proves that a long 404 body stays a caller fault with a bounded length.
+- `TestUpstreamRejectedIsFault` proves that a 404 returns `ErrUpstreamRejected`.
+- `TestUpstreamFailedIsFault` proves that a 502 returns `ErrUpstreamFailed`.
+- `TestUpstreamTimeoutIsFault` proves that a 408 returns `ErrUpstreamTimeout`.
+- `TestUpstreamRateLimitedIsFault` proves that a 429 returns `ErrUpstreamRateLimited`.
+- `TestResponseTooLargeIsFault` proves that an oversize success body returns `ErrResponseTooLarge`.
+- `TestRequestFailedIsFault` proves that an encode failure returns `ErrRequestFailed`.
+- `TestFaultPublicHidesSecret` proves that no secret or hostile value reaches the client view.
+- `TestFaultsMatchCodeTable` proves that `Faults()` matches the code table with no duplicates.
 - `TestHeadSuccessSkipsDecode` proves that `HEAD` skips decode.
 - `TestNoContentAndResetContentSkipDecode` proves that status 204 and status 205 skip decode.
 - `TestGetEmptyBodyStillADecodeError` proves that an empty `GET` body is a decode error.
