@@ -154,7 +154,7 @@ The two repository commands are build-time tools, not runtime dependencies. From
 
 - **Behavior stays explicit.** A route, a stage, a cache and a guard are values in code. There is no annotation, scan, interceptor registry or proxy.
 - **Compile-time answers.** `app.Run`, `schema.Of`, `db.Query` and the generated SQL functions inspect types at compile time or before a row is scanned, without `reflect`.
-- **Bounded by construction.** `meter` folds a metric past 1000 series into `overflow`, `bus.Topic` drops for a slow subscriber instead of blocking, and `web.Server` has read and shutdown deadlines in its fields.
+- **Bounded by construction.** `meter` folds a metric past 1000 series into `overflow`, `bus.Topic` drops for a slow subscriber instead of blocking, and `web.Server` carries a header-read deadline (`ReadHeaderTimeout`) and a shutdown grace (`ShutdownGrace`).
 - **Errors keep a public boundary.** `fault` gives each failure a stable code and a client-safe message; the cause stays in logs.
 - **The exit is real.** If the experiment does not fit, `just eject` leaves ordinary Go that upstream Go builds.
 
