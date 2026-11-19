@@ -238,6 +238,42 @@ func TestH3ListenUDPFailsOnTakenPort(t *testing.T) {
 	}
 }
 
+func TestH3StartFailsWhenTCPPortTaken(t *testing.T) {
+	squat, serr := net.Listen("tcp", "127.0.0.1:0")
+	if serr != nil {
+		t.Fatalf("squat: %v", serr)
+		return
+	}
+	defer func() {
+		if cerr := squat.Close(); cerr != nil {
+			t.Errorf("close squat: %v", cerr)
+		}
+	}()
+	addr := squat.Addr().String()
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, _ := testCert(t)
+	s := &http3.Server{Addr: addr, Router: r, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	err := s.Start(context.Background())
+	if err == nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := s.Stop(cctx); serr != nil {
+			t.Errorf("stop leaked server: %v", serr)
+		}
+		t.Fatal("start on a taken TCP port succeeded")
+		return
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("start error = %v, want the TCP listen failure", err)
+		return
+	}
+	if got := s.BoundUDPAddrForTest(); got != "" {
+		t.Fatalf("UDP bound after failed start: %s", got)
+		return
+	}
+}
+
 func TestH3ServesHTTP3OverUDP(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/hello", h3Hello)

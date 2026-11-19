@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gosuda/spira/web"
@@ -110,16 +111,85 @@ func (s *Server) startH3(ctx context.Context) error {
 	if cfg == nil {
 		return ErrH3NeedsTLS.Err()
 	}
-	conn, port, berr := openUDP(s.Addr)
+	l, conn, berr := bindPair(s.Addr)
 	if berr != nil {
 		return berr
 	}
-	tcpAddr := conn.LocalAddr().String()
-	inner := &web.Server{Addr: tcpAddr, Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
-	if serr := inner.Start(ctx); serr != nil {
-		return errors.Join(serr, conn.Close())
+	if serr := s.Serve(ctx, l, conn); serr != nil {
+		return errors.Join(serr, l.Close(), conn.Close())
 	}
-	return s.store(s.serve(ctx, inner, tcpAddr, newH3(s.Router, cfg, conn, port)), ctx)
+	return nil
+}
+
+func (s *Server) Serve(ctx context.Context, l net.Listener, conn net.PacketConn) error {
+	if l == nil {
+		return errors.New("http3: serve needs a listener")
+	}
+	if conn == nil {
+		return errors.New("http3: serve needs a packet connection")
+	}
+	busy := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run != nil {
+			busy = true
+		}
+	})
+	if busy {
+		return errors.New("http3: server already started")
+	}
+	if s.Router == nil {
+		return errors.New("http3: server needs a router")
+	}
+	cfg := s.TLS
+	if cfg == nil {
+		return ErrH3NeedsTLS.Err()
+	}
+	uaddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ErrListenUDP.Wrap(errors.New("listen udp: address is not UDP"))
+	}
+	inner := &web.Server{Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
+	if serr := inner.Serve(ctx, l); serr != nil {
+		return serr
+	}
+	return s.store(s.serve(ctx, inner, l.Addr().String(), newH3(s.Router, cfg, conn, uaddr.Port)), ctx)
+}
+
+func bindPair(addr string) (net.Listener, net.PacketConn, error) {
+	_, portStr, serr := net.SplitHostPort(addr)
+	if serr != nil {
+		return nil, nil, ErrListenUDP.Wrap(serr)
+	}
+	port, perr := strconv.Atoi(portStr)
+	if perr != nil || port != 0 {
+		return bindExact(addr)
+	}
+	var last error
+	for attempt := 0; attempt < 8; attempt++ {
+		l, lerr := net.Listen("tcp", addr)
+		if lerr != nil {
+			return nil, nil, fmt.Errorf("http3: listen %s: %w", addr, lerr)
+		}
+		conn, _, uerr := openUDP(l.Addr().String())
+		if uerr == nil {
+			return l, conn, nil
+		}
+		last = errors.Join(uerr, l.Close())
+	}
+	return nil, nil, ErrListenUDP.Wrap(fmt.Errorf("listen udp %s after 8 tries: %w", addr, last))
+}
+
+func bindExact(addr string) (net.Listener, net.PacketConn, error) {
+	conn, _, berr := openUDP(addr)
+	if berr != nil {
+		return nil, nil, berr
+	}
+	tcpAddr := conn.LocalAddr().String()
+	l, lerr := net.Listen("tcp", tcpAddr)
+	if lerr != nil {
+		return nil, nil, errors.Join(fmt.Errorf("http3: listen %s: %w", tcpAddr, lerr), conn.Close())
+	}
+	return l, conn, nil
 }
 
 func (s *Server) store(run *serverRun, ctx context.Context) error {

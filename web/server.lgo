@@ -177,6 +177,27 @@ func checkTLSConfig(cfg *tls.Config?) error {
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	if err := s.checkStart(); err != nil {
+		return err
+	}
+	l, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return fmt.Errorf("web: listen %s: %w", s.Addr, err)
+	}
+	return s.serveStored(ctx, l)
+}
+
+func (s *Server) Serve(ctx context.Context, l net.Listener) error {
+	if l == nil {
+		return errors.New("web: serve needs a listener")
+	}
+	if err := s.checkStart(); err != nil {
+		return err
+	}
+	return s.serveStored(ctx, l)
+}
+
+func (s *Server) checkStart() error {
 	busy := false
 	s.state.WithLock(func(st *serverState) {
 		if st.run != nil {
@@ -189,13 +210,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.Router == nil {
 		return errors.New("web: server needs a router")
 	}
-	if err := checkTLSConfig(s.TLS); err != nil {
-		return err
-	}
-	l, err := net.Listen("tcp", s.Addr)
-	if err != nil {
-		return fmt.Errorf("web: listen %s: %w", s.Addr, err)
-	}
+	return checkTLSConfig(s.TLS)
+}
+
+func (s *Server) serveStored(ctx context.Context, l net.Listener) error {
 	run := s.serve(ctx, l)
 	stored := false
 	s.state.WithLock(func(st *serverState) {
