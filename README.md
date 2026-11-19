@@ -197,7 +197,7 @@ Each package has a specification under [docs/specs](docs/specs/README.md). These
 | Model calls | `ai`, `ai/openai`, `ai/anthropic`, `ai/ollama`, `ai/session`, `ai/rag`, `ai/mcp` | Messages, tools, `ai.Run`, `ai.Collect` stream merge, layers, structured output, OpenAI-compatible, Anthropic and Ollama providers, sessions, retrieval, an MCP client and server mount |
 | Tools | `cmd/spira`, `fault/faulttest` | `spira dev`; the spec-backed fault disclosure test kit |
 
-`orm`, `openapi` and `spira new` are specified but not in the tree yet. Generated code that uses keyed tables imports `orm.Table`, so leave `tables` entries empty until `orm` lands. The full map from Spring concepts to spira packages, including what spira does not build, is in [scope and lexicon](docs/specs/scope-and-lexicon.md).
+`orm`, `openapi` and `spira new` are specified but not in the tree yet. Generated code for a table with a `key` imports `orm.Table`, so leave keyed `tables` entries empty until `orm` lands; rename-only entries are safe. The full map from Spring concepts to spira packages, including what spira does not build, is in [scope and lexicon](docs/specs/scope-and-lexicon.md).
 
 ## Documentation
 
