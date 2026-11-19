@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/v2"
+	"io"
 	"strings"
 	"testing"
 
@@ -178,6 +179,40 @@ func TestReadersRefuseInputAboveTheLimit(t *testing.T) {
 
 func isSizeError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "exceeds the size limit")
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func TestReadTextOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	_, err := rag.ReadText(&cutReader{left: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}, "cut.txt")
+	if err == nil || !strings.Contains(err.Error(), "ai/rag: input exceeds the size limit of 1048576 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
+	}
+}
+
+func TestReadJSONOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	_, err := rag.ReadJSON(&cutReader{left: (1 << 20) + 1, cut: io.ErrUnexpectedEOF})
+	if err == nil || !strings.Contains(err.Error(), "ai/rag: input exceeds the size limit of 1048576 bytes") {
+		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
+	}
 }
 
 func TestReadJSONRefusesDeepNesting(t *testing.T) {

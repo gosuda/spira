@@ -79,11 +79,11 @@ func Remote(ctx context.Context, url string) (Source, error) {
 		return mapSource{}, fmt.Errorf("config: remote %q: status %d", url, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, remoteLimit+1))
-	if err != nil {
-		return mapSource{}, fmt.Errorf("config: remote %q: %w", url, err)
-	}
 	if len(body) > remoteLimit {
 		return mapSource{}, fmt.Errorf("config: remote %q: body exceeds %d bytes", url, remoteLimit)
+	}
+	if err != nil {
+		return mapSource{}, fmt.Errorf("config: remote %q: %w", url, err)
 	}
 	values, err := decodeObject(body)
 	if err != nil {

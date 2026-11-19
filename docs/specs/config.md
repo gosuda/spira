@@ -46,6 +46,7 @@ func Fill[S any](ld *Loader, dst *S, prefix string)
 - `Remote` MUST end the request after 10 seconds.
 - `Remote` MUST refuse a status other than 200.
 - `Remote` MUST refuse a body above 1048576 bytes.
+- `Remote` MUST report the size limit when an over-limit body ends in a read error.
 - `File` and `Remote` MUST change each member name to upper case.
 - `File` and `Remote` MUST join the name of a nested object and the name of its member with `_`.
 - `File` and `Remote` MUST skip a member whose value is `null`.
@@ -105,6 +106,7 @@ func Fill[S any](ld *Loader, dst *S, prefix string)
 - `TestRemoteSourceReadsOneJSONObject`, `TestRemoteSourceNestedObjectsFlatten`, `TestRemoteSourceRejectsNonObject` and `TestRemoteSourceRejectsArrayValue` prove the remote document rules.
 - `TestFileSourceRejectsNullDocument` and `TestRemoteSourceRejectsNullDocument` prove that a `null` document is refused.
 - `TestRemoteSourceRejectsNon200` and `TestRemoteSourceRejectsOversizeBody` prove the status rule and the size limit.
+- `TestRemoteSourceOverLimitWithCutConnectionIsFinal` proves an over-limit body with a cut connection reports the size limit.
 - `TestRemoteSourceHonorsContextTimeout` and `TestRemoteSourceHonorsContextCancel` prove that the context bounds the request.
 - `TestProfileDefaultsToDev` and `TestProfileReadsEnvironment` prove `Profile`.
 

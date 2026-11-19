@@ -116,11 +116,11 @@ func jsonScalar(raw jsontext.Value) string {
 
 func readBounded(r io.Reader) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(r, readLimit+1))
-	if err != nil {
-		return nil, fmt.Errorf("ai/rag: read input: %w", err)
-	}
 	if len(data) > readLimit {
 		return nil, fmt.Errorf("ai/rag: input exceeds the size limit of %d bytes", readLimit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ai/rag: read input: %w", err)
 	}
 	return data, nil
 }

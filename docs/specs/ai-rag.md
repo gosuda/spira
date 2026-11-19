@@ -289,6 +289,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - The package MUST return an error that names the bad line when the embedded vocabulary cannot be parsed.
 - The package MUST return an error when the input exceeds `readLimit` bytes.
 - The size error MUST say the input exceeds the size limit and name the bound in bytes.
+- The readers MUST report the size limit when over-limit input ends in a read error.
 - The package MUST return an error when the JSON input is empty, malformed, or starts with neither `{` nor `[`. A scalar root fails here; the reference throws on it too.
 - The package MUST return an error naming the index of an array element that is no JSON object.
 - The package MUST return the decoder depth error for JSON nested past the standard library limit.
@@ -363,6 +364,8 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestReadTextPassesTheSourceThrough` proves `resourceDescriptionHandling` and `resourceWithoutExtension`: the source argument passes into metadata unchanged.
 - `TestReadTextReadsTwiceWithTheSameID` proves `multipleCallsToGetReturnSameResult`, with equal ids where the reference returns random ids.
 - `TestReadersRefuseInputAboveTheLimit` proves the size bound for both readers on syntax-valid input at and above the limit, and names the size error.
+- `TestReadTextOverLimitWithCutConnectionIsFinal` proves over-limit text with a cut connection reports the size limit.
+- `TestReadJSONOverLimitWithCutConnectionIsFinal` proves over-limit JSON with a cut connection reports the size limit.
 - `TestReadJSONRefusesDeepNesting` proves nesting past 10000 fails with the depth error and shallow nesting succeeds.
 - `TestReadJSONReadsAnArrayWithKeys` proves `loadJsonArray` on the `bikes.json` shape with the `description` key.
 - `TestReadJSONReadsAnObjectWithKeys` proves `loadJsonObject` on the `person.json` shape with the `description` key.

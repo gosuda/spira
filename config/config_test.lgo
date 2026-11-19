@@ -3,12 +3,14 @@ package config_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -805,5 +807,55 @@ func TestRemoteSourceRejectsNullDocument(t *testing.T) {
 	_, err := config.Remote(t.Context(), srv.URL)
 	if err == nil || !strings.Contains(err.Error(), "document is not a JSON object") {
 		t.Fatalf("Remote(null) error = %v, want document is not a JSON object", err)
+	}
+}
+
+type cutReader struct {
+	left int
+	cut  error
+}
+
+func (b *cutReader) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, b.cut
+	}
+	n := min(len(p), b.left)
+	for i := range n {
+		p[i] = 'x'
+	}
+	b.left -= n
+	if b.left == 0 {
+		return n, b.cut
+	}
+	return n, nil
+}
+
+func (b *cutReader) Close() error {
+	return nil
+}
+
+type cutTransport struct {
+	calls *atomic.Int64
+	total int
+	cut   error
+}
+
+func (t *cutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &cutReader{left: t.total, cut: t.cut}}, nil
+}
+
+func TestRemoteSourceOverLimitWithCutConnectionIsFinal(t *testing.T) {
+	var calls atomic.Int64
+	transport := &cutTransport{calls: &calls, total: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}
+	prior := http.DefaultClient.Transport
+	http.DefaultClient.Transport = transport
+	defer func() { http.DefaultClient.Transport = prior }()
+	_, err := config.Remote(t.Context(), "http://config.invalid/remote.json")
+	if err == nil || !strings.Contains(err.Error(), "body exceeds 1048576 bytes") {
+		t.Fatalf("err = %v, want the body size limit of 1 MiB", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("transport saw %d calls, want 1", calls.Load())
 	}
 }
