@@ -18,9 +18,7 @@ func TestFaultsMatchSpecCodeTable(t *testing.T) {
 }
 
 func TestBadGatewayThroughDeadUpstream(t *testing.T) {
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	deadURL := dead.URL
-	dead.Close()
+	deadURL := deadUpstream(t)
 	srv := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{deadURL}}}, plainPolicy())
 	resp, err := srv.Client().Get(srv.URL + "/shop/items?page=1")
 	if err != nil {
