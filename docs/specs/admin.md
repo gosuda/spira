@@ -103,7 +103,7 @@ func Faults() []*fault.Error
 - The probe MUST NOT send the token over plaintext HTTP to a non-loopback host. Loopback means the literal host `localhost` (any case) or an IP literal in a loopback range (`127.0.0.0/8`, `::1`).
 - The poll MUST probe each instance concurrently with a bound of 8.
 - Each result MUST apply and publish as its probe completes.
-- A cancelled sweep MUST apply and publish nothing.
+- A cancelled sweep MUST apply and publish nothing further: results that completed before the cancellation stay applied and published, and the rest are dropped.
 - An unhealthy answer MUST mark that instance down.
 - A status change MUST publish exactly one event.
 - `Start` MUST begin polling and `Stop` MUST end it.
@@ -159,6 +159,7 @@ func Faults() []*fault.Error
 - `TestAdminHandoff` proves that an old client stop keeps the replacement.
 - `TestAdminPollConcurrent` proves that a healthy row flips before a blocked probe ends.
 - `TestAdminStopPreservesStatus` proves that a stopped sweep keeps the status silent.
+- `TestAdminCancelledSweepKeepsCompletedDropsRest` proves that a cancelled sweep keeps completed results, drops the rest, and the caller gets nil.
 - `TestAdminMountRequiresGuard` proves the panic for a nil guard.
 - `TestAdminRejectsBadConfig` proves the panics for a bad interval and a bad bound.
 - `TestAdminReRegisterSameURLKeepsStatus` proves that a repeat keeps up and a move resets unknown.
