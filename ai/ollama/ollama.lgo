@@ -151,11 +151,11 @@ func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 		return zero, failure(status, body)
 	}
 	data, err := io.ReadAll(io.LimitReader(body, x.limit+1))
-	if err != nil {
-		return zero, fmt.Errorf("ai/ollama: read response: %w", err)
-	}
 	if int64(len(data)) > x.limit {
 		return zero, fmt.Errorf("%w of %d bytes", errOversize, x.limit)
+	}
+	if err != nil {
+		return zero, fmt.Errorf("ai/ollama: read response: %w", err)
 	}
 	var out T
 	if err := json.Unmarshal(data, &out); err != nil {

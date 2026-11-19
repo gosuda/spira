@@ -34,6 +34,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `Chat` MUST accept a response body of at most 1 MiB.
 - `Embed` MUST accept a response body of at most 1 MiB plus 128 KiB for each input text.
 - A larger body MUST end the call after one attempt.
+- A body already over its limit MUST end the call even when its read fails.
 - The body of a failing status MUST be cut at 1 MiB.
 - The read cap for that body MUST be 1 MiB, not the success limit.
 - The status of a failing answer MUST win over a failed body read.
@@ -71,6 +72,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestEmbedReturnsEmbeddingsInInputOrder` proves the embed path and the vector order.
 - `TestEmbedAcceptsABatchLargerThanOneMebibyte` proves that 128 vectors of 1024 values decode.
 - `TestEmbedBodyOverItsLimitIsFinal` proves the size limit and that the call is not repeated.
+- `TestChatBodyOverLimitWithCutConnectionIsFinal` proves a cut body over the limit ends after one attempt.
 - `TestEmbedRejectsAStalledErrorBodyAfterOneRequest` proves a 1 MiB error body held open still ends after one request.
 - `TestEmbedKeepsTheStatusOfAFailingAnswerWhoseBodyIsCut` proves a cut 400 body still ends after one request with the 400 error.
 - `TestStreamKeepsTheStatusOfAFailingAnswerWhoseBodyIsCut` proves a cut 400 body yields the status, not a read error.
