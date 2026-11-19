@@ -140,7 +140,7 @@ The system `go` cannot build this module. You need a LoGOs toolchain built from 
    logos version
    ```
 
-4. In an application module, add spira. `logos get` resolves the version and writes it into `go.mod`.
+4. In an application module, add spira. `logos get` resolves the version and writes it into `go.mod`. Skip the `mkdir` when you already created `hello` in Quick start; the lines below assume a fresh directory.
 
    ```sh
    mkdir hello && cd hello
