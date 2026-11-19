@@ -15,6 +15,7 @@ func Load(fsys fs.FS) ([]Step, error)
 func Apply(ctx context.Context, p *db.Pool, steps const []Step) error
 func Rollback(ctx context.Context, p *db.Pool, steps const []Step, count int) error
 func CheckReversible(ctx context.Context, p *db.Pool, steps const []Step) error
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -83,28 +84,39 @@ func CheckReversible(ctx context.Context, p *db.Pool, steps const []Step) error
 - On PostgreSQL, the fingerprint MUST use `information_schema.columns` for `current_schema()`.
 - On MySQL, the fingerprint MUST use `information_schema.columns` for `database()`.
 - On SQL Server, the fingerprint MUST use `information_schema.columns` for `SCHEMA_NAME()`.
-- Each row MUST have `table_name`, `column_name`, `data_type`, `is_nullable` and `column_default` on PostgreSQL, MySQL and SQL Server.
 - The fingerprint MUST sort the rows and MUST compare them as one string.
+
+### Faults
+
+- Pairing failures MUST map to `migrate.missing_down` with the file in the cause.
+- Applied-step divergences MUST map to `migrate.order_mismatch`.
+- A bad fingerprint match MUST map to `migrate.not_reversible`.
+- A non-empty scratch database MUST map to `migrate.scratch_not_empty`.
+- A failed write on MySQL MUST map to `migrate.partial_ddl`.
+- Connection failures MUST map to `migrate.unavailable`.
+- Steps MUST pass database faults through with the step name.
+
+### Code table
+
+| Code | Kind | Message |
+| --- | --- | --- |
+| `migrate.missing_down` | internal | "A migration is missing its down file." |
+| `migrate.order_mismatch` | internal | "The applied migrations do not match the given steps." |
+| `migrate.not_reversible` | internal | "A migration does not restore the schema." |
+| `migrate.scratch_not_empty` | internal | "The scratch database is not empty." |
+| `migrate.partial_ddl` | internal | "A migration failed and may have left its schema changes." |
+| `migrate.unavailable` | unavailable | "The migration store is unavailable." |
 
 ## Errors
 
-- `migrate: read migrations: <cause>` when `Load` cannot read the directory.
-- `migrate: <file> has no matching .down.sql file` when an `up` file has no `down` file.
-- `migrate: <file> has no matching .up.sql file` when a `down` file has no `up` file.
-- `migrate: read <file>: <cause>` when `Load` cannot read a pair file.
-- `migrate: create bookkeeping table: <cause>` when the bookkeeping table cannot be created.
-- `migrate: read applied steps: <cause>` when the applied names cannot be read.
-- `migrate: applied step %d is %q, expected %q` when an applied name differs from the step at that index.
-- `migrate: applied step %q is not in the given steps` when an applied name is outside the steps.
-- `migrate: record <name>: <cause>` when the bookkeeping insert fails.
-- On SQLite, PostgreSQL and SQL Server, `migrate: <name> up: <cause>` when an `up` fails.
-- On MySQL, `migrate: <name> failed; mysql does not roll back DDL, inspect the schema: <cause>` when an `up` fails.
-- `migrate: cannot roll back %d of %d applied steps` when `count` is out of range.
-- `migrate: <name> down: <cause>` when a `down` fails in `Rollback`.
-- `migrate: unrecord <name>: <cause>` when the bookkeeping delete fails.
-- `migrate: scratch database is not empty` when `CheckReversible` finds a user table.
-- `migrate: inspect schema: <cause>` when the user-table query fails.
-- `migrate: fingerprint: <cause>` when the fingerprint query fails.
+- Unmatched pair files MUST map to `migrate.missing_down` with the file in the cause.
+- Applied-step divergences MUST map to `migrate.order_mismatch` with the names in the cause.
+- A down file that does not restore the schema MUST map to `migrate.not_reversible`.
+- A non-empty scratch database MUST map to `migrate.scratch_not_empty`.
+- A failed MySQL write MUST map to `migrate.partial_ddl` with the step in the cause.
+- Connection failures MUST map to `migrate.unavailable` with the cause.
+- Steps MUST pass database faults through with the step name.
+- Public views MUST NOT carry file names, step names or SQL text.
 
 ## Proof
 
@@ -112,13 +124,20 @@ func CheckReversible(ctx context.Context, p *db.Pool, steps const []Step) error
 - `TestLoadRefusesDownWithoutUp` and `TestLoadRefusesUpWithoutDown` prove the two missing-file errors.
 - `TestApplyAppliesInOrderAndIsIdempotent` proves apply order and a second apply that writes nothing.
 - `TestApplyRefusesReorderedSteps` proves that a reordered list fails and leaves the schema unchanged. The oracle is a direct schema fingerprint.
-- `TestApplyRefusesMissingMiddleStep` proves the same refusal for a missing middle step.
-- `TestApplyFailingStepLeavesNothing` proves that a failed `up` leaves no user table and no bookkeeping row.
+- `TestApplyFailingStepLeavesNothing` proves that a failed `up` leaves no user table and returns `db.statement_failed`.
 - `TestApplyPartialPrefixLeavesSchema` proves that a later apply runs only the remaining steps.
 - `TestRollbackOneAndAll` proves one rollback and a full rollback, and the refusal of a large count.
 - `TestCheckReversiblePasses` proves that a correct pair leaves no table. The oracle is a direct fingerprint.
 - `TestCheckReversibleFailsOnLeftoverColumn` proves the mismatch error.
 - `TestCheckReversibleRefusesNonEmpty` proves the empty-database rule.
+- `TestFaultMissingDown` proves missing pair files return `migrate.missing_down`.
+- `TestFaultOrderMismatch` proves reordered steps return `migrate.order_mismatch`.
+- `TestFaultNotReversible` proves a bad pair returns `migrate.not_reversible`.
+- `TestFaultScratchNotEmpty` proves a dirty scratch database returns `migrate.scratch_not_empty`.
+- `TestFaultUnavailable` proves store failures return `migrate.unavailable`.
+- `TestFaultPartialDDLMySQL` proves a bad MySQL `up` returns `migrate.partial_ddl`.
+- `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
+- `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
 
 ## Not in scope
 
