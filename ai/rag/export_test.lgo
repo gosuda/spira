@@ -24,14 +24,14 @@ func FirstHeldSlot(m *Memory) int {
 
 func EncodeTextForTest(enc *Encoder?, text string) ([]int, error) {
 	if enc == nil {
-		return nil, fmt.Errorf("ai/rag: split: encoder is nil")
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encoder is nil"))
 	}
 	return enc.encode(text)
 }
 
 func DecodeTokensForTest(enc *Encoder?, tokens []int) (string, error) {
 	if enc == nil {
-		return "", fmt.Errorf("ai/rag: split: encoder is nil")
+		return "", ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encoder is nil"))
 	}
 	return enc.decode(tokens)
 }

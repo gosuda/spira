@@ -991,8 +991,8 @@ func TestRememberStreamFailedCallAppendsNothing(t *testing.T) {
 	if len(failures) != 1 {
 		t.Fatalf("the stream gave the errors %v, want one error", failures)
 	}
-	if !strings.Contains(failures[0].Error(), "stream cut") {
-		t.Fatalf("the stream error does not name the provider failure: %v", failures[0])
+	if !errors.Is(failures[0], openai.ErrProviderError) {
+		t.Fatalf("the stream error is not the provider fault: %v", failures[0])
 	}
 	if events := eventsOf(t, s, "s1"); len(events) != 0 {
 		t.Fatalf("a stream that failed left %d events, want 0", len(events))

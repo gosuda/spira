@@ -45,7 +45,7 @@ func (c *Client) http() *http.Client {
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	payload, err := requestJSON(req, false, c)
 	if err != nil {
-		return ai.Reply{}, err
+		return ai.Reply{}, ErrInvalidRequest.Wrap(err)
 	}
 	out, err := send[chatResponse](ctx, c, exchange{path: "/chat/completions", payload: payload, limit: replyLimit})
 	if err != nil {
@@ -68,7 +68,7 @@ func realIdleTimer(limit time.Duration, onIdle func()) (func(time.Duration) bool
 func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
 	payload, err := requestJSON(req, true, c)
 	if err != nil {
-		yield ai.Chunk{}, err
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(err)
 		return
 	}
 	limit := c.Policy.Timeout
@@ -83,7 +83,7 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	defer stop()
 	status, body, err := c.do(bounded, "/chat/completions", payload)
 	if err != nil {
-		yield ai.Chunk{}, streamDoError("/chat/completions", bounded, err)
+		yield ai.Chunk{}, streamDoError(bounded, err)
 		return
 	}
 	defer closeBody(body)
@@ -95,51 +95,36 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	for chunk, err := range streamEvents(bounded, alive, func() { reset(limit) }) {
 		stop()
 		if err != nil {
-			yield chunk, streamDoError("/chat/completions", bounded, err)
+			yield chunk, streamDoError(bounded, err)
 			return
 		}
 		if cause := context.Cause(bounded); cause != nil {
-			yield ai.Chunk{}, streamDoError("/chat/completions", bounded, cause)
+			yield ai.Chunk{}, streamDoError(bounded, cause)
 			return
 		}
 		yield chunk, nil
 		if cause := context.Cause(bounded); cause != nil {
-			yield ai.Chunk{}, streamDoError("/chat/completions", bounded, cause)
+			yield ai.Chunk{}, streamDoError(bounded, cause)
 			return
 		}
 		reset(limit)
 	}
 	if cause := context.Cause(bounded); cause != nil {
-		yield ai.Chunk{}, streamDoError("/chat/completions", bounded, cause)
+		yield ai.Chunk{}, streamDoError(bounded, cause)
 		return
 	}
 }
 
-func streamDoError(path string, ctx context.Context, err error) error {
+func streamDoError(ctx context.Context, err error) error {
 	if cause := context.Cause(ctx); cause != nil {
-		if isStall(cause) {
-			return cause
-		}
-		return fmt.Errorf("ai/openai: %s: %w", path, cause)
+		return ErrProviderStreamCut.Wrap(cause)
 	}
-	return err
+	return ErrProviderError.Wrap(err)
 }
 
 func isStall(err error) bool {
 	stall := &stallError{}
 	return errors.As(err, &stall)
-}
-
-func failure(ctx context.Context, status int, body io.Reader) error {
-	data, err := io.ReadAll(io.LimitReader(body, replyLimit))
-	if err == nil {
-		return statusError(status, data)
-	}
-	cause := context.Cause(ctx)
-	if cause == nil {
-		cause = err
-	}
-	return fmt.Errorf("%w: body read ended early: %w", statusError(status, data), cause)
 }
 
 type stallError struct {
@@ -150,19 +135,36 @@ func (e *stallError) Error() string {
 	return fmt.Sprintf("ai/openai: no stream event for %s", e.limit)
 }
 
+func failure(ctx context.Context, status int, body io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(body, replyLimit))
+	detail := statusDetailOf(status, data)
+	if err == nil {
+		return classifyStatus(status, detail)
+	}
+	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = err
+	}
+	return classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", detail, cause))
+}
+
 func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
 	input := make([]string, len(texts))
 	copy(input, texts)
 	payload, err := json.Marshal(embedRequest{Model: c.Model, Input: input, EncodingFormat: "float"})
 	if err != nil {
-		return nil, fmt.Errorf("ai/openai: encode request: %w", err)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
 	}
 	limit := replyLimit + int64(len(texts))*embedVectorLimit
 	out, err := send[embedResponse](ctx, c, exchange{path: "/embeddings", payload: payload, limit: limit})
 	if err != nil {
 		return nil, err
 	}
-	return out.vectors()
+	vectors, verr := out.vectors()
+	if verr != nil {
+		return nil, ErrProviderError.Wrap(verr)
+	}
+	return vectors, nil
 }
 
 func closeBody(body io.Closer) {
@@ -174,8 +176,6 @@ func closeBody(body io.Closer) {
 const replyLimit = 1 << 20
 
 const embedVectorLimit = 128 << 10
-
-var errOversize = errors.New("ai/openai: response exceeds the size limit")
 
 type exchange struct {
 	path    string
@@ -190,7 +190,7 @@ func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 		if err == nil {
 			return value, nil
 		}
-		if callerFault(err) || errors.Is(err, errOversize) {
+		if callerFault(err) || errors.Is(err, ErrProviderTooLarge) || errors.Is(err, ErrInvalidRequest) {
 			return zero, resilience.Ignored(err)
 		}
 		return zero, err
@@ -198,19 +198,13 @@ func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 }
 
 func callerFault(err error) bool {
-	answer := &statusAnswer{}
-	if !errors.As(err, &answer) {
-		return false
-	}
-	s := answer.status
-	return s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests
+	return errors.Is(err, ErrProviderRejected)
 }
-
 func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	var zero T
 	status, body, err := c.do(ctx, x.path, x.payload)
 	if err != nil {
-		return zero, err
+		return zero, ErrProviderError.Wrap(err)
 	}
 	defer body.Close()?
 	if status < 200 || status > 299 {
@@ -218,14 +212,14 @@ func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	}
 	data, err := io.ReadAll(io.LimitReader(body, x.limit+1))
 	if int64(len(data)) > x.limit {
-		return zero, fmt.Errorf("%w of %d bytes", errOversize, x.limit)
+		return zero, ErrProviderTooLarge.Wrap(fmt.Errorf("response size %d exceeds the limit %d", len(data), x.limit))
 	}
 	if err != nil {
-		return zero, fmt.Errorf("ai/openai: read response: %w", err)
+		return zero, ErrProviderError.Wrap(fmt.Errorf("read response: %w", err))
 	}
 	var out T
 	if err := json.Unmarshal(data, &out); err != nil {
-		return zero, fmt.Errorf("ai/openai: decode response: %w", err)
+		return zero, ErrProviderError.Wrap(fmt.Errorf("decode response: %w", err))
 	}
 	return out, nil
 }
@@ -244,19 +238,6 @@ func (c *Client) do(ctx context.Context, path string, payload []byte) (int, io.R
 		return 0, nil, fmt.Errorf("ai/openai: %s: %w", path, err)
 	}
 	return resp.StatusCode, resp.Body, nil
-}
-
-type statusAnswer struct {
-	status int
-	body   string
-}
-
-func (a *statusAnswer) Error() string {
-	return fmt.Sprintf("ai/openai: %d: %s", a.status, a.body)
-}
-
-func statusError(status int, body []byte) error {
-	return &statusAnswer{status: status, body: string(body)}
 }
 
 func replyOf(resp *chatResponse) ai.Reply {
@@ -581,7 +562,7 @@ func streamEnd(ctx context.Context, err error, state *streamState) iter.Seq2[ai.
 		return
 	}
 	if cause := context.Cause(ctx); cause != nil {
-		yield ai.Chunk{}, cause
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(cause)
 		return
 	}
 	for chunk, cerr := range endOfStream(state) {
@@ -593,7 +574,7 @@ func endOfStream(state *streamState) iter.Seq2[ai.Chunk, error] {
 	for chunk, cerr := range state.flushCalls() {
 		yield chunk, cerr
 	}
-	yield ai.Chunk{}, fmt.Errorf("ai/openai: stream ended before [DONE]")
+	yield ai.Chunk{}, ErrProviderStreamCut.Err()
 }
 
 func eventLine(text string, state *streamState) iter.Seq2[ai.Chunk, error] {
@@ -610,7 +591,7 @@ func eventLine(text string, state *streamState) iter.Seq2[ai.Chunk, error] {
 	}
 	var chunk wireChunk
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-		yield ai.Chunk{}, fmt.Errorf("ai/openai: decode stream event: %w", err)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(fmt.Errorf("decode stream event: %w", err))
 		return
 	}
 	for part, err := range deltaParts(&chunk) {

@@ -21,7 +21,7 @@ func Rewrite(ctx context.Context, m ai.Model, query string) (string, error) {
 	prompt := "Given a user query, rewrite it to provide better results when querying a vector store.\nRemove any irrelevant information, and ensure the query is concise and specific.\n\nOriginal query:\n" + query + "\n\nRewritten query:\n"
 	out, err := ask(ctx, m, prompt)
 	if err != nil {
-		return "", fmt.Errorf("ai/rag: rewrite: %w", err)
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: rewrite: %w", err))
 	}
 	return orQuery(out, query), nil
 }
@@ -30,7 +30,7 @@ func Translate(ctx context.Context, m ai.Model, query string, language string) (
 	prompt := "Given a user query, translate it to " + language + ".\nIf the query is already in " + language + ", return it unchanged.\nIf you don't know the language of the query, return it unchanged.\nDo not add explanations nor any other text.\n\nOriginal query: " + query + "\n\nTranslated query:\n"
 	out, err := ask(ctx, m, prompt)
 	if err != nil {
-		return "", fmt.Errorf("ai/rag: translate: %w", err)
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: translate: %w", err))
 	}
 	return orQuery(out, query), nil
 }
@@ -39,7 +39,7 @@ func Compress(ctx context.Context, m ai.Model, history []ai.Message, query strin
 	prompt := "Given the following conversation history and a follow-up query, your task is to synthesize\na concise, standalone query that incorporates the context from the history.\nEnsure the standalone query is clear, specific, and maintains the user's intent.\n\nConversation history:\n" + historyText(history) + "\n\nFollow-up query:\n" + query + "\n\nStandalone query:\n"
 	out, err := ask(ctx, m, prompt)
 	if err != nil {
-		return "", fmt.Errorf("ai/rag: compress: %w", err)
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: compress: %w", err))
 	}
 	return orQuery(out, query), nil
 }
@@ -48,7 +48,7 @@ func Expand(ctx context.Context, m ai.Model, query string, n int) ([]string, err
 	prompt := "You are an expert at information retrieval and search optimization.\nYour task is to generate " + strconv.Itoa(n) + " different versions of the given query.\n\nEach variant must cover different perspectives or aspects of the topic,\nwhile maintaining the core intent of the original query. The goal is to\nexpand the search space and improve the chances of finding relevant information.\n\nDo not explain your choices or add any other text.\nProvide the query variants separated by newlines.\n\nOriginal query: " + query + "\n\nQuery variants:\n"
 	out, err := ask(ctx, m, prompt)
 	if err != nil {
-		return nil, fmt.Errorf("ai/rag: expand: %w", err)
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: expand: %w", err))
 	}
 	if strings.TrimSpace(out) == "" {
 		return []string{query}, nil

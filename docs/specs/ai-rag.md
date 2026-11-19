@@ -101,6 +101,13 @@ type Store interface {
 	Search(ctx context.Context, q Search) ([]Document, error)
 }
 
+var ErrInvalidFilter = fault.New("rag.invalid_filter", fault.Invalid, "The filter is invalid.")
+var ErrInvalidRequest = fault.New("rag.invalid_request", fault.Invalid, "The retrieval request is invalid.")
+var ErrTooLarge = fault.New("rag.too_large", fault.TooLarge, "The input is too large.")
+var ErrStoreFailed = fault.New("rag.store_failed", fault.Unavailable, "The document store is unavailable.")
+
+func Faults() []*fault.Error
+
 type Pgvector struct {
 	// unexported fields
 }
@@ -153,6 +160,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `ParseFilter` MUST read a lone `l` or `L` as the long suffix of the integer before it.
 - `ParseFilter` MUST refuse a lone `l` or `L` in each other position, as the reference grammar does.
 - `ParseFilter` MUST return a closed tree.
+- `ParseFilter` MUST report the error position without the filter text.
 - No store MUST receive filter text.
 - `Search` MUST default `TopK` to 4.
 - `Search` MUST default threshold to 0.
@@ -274,6 +282,15 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - The readers MUST NOT take a custom-metadata argument.
 - The caller MUST own the reader. The readers never close it.
 
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `rag.invalid_filter` | invalid | The filter is invalid. |
+| `rag.invalid_request` | invalid | The retrieval request is invalid. |
+| `rag.store_failed` | unavailable | The document store is unavailable. |
+| `rag.too_large` | too_large | The input is too large. |
+
 ## Errors
 
 - The package MUST return an error when `ParseFilter` cannot parse the text.
@@ -286,7 +303,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - The package MUST wrap an encode failure as `ai/rag: split: encode: %w`.
 - The package MUST wrap a decode failure as `ai/rag: split: decode: %w`.
 - The package MUST return `ai/rag: split: encoder is nil` when `Encoder` holds no value.
-- The package MUST return an error that names the bad line when the embedded vocabulary cannot be parsed.
+- The package MUST refuse a bad vocabulary line with an error.
 - The package MUST return an error when the input exceeds `readLimit` bytes.
 - The size error MUST say the input exceeds the size limit and name the bound in bytes.
 - The readers MUST report the size limit when over-limit input ends in a read error.

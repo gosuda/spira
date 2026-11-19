@@ -40,13 +40,13 @@ type Pgvector struct {
 
 func NewPgvector(pool *db.Pool, embed ai.Embedder, table string, dims int) (*Pgvector?, error) {
 	if embed == nil {
-		return nil, errors.New("ai/rag: pgvector needs an embedder")
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: pgvector needs an embedder"))
 	}
 	if !validTable(table) {
-		return nil, fmt.Errorf("ai/rag: pgvector table %q must match ^[a-z_][a-z0-9_]{0,62}$", table)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: pgvector table %q must match ^[a-z_][a-z0-9_]{0,62}$", table))
 	}
 	if dims <= 0 {
-		return nil, fmt.Errorf("ai/rag: pgvector needs dimensions above 0, got %d", dims)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: pgvector needs dimensions above 0, got %d", dims))
 	}
 	return &Pgvector{pool: pool, embed: embed, table: table, dims: dims}, nil
 }
@@ -111,14 +111,14 @@ func (p *Pgvector) Setup(ctx context.Context) error {
 
 func (p *Pgvector) execSetup(ctx context.Context, query string) error {
 	if _, err := p.pool.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("ai/rag: pgvector setup: %w", err)
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector setup: %w", err))
 	}
 	return nil
 }
 
 func (p *Pgvector) Add(ctx context.Context, docs []Document) error {
 	if p.embed == nil {
-		return errors.New("ai/rag: pgvector needs an embedder")
+		return ErrInvalidRequest.Wrap(errors.New("ai/rag: pgvector needs an embedder"))
 	}
 	texts, err := addTexts(docs)
 	if err != nil {
@@ -126,17 +126,17 @@ func (p *Pgvector) Add(ctx context.Context, docs []Document) error {
 	}
 	vectors, err := p.embed.Embed(ctx, texts)
 	if err != nil {
-		return fmt.Errorf("ai/rag: embed documents: %w", err)
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed documents: %w", err))
 	}
 	if len(vectors) != len(docs) {
-		return fmt.Errorf("ai/rag: embedder returned %d vectors for %d documents", len(vectors), len(docs))
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for %d documents", len(vectors), len(docs)))
 	}
 	if err := checkAddVectors(docs, vectors, p.dims); err != nil {
-		return err
+		return ErrInvalidRequest.Wrap(err)
 	}
 	rows, err := addRows(docs, vectors)
 	if err != nil {
-		return err
+		return ErrStoreFailed.Wrap(err)
 	}
 	return p.insertRows(ctx, rows)
 }
@@ -150,12 +150,12 @@ type addRow struct {
 
 func addTexts(docs []Document) ([]string, error) {
 	if len(docs) == 0 {
-		return nil, errors.New("ai/rag: add needs a document")
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: add needs a document"))
 	}
 	texts := make([]string, len(docs))
 	for i, d := range docs {
 		if strings.TrimSpace(d.ID) == "" {
-			return nil, errors.New("ai/rag: document needs an id")
+			return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: document needs an id"))
 		}
 		texts[i] = d.Text
 	}
@@ -188,7 +188,7 @@ func (p *Pgvector) insertRows(ctx context.Context, rows const []addRow) error {
 	query := "INSERT INTO " + p.table + " (id, content, metadata, embedding) VALUES ($1, $2, $3::jsonb, $4::vector) ON CONFLICT (id) DO UPDATE SET content = $2, metadata = $3::jsonb, embedding = $4::vector"
 	for _, r := range rows {
 		if _, err := p.pool.ExecContext(ctx, query, r.id, r.text, r.meta, r.vector); err != nil {
-			return fmt.Errorf("ai/rag: pgvector add: %w", err)
+			return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector add: %w", err))
 		}
 	}
 	return nil
@@ -284,11 +284,11 @@ func metadataNumber(key string, n float64) (any, error) {
 
 func (p *Pgvector) Delete(ctx context.Context, ids const []string) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return ErrStoreFailed.Wrap(err)
 	}
 	for _, id := range ids {
 		if _, err := p.pool.ExecContext(ctx, "DELETE FROM "+p.table+" WHERE id = $1", id); err != nil {
-			return fmt.Errorf("ai/rag: pgvector delete: %w", err)
+			return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector delete: %w", err))
 		}
 	}
 	return nil
@@ -296,10 +296,10 @@ func (p *Pgvector) Delete(ctx context.Context, ids const []string) error {
 
 func (p *Pgvector) Search(ctx context.Context, q Search) ([]Document, error) {
 	if err := checkSearch(q); err != nil {
-		return nil, err
+		return nil, ErrInvalidRequest.Wrap(err)
 	}
 	if p.embed == nil {
-		return nil, errors.New("ai/rag: pgvector needs an embedder")
+		return nil, ErrInvalidRequest.Wrap(errors.New("ai/rag: pgvector needs an embedder"))
 	}
 	vector, err := queryVector(ctx, p.embed, q.Query, p.dims)
 	if err != nil {
@@ -334,16 +334,16 @@ func checkSearch(q Search) error {
 func queryVector(ctx context.Context, embed ai.Embedder, query string, dims int) (string, error) {
 	vectors, err := embed.Embed(ctx, []string{query})
 	if err != nil {
-		return "", fmt.Errorf("ai/rag: embed query: %w", err)
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embed query: %w", err))
 	}
 	if len(vectors) != 1 {
-		return "", fmt.Errorf("ai/rag: embedder returned %d vectors for the query", len(vectors))
+		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: embedder returned %d vectors for the query", len(vectors)))
 	}
 	if _, err := squaredLength(vectors[0]); err != nil {
-		return "", fmt.Errorf("ai/rag: query: %w", err)
+		return "", ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query: %w", err))
 	}
 	if len(vectors[0]) != dims {
-		return "", fmt.Errorf("ai/rag: query vector has %d dimensions, the store holds %d", len(vectors[0]), dims)
+		return "", ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: query vector has %d dimensions, the store holds %d", len(vectors[0]), dims))
 	}
 	return vectorText(vectors[0]), nil
 }
@@ -355,7 +355,7 @@ func filterWhere(f Filter?, start int) (string, []any, error) {
 	b := &filterArgs{args: []any{}, next: start}
 	fragment, err := translate(f, b)
 	if err != nil {
-		return "", nil, fmt.Errorf("ai/rag: filter: %w", err)
+		return "", nil, ErrInvalidFilter.Wrap(fmt.Errorf("ai/rag: filter: %w", err))
 	}
 	return " AND (" + fragment + ")", b.args, nil
 }
@@ -365,9 +365,12 @@ func (p *Pgvector) searchRows(ctx context.Context, plan searchPlan) ([]Document,
 	full := make([]any, 0, len(plan.args)+3)
 	full = append(full, plan.vector, plan.bound, plan.top)
 	full = append(full, plan.args...)
-	rows := p.pool.QueryContext(ctx, query, full...)?
+	rows, err := p.pool.QueryContext(ctx, query, full...)
+	if err != nil {
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector search: %w", err))
+	}
 	if rows == nil {
-		return nil, errors.New("ai/rag: pgvector search returned no rows handle")
+		return nil, ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector search returned no rows handle"))
 	}
 	defer rows.Close()?
 	return scanDocuments(rows)
@@ -378,7 +381,7 @@ func scanDocuments(rows *sql.Rows) ([]Document, error) {
 	for rows.Next() {
 		var vid, vcontent, vmeta, vdist any
 		if err := rows.Scan(&vid, &vcontent, &vmeta, &vdist); err != nil {
-			return nil, fmt.Errorf("ai/rag: pgvector scan: %w", err)
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
 		}
 		doc, err := scannedDocument(vid, vcontent, vmeta, vdist)
 		if err != nil {
@@ -387,7 +390,7 @@ func scanDocuments(rows *sql.Rows) ([]Document, error) {
 		out = append(out, doc)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("ai/rag: pgvector scan: %w", err)
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan: %w", err))
 	}
 	if out == nil {
 		return []Document{}, nil
@@ -426,7 +429,7 @@ func scannedText(v any) (string, error) {
 	case []byte:
 		return string(held), nil
 	default:
-		return "", errors.New("ai/rag: pgvector scan holds an unsupported text value")
+		return "", ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector scan holds an unsupported text value"))
 	}
 }
 
@@ -450,14 +453,14 @@ func scannedTextNumber(v any) (float64, error) {
 	case string:
 		return parseScannedNumber(held)
 	default:
-		return 0, errors.New("ai/rag: pgvector scan holds an unsupported numeric value")
+		return 0, ErrStoreFailed.Wrap(errors.New("ai/rag: pgvector scan holds an unsupported numeric value"))
 	}
 }
 
 func parseScannedNumber(text string) (float64, error) {
 	f, err := strconv.ParseFloat(text, 64)
 	if err != nil {
-		return 0, fmt.Errorf("ai/rag: pgvector scan holds a distance that is not a number: %w", err)
+		return 0, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: pgvector scan holds a distance that is not a number: %w", err))
 	}
 	return f, nil
 }
@@ -465,13 +468,13 @@ func parseScannedNumber(text string) (float64, error) {
 func decodeMetadata(raw string, id string) (map[string]Value, error) {
 	var body map[string]any
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
-		return nil, fmt.Errorf("ai/rag: decode metadata of %q: %w", id, err)
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: decode metadata of %q: %w", id, err))
 	}
 	out := map[string]Value{}
 	for k, v := range body {
 		held, err := decodedValue(k, v)
 		if err != nil {
-			return nil, fmt.Errorf("ai/rag: decode metadata of %q: %w", id, err)
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: decode metadata of %q: %w", id, err))
 		}
 		out[k] = held
 	}
@@ -489,7 +492,7 @@ func decodedValue(key string, v any) (Value, error) {
 	case float64:
 		return Number{Number: held}, nil
 	default:
-		return nil, fmt.Errorf("key %q holds an unsupported value", key)
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("key %q holds an unsupported value", key))
 	}
 }
 

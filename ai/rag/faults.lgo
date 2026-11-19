@@ -1,0 +1,17 @@
+package rag
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrInvalidFilter = fault.New("rag.invalid_filter", fault.Invalid, "The filter is invalid.")
+
+var ErrInvalidRequest = fault.New("rag.invalid_request", fault.Invalid, "The retrieval request is invalid.")
+
+var ErrTooLarge = fault.New("rag.too_large", fault.TooLarge, "The input is too large.")
+
+var ErrStoreFailed = fault.New("rag.store_failed", fault.Unavailable, "The document store is unavailable.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrInvalidFilter, ErrInvalidRequest, ErrTooLarge, ErrStoreFailed}
+}

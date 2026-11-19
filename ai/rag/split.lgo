@@ -23,18 +23,18 @@ type SplitOptions struct {
 
 func Split(text string, o SplitOptions) ([]string, error) {
 	if err := checkSplitOptions(o); err != nil {
-		return nil, err
+		return nil, ErrInvalidRequest.Wrap(err)
 	}
 	encoder := o.Encoder
 	if encoder == nil {
-		return nil, fmt.Errorf("ai/rag: split: encoder is nil")
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encoder is nil"))
 	}
 	if strings.TrimSpace(text) == "" {
 		return nil, nil
 	}
 	tokens, err := encoder.encode(text)
 	if err != nil {
-		return nil, fmt.Errorf("ai/rag: split: encode: %w", err)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encode: %w", err))
 	}
 	if len(tokens) <= o.ChunkSize {
 		return splitSingle(text, o), nil
@@ -101,7 +101,7 @@ func (s *splitter) step() error {
 	end := min(s.position+s.options.ChunkSize, len(s.tokens))
 	chunk, err := s.encoder.decode(s.tokens[s.position:end])
 	if err != nil {
-		return fmt.Errorf("ai/rag: split: decode: %w", err)
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: decode: %w", err))
 	}
 	if strings.TrimSpace(chunk) == "" {
 		s.position = end
@@ -113,7 +113,7 @@ func (s *splitter) step() error {
 	}
 	optimizedTokens, err := s.encoder.encode(optimized)
 	if err != nil {
-		return fmt.Errorf("ai/rag: split: encode: %w", err)
+		return ErrInvalidRequest.Wrap(fmt.Errorf("ai/rag: split: encode: %w", err))
 	}
 	next, err := s.nextPosition(len(optimizedTokens))
 	if err != nil {
@@ -137,7 +137,7 @@ func (s *splitter) nextPosition(count int) (int, error) {
 	if rest <= s.options.ChunkSize {
 		tail, err := s.encoder.decode(s.tokens[stop:])
 		if err != nil {
-			return 0, fmt.Errorf("ai/rag: split: decode: %w", err)
+			return 0, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: decode: %w", err))
 		}
 		if strings.TrimSpace(tail) == "" {
 			return len(s.tokens), nil
@@ -152,7 +152,7 @@ func (s *splitter) finish() error {
 	}
 	rest, err := s.encoder.decode(s.tokens[s.position:])
 	if err != nil {
-		return fmt.Errorf("ai/rag: split: decode: %w", err)
+		return ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: decode: %w", err))
 	}
 	formatted := strings.TrimSpace(strings.ReplaceAll(rest, "\n", " "))
 	if runeCount(formatted) > s.options.MinChunkLengthToEmbed {

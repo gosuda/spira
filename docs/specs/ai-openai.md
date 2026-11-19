@@ -20,6 +20,14 @@ type Client struct {
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error)
 func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error]
 func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, error)
+
+var ErrProviderRejected = fault.New("openai.provider_rejected", fault.Invalid, "The model provider rejected the request.")
+var ErrProviderRateLimited = fault.New("openai.provider_rate_limited", fault.RateLimited, "The model provider rate limited the request.")
+var ErrProviderError = fault.New("openai.provider_error", fault.Unavailable, "The model provider returned an error.")
+var ErrProviderTooLarge = fault.New("openai.provider_too_large", fault.TooLarge, "The provider response is too large.")
+var ErrProviderStreamCut = fault.New("openai.provider_stream_cut", fault.Unavailable, "The model provider stream was cut.")
+var ErrInvalidRequest = fault.New("openai.invalid_request", fault.Invalid, "The model request is invalid.")
+func Faults() []*fault.Error
 ```
 
 `Model` names the model for `Embed`, which takes no model argument. `Key` is sent as the bearer token when it is not empty. `SafePrompt` and `RandomSeed` are the Mistral options. They go out only when the caller sets them.
@@ -60,26 +68,42 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - A `Format` that is a JSON object MUST go out as a `json_schema` response format.
 - That response format MUST set `strict`, as the reference does, so the answer conforms to the schema.
 - The caller MUST give a schema of the strict subset of the provider.
-- Any other `Format` MUST be an error before the request is sent.
-- A stream that ends before `data: [DONE]` MUST yield an error and no reply.
-- An error MUST name the package, the status and the body as `ai/openai: <status>: <body>`.
-- An error that `Stream` returns before response headers MUST name the package and the path, except the stall error.
-- A caller cancel MUST carry the package prefix and satisfy errors.Is with context.Canceled.
+- Any other `Format` MUST surface as `openai.invalid_request` before the request is sent.
+- A bad tool schema MUST surface as `openai.invalid_request` before the request is sent.
+- A stream that ends before `data: [DONE]` MUST yield `openai.provider_stream_cut` and no reply.
+- A provider error event or a broken stream record MUST yield `openai.provider_stream_cut`.
+- A stall MUST yield `openai.provider_stream_cut` and satisfy `IsStall`.
+- A 4xx answer other than 408 and 429 MUST surface as `openai.provider_rejected`.
+- A 429 answer MUST surface as `openai.provider_rate_limited`.
+- Any other failing answer MUST surface as `openai.provider_unavailable`.
+- A failing status MUST win over a failed error-body read, keeping the read cause.
+- A status fault cause MUST hold the status, the parsed error type and the body length.
+- A status fault cause MUST NOT hold the body text or the key.
+- A body over its limit MUST surface as `openai.provider_too_large`.
+- An inconsistent embedding answer MUST surface as `openai.provider_unavailable`.
 - A zero Policy.Timeout MUST fall back to the default idle bound.
-- A failing status MUST win over a failed error-body read, keeping bytes and cause.
+- A caller cancel MUST yield `openai.provider_stream_cut` and satisfy `errors.Is` with `context.Canceled`.
 - The key MUST NOT appear in an error or a log.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `openai.provider_rejected` | invalid | The model provider rejected the request. |
+| `openai.provider_rate_limited` | rate_limited | The model provider rate limited the request. |
+| `openai.provider_error` | unavailable | The model provider returned an error. |
+| `openai.provider_too_large` | too_large | The provider response is too large. |
+| `openai.provider_stream_cut` | unavailable | The model provider stream was cut. |
+| `openai.invalid_request` | invalid | The model request is invalid. |
 
 ## Errors
 
-- `ai/openai: <status>: <body>` when the provider returns a failing status.
-- `ai/openai: stream ended before [DONE]` when the stream is cut.
-- `ai/openai: no stream event for <timeout>` when the provider sends no event for `Policy.Timeout`.
-- `ai/openai: /chat/completions: <cause>` when the stream request ends before response headers.
-- `ai/openai: format is not json and not a JSON schema` when `Format` is any other text.
-- `ai/openai: tool <name> schema: <cause>` when a tool schema is not a JSON object.
-- `ai/openai: embedding index <i> is outside the <n> vectors of the answer` when the provider names an index it did not send.
-- `ai/openai: encode request: <cause>` and `ai/openai: decode response: <cause>` for the JSON steps, and `ai/openai: read response: <cause>` for a failed read of a successful status.
-- `ai/openai: response exceeds the size limit of <n> bytes` when a body is larger than its limit.
+- `openai.provider_rejected` MUST surface for a 4xx answer other than 408 and 429.
+- `openai.provider_rate_limited` MUST surface for a 429 answer.
+- `openai.provider_unavailable` MUST surface for a 5xx answer, a 408 answer and a transport failure.
+- `openai.provider_too_large` MUST surface for a body over its limit.
+- `openai.provider_stream_cut` MUST surface for a cut stream, a broken record and a stall.
+- `openai.invalid_request` MUST surface for a bad `Format` and a bad tool schema.
 
 ## Proof
 
@@ -96,10 +120,10 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestStreamCanceledBeforeHeadersKeepsThePackagePrefix` proves a canceled stream still names the package.
 - `TestStreamCancelBetweenChunksKeepsThePackagePrefix` proves a mid-stream cancel keeps the package prefix.
 - `TestStreamCancelBetweenBufferedChunksKeepsThePackagePrefix` proves a cancel over buffered chunks keeps the package prefix.
-- `TestStreamStallBeforeHeadersNamesTheStall` proves a stall before headers ends as the named stall error.
+- `TestStreamTouchesTheTimerOnPartialReads` proves the idle bound refreshes on every provider read, also before the newline.
 - `TestStreamEndsWhenDoneHasNoTrailingNewline` proves a final line without a newline still ends the stream.
 - `TestZeroTimeoutStreamsWithoutAnIdleBound` proves a zero timeout still streams a full answer under a positive fallback bound.
-- `TestStreamTouchesTheTimerOnPartialReads` proves the idle bound refreshes on every provider read, also before the newline.
+- `TestStreamStallBeforeHeadersNamesTheStall` proves a stall before headers ends as the stream cut fault and satisfies `IsStall`.
 - `TestIdleProbeAffectsOnlyItsOwnClient` proves the idle probe of one client never counts another client.
 - `TestStreamClosesTheBodyOfAFailingAnswer` proves the body of a failing answer closes when the caller stops.
 - `TestChatReportsFailingStatusWhenTheBodyStalls` proves a stalled 400 body ends after one request with the status error.
@@ -113,13 +137,16 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestDeepSeekReasoningPart` proves `reasoning_content` becomes a reasoning part.
 - `TestMistralChunkArrayContentAndOptions` proves the chunk-array content and the Mistral options on the wire.
 - `TestFormatGoesOutAsJSONObjectOrSchema` proves the two wire forms of `Format` and the error for any other text.
-- `TestUnauthorizedIsFinal` proves that a 401 answer ends after one request with the named error.
-- `TestRateLimitedIsRetried` proves that a 429 answer is retried.
-- `TestServerErrorIsRetried` proves that a 500 answer is retried.
+- `TestUnauthorizedIsFinal` proves that a 401 answer ends after one request as the provider rejection.
+- `TestRateLimitedIsRetried` proves that a 429 answer is retried as the rate limited fault.
+- `TestServerErrorIsRetried` proves that a 500 answer is retried as the provider error.
 - `TestClientErrorAddsNoResultToTheBreaker` proves a 500 answer and a 400 answer add no result to the breaker.
 - `TestFailingStatusBodyIsCutAtOneMiB` proves a failing status body is cut at one mebibyte and the status is still classified.
-- `TestBadRequestIsFinal` proves that a 400 answer ends after one request.
+- `TestBadRequestIsFinal` proves that a 400 answer ends after one request as the provider rejection.
 - `TestKeyNeverAppearsInError` proves the key is absent from the error text and present as the bearer header.
+- `TestFaultsMatchSpecCodeTable` proves `Faults()` equals the code table above.
+- `TestAdversarialSecretsStayOutOfPublicView` proves secrets and hostile input stay out of the public view.
+- `TestBadToolSchemaIsAnInvalidRequest` proves a bad tool schema ends as the invalid request fault.
 - No test needs a key or the network.
 
 ## Not in scope

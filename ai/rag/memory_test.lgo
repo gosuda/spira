@@ -11,6 +11,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -334,11 +335,11 @@ func TestMemoryAddRefusesAChangeOfDimensions(t *testing.T) {
 func TestMemoryGivesTheErrorOfTheEmbedder(t *testing.T) {
 	store := newStore(t, map[string][]float32{})
 
-	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "t"}}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed documents: ai/openai: 400: no vector for t") {
-		t.Errorf("Add error = %v", err)
+	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "t"}}); err == nil || !errors.Is(err, openai.ErrProviderRejected) {
+		t.Errorf("Add error = %v, want the openai provider fault", err)
 	}
-	if _, err := store.Search(t.Context(), rag.Search{Query: "t"}); err == nil || !strings.Contains(err.Error(), "ai/rag: embed query: ai/openai: 400: no vector for t") {
-		t.Errorf("Search error = %v", err)
+	if _, err := store.Search(t.Context(), rag.Search{Query: "t"}); err == nil || !errors.Is(err, openai.ErrProviderRejected) {
+		t.Errorf("Search error = %v, want the openai provider fault", err)
 	}
 }
 

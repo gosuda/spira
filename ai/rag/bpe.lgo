@@ -35,21 +35,21 @@ func NewEncoder() (*Encoder?, error) {
 		}
 		at := strings.IndexByte(line, ' ')
 		if at < 0 {
-			return nil, fmt.Errorf("ai/rag: split: bad vocabulary line %q", line)
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: bad vocabulary line"))
 		}
 		token, err := base64.StdEncoding.DecodeString(line[:at])
 		if err != nil {
-			return nil, fmt.Errorf("ai/rag: split: bad vocabulary line %q: %w", line, err)
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: bad vocabulary line: %w", err))
 		}
 		rank, err := strconv.Atoi(line[at+1:])
 		if err != nil {
-			return nil, fmt.Errorf("ai/rag: split: bad vocabulary rank %q: %w", line, err)
+			return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: bad vocabulary rank: %w", err))
 		}
 		ranks[string(token)] = rank
 		blobs[rank] = token
 	}
 	if len(ranks) == 0 {
-		return nil, fmt.Errorf("ai/rag: split: the embedded vocabulary holds no ranks")
+		return nil, ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: the embedded vocabulary holds no ranks"))
 	}
 	return &Encoder{ranks: ranks, blobs: blobs}, nil
 }
@@ -75,7 +75,7 @@ func (e *Encoder) decode(tokens []int) (string, error) {
 	for _, token := range tokens {
 		blob, ok := e.blobs[token]
 		if !ok {
-			return "", fmt.Errorf("ai/rag: split: unknown token %d", token)
+			return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: split: unknown token %d", token))
 		}
 		raw = append(raw, blob...)
 	}

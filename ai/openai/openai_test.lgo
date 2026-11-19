@@ -420,7 +420,7 @@ func TestCutStreamYieldsErrorChunkAndNoReply(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error chunk")
 	}
-	if !strings.Contains(err.Error(), "[DONE]") {
+	if !errors.Is(err, openai.ErrProviderStreamCut) {
 		t.Fatalf("error: %v", err)
 	}
 	if _, cerr := ai.Collect(c.Stream(context.Background(), ai.Request{
@@ -462,8 +462,8 @@ func TestEmbeddingIndexOutsideTheAnswerIsAnError(t *testing.T) {
 	rec := &recorder{}
 	srv := rec.serve(t, http.StatusOK, "application/json", `{"object":"list","data":[{"object":"embedding","index":2,"embedding":[1,2,3]},{"object":"embedding","index":0,"embedding":[4,5,6]}]}`)
 	_, err := testClient(srv).Embed(context.Background(), []string{"first", "second"})
-	if err == nil || err.Error() != "ai/openai: embedding index 2 is outside the 2 vectors of the answer" {
-		t.Fatalf("err = %v, want the error that names index 2 and the 2 vectors", err)
+	if err == nil || !errors.Is(err, openai.ErrProviderError) {
+		t.Fatalf("err = %v, want the provider error for an index outside the answer", err)
 	}
 }
 
@@ -496,7 +496,7 @@ func TestEmbedBodyOverItsLimitIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the size limit error")
 	}
-	if !strings.Contains(err.Error(), "ai/openai: response exceeds the size limit of 1179648 bytes") {
+	if !errors.Is(err, openai.ErrProviderTooLarge) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -602,8 +602,8 @@ func TestFormatGoesOutAsJSONObjectOrSchema(t *testing.T) {
 			Model:    "gpt-6-astra",
 			Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "hi"}}}},
 			Format:   bad,
-		}); err == nil || !strings.Contains(err.Error(), "ai/openai: format is not json") {
-			t.Fatalf("chat with format %s: err = %v, want the format error", bad, err)
+		}); err == nil || !errors.Is(err, openai.ErrInvalidRequest) {
+			t.Fatalf("chat with format %s: err = %v, want the invalid request fault", bad, err)
 		}
 	}
 	if rec.count() != sent {
@@ -635,8 +635,11 @@ func TestUnauthorizedIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if got, want := err.Error(), `ai/openai: 401: {"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}`; got != want {
-		t.Fatalf("error:\n got %s\nwant %s", got, want)
+	if !errors.Is(err, openai.ErrProviderRejected) {
+		t.Fatalf("error: %v, want the provider rejection for a 401 answer", err)
+	}
+	if status, errType, length, ok := openai.FaultDetail(err); !ok || status != 401 || errType != "invalid_request_error" {
+		t.Fatalf("detail = %d %q %d, want status 401 with the parsed error type", status, errType, length)
 	}
 	if rec.count() != 1 {
 		t.Fatalf("401 was retried: %d requests", rec.count())
@@ -782,11 +785,11 @@ func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want a failing status")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/openai: 500: ") {
-		t.Fatalf("error does not classify the status: %q", err.Error()[:64])
+	if !errors.Is(err, openai.ErrProviderError) {
+		t.Fatalf("error: %v, want the provider error for a 500 answer", err)
 	}
-	if len(err.Error()) > (1<<20)+64 {
-		t.Fatalf("error holds %d bytes, want at most one mebibyte of body: the limit of this call is two mebibytes", len(err.Error()))
+	if status, _, length, ok := openai.FaultDetail(err); !ok || status != 500 || length != 1<<20 {
+		t.Fatalf("detail = %d %d, want status 500 with the body cut at one mebibyte", status, length)
 	}
 	if rec.count() != 2 {
 		t.Fatalf("server saw %d calls, want 2: the 500 is retried, not a caller fault", rec.count())
@@ -803,7 +806,7 @@ func TestBadRequestIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.HasPrefix(err.Error(), "ai/openai: 400: ") {
+	if !errors.Is(err, openai.ErrProviderRejected) {
 		t.Fatalf("error: %v", err)
 	}
 	if rec.count() != 1 {
@@ -866,9 +869,8 @@ func TestStreamOfAStalledProviderEndsAtThePolicyTimeout(t *testing.T) {
 	defer cancel()
 	_, err := ai.Collect(c.Stream(ctx, askHello()))
 
-	if err == nil || !strings.Contains(err.Error(), "ai/openai: no stream event for") {
-		t.Fatalf("collect error = %v, want the stall error", err)
-		return
+	if err == nil || !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("collect error = %v, want the stream cut fault", err)
 	}
 	if errors.Is(err, context.Canceled) {
 		t.Fatalf("stall error = %v, want the named stall error, not a cancel", err)
@@ -937,8 +939,8 @@ func TestStreamClosesTheBodyOfAFailingAnswer(t *testing.T) {
 
 	_, err := ai.Collect(c.Stream(context.Background(), askHello()))
 
-	if err == nil || !strings.Contains(err.Error(), "ai/openai: 502") {
-		t.Fatalf("collect error = %v, want the 502 answer", err)
+	if err == nil || !errors.Is(err, openai.ErrProviderError) {
+		t.Fatalf("collect error = %v, want the 502 answer as a provider error", err)
 	}
 	select {
 	case <-released:
@@ -1099,14 +1101,11 @@ func TestStreamCanceledBeforeHeadersKeepsThePackagePrefix(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error from a canceled context")
 	}
-	if !strings.Contains(err.Error(), "ai/openai:") {
-		t.Fatalf("canceled stream error = %v, want the package prefix", err)
+	if !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("canceled stream error = %v, want the stream cut fault", err)
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled stream error = %v, want it to match context.Canceled", err)
-	}
-	if err.Error() != "ai/openai: /chat/completions: context canceled" {
-		t.Fatalf("canceled stream error = %v, want the short cause form", err)
 	}
 }
 
@@ -1145,8 +1144,8 @@ func TestStreamCancelBetweenChunksKeepsThePackagePrefix(t *testing.T) {
 	if cancelErr == nil {
 		t.Fatal("expected an error after the cancel")
 	}
-	if !strings.HasPrefix(cancelErr.Error(), "ai/openai:") {
-		t.Fatalf("cancel error = %v, want the package prefix", cancelErr)
+	if !errors.Is(cancelErr, openai.ErrProviderStreamCut) {
+		t.Fatalf("cancel error = %v, want the stream cut fault", cancelErr)
 	}
 	if !errors.Is(cancelErr, context.Canceled) {
 		t.Fatalf("cancel error = %v, want it to match context.Canceled", cancelErr)
@@ -1179,8 +1178,8 @@ func TestStreamCancelBetweenBufferedChunksKeepsThePackagePrefix(t *testing.T) {
 	if cancelErr == nil {
 		t.Fatal("expected an error after the cancel of a buffered stream")
 	}
-	if !strings.HasPrefix(cancelErr.Error(), "ai/openai:") {
-		t.Fatalf("cancel error = %v, want the package prefix", cancelErr)
+	if !errors.Is(cancelErr, openai.ErrProviderStreamCut) {
+		t.Fatalf("cancel error = %v, want the stream cut fault", cancelErr)
 	}
 	if !errors.Is(cancelErr, context.Canceled) {
 		t.Fatalf("cancel error = %v, want it to match context.Canceled", cancelErr)
@@ -1210,8 +1209,8 @@ func TestStreamStallBeforeHeadersNamesTheStall(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the stall error")
 	}
-	if err.Error() != "ai: collect: ai/openai: no stream event for 2s" {
-		t.Fatalf("stall error = %v, want the bare named stall", err)
+	if !errors.Is(err, openai.ErrProviderStreamCut) {
+		t.Fatalf("stall error = %v, want the stream cut fault", err)
 	}
 	if !openai.IsStall(err) {
 		t.Fatalf("stall error = %v, want the named stall error", err)
@@ -1253,7 +1252,7 @@ func TestChatReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the 400 answer")
 	}
-	if !strings.Contains(err.Error(), "ai/openai: 400") {
+	if !errors.Is(err, openai.ErrProviderRejected) {
 		t.Fatalf("chat error = %v, want the 400 status error", err)
 	}
 	if !strings.Contains(err.Error(), "body read ended early") {
@@ -1337,7 +1336,7 @@ func TestStreamReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the 400 answer")
 	}
-	if !strings.Contains(err.Error(), "ai/openai: 400") {
+	if !errors.Is(err, openai.ErrProviderRejected) {
 		t.Fatalf("stream error = %v, want the 400 status error", err)
 	}
 	if !strings.Contains(err.Error(), "body read ended early") {
@@ -1521,7 +1520,7 @@ func TestEmbedBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
 	transport := &cutTransport{calls: &calls, total: (1 << 20) + (128 << 10) + 1, cut: io.ErrUnexpectedEOF}
 	c := &openai.Client{BaseURL: "http://openai.invalid", Model: "text-embedding-3-small", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
 	_, err := c.Embed(context.Background(), []string{"one"})
-	if err == nil || !strings.Contains(err.Error(), "ai/openai: response exceeds the size limit of 1179648 bytes") {
+	if err == nil || !errors.Is(err, openai.ErrProviderTooLarge) {
 		t.Fatalf("err = %v, want the size limit of 1179648 bytes", err)
 	}
 	if calls.Load() != 1 {
