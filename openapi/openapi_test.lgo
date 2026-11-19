@@ -400,3 +400,26 @@ func TestDocumentBytesAreIdenticalAcrossCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultResponseDocumentsFaultFields(t *testing.T) {
+	doc := openapi.Document(fixtureRouter(), fixtureInfo())
+	collection := doc.Paths["/users"] ?? openapi.PathItem{}
+	op := collection.Post ?? &openapi.Operation{}
+	def, ok := op.Responses["default"]
+	if !ok {
+		t.Fatalf("post needs a default problem response")
+		return
+	}
+	prob, ok := def.Content["application/problem+json"]
+	if !ok {
+		t.Fatalf("default response needs problem json")
+		return
+	}
+	for _, name := range []string{"code", "message"} {
+		field, ok := prob.Schema.Properties[name]
+		if !ok || field.Type != "string" {
+			t.Fatalf("default problem schema needs string %q", name)
+			return
+		}
+	}
+}

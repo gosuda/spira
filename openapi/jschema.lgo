@@ -79,6 +79,8 @@ func problemSchema() Schema {
 		"status": {Type: "integer"},
 		"detail": {Type: "string"},
 		"instance": {Type: "string"},
+		"code": {Type: "string"},
+		"message": {Type: "string"},
 		"errors": errorListSchema(),
 	}
 	return out
