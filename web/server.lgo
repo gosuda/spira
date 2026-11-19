@@ -31,6 +31,7 @@ type serverRun struct {
 	join       *joinState
 	joinCancel context.CancelFunc
 	upgrades   *upgrades
+	listener   net.Listener
 }
 
 type upgradesKey struct{}
@@ -167,7 +168,7 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 		})
 		close(js.done)
 	})
-	return &serverRun{srv: srv, join: js, joinCancel: joinCancel, upgrades: ups}
+	return &serverRun{srv: srv, join: js, joinCancel: joinCancel, upgrades: ups, listener: l}
 }
 
 func (s *Server) Stop(ctx context.Context) error {
