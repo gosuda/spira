@@ -7,6 +7,7 @@ import (
 	"logos/sync"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
 )
 
 type Client struct {
@@ -39,7 +40,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 		return err
 	}
 	if result.ProtocolVersion != ProtocolVersion {
-		return fmt.Errorf("mcp: server answered protocol version %q, want %q", result.ProtocolVersion, ProtocolVersion)
+		return ErrProtocolError.Wrap(fmt.Errorf("mcp: server answered protocol version %q, want %q", result.ProtocolVersion, ProtocolVersion))
 	}
 	return c.notifyInitialized(ctx)
 }
@@ -50,7 +51,10 @@ func (c *Client) notifyInitialized(ctx context.Context) error {
 		return err
 	}
 	if err := c.t.Notify(ctx, msg); err != nil {
-		return fmt.Errorf("mcp: notifications/initialized: %w", err)
+		if fault.Of(err) != nil {
+			return err
+		}
+		return ErrUpstreamFailed.Wrap(fmt.Errorf("mcp: notifications/initialized: %w", err))
 	}
 	return nil
 }

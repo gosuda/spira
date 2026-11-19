@@ -37,7 +37,7 @@ func (s *Stdio) Request(ctx context.Context, msg Envelope) (Envelope, error) {
 	want := idKey(msg.ID)
 	for {
 		if err := ctx.Err(); err != nil {
-			return Envelope{}, fmt.Errorf("mcp: stdio: %w", err)
+			return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", err))
 		}
 		reply, err := s.nextMessage(ctx)
 		if err != nil {
@@ -51,10 +51,10 @@ func (s *Stdio) Request(ctx context.Context, msg Envelope) (Envelope, error) {
 
 func (s *Stdio) send(ctx context.Context, msg Envelope) error {
 	if s.broken {
-		return errors.New("mcp: stdio: transport is unusable after a partial write")
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: transport is unusable after a partial write"))
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("mcp: stdio: %w", err)
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", err))
 	}
 	if err := s.armWrite(ctx); err != nil {
 		return err
@@ -68,14 +68,14 @@ func (s *Stdio) send(ctx context.Context, msg Envelope) error {
 	if n > 0 && n < len(frame) {
 		s.broken = true
 		if err == nil {
-			return errors.New("mcp: stdio: short write of a message line")
+			return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: short write of a message line"))
 		}
 	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mcp: stdio: %w", ctxErr)
+			return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", ctxErr))
 		}
-		return fmt.Errorf("mcp: stdio write: %w", err)
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio write: %w", err))
 	}
 	return nil
 }
@@ -101,18 +101,18 @@ func (s *Stdio) nextMessage(ctx context.Context) (Envelope, error) {
 func (s *Stdio) readError(ctx context.Context, pending []byte, line string, err error) (Envelope, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		s.keep(line)
-		return Envelope{}, fmt.Errorf("mcp: stdio: %w", ctxErr)
+		return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", ctxErr))
 	}
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		s.keep(line)
-		return Envelope{}, fmt.Errorf("mcp: stdio: %w", context.DeadlineExceeded)
+		return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio: %w", context.DeadlineExceeded))
 	}
 	if int64(len(pending)+len(line)) > maxMessage {
 		s.pending = nil
 		s.broken = true
-		return Envelope{}, fmt.Errorf("mcp: stdio line exceeds the size limit of %d bytes: %w", maxMessage, err)
+		return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio line exceeds the size limit of %d bytes: %w", maxMessage, err))
 	}
-	return Envelope{}, fmt.Errorf("mcp: stdio read: %w", err)
+	return Envelope{}, ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio read: %w", err))
 }
 
 func (s *Stdio) keep(prefix string) {
@@ -145,7 +145,7 @@ func (s *Stdio) armRead(ctx context.Context) error {
 		if errors.Is(err, os.ErrNoDeadline) {
 			return nil
 		}
-		return fmt.Errorf("mcp: stdio read deadline: %w", err)
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio read deadline: %w", err))
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func (s *Stdio) armWrite(ctx context.Context) error {
 		if errors.Is(err, os.ErrNoDeadline) {
 			return nil
 		}
-		return fmt.Errorf("mcp: stdio write deadline: %w", err)
+		return ErrTransportFailed.Wrap(fmt.Errorf("mcp: stdio write deadline: %w", err))
 	}
 	return nil
 }
@@ -177,5 +177,9 @@ func (s *Stdio) Close() error {
 			errs = append(errs, fmt.Errorf("mcp: stdio close read: %w", err))
 		}
 	}
-	return errors.Join(errs...)
+	joined := errors.Join(errs...)
+	if joined == nil {
+		return nil
+	}
+	return ErrTransportFailed.Wrap(joined)
 }

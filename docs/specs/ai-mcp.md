@@ -24,6 +24,19 @@ type RPCError struct {
 
 func (e *RPCError) Error() string
 
+var ErrForbiddenOrigin = fault.New("mcp.forbidden_origin", fault.Forbidden, "The origin is forbidden.")
+var ErrUnsupportedVersion = fault.New("mcp.unsupported_version", fault.Invalid, "The protocol version is unsupported.")
+var ErrParseError = fault.New("mcp.parse_error", fault.Invalid, "The request could not be parsed.")
+var ErrMethodNotFound = fault.New("mcp.method_not_found", fault.Invalid, "The method was not found.")
+var ErrInvalidParams = fault.New("mcp.invalid_params", fault.Invalid, "The tool call parameters are invalid.")
+var ErrUnknownTool = fault.New("mcp.unknown_tool", fault.Invalid, "The tool was not found.")
+var ErrToolFailed = fault.New("mcp.tool_failed", fault.Unprocessable, "The tool call failed.")
+var ErrProtocolError = fault.New("mcp.protocol_error", fault.Invalid, "The protocol request failed.")
+var ErrUpstreamFailed = fault.New("mcp.upstream_failed", fault.Unavailable, "The MCP server returned an error.")
+var ErrTransportFailed = fault.New("mcp.transport_failed", fault.Internal, "The MCP transport failed.")
+
+func Faults() []*fault.Error
+
 type Implementation struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
@@ -106,14 +119,15 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `Mount` MUST serve every tool in one `tools/list` page and no `nextCursor`.
 - Each `tools/list` item MUST carry `name`, `description` and the tool's `Schema` as `inputSchema`.
 - A blank `Schema` MUST become `{"type":"object"}` in `inputSchema`.
-- `Mount` MUST answer an unknown `tools/call` name with protocol error `-32602` `Unknown tool: <name>`.
+- `Mount` MUST answer an unknown `tools/call` name with protocol error `-32602` `Unknown tool`.
 - `Mount` MUST answer malformed params with `-32602` `Invalid params`.
 - `Mount` MUST answer an unknown method with `-32601` `Method not found`.
+- Each protocol error MUST carry the fault code in `data.code`.
 - Each protocol error MUST echo the request id at HTTP 200.
 - `tools/call` MUST run the tool's `Call` with the arguments object.
 - Blank arguments MUST become `{}` for `tools/call`.
-- A `Call` error MUST become a result whose `isError` is true and whose text is the error text.
-- Blank error text MUST become `tool <name> failed` in the result text.
+- A `Call` error MUST become an `isError` result with the `mcp.tool_failed` message.
+- A `Call` error MUST never echo its text on the wire.
 - A result MUST be one `text` content item.
 - The `text` member MUST be present on the wire, also for an empty result.
 - `text` content items MUST be joined with `\n` in arrival order.
@@ -138,6 +152,21 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - A failing HTTP status with a cut body MUST keep the status with the read cause.
 - A failing HTTP status with a cut RPC error body MUST keep the status, the read cause and the error.
 - A stdio line over 4 MiB cut by a read error MUST report the size limit and poison the transport.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `mcp.forbidden_origin` | forbidden | The origin is forbidden. |
+| `mcp.invalid_params` | invalid | The tool call parameters are invalid. |
+| `mcp.method_not_found` | invalid | The method was not found. |
+| `mcp.parse_error` | invalid | The request could not be parsed. |
+| `mcp.protocol_error` | invalid | The protocol request failed. |
+| `mcp.tool_failed` | unprocessable | The tool call failed. |
+| `mcp.transport_failed` | internal | The MCP transport failed. |
+| `mcp.unknown_tool` | invalid | The tool was not found. |
+| `mcp.unsupported_version` | invalid | The protocol version is unsupported. |
+| `mcp.upstream_failed` | unavailable | The MCP server returned an error. |
 
 ## Errors
 
