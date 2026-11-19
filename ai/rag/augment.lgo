@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
 )
 
 func Augment(search func(ctx context.Context, q Search) ([]Document, error), base Search) ai.Layer {
@@ -67,6 +68,9 @@ func (a augmenter) searchFor(ctx context.Context, query string) (string, error) 
 	q.Query = query
 	docs, err := a.search(ctx, q)
 	if err != nil {
+		if fault.Of(err) != nil {
+			return "", err
+		}
 		return "", ErrStoreFailed.Wrap(fmt.Errorf("ai/rag: augment: %w", err))
 	}
 	return renderPrompt(query, joinDocuments(docs)), nil
