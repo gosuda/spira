@@ -156,10 +156,12 @@ func genApp(t *testing.T, module string, flag string) string {
 func expectedFiles(engine string) []string {
 	files := []string{
 		"go.mod",
+		"go.sum",
 		"logos.toml",
 		"justfile",
 		"sqlc.yaml",
 		"tools/go.mod",
+		"tools/go.sum",
 		"main.lgo",
 		"db/migrations.lgo",
 		"db/check_test.lgo",

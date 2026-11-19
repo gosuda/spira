@@ -231,10 +231,12 @@ func writeRendered(dir string, dst string, text string) error {
 func sharedFiles() []filePair {
 	return []filePair{
 		{"templates/go.mod.tmpl", "go.mod"},
+		{"templates/go.sum.tmpl", "go.sum"},
 		{"templates/logos.toml.tmpl", "logos.toml"},
 		{"templates/justfile.tmpl", "justfile"},
 		{"templates/sqlc.yaml.tmpl", "sqlc.yaml"},
 		{"templates/tools-go.mod.tmpl", "tools/go.mod"},
+		{"templates/tools-go.sum.tmpl", "tools/go.sum"},
 		{"templates/main.lgo.tmpl", "main.lgo"},
 		{"templates/db-migrations.lgo.tmpl", "db/migrations.lgo"},
 		{"templates/home-home.lgo.tmpl", "features/home/home.lgo"},
