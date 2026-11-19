@@ -9,6 +9,7 @@ export default function Counter(props: { label?: string }): JSX.Element {
 		<button
 			type="button"
 			data-label={props.label ?? ""}
+			data-island="solid-fixture"
 			onClick={() => setCount(count() + 1)}
 		>
 			{`solid ${count()}`}

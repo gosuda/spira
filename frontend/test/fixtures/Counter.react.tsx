@@ -6,6 +6,7 @@ export default function Counter(props: { label?: string }) {
 		<button
 			type="button"
 			data-label={props.label ?? ""}
+			data-island="react-fixture"
 			onClick={() => setCount(count + 1)}
 		>
 			{`react ${count}`}
