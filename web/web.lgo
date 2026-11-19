@@ -3,6 +3,7 @@ package web
 import (
 	"bufio"
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"log/slog"
 	"net"
@@ -11,16 +12,19 @@ import (
 
 	"logos/sync"
 
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/schema"
 	"github.com/gosuda/spira/view"
 )
 
 type Handler func(ctx *Context) (Reply, error)
 
 type Stage func(next Handler) Handler
-
 type RouteInfo struct {
 	Method  string
 	Pattern string
+	In      schema.Schema
+	Doc     Doc?
 }
 
 type routeList struct {
@@ -76,20 +80,22 @@ func (r *Router) Handle(method string, pattern string, h Handler) {
 	r.record(method, full)
 	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
 }
-
 func (r *Router) record(method string, pattern string) {
+	r.recordRoute(method, pattern, nil, nil)
+}
+
+func (r *Router) recordRoute(method string, pattern string, in schema.Schema, doc Doc?) {
 	r.routes.items.WithLock(func(list *[]RouteInfo) {
-		*list = append(*list, RouteInfo{Method: method, Pattern: pattern})
+		*list = append(*list, RouteInfo{Method: method, Pattern: pattern, In: in, Doc: doc})
 	})
 }
 
-func (r *Router) Routes() const []RouteInfo {
+func (r *Router) Routes() []RouteInfo {
 	var out []RouteInfo
 	r.routes.items.WithLock(func(list *[]RouteInfo) {
 		out = append(out, (*list)...)
 	})
-	var snapshot const []RouteInfo = out
-	return snapshot
+	return out
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -170,8 +176,62 @@ func (r *Router) answerError(c *Context, err error) {
 		r.answerProblem(c, pe.Problem)
 		return
 	}
+	if f := fault.Of(err); f != nil {
+		r.answerFault(c, err, statusForKind(f.Kind))
+		return
+	}
 	slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
-	r.answerProblem(c, internalProblem())
+	r.answerFault(c, err, http.StatusInternalServerError)
+}
+
+const statusClientClosed = 499
+
+func statusForKind(k fault.Kind) int {
+	switch k {
+	case fault.Invalid:
+		return http.StatusBadRequest
+	case fault.Unprocessable:
+		return http.StatusUnprocessableEntity
+	case fault.Unauthenticated:
+		return http.StatusUnauthorized
+	case fault.Forbidden:
+		return http.StatusForbidden
+	case fault.NotFound:
+		return http.StatusNotFound
+	case fault.Conflict:
+		return http.StatusConflict
+	case fault.TooLarge:
+		return http.StatusRequestEntityTooLarge
+	case fault.RateLimited:
+		return http.StatusTooManyRequests
+	case fault.Canceled:
+		return statusClientClosed
+	case fault.Timeout:
+		return http.StatusGatewayTimeout
+	case fault.Unavailable:
+		return http.StatusServiceUnavailable
+	case fault.Internal:
+		return http.StatusInternalServerError
+	}
+	return http.StatusInternalServerError
+}
+
+func (r *Router) answerFault(c *Context, err error, status int) {
+	if c.writer.wrote {
+		return
+	}
+	b, merr := json.Marshal(fault.Public(err))
+	if merr != nil {
+		slog.Error("web: encode fault", "error", merr)
+		r.answerProblem(c, internalProblem())
+		return
+	}
+	w := c.writer
+	w.Header().Set("Content-Type", "application/problem+json")
+	writeHead(c, status)
+	if _, werr := w.Write(b); werr != nil {
+		slog.Error("web: write fault", "error", werr)
+	}
 }
 
 func (r *Router) answerProblem(c *Context, p Problem) {

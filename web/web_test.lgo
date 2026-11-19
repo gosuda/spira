@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/fault/faulttest"
 	"github.com/gosuda/spira/validate"
 	"github.com/gosuda/spira/view"
 	"github.com/gosuda/spira/web"
@@ -50,19 +51,19 @@ func pageReply(ctx *web.Context) (web.Reply, error) {
 	return web.Page{Title: "Shop", Body: view.P(view.T("catalog-body"))}, nil
 }
 
-func notFoundFail(ctx *web.Context) (web.Reply, error) {
-	return nil, web.Fail(web.Problem{
+func notFoundReply(ctx *web.Context) (web.Reply, error) {
+	return web.Problem{
 		Type:     "https://spira.example/thing-missing",
 		Title:    "Thing Missing",
 		Status:   http.StatusNotFound,
 		Detail:   "thing 7 absent",
 		Instance: "/thing/7",
 		Errors:   validate.Errors{{Field: "id", Rule: "present", Message: "id is required"}},
-	})
+	}, nil
 }
 
-func goneFail(ctx *web.Context) (web.Reply, error) {
-	return nil, web.Fail(web.Problem{Title: "Gone", Status: http.StatusNotFound})
+func goneReply(ctx *web.Context) (web.Reply, error) {
+	return web.Problem{Title: "Gone", Status: http.StatusNotFound}, nil
 }
 
 func call(t *testing.T, r *web.Router, req *http.Request) *httptest.ResponseRecorder {
@@ -231,7 +232,7 @@ func TestRedirectUnderHtmxAndPlain(t *testing.T) {
 
 func TestFailWritesProblemMembers(t *testing.T) {
 	r := web.NewRouter()
-	r.Handle("GET", "/thing", notFoundFail)
+	r.Handle("GET", "/thing", notFoundReply)
 	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/thing", nil))
 	doc := assertProblemJSON(t, rec, http.StatusNotFound)
 	if doc.Type != "https://spira.example/thing-missing" || doc.Title != "Thing Missing" {
@@ -335,13 +336,8 @@ func TestUnknownErrorAndPanicStayHidden(t *testing.T) {
 	r.Use(web.Defaults()...)
 	r.Handle("GET", "/boom", markerHandler(marker))
 	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/boom", nil))
-	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
-	if doc.Title != "Internal Server Error" || doc.Detail != "" {
-		t.Fatalf("title %q detail %q wrong", doc.Title, doc.Detail)
-	}
-	if strings.Contains(rec.Body.String(), marker) {
-		t.Fatalf("error text leaked into %s", rec.Body.String())
-	}
+	assertFault(t, rec, http.StatusInternalServerError, "internal")
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), marker)
 	if rec.Header().Get("X-Request-Id") == "" {
 		t.Fatal("Defaults did not run RequestID before the failing handler")
 	}
@@ -352,9 +348,7 @@ func TestUnknownErrorAndPanicStayHidden(t *testing.T) {
 	})
 	rec2 := call(t, panicky, httptest.NewRequest(http.MethodGet, "/panic", nil))
 	assertProblemJSON(t, rec2, http.StatusInternalServerError)
-	if strings.Contains(rec2.Body.String(), marker) {
-		t.Fatalf("panic value leaked into %s", rec2.Body.String())
-	}
+	faulttest.RefuseLeak(t, rec2.Body.Bytes(), marker)
 }
 
 func TestPageWithoutLayoutIs500(t *testing.T) {
@@ -373,7 +367,7 @@ func TestProblemViewOnlyWhenAcceptPrefersHTML(t *testing.T) {
 		var node view.Node = view.P(view.T("html-problem " + p.Title))
 		return node
 	}
-	r.Handle("GET", "/thing", notFoundFail)
+	r.Handle("GET", "/thing", notFoundReply)
 	html := call(t, r, reqWithHeaders("/thing", http.Header{"Accept": []string{"text/html"}}))
 	if html.Code != http.StatusNotFound {
 		t.Fatalf("html problem status %d want 404", html.Code)
@@ -587,7 +581,7 @@ func TestCacheControlSetsHeaderOnSuccessOnly(t *testing.T) {
 	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
 		return web.Data{Value: "ok"}, nil
 	})
-	r.Handle("GET", "/gone", goneFail)
+	r.Handle("GET", "/gone", goneReply)
 	ok := call(t, r, httptest.NewRequest(http.MethodGet, "/ok", nil))
 	if got := ok.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control %q want no-store", got)
@@ -606,7 +600,7 @@ func TestAccessLogRecordsRequestFields(t *testing.T) {
 	r.Handle("GET", "/logged", func(ctx *web.Context) (web.Reply, error) {
 		return web.Data{Value: "ok"}, nil
 	})
-	r.Handle("GET", "/gone", goneFail)
+	r.Handle("GET", "/gone", goneReply)
 	call(t, r, httptest.NewRequest(http.MethodGet, "/logged", nil))
 	call(t, r, httptest.NewRequest(http.MethodGet, "/gone", nil))
 	out := buf.String()
@@ -629,8 +623,8 @@ func TestRoutesListsRegistrationOrder(t *testing.T) {
 		t.Fatalf("routes lists %d entries, want %d", len(got), len(want))
 	}
 	for i, info := range got {
-		if info != want[i] {
-			t.Fatalf("route %d is %v, want %v", i, info, want[i])
+		if info.Method != want[i].Method || info.Pattern != want[i].Pattern {
+			t.Fatalf("route %d is %s %s, want %s %s", i, string(info.Method), string(info.Pattern), want[i].Method, want[i].Pattern)
 		}
 	}
 }
@@ -715,7 +709,7 @@ func TestStageSetsResponseHeaderOnEveryReply(t *testing.T) {
 	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
 		return web.Data{Value: "ok"}, nil
 	})
-	r.Handle("GET", "/gone", goneFail)
+	r.Handle("GET", "/gone", goneReply)
 	for _, path := range []string{"/ok", "/gone"} {
 		rec := call(t, r, httptest.NewRequest(http.MethodGet, path, nil))
 		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
@@ -888,7 +882,7 @@ func TestStageReadsTheWrittenStatus(t *testing.T) {
 	r.Handle("GET", "/ok", func(ctx *web.Context) (web.Reply, error) {
 		return web.Data{Value: "ok"}, nil
 	})
-	r.Handle("GET", "/gone", goneFail)
+	r.Handle("GET", "/gone", goneReply)
 	call(t, r, httptest.NewRequest(http.MethodGet, "/ok", nil))
 	call(t, r, httptest.NewRequest(http.MethodGet, "/gone", nil))
 	if got := seen["/ok"] ?? 0; got != http.StatusOK {
@@ -947,7 +941,7 @@ func TestStageProblemSetsStatusForOuterStages(t *testing.T) {
 	seen := 0
 	denied := func(next web.Handler) web.Handler {
 		return func(ctx *web.Context) (web.Reply, error) {
-			return nil, web.Fail(web.Problem{Status: http.StatusForbidden, Title: "forbidden"})
+			return nil, errTestForbidden.Err()
 		}
 	}
 	watch := func(next web.Handler) web.Handler {
@@ -994,16 +988,16 @@ func TestDataEncodeFailureAnswersProblem(t *testing.T) {
 func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/joined", func(ctx *web.Context) (web.Reply, error) {
-		return nil, errors.Join(web.Fail(web.Problem{Title: "Conflict", Status: http.StatusConflict}), errors.New("x"))
+		return nil, errors.Join(errTestConflict.Err(), errors.New("x"))
 	})
 	r.Handle("GET", "/wrapped", func(ctx *web.Context) (web.Reply, error) {
-		return nil, fmt.Errorf("wrap: %w", web.Fail(web.Problem{Title: "Conflict", Status: http.StatusConflict}))
+		return nil, fmt.Errorf("wrap: %w", errTestConflict.Err())
 	})
 	for _, path := range []string{"/joined", "/wrapped"} {
 		rec := call(t, r, httptest.NewRequest(http.MethodGet, path, nil))
-		doc := assertProblemJSON(t, rec, http.StatusConflict)
-		if doc.Title != "Conflict" {
-			t.Fatalf("%s title %q want Conflict", path, doc.Title)
+		doc := assertFault(t, rec, http.StatusConflict, "webtest.conflict")
+		if doc.Message == "" {
+			t.Fatalf("%s fault message is empty", path)
 		}
 	}
 }
@@ -1011,7 +1005,7 @@ func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
 func TestProblemWithoutStatusAnswers500(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/blank", func(ctx *web.Context) (web.Reply, error) {
-		return nil, web.Fail(web.Problem{Title: "Not Found"})
+		return web.Problem{Title: "Not Found"}, nil
 	})
 	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/blank", nil))
 	doc := assertProblemJSON(t, rec, http.StatusInternalServerError)
@@ -1094,7 +1088,7 @@ func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
 		var node view.Node = view.P(view.T("problem-view"))
 		return node
 	}
-	withView.Handle("GET", "/thing", goneFail)
+	withView.Handle("GET", "/thing", goneReply)
 	for _, accept := range []string{"application/json", "text/html"} {
 		rec := call(t, withView, reqWithHeaders("/thing", http.Header{"Accept": []string{accept}}))
 		if got := rec.Header().Get("Vary"); got != "Accept" {
@@ -1102,7 +1096,7 @@ func TestProblemVaryAcceptOnlyWithView(t *testing.T) {
 		}
 	}
 	plain := web.NewRouter()
-	plain.Handle("GET", "/thing", goneFail)
+	plain.Handle("GET", "/thing", goneReply)
 	rec := call(t, plain, httptest.NewRequest(http.MethodGet, "/thing", nil))
 	if got := rec.Header().Get("Vary"); got != "" {
 		t.Fatalf("Vary %q set without a problem view", got)
@@ -1115,7 +1109,7 @@ func TestProblemNegotiationTable(t *testing.T) {
 		var node view.Node = view.P(view.T("problem-view"))
 		return node
 	}
-	r.Handle("GET", "/thing", goneFail)
+	r.Handle("GET", "/thing", goneReply)
 	cases := []struct {
 		accept string
 		html   bool

@@ -60,6 +60,8 @@ type Stage func(next Handler) Handler
 type RouteInfo struct {
 	Method  string
 	Pattern string
+	In      schema.Schema
+	Doc     Doc?
 }
 
 type Router struct {
@@ -73,8 +75,113 @@ func NewRouter() *Router
 func (r *Router) Use(stages ...Stage)
 func (r *Router) Group(prefix string, build func(g *Router))
 func (r *Router) Handle(method string, pattern string, h Handler)
-func (r *Router) Routes() const []RouteInfo
+func (r *Router) Routes() []RouteInfo
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request)
+
+type Doc struct {
+	Summary string
+	Returns []Response
+}
+
+type Response struct {
+	Status int
+	Body   schema.Schema?
+}
+
+func Route[In any](r *Router, method string, pattern string, h func(ctx *Context, in In) (Reply, error))
+func Bind[In any](ctx *Context) (In, error)
+func (r *Router) Describe(method string, pattern string, doc Doc)
+func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler)
+
+type BindCtx struct {
+	Req      *http.Request
+	Body     []byte
+	Rejected *RejectLog
+}
+
+type FieldTags struct {
+	Name   string
+	Body   string
+	Path   string
+	Query  string
+	Header string
+	Form   string
+	Cookie string
+}
+
+type BindSpec struct {
+	Field    string
+	Source   string
+	Key      string
+	Raw      string
+	Present  bool
+	Rejected *RejectLog
+}
+
+type StructBindState struct {
+	Set    bool
+	Failed bool
+	Cause  string
+	Bad    bool
+}
+
+var ErrBindInvalid = fault.New("web.bind_invalid", fault.Invalid, "The request is invalid.")
+
+var ErrBindUnprocessable = fault.New("web.bind_unprocessable", fault.Unprocessable, "The request cannot be processed.")
+
+var ErrBodyTooLarge = fault.New("web.body_too_large", fault.TooLarge, "The request body is too large.")
+
+func Faults() []*fault.Error
+
+func BindRecord[In any](ctx *Context, row *In) (In, error)
+func BindProblem(base *fault.Error, errs validate.Errors) error
+func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectLog) ([]byte, error)
+func CheckBound(row any, errs validate.Errors, rejected *RejectLog) error
+func BindStructField(dst any, name string, spec BindSpec, state *StructBindState)
+
+type RejectLog struct {
+	// unexported fields
+}
+
+func (l *RejectLog) Add(field string, rule string, cause string)
+func (l *RejectLog) Empty() bool
+func (l *RejectLog) Text() string
+func LogRejected(rejected *RejectLog)
+func unknownMember(body []byte, err error) (string, bool)
+
+func CountBody[In any]() int
+func BindSources[In any](bctx BindCtx, row *In, errs *validate.Errors)
+func BindBodies[In any](row *In, body []byte, errs *validate.Errors, rejected *RejectLog)
+func BindOneField[F any](bctx BindCtx, dst *(F), tags FieldTags, errs *validate.Errors)
+func BindStructBranch[F any](dst *(F), spec BindSpec, errs *validate.Errors)
+func BindStructValue(dst any, spec BindSpec, state *StructBindState)
+func BindLeafBranch(dst any, spec BindSpec, errs *validate.Errors)
+func LookupSource(req *http.Request, source string, key string) (string, bool)
+func lookupQuery(raw string, key string) (string, bool)
+func ReadBody(req *http.Request, max int64) ([]byte, error)
+func BindJSONField(dst any, spec BindSpec, body []byte, errs *validate.Errors)
+func SetStringAny(dst any, raw string) error
+func SetPresentAny(dst any)
+func BindPlain(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindPlainFloatTime(dst any, spec BindSpec, errs *validate.Errors) bool
+func BindPlainInt(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindPlainIntNarrow(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindPlainIntWide(dst any, spec BindSpec, errs *validate.Errors) bool
+func BindPlainUint(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindPlainUintNarrow(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindPlainUintWide(dst any, spec BindSpec, errs *validate.Errors) bool
+func BindOption(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindOptionFloatTime(dst any, spec BindSpec, errs *validate.Errors) bool
+func BindOptionInt(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindOptionIntNarrow(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindOptionIntWide(dst any, spec BindSpec, errs *validate.Errors) bool
+func BindOptionUint(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindOptionUintNarrow(dst any, spec BindSpec, errs *validate.Errors) bool
+func bindOptionUintWide(dst any, spec BindSpec, errs *validate.Errors) bool
+func BindAbsentOption(dst any) bool
+func BindAbsentMore(dst any) bool
+func BindingTag(tags FieldTags) (string, string)
+func RouteSchema[In any]() schema.Schema
 
 type Key[T any] struct {
 	// unexported fields
@@ -124,11 +231,14 @@ type Server struct {
 	Router            *Router
 	ReadHeaderTimeout time.Duration = 5 * time.Second
 	ShutdownGrace     time.Duration = 20 * time.Second
+	TLS               *tls.Config?
+	H2C               bool
 	// unexported fields
 }
 
 func (s *Server) Start(ctx context.Context) error
 func (s *Server) Stop(ctx context.Context) error
+func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 ```
 
 ## Requirements
@@ -144,6 +254,8 @@ func (s *Server) Stop(ctx context.Context) error
 - `Group` MUST give the inner router the parent stages from the time of the call.
 - A `Use` after `Group` MUST NOT apply to a route inside that group.
 - `Routes` MUST list each route in registration order.
+- `Routes` MUST return a new slice on each call.
+- A caller MUST NOT change a schema that a route record holds.
 - A route inside a group MUST use the parent prefix plus the inner pattern.
 - When the inner pattern starts with a host, the parent prefix MUST follow that host.
 - The router MUST write a reply at the stage that returns it.
@@ -182,9 +294,32 @@ func (s *Server) Stop(ctx context.Context) error
 - `Htmx.HistoryRestore` MUST come from `HX-History-Restore-Request`.
 - `Htmx.Target` MUST come from `HX-Target`.
 - `Htmx.Trigger` MUST come from `HX-Trigger`.
-- `Htmx.CurrentURL` MUST come from `HX-Current-URL`.
 - `ResponseHeader` MUST be the header map of the response.
 - Before a write, `Status` MUST be 200.
+### Typed binding and routes
+
+- `Bind` MUST read `path`, `query`, `header`, `form` and `cookie` tags.
+- `Bind` MUST convert each present value to the field type.
+- `Bind` MUST collect every field failure before it answers.
+- `Bind` MUST keep `;` as data when it reads query values.
+- `Bind` MUST leave untagged fields alone.
+- `Bind` MUST decode one `body:"json"` field under `MaxBody`.
+- `Bind` MUST reject an unknown JSON member in the body.
+- `Bind` MUST answer 400 when any field fails.
+- `Bind` MUST answer 413 when the body passes `MaxBody`.
+- `Bind` MUST answer 422 when `Check` returns errors.
+- A missing non-option value MUST fail with rule `required`.
+- An absent option value MUST stay absent with no error.
+- Field types MUST be string, bool, the int kinds, float64, `time.Duration`, named strings and their option forms.
+- `Route` MUST set each top-level `Wire` to the binding-tag key.
+- Each `Source` MUST name its source or stay empty.
+- A `body` field MUST keep its JSON wire name.
+- `Route` MUST store that schema in the `RouteInfo`.
+- `Route` MUST run `Bind` before it calls the handler.
+- `Describe` MUST attach the `Doc` to the named route.
+- `Describe` MUST panic when the route is unknown.
+- A field failure message MUST name only the field and the rule.
+- An unknown JSON member MUST fail with rule `unknown`.
 
 ### Replies
 
@@ -232,6 +367,15 @@ func (s *Server) Stop(ctx context.Context) error
 - The internal problem MUST NOT include the panic text or the error text.
 - An unknown error MUST be logged as `web: handler failed`.
 - `Fail` MUST be written as its problem, including a wrapped or joined error.
+- `ProblemError.Error` MUST return `web: ` plus `Problem.Title`.
+- The answer status MUST be 400 for `invalid`, 422 for `unprocessable` and 401 for `unauthenticated`.
+- The answer status MUST be 403 for `forbidden`, 404 for `not_found` and 409 for `conflict`.
+- The answer status MUST be 413 for `too_large`, 429 for `rate_limited` and 499 for `canceled`.
+- The answer status MUST be 504 for `timeout`, 503 for `unavailable` and 500 for `internal`.
+- A fault wrapped under `fmt.Errorf` and a fault joined under `errors.Join` MUST map by the outermost fault in the chain.
+- The public view MUST carry the fault code and the constant message.
+- The public view MUST NOT carry cause text, driver text or a submitted value.
+- The body of a fault answer MUST use content type `application/problem+json`.
 - `RequestID` MUST keep an inbound `X-Request-Id` of 1 to 64 allowed bytes.
 - An allowed byte MUST be a letter, a digit, `.`, `_` or `-`.
 - Any other inbound id MUST be replaced with 32 lowercase hex characters.
@@ -254,6 +398,24 @@ func (s *Server) Stop(ctx context.Context) error
 - When a handler closes its upgraded connection, the server MUST forget that connection.
 - A hijacked connection MUST support TCP half-close.
 - `Stop` of a server that is not started MUST return a nil error.
+- `TLS` MUST stay nil for cleartext or hold the server TLS config.
+- When `TLS` is set, the server MUST serve HTTPS with TLS 1.3 as the minimum version.
+- When `TLS` is set, the server MUST advertise `h2` and `http/1.1` through ALPN.
+- `H2C` MUST stay false unless prior-knowledge cleartext HTTP/2 is wanted.
+- When `H2C` is true, the server MUST accept prior-knowledge cleartext HTTP/2.
+- When `H2C` is false, a prior-knowledge preface MUST NOT become an HTTP/2 session.
+- `Stop` MUST end HTTP/2 streams within `ShutdownGrace` like HTTP/1.1 connections.
+- `TrackConn` MUST return the tracked connection when the context comes from the server.
+- `TrackConn` MUST return the same connection when the context holds no server state.
+- Extended CONNECT over HTTP/2 MUST stay unbuilt in this toolchain.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `web.bind_invalid` | invalid | The request is invalid. |
+| `web.bind_unprocessable` | unprocessable | The request cannot be processed. |
+| `web.body_too_large` | too_large | The request body is too large. |
 
 ## Errors
 
@@ -268,23 +430,30 @@ func (s *Server) Stop(ctx context.Context) error
 - `web: server already started` when `Start` runs on a live server.
 - `web: server needs a router` when `Router` is nil.
 - `web: listen <addr>: <cause>` when the listen fails.
-- `web: serve: <cause>` when `Serve` fails with an error other than `http.ErrServerClosed`.
+- `web: serve: <cause>` when `Serve` or `ServeTLS` fails with an error other than `http.ErrServerClosed`.
 - `web: shutdown: <cause>` when `Shutdown` fails. `Stop` then closes the listener and joins that error.
-- `web: server is stopping` when a handler calls `Hijack` after `Stop` closed the upgraded connections.
+- `web: server is stopping` when a handler calls `Hijack` or `TrackConn` after `Stop` closed the upgraded connections.
 - `web: close upgraded connection: <cause>` when `Stop` cannot close an upgraded connection.
 - `web: CloseRead not supported by the underlying connection` when the taken-over connection lacks a read half-close, and the same text with `CloseWrite` for the write side. Callers MUST check the returned error: the methods exist on every hijacked connection, so a type assertion alone reports support.
-- `ProblemError.Error` returns `web: ` plus `Problem.Title`.
+- `web: encode fault` when a fault view does not encode.
+- `web: write fault` when a fault body write fails.
 - A dropped second reply is logged as `web: reply dropped, the response is already written`.
 - An encode or write failure of a reply is logged once as `web: reply write failed`, and the client gets the internal problem.
 - An error after the response was written is logged as `web: error after the response was written`.
+- `web: bind form cannot be read` when the form does not parse.
+- `web: bind body is larger than the limit` when the body passes `MaxBody`.
+- `web: bind body is not valid JSON for this request` when the body does not decode.
+- `web: bind <name> is not a known field` with rule `unknown` and the member name as the field.
+- `web: bind needs a struct input` when `In` is not a struct.
+- `web: describe <method> <pattern>: no such route` panics when `Describe` names no route.
 
 ## Proof
 
 - `TestPageReplyRespectsHtmxHeaders` proves the full page, the fragment and the boosted page, plus `Vary`.
 - `TestStageOrderFollowsRegistration` and `TestStageAfterGroupSkipsInnerRoutes` prove stage order.
 - `TestRedirectUnderHtmxAndPlain` proves `HX-Redirect` and `Location`.
-- `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped `Fail`.
-- `TestUnknownErrorAndPanicStayHidden` proves that an unknown error and a panic omit their text.
+- `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped or joined fault.
+- `TestUnknownErrorAndPanicStayHidden` proves that an unknown error answers the fixed internal view and that both omit their text.
 - `TestErrAbortHandlerAbortsACutStream` proves that a cut stream ends in a body read error.
 - `TestAccessLogRecordsAnAbortedStream` proves the log record for an aborted stream.
 - `TestPageWithoutLayoutIs500` proves the missing-layout detail.
@@ -325,6 +494,28 @@ func (s *Server) Stop(ctx context.Context) error
 - `TestServerForgetsAnUpgradedConnectionThatItsHandlerCloses` proves that a connection closed by its handler leaves the set.
 - `TestUpgradedConnectionKeepsTCPHalfClose` proves the half-close of a hijacked connection.
 - `TestUpgradedConnectionWithoutHalfCloseReportsNamedError` proves the named half-close errors when the peer lacks them.
+- `TestTLSServesHTTP2` proves TLS serves HTTP/2 with ALPN `h2`.
+- `TestH2CPriorKnowledgeServesHTTP2` proves prior-knowledge h2c serves HTTP/2 when `H2C` is true.
+- `TestH2CRefusedWithoutField` proves prior-knowledge h2c is refused when `H2C` is false.
+- `TestServerStopReturnsWithinGraceForH2WhenHandlerNeverReturns` proves the grace deadline for an h2 stream.
+- `TestServerStopClosesH2StreamWhenShutdownTimesOut` proves a timed-out shutdown ends an h2 stream context.
+- `TestTrackConnWithoutServerReturnsUntracked` proves `TrackConn` without server state returns the same connection.
+- `TestRouteBindsTypedFields` proves path, query, header, cookie and form binding.
+- `TestBindCollectsEveryFieldError` proves that one 400 lists every bad field.
+- `TestBindRequiredFieldMissing` proves the `required` rule.
+- `TestBindCheckerFailureAnswers422` proves the 422 answer and the pass-through.
+- `TestBindUnknownJSONMemberRejected` proves an unknown member fails with rule `unknown` and its name.
+- `TestBindHostileValueNeverEchoed` proves submitted values never reach the response.
+- `TestBindDurationAndNamedString` proves durations and named strings.
+- `TestRouteBindsBodyField` proves JSON body decoding.
+- `TestBindBodyOverMaxBody` proves the 413 answer.
+- `TestRouteInfoCarriesSchemaAndDoc` proves the stored `Wire`, the stored `Source` and the attached `Doc`.
+- `TestRoutesReturnsACopy` proves that mutating one call leaves the next call unchanged.
+- `TestDescribeUnknownRoutePanics` proves the unknown-route panic.
+- `TestWebFaultsMatchSpecCodeTable` proves the declared set equals the code table.
+- `TestFaultKindMapsToStatusAndCode` proves one status and public code per kind.
+- `TestWrappedAndJoinedFaultsMapByOutermost` proves a wrapped or joined fault keeps its outermost fault.
+- `TestFaultCauseNeverReachesClient` proves a wrapped cause never reaches the response.
 
 ## Not in scope
 

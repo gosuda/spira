@@ -3,6 +3,7 @@ package web
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -18,6 +19,8 @@ type Server struct {
 	Router            *Router
 	ReadHeaderTimeout time.Duration = 5 * time.Second
 	ShutdownGrace     time.Duration = 20 * time.Second
+	TLS               *tls.Config?
+	H2C               bool
 
 	state sync.Locked[serverState]
 }
@@ -73,6 +76,25 @@ func (u *upgrades) adopt(conn net.Conn, buf *bufio.ReadWriter) (net.Conn, *bufio
 	return c, buf, nil
 }
 
+func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error) {
+	ups, ok := ctx.Value(upgradesKey{}).(*upgrades)
+	if !ok {
+		return conn, nil
+	}
+	c := &upgradedConn{Conn: conn, owner: ups}
+	stopped := false
+	ups.state.WithLock(func(st *upgradeState) {
+		stopped = st.stopped
+		if !stopped {
+			st.open[c] = struct{}{}
+		}
+	})
+	if stopped {
+		return c, errors.Join(errors.New("web: server is stopping"), conn.Close())
+	}
+	return c, nil
+}
+
 func (c *upgradedConn) Close() error {
 	c.owner.state.WithLock(func(st *upgradeState) {
 		delete(st.open, c)
@@ -117,6 +139,19 @@ type joinState struct {
 	err  sync.Locked[error]
 }
 
+func (s *Server) cloneTLS() *tls.Config? {
+	cfg := s.TLS
+	if cfg == nil {
+		return nil
+	}
+	out := cfg.Clone()
+	if out.MinVersion < tls.VersionTLS13 {
+		out.MinVersion = tls.VersionTLS13
+	}
+	out.NextProtos = []string{"h2", "http/1.1"}
+	return out
+}
+
 func (s *Server) Start(ctx context.Context) error {
 	busy := false
 	s.state.WithLock(func(st *serverState) {
@@ -153,13 +188,35 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 	srv := &http.Server{Handler: s.Router, DisableGeneralOptionsHandler: true, ReadHeaderTimeout: s.ReadHeaderTimeout, BaseContext: func(_ net.Listener) context.Context {
 		return context.WithValue(context.Background(), upgradesKey{}, ups)
 	}}
-	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
-	g.Go(func(_ context.Context) error {
-		if serr := srv.Serve(l); !errors.Is(serr, http.ErrServerClosed) {
-			return fmt.Errorf("web: serve: %w", serr)
+	cfg := s.cloneTLS()
+	if cfg != nil {
+		srv.TLSConfig = cfg
+	}
+	if s.H2C {
+		protos := &http.Protocols{}
+		protos.SetHTTP1(true)
+		protos.SetUnencryptedHTTP2(true)
+		if cfg != nil {
+			protos.SetHTTP2(true)
 		}
-		return nil
-	})
+		srv.Protocols = protos
+	}
+	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
+	if cfg != nil {
+		g.Go(func(_ context.Context) error {
+			if serr := srv.ServeTLS(l, "", ""); !errors.Is(serr, http.ErrServerClosed) {
+				return fmt.Errorf("web: serve: %w", serr)
+			}
+			return nil
+		})
+	} else {
+		g.Go(func(_ context.Context) error {
+			if serr := srv.Serve(l); !errors.Is(serr, http.ErrServerClosed) {
+				return fmt.Errorf("web: serve: %w", serr)
+			}
+			return nil
+		})
+	}
 	js := &joinState{done: make(chan struct{})}
 	joinCtx, joinCancel := context.WithCancel(context.Background())
 	context.AfterFunc(joinCtx, func() {
