@@ -1,0 +1,5 @@
+package admin
+
+func TokenHostAllowedForTest(raw string) bool {
+	return tokenHostAllowed(raw)
+}
