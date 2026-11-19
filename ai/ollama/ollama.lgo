@@ -71,6 +71,10 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	}
 	status, body, err := c.do(ctx, "/api/chat", payload)
 	if err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() == context.Canceled {
+			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(ctx.Err())
+			return
+		}
 		yield ai.Chunk{}, ErrProviderError.Wrap(err)
 		return
 	}
