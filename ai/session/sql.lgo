@@ -41,6 +41,9 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if tooLongID(id) {
+		return nil
+	}
 	s.store.WithLock(func(m *memory) {
 		delete(m.logs, id)
 	})
@@ -122,6 +125,7 @@ type sessionStmts struct {
 	bump           string
 	insert         string
 	selectEvents   string
+	countEvents    string
 	newestBoundary string
 	selectAfter    string
 	deleteEvents   string
@@ -138,6 +142,7 @@ func sqliteSessionStmts() sessionStmts {
 		bump:           "UPDATE spira_sessions SET version = ? WHERE id = ? AND version = ? AND expires_at >= ?",
 		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)",
 		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? ORDER BY seq",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = ?",
 		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = ? AND event_type = ? ORDER BY seq DESC LIMIT ?",
 		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? AND seq > ? ORDER BY seq",
 		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = ?",
@@ -155,6 +160,7 @@ func postgresSessionStmts() sessionStmts {
 		bump:           "UPDATE spira_sessions SET version = $1 WHERE id = $2 AND version = $3 AND expires_at >= $4",
 		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES ($1, $2, $3, $4, $5, $6)",
 		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = $1 ORDER BY seq",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = $1",
 		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = $1 AND event_type = $2 ORDER BY seq DESC LIMIT $3",
 		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = $1 AND seq > $2 ORDER BY seq",
 		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = $1",
@@ -166,12 +172,13 @@ func mysqlSessionStmts() sessionStmts {
 		createSessions: "CREATE TABLE IF NOT EXISTS spira_sessions (id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
 		createEvents:   "CREATE TABLE IF NOT EXISTS spira_session_events (seq BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, session_id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL, at_nanos BIGINT NOT NULL, event_type VARCHAR(64) NOT NULL, msg_role VARCHAR(20) CHARACTER SET utf8mb4 NOT NULL DEFAULT '', parts LONGTEXT CHARACTER SET utf8mb4 NOT NULL, INDEX idx_spira_session_events_session_seq (session_id, seq), CONSTRAINT fk_spira_session_events_session FOREIGN KEY (session_id) REFERENCES spira_sessions (id) ON DELETE CASCADE)",
 		createIdx:      "",
-		insertNew:      "INSERT IGNORE INTO spira_sessions (id, created_at, expires_at, version) VALUES (?, ?, ?, ?)",
+		insertNew:      "INSERT INTO spira_sessions (id, created_at, expires_at, version) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE id = id",
 		claim:          "UPDATE spira_sessions SET version = ?, created_at = ?, expires_at = ? WHERE id = ? AND version = ? AND expires_at = ?",
 		selectSession:  "SELECT id, created_at, expires_at, version FROM spira_sessions WHERE id = ?",
 		bump:           "UPDATE spira_sessions SET version = ? WHERE id = ? AND version = ? AND expires_at >= ?",
 		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)",
 		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? ORDER BY seq",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = ?",
 		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = ? AND event_type = ? ORDER BY seq DESC LIMIT ?",
 		selectAfter:    "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = ? AND seq > ? ORDER BY seq",
 		deleteEvents:   "DELETE FROM spira_session_events WHERE session_id = ?",
@@ -180,14 +187,15 @@ func mysqlSessionStmts() sessionStmts {
 }
 func mssqlSessionStmts() sessionStmts {
 	return sessionStmts{
-		createSessions: "IF OBJECT_ID('spira_sessions', 'U') IS NULL CREATE TABLE spira_sessions (id VARBINARY(512) NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
-		createEvents:   "IF OBJECT_ID('spira_session_events', 'U') IS NULL CREATE TABLE spira_session_events (seq BIGINT IDENTITY(1, 1) NOT NULL PRIMARY KEY, id NVARCHAR(255) COLLATE Latin1_General_100_BIN2 NOT NULL, session_id VARBINARY(512) NOT NULL, at_nanos BIGINT NOT NULL, event_type NVARCHAR(64) NOT NULL, msg_role NVARCHAR(20) NOT NULL DEFAULT '', parts NVARCHAR(MAX) NOT NULL, INDEX idx_spira_session_events_session_seq (session_id, seq), CONSTRAINT fk_spira_session_events_session FOREIGN KEY (session_id) REFERENCES spira_sessions (id) ON DELETE CASCADE)",
+		createSessions: "IF OBJECT_ID('spira_sessions', 'U') IS NULL CREATE TABLE spira_sessions (id VARBINARY(255) NOT NULL PRIMARY KEY, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 0)",
+		createEvents:   "IF OBJECT_ID('spira_session_events', 'U') IS NULL CREATE TABLE spira_session_events (seq BIGINT IDENTITY(1, 1) NOT NULL PRIMARY KEY, id NVARCHAR(255) COLLATE Latin1_General_100_BIN2 NOT NULL, session_id VARBINARY(255) NOT NULL, at_nanos BIGINT NOT NULL, event_type NVARCHAR(64) NOT NULL, msg_role NVARCHAR(20) NOT NULL DEFAULT '', parts NVARCHAR(MAX) NOT NULL, INDEX idx_spira_session_events_session_seq (session_id, seq), CONSTRAINT fk_spira_session_events_session FOREIGN KEY (session_id) REFERENCES spira_sessions (id) ON DELETE CASCADE)",
 		binaryKeys:     true,
 		createIdx:      "",
 		insertNew:      "MERGE INTO spira_sessions WITH (HOLDLOCK) AS t USING (SELECT @p1 AS id, @p2 AS created_at, @p3 AS expires_at, @p4 AS version) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, created_at, expires_at, version) VALUES (s.id, s.created_at, s.expires_at, s.version);",
 		claim:          "UPDATE spira_sessions SET version = @p1, created_at = @p2, expires_at = @p3 WHERE id = @p4 AND version = @p5 AND expires_at = @p6",
 		selectSession:  "SELECT id, created_at, expires_at, version FROM spira_sessions WHERE id = @p1",
 		bump:           "UPDATE spira_sessions SET version = @p1 WHERE id = @p2 AND version = @p3 AND expires_at >= @p4",
+		countEvents:    "SELECT COUNT(*) FROM spira_session_events WHERE session_id = @p1",
 		insert:         "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (@p1, @p2, @p3, @p4, @p5, @p6)",
 		selectEvents:   "SELECT id, session_id, at_nanos, event_type, msg_role, parts FROM spira_session_events WHERE session_id = @p1 ORDER BY seq",
 		newestBoundary: "SELECT seq, parts FROM spira_session_events WHERE session_id = @p1 AND event_type = @p2 ORDER BY seq DESC OFFSET 0 ROWS FETCH NEXT @p3 ROWS ONLY",
@@ -229,14 +237,19 @@ func (s *SQLStore) Prepare(ctx context.Context) error {
 
 const maxEnsureAttempts = 8
 
+func lockConflict(err error) bool {
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "locked") || strings.Contains(text, "busy") || strings.Contains(text, "deadlock") || strings.Contains(text, "serialization")
+}
+
 type ensureResult struct {
 	sess  *Session?
 	retry bool
 }
 
 func (s *SQLStore) Ensure(id string) (*Session?, error) {
-	if strings.TrimSpace(id) == "" {
-		return nil, errors.New("ai/session: session id must not be blank")
+	if err := checkSessionID(id); err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sqlOpTimeout)
 	defer cancel()
@@ -250,10 +263,10 @@ func (s *SQLStore) Ensure(id string) (*Session?, error) {
 			w := sessionTx{ctx: ctx, tx: tx, stmts: stmts, id: id}
 			return w.claimGeneration(created, expires, at.UnixNano())
 		})
-		if err != nil {
+		if err != nil && !lockConflict(err) {
 			return nil, fmt.Errorf("ai/session: ensure: %w", err)
 		}
-		if !res.retry {
+		if err == nil && !res.retry {
 			return res.sess, nil
 		}
 		attempts++
@@ -277,22 +290,11 @@ func keyArg(stmts sessionStmts, id string) any {
 	return id
 }
 
-func (w sessionTx) claimGeneration(created int64, expires int64, now int64) (ensureResult, error) {
-	row, err := db.One[sessionRow](w.ctx, w.tx, w.stmts.selectSession, keyArg(w.stmts, w.id))
-	if err != nil {
-		return ensureResult{}, fmt.Errorf("ai/session: ensure: %w", err)
-	}
-	if row == nil {
-		return w.claimMissing(created, expires)
-	}
-	live := row ?? sessionRow{}
-	if live.Expires >= now {
-		return ensureResult{sess: &Session{ID: live.ID, CreatedAt: time.Unix(0, live.Created).UTC(), ExpiresAt: time.Unix(0, live.Expires).UTC()}}, nil
-	}
-	return w.claimStale(created, expires, live)
+func sessionOf(row sessionRow) *Session {
+	return &Session{ID: row.ID, CreatedAt: time.Unix(0, row.Created).UTC(), ExpiresAt: time.Unix(0, row.Expires).UTC()}
 }
 
-func (w sessionTx) claimMissing(created int64, expires int64) (ensureResult, error) {
+func (w sessionTx) claimGeneration(created int64, expires int64, now int64) (ensureResult, error) {
 	res, err := db.Exec(w.ctx, w.tx, w.stmts.insertNew, keyArg(w.stmts, w.id), created, expires, 1)
 	if err != nil {
 		return ensureResult{}, fmt.Errorf("ai/session: ensure: insert: %w", err)
@@ -301,10 +303,25 @@ func (w sessionTx) claimMissing(created int64, expires int64) (ensureResult, err
 	if err != nil {
 		return ensureResult{}, fmt.Errorf("ai/session: ensure: insert: %w", err)
 	}
-	if n != 1 {
+	if n == 1 {
+		return ensureResult{sess: &Session{ID: w.id, CreatedAt: time.Unix(0, created).UTC(), ExpiresAt: time.Unix(0, expires).UTC()}}, nil
+	}
+	return w.existingSession(created, expires, now)
+}
+
+func (w sessionTx) existingSession(created int64, expires int64, now int64) (ensureResult, error) {
+	row, err := db.One[sessionRow](w.ctx, w.tx, w.stmts.selectSession, keyArg(w.stmts, w.id))
+	if err != nil {
+		return ensureResult{}, fmt.Errorf("ai/session: ensure: %w", err)
+	}
+	if row == nil {
 		return ensureResult{retry: true}, nil
 	}
-	return ensureResult{sess: &Session{ID: w.id, CreatedAt: time.Unix(0, created).UTC(), ExpiresAt: time.Unix(0, expires).UTC()}}, nil
+	live := row ?? sessionRow{}
+	if live.Expires >= now {
+		return ensureResult{sess: sessionOf(live)}, nil
+	}
+	return w.claimStale(created, expires, live)
 }
 
 func (w sessionTx) claimStale(created int64, expires int64, old sessionRow) (ensureResult, error) {
@@ -329,6 +346,9 @@ func (w sessionTx) claimStale(created int64, expires int64, old sessionRow) (ens
 func (s *SQLStore) Find(id string) *Session? {
 	ctx, cancel := context.WithTimeout(context.Background(), sqlOpTimeout)
 	defer cancel()
+	if tooLongID(id) {
+		return nil
+	}
 	stmts := stmtsFor(s.Pool.Dialect())
 	row, err := db.One[sessionRow](ctx, s.Pool, stmts.selectSession, keyArg(stmts, id))
 	if err != nil {
@@ -347,6 +367,9 @@ func (s *SQLStore) Find(id string) *Session? {
 func (s *SQLStore) Events(ctx context.Context, id string) ([]Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if tooLongID(id) {
+		return nil, nil
 	}
 	stmts := stmtsFor(s.Pool.Dialect())
 	live, err := s.liveSession(ctx, stmts, id, s.now().UnixNano())
@@ -405,6 +428,9 @@ func (s *SQLStore) Active(ctx context.Context, id string) ([]ai.Message, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if tooLongID(id) {
+		return nil, nil
+	}
 	stmts := stmtsFor(s.Pool.Dialect())
 	live, err := s.liveSession(ctx, stmts, id, s.now().UnixNano())
 	if err != nil {
@@ -460,8 +486,14 @@ func (s *SQLStore) Append(ctx context.Context, id string, version int64, events 
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if tooLongID(id) {
+		return false, overlongIDError(id, "session id")
+	}
 	if len(events) == 0 {
 		return false, errors.New("ai/session: Append: no events")
+	}
+	if err := checkEventIDs(events); err != nil {
+		return false, err
 	}
 	for _, e := range events {
 		if m := e.Message; m != nil && m.Role == ai.RoleSystem {
@@ -515,6 +547,9 @@ func (s *SQLStore) Version(ctx context.Context, id string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if tooLongID(id) {
+		return 0, nil
+	}
 	stmts := stmtsFor(s.Pool.Dialect())
 	row, err := db.One[sessionRow](ctx, s.Pool, stmts.selectSession, keyArg(stmts, id))
 	if err != nil {
@@ -551,13 +586,16 @@ func (s *SQLStore) Delete(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if tooLongID(id) {
+		return nil
+	}
 	stmts := stmtsFor(s.Pool.Dialect())
 	_, err := db.InTx[int](ctx, s.Pool, func(tx *db.Tx) (int, error) {
-		if _, err := db.Exec(ctx, tx, stmts.deleteEvents, keyArg(stmts, id)); err != nil {
-			return 0, fmt.Errorf("ai/session: delete: clear events: %w", err)
-		}
 		if _, err := db.Exec(ctx, tx, stmts.retireSession, 0, keyArg(stmts, id)); err != nil {
 			return 0, fmt.Errorf("ai/session: delete: retire session: %w", err)
+		}
+		if _, err := db.Exec(ctx, tx, stmts.deleteEvents, keyArg(stmts, id)); err != nil {
+			return 0, fmt.Errorf("ai/session: delete: clear events: %w", err)
 		}
 		return 0, nil
 	})

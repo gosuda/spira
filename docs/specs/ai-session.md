@@ -182,6 +182,13 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `Ensure` MUST claim a missing or expired session in one atomic step.
 - A claim that loses to another opener MUST return the live session and write nothing.
 - Session keys MUST treat trailing spaces as significant on every engine.
+- `Ensure` MUST reject an id longer than 255 bytes with an error that names the limit.
+- `Ensure` MUST accept an id of exactly 255 bytes on every engine.
+- `Append` MUST reject an id longer than 255 bytes with an error that names the limit.
+- `Append` MUST reject an event with an id longer than 255 bytes with an error that names the limit.
+- Session and event ids MUST share one 255-byte limit on every engine.
+- Reads and `Delete` MUST treat an id longer than 255 bytes as a missing session.
+- `Delete` MUST retire the session row before it clears the events of that session.
 
 ## Errors
 
@@ -271,7 +278,10 @@ func (s *Service) Run(ctx context.Context, id string, t Turn) (ai.Reply, error)
 - `contractCustomTTLCoversAMinute` proves a set TTL on every store.
 - `contractTrailingSpaceIDsStayIsolated` proves trailing-space isolation on every store.
 - `contractDeleteThenRecreateRefusesTheOldVersion` proves a deleted version stays dead on every store.
-- `TestSessionClaimAdmitsOneWinner` proves one claim wins on every engine.
+- `contractOverlongIDIsRefused` proves the id byte limit on every store.
+- `TestEngineSessionClaimAdmitsOneWinner` proves one claim wins on every engine.
+- `TestEngineDeleteClearsAConcurrentAppend` proves a concurrent append leaves no rows after `Delete` on every engine.
+- `TestEngineSQLiteConcurrentEnsureOpensOneSession` proves two overlapping opens on SQLite share one session.
 - `TestRememberNestedSameSessionRecordsOnce` proves nested layers record once.
 
 ## Not in scope
