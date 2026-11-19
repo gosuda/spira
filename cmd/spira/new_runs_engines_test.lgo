@@ -1,0 +1,45 @@
+//go:build engines
+
+package main_test
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	spira "github.com/gosuda/spira/cmd/spira"
+)
+
+func TestNewEnginePostgreSQLRuns(t *testing.T) {
+	runEngineApp(t, "postgresql", "SPIRA_TEST_POSTGRES_DSN")
+}
+
+func TestNewEngineMySQLRuns(t *testing.T) {
+	runEngineApp(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
+}
+
+func TestNewEngineMSSQLRuns(t *testing.T) {
+	runEngineApp(t, "mssql", "SPIRA_TEST_MSSQL_DSN")
+}
+
+func runEngineApp(t *testing.T, engine string, env string) {
+	t.Helper()
+	if os.Getenv(env) == "" {
+		t.Fatalf("%s is empty; run the engines recipe", env)
+		return
+	}
+	root := spiraRoot(t)
+	if _, err := os.Stat(filepath.Join(root, "orm")); err != nil {
+		t.Skipf("orm not in tree; generated store cannot build until it lands")
+		return
+	}
+	dir := filepath.Join(t.TempDir(), "app")
+	args := []string{"-engine", engine, "-spira-dir", root, dir, "example.com/demo"}
+	if err := spira.RunNew(args); err != nil {
+		t.Fatalf("RunNew: %v", err)
+		return
+	}
+	runIn(t, dir, []string{"just", "sql"})
+	runIn(t, dir, []string{"logos", "build", "./..."})
+	runIn(t, dir, []string{"just", "engines"})
+}

@@ -2,3 +2,5 @@ package main
 
 var Watch = watch
 var Frontend = frontend
+var PseudoVersion = pseudoVersion
+var SpiraVersionFor = spiraVersionFor
