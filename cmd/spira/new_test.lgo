@@ -56,6 +56,7 @@ func checkEngineApp(t *testing.T, c newEngineCase) {
 	assertContains(t, dir, "go.mod", "module example.com/demo")
 	assertGoModPinsMatchRepo(t, dir)
 	assertContains(t, dir, "go.mod", "replace github.com/gosuda/spira => ")
+	assertContains(t, dir, "justfile", "logos build -o bin/sqlc-gen-spira github.com/gosuda/spira/cmd/sqlc-gen-spira")
 	assertContains(t, dir, "sqlc.yaml", "engine: "+c.sqlcEngine)
 	assertContains(t, dir, "db/migrations/0001_create_users.up.sql", c.dialect)
 	assertContains(t, dir, "db/queries/users.sql", c.userQuery)

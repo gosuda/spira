@@ -3,7 +3,7 @@ upstream_go := env_var_or_default("UPSTREAM_GO", "/home/linuxbrew/.linuxbrew/bin
 
 export GOROOT := logos_root
 export GOTOOLCHAIN := "local"
-export PATH := logos_root / "bin:" + env_var("PATH")
+export PATH := justfile_directory() / "bin:" + logos_root / "bin:" + env_var("PATH")
 
 gate: build lint test web
 
@@ -17,6 +17,7 @@ test:
     logos test -count=1 ./...
 
 sql:
+    logos build -o bin/sqlc-gen-spira github.com/gosuda/spira/cmd/sqlc-gen-spira
     cd tools && go mod tidy && go tool sqlc generate -f ../sqlc.yaml
 
 sql-check:
