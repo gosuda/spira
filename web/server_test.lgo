@@ -163,34 +163,82 @@ func TestSecondStartOnTakenPortFails(t *testing.T) {
 	}
 }
 
-func TestStartWithoutTLSCertificateFailsAndFreesThePort(t *testing.T) {
+func TestServeWithoutTLSCertificateFailsAndKeepsTheListener(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
+		t.Fatalf("reserve a listener: %v", err)
 		return
 	}
-	addr := ln.Addr().String()
-	if cerr := ln.Close(); cerr != nil {
-		t.Fatalf("release the port: %v", cerr)
-		return
-	}
+	t.Cleanup(func() {
+		if cerr := ln.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("listener close: %v", cerr)
+		}
+	})
 	r := web.NewRouter()
 	r.Handle("GET", "/hello", func(ctx *web.Context) (web.Reply, error) {
 		return web.Data{Value: "hi"}, nil
 	})
-	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: time.Second, TLS: &tls.Config{}}
-	if err := s.Start(context.Background()); err == nil {
+	s := &web.Server{Router: r, ShutdownGrace: time.Second, TLS: &tls.Config{}}
+	serr := s.Serve(context.Background(), ln)
+	if serr == nil {
+		stopServer(t, s)
+		t.Fatal("Serve without a certificate reported success")
+		return
+	}
+	if !strings.Contains(serr.Error(), "certificate") {
+		t.Fatalf("Serve error %q does not name the missing certificate", serr.Error())
+		return
+	}
+	if got := s.BoundAddrForTest(); got != "" {
+		t.Fatalf("the failed Serve bound %s", got)
+		return
+	}
+	good := &web.Server{Router: r, ShutdownGrace: time.Second}
+	if gerr := good.Serve(context.Background(), ln); gerr != nil {
+		t.Fatalf("Serve on the kept listener: %v", gerr)
+		return
+	}
+	stopServer(t, good)
+	resp, gerr := http.Get("http://" + ln.Addr().String() + "/hello")
+	if gerr != nil {
+		t.Fatalf("get on the kept listener: %v", gerr)
+		return
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("body close: %v", cerr)
+		}
+	}()
+	bs, rerr := io.ReadAll(resp.Body)
+	if rerr != nil {
+		t.Fatalf("read hello: %v", rerr)
+		return
+	}
+	if !strings.Contains(string(bs), `"hi"`) {
+		t.Fatalf("hello body %q lacks the value", string(bs))
+		return
+	}
+}
+
+func TestStartWithoutTLSCertificateFailsBeforeBinding(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "hi"}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: time.Second, TLS: &tls.Config{}}
+	serr := s.Start(context.Background())
+	if serr == nil {
 		stopServer(t, s)
 		t.Fatal("Start without a certificate reported success")
 		return
 	}
-	probe, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("the port stays bound after the failed Start: %v", err)
+	if !strings.Contains(serr.Error(), "certificate") {
+		t.Fatalf("Start error %q does not name the missing certificate", serr.Error())
 		return
 	}
-	if cerr := probe.Close(); cerr != nil {
-		t.Errorf("probe close: %v", cerr)
+	if got := s.BoundAddrForTest(); got != "" {
+		t.Fatalf("the failed Start bound %s", got)
+		return
 	}
 }
 
