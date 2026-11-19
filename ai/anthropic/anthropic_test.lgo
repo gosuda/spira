@@ -47,11 +47,12 @@ func testClient(srv *httptest.Server) *anthropic.Client {
 }
 
 type recorder struct {
-	mu     sync.Mutex
+	mu sync.Mutex
 	bodies []string
-	keys   []string
-	vers   []string
-	paths  []string
+	keys []string
+	vers []string
+	paths []string
+	want string
 }
 
 func (r *recorder) add(req *http.Request, body string) {
@@ -61,6 +62,23 @@ func (r *recorder) add(req *http.Request, body string) {
 	r.keys = append(r.keys, req.Header.Get("x-api-key"))
 	r.vers = append(r.vers, req.Header.Get("anthropic-version"))
 	r.paths = append(r.paths, req.URL.Path)
+}
+func (r *recorder) admit(req *http.Request, body string) (int, bool) {
+	key := req.Header.Get("x-api-key")
+	want := r.want
+	if want == "" {
+		want = "test-key"
+	}
+	if key != want {
+		return 0, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bodies = append(r.bodies, body)
+	r.keys = append(r.keys, key)
+	r.vers = append(r.vers, req.Header.Get("anthropic-version"))
+	r.paths = append(r.paths, req.URL.Path)
+	return len(r.bodies), true
 }
 
 func (r *recorder) count() int {
@@ -88,13 +106,15 @@ func (r *recorder) version(i int) string {
 }
 
 func (rec *recorder) serve(t *testing.T, status int, contentType string, body string) *httptest.Server {
-	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", contentType)
 		if status != http.StatusOK {
 			w.WriteHeader(status)
@@ -393,7 +413,10 @@ func TestStreamEndsAtMessageStopWhileTheBodyStaysOpen(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if _, err := io.WriteString(w, fixture(t, "stream-plain.txt")); err != nil {
 			t.Errorf("server write: %v", err)
@@ -508,9 +531,13 @@ func TestServerErrorIsRetried(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if rec.count() == 1 {
+		if n == 1 {
 			w.WriteHeader(http.StatusInternalServerError)
 			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"internal"}}`); err != nil {
 				t.Errorf("server write: %v", err)
@@ -547,9 +574,13 @@ func TestRateLimitedIsRetried(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if rec.count() == 1 {
+		if n == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
 				t.Errorf("server write: %v", err)
@@ -587,8 +618,11 @@ func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
-		n := rec.count()
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if n <= len(statuses) {
 			w.WriteHeader(statuses[n-1])
@@ -631,7 +665,10 @@ func TestBodyOverTheLimitIsFinal(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := io.WriteString(w, body); err != nil {
 			t.Logf("server write ended when the client stopped at its limit: %v", err)
@@ -663,7 +700,10 @@ func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		if _, err := io.WriteString(w, body); err != nil {
@@ -694,7 +734,7 @@ func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 }
 
 func TestKeyNeverAppearsInError(t *testing.T) {
-	rec := &recorder{}
+	rec := &recorder{want: "sk-ant-super-secret-value"}
 	srv := rec.serve(t, http.StatusUnauthorized, "application/json", `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
 	c := testClient(srv)
 	c.Key = "sk-ant-super-secret-value"
@@ -865,16 +905,19 @@ func TestStreamEndsAtAMessageStopRecordWithoutEventLines(t *testing.T) {
 	}
 }
 
-func TestTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
-	rec := &recorder{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func truncatedFailingHandler(t *testing.T, rec *recorder) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if rec.count() > 1 {
+		if n > 1 {
 			if _, err := io.WriteString(w, fixture(t, "message-response.json")); err != nil {
 				t.Errorf("server write: %v", err)
 			}
@@ -885,7 +928,12 @@ func TestTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
 		if _, err := io.WriteString(w, `{"type":"error","error":{"type":"inval`); err != nil {
 			t.Logf("server write ended early: %v", err)
 		}
-	}))
+	}
+}
+
+func TestTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(truncatedFailingHandler(t, rec))
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
 	c.Policy = resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}, Breaker: &resilience.Breaker{Window: 1, FailureRate: 0.5, OpenFor: time.Hour}}
@@ -943,7 +991,10 @@ func TestRedirectToAnotherOriginDropsTheKey(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		seen.add(r, string(raw))
+		if _, ok := seen.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		http.Redirect(w, r, target.URL+"/land", http.StatusTemporaryRedirect)
 	}))
 	t.Cleanup(front.Close)
@@ -975,7 +1026,10 @@ func TestRedirectOnTheSameOriginKeepsTheKey(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if r.URL.Path == "/v1/messages" {
 			http.Redirect(w, r, "/land", http.StatusTemporaryRedirect)
 			return
@@ -1007,17 +1061,19 @@ func TestRedirectOnTheSameOriginKeepsTheKey(t *testing.T) {
 }
 
 func TestRetryAfterHoldsTheNextAttempt(t *testing.T) {
+	rec := &recorder{}
 	log := &arrivalLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := io.ReadAll(r.Body); err != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		if !isClientCall(r) {
-			log.stranger(r)
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		n := log.add(r)
+		log.add(r)
 		w.Header().Set("Content-Type", "application/json")
 		if n == 1 {
 			w.Header().Set("Retry-After", "1")
@@ -1050,7 +1106,7 @@ func TestRetryAfterHoldsTheNextAttempt(t *testing.T) {
 	if reply.ID != "msg_013Zva2CMHLNnXjNJJKqJ2EF" {
 		t.Fatalf("reply: %+v", reply)
 	}
-	if got := log.count(); got != 2 {
+	if got := rec.count(); got != 2 {
 		t.Fatalf("requests: %d, want 2: the second attempt must wait out the advertised second\n%s", got, log.dump())
 		return
 	}
@@ -1080,21 +1136,13 @@ type arrival struct {
 	werr   string
 }
 
-type stranger struct {
-	offset time.Duration
-	method string
-	path   string
-	remote string
-	ua     string
-}
 
 type arrivalLog struct {
-	mu        sync.Mutex
-	first     time.Time
-	at        []time.Time
-	answered  []time.Time
-	rows      []arrival
-	strangers []stranger
+	mu       sync.Mutex
+	first    time.Time
+	at       []time.Time
+	answered []time.Time
+	rows     []arrival
 }
 
 func (l *arrivalLog) add(r *http.Request) int {
@@ -1122,21 +1170,6 @@ func (l *arrivalLog) add(r *http.Request) int {
 	return len(l.at)
 }
 
-func (l *arrivalLog) stranger(r *http.Request) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	if l.first.IsZero() {
-		l.first = now
-	}
-	l.strangers = append(l.strangers, stranger{
-		offset: now.Sub(l.first),
-		method: r.Method,
-		path:   r.URL.Path,
-		remote: r.RemoteAddr,
-		ua:     r.Header.Get("User-Agent"),
-	})
-}
 
 func (l *arrivalLog) done(n int, err error) {
 	l.mu.Lock()
@@ -1176,21 +1209,12 @@ func (l *arrivalLog) dump() string {
 			i+1, row.offset, row.method, row.path, row.remote, row.proto, row.closed, row.length,
 			row.idem, row.xidem, row.sretry, row.conn, row.ua, row.wrote, row.werr)
 	}
-	if len(l.strangers) > 0 {
-		b.WriteString("strangers:\n")
-		for i, s := range l.strangers {
-			fmt.Fprintf(&b, "  s%d off=%v %s %s %s ua=%q\n", i+1, s.offset, s.method, s.path, s.remote, s.ua)
-		}
-	}
 	return b.String()
 }
 
-func isClientCall(r *http.Request) bool {
-	return r.Method == http.MethodPost && r.URL.Path == "/v1/messages" && r.Header.Get("x-api-key") == "test-key"
-}
 
 func TestEchoedKeyNeverAppearsInError(t *testing.T) {
-	rec := &recorder{}
+	rec := &recorder{want: "sk-ant-super-secret-value"}
 	srv := rec.serve(t, http.StatusUnauthorized, "application/json", `{"type":"error","error":{"type":"authentication_error","message":"key sk-ant-super-secret-value is unknown"}}`)
 	c := testClient(srv)
 	c.Key = "sk-ant-super-secret-value"
@@ -1212,7 +1236,7 @@ func TestEchoedKeyNeverAppearsInError(t *testing.T) {
 }
 
 func TestStreamErrorEventHidesTheKey(t *testing.T) {
-	rec := &recorder{}
+	rec := &recorder{want: "sk-ant-super-secret-value"}
 	body := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"key sk-ant-super-secret-value overloaded\"}}\n\n"
 	srv := rec.serve(t, http.StatusOK, "text/event-stream", body)
 	c := testClient(srv)
@@ -1504,17 +1528,17 @@ data: {"type":"message_stop"}
 
 func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
 	start := time.Now()
-	log := &arrivalLog{}
+	rec := &recorder{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := io.ReadAll(r.Body); err != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		if !isClientCall(r) {
-			log.stranger(r)
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		n := log.add(r)
 		w.Header().Set("Content-Type", "application/json")
 		if n == 1 {
 			w.Header().Set("Retry-After", "9223372036854775807")
@@ -1546,8 +1570,8 @@ func TestRetryAfterIsBoundedByTheRetryMaximum(t *testing.T) {
 	if waited := time.Since(start); waited > 30*time.Second {
 		t.Fatalf("the wait took %v: an advertisement past the retry maximum must be capped at it", waited)
 	}
-	if log.count() != 2 {
-		t.Fatalf("requests: %d, want the rejected attempt and its retry", log.count())
+	if rec.count() != 2 {
+		t.Fatalf("requests: %d, want the rejected attempt and its retry", rec.count())
 	}
 }
 
@@ -1558,7 +1582,10 @@ func TestRetryAfterLeavesACallerFaultFinal(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusBadRequest)
@@ -1587,13 +1614,16 @@ func TestRetryAfterLeavesACallerFaultFinal(t *testing.T) {
 func TestKeyStraddlingTheCutIsRedacted(t *testing.T) {
 	key := strings.Repeat("k", 64)
 	body := strings.Repeat("x", (1<<20)-10) + key + "yyyyyyyy"
-	rec := &recorder{}
+	rec := &recorder{want: key}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		if _, err := io.WriteString(w, body); err != nil {
@@ -1660,9 +1690,13 @@ func TestStreamRetriesARateLimitedAnswerBeforeAnyEvent(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		n, ok := rec.admit(r, string(raw))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		if rec.count() == 1 {
+		if n == 1 {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			if _, err := io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); err != nil {
@@ -1721,7 +1755,10 @@ func TestStreamTruncatedFailingBodyKeepsTheStatus(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", "100")
 		w.WriteHeader(http.StatusBadRequest)
@@ -1765,7 +1802,10 @@ func TestStreamCancelKeepsThePrefixAndTheCause(t *testing.T) {
 		if err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
+		if _, ok := rec.admit(r, string(raw)); !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if _, err := io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"); err != nil {
 			t.Errorf("server write: %v", err)
