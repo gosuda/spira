@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 
 	"logos/sync"
 
@@ -75,8 +74,7 @@ func (r *Router) Group(prefix string, build func(g *Router)) {
 }
 
 func (r *Router) Handle(method string, pattern string, h Handler) {
-	host := pattern[:max(strings.IndexByte(pattern, '/'), 0)]
-	full := host + r.prefix + pattern[len(host):]
+	full := fullPattern(r.prefix, pattern)
 	r.record(method, full)
 	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
 }
@@ -93,7 +91,17 @@ func (r *Router) recordRoute(method string, pattern string, in schema.Schema, do
 func (r *Router) Routes() []RouteInfo {
 	var out []RouteInfo
 	r.routes.items.WithLock(func(list *[]RouteInfo) {
-		out = append(out, (*list)...)
+		for i := range *list {
+			info := (*list)[i]
+			if info.Doc != nil {
+				held := info.Doc ?? Doc{}
+				fresh := make([]Response, len(held.Returns))
+				copy(fresh, held.Returns)
+				held.Returns = fresh
+				info.Doc = held
+			}
+			out = append(out, info)
+		}
 	})
 	return out
 }
@@ -177,7 +185,11 @@ func (r *Router) answerError(c *Context, err error) {
 		return
 	}
 	if f := fault.Of(err); f != nil {
-		r.answerFault(c, err, statusForKind(f.Kind))
+		status := statusForKind(f.Kind)
+		if status >= http.StatusInternalServerError {
+			slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
+		}
+		r.answerFault(c, err, status)
 		return
 	}
 	slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)

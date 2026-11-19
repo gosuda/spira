@@ -32,9 +32,13 @@ func Route[In any](r *Router, method string, pattern string, h func(ctx *Context
 	}
 }
 
-func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler) {
+func fullPattern(prefix string, pattern string) string {
 	host := pattern[:max(strings.IndexByte(pattern, '/'), 0)]
-	full := host + r.prefix + pattern[len(host):]
+	return host + prefix + pattern[len(host):]
+}
+
+func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler) {
+	full := fullPattern(r.prefix, pattern)
 	r.recordRoute(method, full, in, nil)
 	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
 }
@@ -70,10 +74,11 @@ func RouteSchema[In any]() schema.Schema {
 }
 
 func (r *Router) Describe(method string, pattern string, doc Doc) {
+	full := fullPattern(r.prefix, pattern)
 	found := false
 	r.routes.items.WithLock(func(list *[]RouteInfo) {
 		for i := range *list {
-			if (*list)[i].Method == method && (*list)[i].Pattern == pattern {
+			if (*list)[i].Method == method && (*list)[i].Pattern == full {
 				(*list)[i].Doc = doc
 				found = true
 			}

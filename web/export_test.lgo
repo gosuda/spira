@@ -1,8 +1,13 @@
 package web
 
 import (
+	"crypto/tls"
 	"net"
 )
+
+func CloneTLSForTest(s *Server) *tls.Config? {
+	return s.cloneTLS()
+}
 
 func (s *Server) UpgradedConnections() int {
 	var held *serverRun?

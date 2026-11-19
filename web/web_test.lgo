@@ -985,6 +985,25 @@ func TestDataEncodeFailureAnswersProblem(t *testing.T) {
 	}
 }
 
+func TestInternalFaultIsLoggedOnce(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(prev)
+	r := web.NewRouter()
+	r.Handle("GET", "/boom", func(ctx *web.Context) (web.Reply, error) {
+		return nil, fmt.Errorf("boom: %w", errTestInternal.Err())
+	})
+	r.Handle("GET", "/clash", func(ctx *web.Context) (web.Reply, error) {
+		return nil, fmt.Errorf("clash: %w", errTestConflict.Err())
+	})
+	assertFault(t, call(t, r, httptest.NewRequest(http.MethodGet, "/boom", nil)), http.StatusInternalServerError, "internal")
+	assertFault(t, call(t, r, httptest.NewRequest(http.MethodGet, "/clash", nil)), http.StatusConflict, "webtest.conflict")
+	if n := strings.Count(buf.String(), "web: handler failed"); n != 1 {
+		t.Fatalf("handler failures logged %d times, want 1: %q", n, buf.String())
+	}
+}
+
 func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/joined", func(ctx *web.Context) (web.Reply, error) {
@@ -999,6 +1018,57 @@ func TestJoinedProblemErrorsKeepTheProblem(t *testing.T) {
 		if doc.Message == "" {
 			t.Fatalf("%s fault message is empty", path)
 		}
+	}
+}
+
+func TestWrappedLegacyProblemKeepsTheProblem(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/legacy-wrapped", func(ctx *web.Context) (web.Reply, error) {
+		return nil, fmt.Errorf("wrap: %w", web.Fail(web.Problem{Title: "Thing Missing", Status: http.StatusNotFound}))
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/legacy-wrapped", nil))
+	doc := assertProblemJSON(t, rec, http.StatusNotFound)
+	if doc.Title != "Thing Missing" {
+		t.Fatalf("wrapped legacy problem title %q want Thing Missing", doc.Title)
+	}
+}
+
+func TestDescribeInsideAGroupAttachesTheDoc(t *testing.T) {
+	r := web.NewRouter()
+	r.Group("/api", func(g *web.Router) {
+		web.Route(g, "GET", "/items", func(ctx *web.Context, in BindSearchIn) (web.Reply, error) {
+			return web.Empty{}, nil
+		})
+		g.Describe("GET", "/items", web.Doc{Summary: "List items"})
+	})
+	infos := r.Routes()
+	if len(infos) != 1 {
+		t.Fatalf("routes hold %d entries, want 1", len(infos))
+		return
+	}
+	if infos[0].Pattern != "/api/items" {
+		t.Fatalf("route pattern %q want /api/items", infos[0].Pattern)
+		return
+	}
+	given := infos[0].Doc ?? web.Doc{}
+	if given.Summary != "List items" {
+		t.Fatalf("route Doc summary %q want List items", given.Summary)
+	}
+}
+
+func TestRoutesDeepCopiesDocReturns(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/search", func(ctx *web.Context, in BindSearchIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Describe("GET", "/search", web.Doc{Summary: "Search catalog", Returns: []web.Response{{Status: 200}}})
+	first := r.Routes()
+	held := first[0].Doc ?? web.Doc{}
+	held.Returns[0].Status = 999
+	second := r.Routes()
+	given := second[0].Doc ?? web.Doc{}
+	if len(given.Returns) != 1 || given.Returns[0].Status != 200 {
+		t.Fatalf("second Routes call sees %+v, want one 200 response", given.Returns)
 	}
 }
 

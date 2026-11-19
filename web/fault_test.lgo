@@ -17,6 +17,8 @@ var errTestForbidden = fault.New("webtest.forbidden", fault.Forbidden, "Test for
 
 var errTestConflict = fault.New("webtest.conflict", fault.Conflict, "Test conflict fault.")
 
+var errTestInternal = fault.New("webtest.internal", fault.Internal, "Test internal fault.")
+
 type faultDoc struct {
 	Code    string          `json:"code"`
 	Message string          `json:"message"`
