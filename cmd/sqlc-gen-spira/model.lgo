@@ -739,22 +739,35 @@ func (r *resolver) queryField(q *Query, col *Column, index int) (Field, error) {
 	if col.Name == "" {
 		return Field{}, fmt.Errorf("sqlc-gen-spira: %s: column %d needs an alias", q.Name, index)
 	}
+	if col.EmbedTable.Name != "" {
+		return r.embedField(q, col)
+	}
 	schema := r.schemaForColumn(col)
 	goType, err := r.goColumnType(schema, col.Table.Name, col)
 	if err != nil {
 		return Field{}, fmt.Errorf("sqlc-gen-spira: query %s column %d: %w", q.Name, index, err)
-	}
-	embed := ""
-	if col.EmbedTable.Name != "" {
-		embed = col.EmbedTable.Name
 	}
 	return Field{
 		Name:    col.Name,
 		GoName:  goField(col.Name),
 		GoType:  goType,
 		Table:   col.Table.Name,
-		Embed:   embed,
 		NotNull: col.NotNull,
+	}, nil
+}
+
+func (r *resolver) embedField(q *Query, col *Column) (Field, error) {
+	st, err := r.embedStruct(q, col.EmbedTable.Name)
+	if err != nil {
+		return Field{}, err
+	}
+	return Field{
+		Name:    col.Name,
+		GoName:  st,
+		GoType:  st,
+		Table:   col.Table.Name,
+		Embed:   col.EmbedTable.Name,
+		NotNull: true,
 	}, nil
 }
 

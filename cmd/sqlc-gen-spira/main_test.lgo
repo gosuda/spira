@@ -1110,3 +1110,63 @@ func TestOverridesNormalizeCase(t *testing.T) {
 		t.Fatalf("id type = %q, want the ItemCode override to win", got)
 	}
 }
+
+func singleColumnEmbedFixture(t *testing.T) *Request {
+	t.Helper()
+	req := loadRequest(t, "embed")
+	req.PluginOptions = pluginOptions(t, map[string]any{
+		"tables": map[string]any{
+			"cart_items": map[string]any{"type": "CartItem", "key": "id", "key_type": "CartItemID"},
+			"products":   map[string]any{"type": "Product", "key": "id", "key_type": "ProductID"},
+		},
+		"refs": map[string]any{"cart_items.product_id": "products"},
+	})
+	return req
+}
+
+func TestSingleColumnEmbed(t *testing.T) {
+	req := singleColumnEmbedFixture(t)
+	model, _, err := Generate(req)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+		return
+	}
+	found := findQuery(t, model, "ListCartItems")
+	if found.RowGoType != "ListCartItemsRow" {
+		t.Fatalf("ListCartItems row = %q, want a ListCartItemsRow struct", found.RowGoType)
+		return
+	}
+	if len(found.Embeds) != 1 {
+		t.Fatalf("ListCartItems embeds = %+v, want one products embed", found.Embeds)
+		return
+	}
+	embed := found.Embeds[0]
+	if embed.Table != "products" || embed.Field != "Product" || embed.Struct != "Product" {
+		t.Fatalf("ListCartItems embed = %+v, want products as Product Product", embed)
+		return
+	}
+	src := queryFile(t, req, "cart.sql.lgo")
+	for _, want := range []string{"type ListCartItemsRow struct", "Product Product"} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("query file holds no %q:\n%s", want, src)
+			return
+		}
+	}
+	row := structFields(t, src, "ListCartItemsRow")
+	if (row["ID"] ?? "") != "CartItemID" || (row["Quantity"] ?? "") != "int64" {
+		t.Fatalf("ListCartItemsRow fields = %v, want the key type on ID", row)
+	}
+}
+
+func TestMissingEmbedTable(t *testing.T) {
+	req := singleColumnEmbedFixture(t)
+	req.Queries[0].Columns[1].EmbedTable.Name = "ghosts"
+	_, _, err := Generate(req)
+	if err == nil {
+		t.Fatal("Generate succeeded; want the missing embed table error")
+		return
+	}
+	if !strings.Contains(err.Error(), `query ListCartItems: embed table "ghosts" is not in the catalog`) {
+		t.Fatalf("error = %v, want it to name the query and the ghosts table", err)
+	}
+}

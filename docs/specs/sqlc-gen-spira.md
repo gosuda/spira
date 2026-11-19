@@ -158,6 +158,7 @@ SQL Server:
 - `sqlc.embed` MUST become a nested field of the table struct.
 - The nested field MUST use the embedded table struct name.
 - A nullable key parameter MUST use the underlying option type.
+- An embed column MUST resolve to the nested field without a type lookup.
 - An output column with no name MUST be the error `<Name>: column <i> needs an alias`.
 - Function, constant, row and argument names MUST derive from the query name in Pascal-case.
 - Two parameters with one name MUST differ by the parameter number suffix.
@@ -180,6 +181,7 @@ SQL Server:
 - `<Name>: writes versioned table <table> without <version column>` for a versioned write that omits the version column.
 - `duplicate query "<Name>"` for two queries with one name.
 - A slice marker without a slice parameter names the marker and the query.
+- An unknown embed table MUST be the error naming the query and the table.
 - An unmapped type and an array column each produce an error.
 - An unsigned MySQL integer produces an error.
 - Each error names the table and the column.
@@ -193,6 +195,7 @@ SQL Server:
 - It also proves a three-parameter `UpdateItem` with one `UpdateItemArgs` struct.
 - `TestSliceQuery` proves a `sqlc.slice` parameter becomes a `[]T` expanded with `db.In`, and a marker-less slice passes as one argument.
 - `TestEmbedQuery` proves a `sqlc.embed` table becomes a nested field of the row struct.
+- `TestSingleColumnEmbed` proves one embed column with no type becomes the same nested field.
 - Each negative case requires the named message.
 - The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
 - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
