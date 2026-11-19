@@ -1,5 +1,13 @@
 package gateway
 
+import (
+	"time"
+)
+
 func CutEscapedSuffixForTest(path string, mounted string) string {
 	return cutEscapedSuffix(path, mounted)
+}
+
+func HeadersLateForTest(done time.Time, deadline time.Time) bool {
+	return headersLate(done, deadline)
 }

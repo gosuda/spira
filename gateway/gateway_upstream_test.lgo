@@ -605,3 +605,71 @@ func TestNilBreakerPolicyAddsNoBreaker(t *testing.T) {
 		t.Fatalf("the upstream saw %d requests, want 30: a nil breaker must leave every request admitted\n%s", hits.Load(), grd.report())
 	}
 }
+
+func TestHeadersLateComparesCompletionAgainstDeadline(t *testing.T) {
+	deadline := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	if gateway.HeadersLateForTest(deadline.Add(-time.Millisecond), deadline) {
+		t.Fatal("a completion before the deadline counts as late")
+	}
+	if gateway.HeadersLateForTest(deadline, deadline) {
+		t.Fatal("a completion at the deadline counts as late")
+	}
+	if !gateway.HeadersLateForTest(deadline.Add(time.Millisecond), deadline) {
+		t.Fatal("a completion after the deadline does not count as late")
+	}
+}
+
+func TestClientCancelNeverReportsAHeaderTimeout(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		case <-r.Context().Done():
+			return
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(up.Close)
+	logs := &lockedBuffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gw.URL+"/shop/x", nil)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	done := make(chan error, 1)
+	g, _ := rt.NewGroup(t.Context(), 1)
+	g.Go(func(gctx context.Context) error {
+		_, derr := http.DefaultClient.Do(req)
+		select {
+		case done <- derr:
+		case <-gctx.Done():
+		}
+		return nil
+	})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the upstream never saw the request")
+	}
+	cancel()
+	select {
+	case derr := <-done:
+		if derr == nil {
+			t.Fatal("the canceled client saw no error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client call never returned after cancel")
+	}
+	if gerr := g.Wait(); gerr != nil {
+		t.Fatalf("client group: %v", gerr)
+	}
+	if line := logs.String(); strings.Contains(line, "gateway: upstream headers exceeded") {
+		t.Fatalf("log %q reports a header timeout for a canceled client", line)
+	}
+}

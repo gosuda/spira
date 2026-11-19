@@ -189,6 +189,7 @@ type delivery struct {
 	target   *url.URL
 	slot     context.Context
 	settled  chan struct{}
+	deadline time.Time
 	state    sync.Locked[deliveryState]
 	fired    sync.Locked[bool]
 }
@@ -196,11 +197,13 @@ type delivery struct {
 type deliveryState struct {
 	resp  *http.Response?
 	fault error
+	done  time.Time
 }
 
 func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, error) {
 	outctx, cancel := context.WithCancel(req.Context())
-	d := &delivery{upstream: rl, demand: req, target: base, slot: outctx, settled: make(chan struct{})}
+	deadline := time.Now().Add(rl.timeout)
+	d := &delivery{upstream: rl, demand: req, target: base, slot: outctx, settled: make(chan struct{}), deadline: deadline}
 	go group (req.Context()) {
 		go d.fetchUpstream()
 		go d.watchTimeout(req.Context(), cancel)
@@ -223,7 +226,7 @@ func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, err
 		cancel()
 		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered without a response"))
 	}
-	if exceeded {
+	if exceeded || headersLate(got.done, deadline) {
 		cancel()
 		upstream.Body.Close()?
 		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
@@ -237,12 +240,17 @@ func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, err
 	return upstream, nil
 }
 
+func headersLate(done time.Time, deadline time.Time) bool {
+	return done.After(deadline)
+}
+
 func (d *delivery) fetchUpstream() error {
 	defer close(d.settled)
 	resp, err := http.DefaultTransport.RoundTrip(d.upstream.outbound(d.demand, d.target, d.slot))
 	d.state.WithLock(func(slot *deliveryState) {
 		slot.resp = resp
 		slot.fault = err
+		slot.done = time.Now()
 	})
 	return nil
 }
@@ -252,8 +260,12 @@ func (d *delivery) watchTimeout(ctx context.Context, cancel context.CancelFunc) 
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		d.fired.WithLock(func(mark *bool) { *mark = true })
-		cancel()
+		select {
+		case <-d.settled:
+		default:
+			d.fired.WithLock(func(mark *bool) { *mark = true })
+			cancel()
+		}
 	case <-d.settled:
 	case <-ctx.Done():
 	}

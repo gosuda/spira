@@ -73,6 +73,8 @@ func Faults() []*fault.Error
 - A nil `Policy.Breaker` MUST leave the upstream with no breaker.
 - `Mount` MUST NOT apply `Policy.Retry`.
 - `Policy.Timeout` MUST bound the wait for response headers.
+- `Policy.Timeout` MUST be measured from the start of the delivery: a response completed after the deadline counts as missed.
+- When the response and the timeout settle together, the response MUST win.
 - `Policy.Timeout` MUST NOT end the body read after the headers arrive.
 - The proxy MUST write the first body chunk before the upstream finishes the body.
 - The proxy MUST cancel the upstream request when the client context ends.
@@ -133,6 +135,8 @@ func Faults() []*fault.Error
 - `TestClientErrorsAndInternalErrorsPassThroughWithoutOpeningBreaker` proves that 404 and 500 pass through and do not open the breaker.
 - `TestServiceUnavailableCountsAsFailedAndAnswersProblem` proves that status 503 counts as a failure.
 - `TestTimeoutBeforeHeadersCountsAsFailed` proves that the header wait is bounded.
+- `TestHeadersLateComparesCompletionAgainstDeadline` proves that a completion after the deadline counts as late and a completion at or before it does not.
+- `TestClientCancelNeverReportsAHeaderTimeout` proves that a canceled client is never reported as a header timeout.
 - `TestFirstChunkStreamsBeforeUpstreamFinishes` proves that the first chunk arrives before the upstream finishes.
 - `TestClientCancelReachesUpstream` proves that a client cancel ends the upstream request.
 - `TestSlashEndingPrefixServesSubpathsWithoutARedirect` proves that a prefix ending in a slash serves subpaths without a redirect.
