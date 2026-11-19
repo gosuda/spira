@@ -255,7 +255,7 @@ func TestStreamCutBeforeDoneYieldsErrorAndNoReply(t *testing.T) {
 		t.Fatal("no chunks")
 	}
 	last := chunks[len(chunks)-1]
-	if last.err == nil || !strings.Contains(last.err.Error(), "before done") {
+	if last.err == nil || !errors.Is(last.err, ollama.ErrProviderStreamCut) {
 		t.Fatalf("last error = %v, want stream ended before done", last.err)
 	}
 	if _, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "mistral"})); err == nil {
@@ -287,8 +287,8 @@ func TestStreamCallerCancelYieldsPrefixedCancelError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the cancel error after cancel")
 	}
-	if !strings.Contains(err.Error(), "ai/ollama:") {
-		t.Fatalf("cancel error = %v, want the package prefix", err)
+	if !errors.Is(err, ollama.ErrProviderStreamCut) {
+		t.Fatalf("cancel error = %v, want the stream cut fault", err)
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel error = %v, want context.Canceled", err)
@@ -362,7 +362,7 @@ func TestFormatGoesOutAsJSONModeOrAsASchemaObject(t *testing.T) {
 	}
 	sent := rec.count()
 	for _, bad := range []string{`"type"`, `{"type":`, `[1]`} {
-		if _, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2", Format: bad}); err == nil || !strings.Contains(err.Error(), "ai/ollama: format is not json") {
+		if _, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2", Format: bad}); err == nil || !errors.Is(err, ollama.ErrInvalidRequest) {
 			t.Fatalf("Chat with format %s: err = %v, want the format error", bad, err)
 		}
 	}
@@ -387,8 +387,8 @@ func TestClientErrorIsFinal(t *testing.T) {
 	if err == nil {
 		t.Fatal("err=nil, want the 400 answer")
 	}
-	if !strings.Contains(err.Error(), "ai/ollama: 400:") {
-		t.Fatalf("err = %v, want ai/ollama: 400: prefix", err)
+	if !errors.Is(err, ollama.ErrProviderRejected) {
+		t.Fatalf("err = %v, want the provider rejection for a 400 answer", err)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("server saw %d calls, want 1: a 400 is final", calls.Load())
@@ -547,7 +547,7 @@ func TestEmbedBodyOverItsLimitIsFinal(t *testing.T) {
 	}))
 	defer srv.Close()
 	_, err := testClient(srv).Embed(context.Background(), []string{"one"})
-	if err == nil || !strings.Contains(err.Error(), "ai/ollama: response exceeds the size limit of 1179648 bytes") {
+	if err == nil || !errors.Is(err, ollama.ErrProviderTooLarge) {
 		t.Fatalf("err = %v, want the size limit of 1 MiB plus 128 KiB", err)
 	}
 	if calls.Load() != 1 {
@@ -616,7 +616,7 @@ func TestEmbedRejectsAStalledErrorBodyAfterOneRequest(t *testing.T) {
 	c := testClient(srv)
 	c.Policy.Timeout = 10 * time.Second
 	_, err := c.Embed(context.Background(), []string{"one"})
-	if err == nil || !strings.Contains(err.Error(), "ai/ollama: 400:") {
+	if err == nil || !errors.Is(err, ollama.ErrProviderRejected) {
 		t.Fatalf("err = %v, want the 400 rejection", err)
 		return
 	}
@@ -632,7 +632,7 @@ func TestEmbedKeepsTheStatusOfAFailingAnswerWhoseBodyIsCut(t *testing.T) {
 	c.Policy.Timeout = 10 * time.Second
 	start := time.Now()
 	_, err := c.Embed(context.Background(), []string{"one"})
-	if err == nil || !strings.Contains(err.Error(), "ai/ollama: 400:") {
+	if err == nil || !errors.Is(err, ollama.ErrProviderRejected) {
 		t.Fatalf("err = %v, want the 400 rejection", err)
 		return
 	}
@@ -658,7 +658,7 @@ func TestStreamKeepsTheStatusOfAFailingAnswerWhoseBodyIsCut(t *testing.T) {
 		t.Fatal("no chunks")
 	}
 	last := chunks[len(chunks)-1]
-	if last.err == nil || !strings.Contains(last.err.Error(), "ai/ollama: 400:") {
+	if last.err == nil || !errors.Is(last.err, ollama.ErrProviderRejected) {
 		t.Fatalf("last error = %v, want the 400 rejection", last.err)
 		return
 	}
@@ -729,7 +729,7 @@ func TestChatBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
 	transport := &cutTransport{calls: &calls, total: (1 << 20) + 1, cut: io.ErrUnexpectedEOF}
 	c := &ollama.Client{BaseURL: "http://ollama.invalid", Model: "llama3.2", HTTP: &http.Client{Transport: transport}, Policy: resilience.Policy{Timeout: 2 * time.Second, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}}
 	_, err := c.Chat(context.Background(), ai.Request{Model: "llama3.2"})
-	if err == nil || !strings.Contains(err.Error(), "ai/ollama: response exceeds the size limit of 1048576 bytes") {
+	if err == nil || !errors.Is(err, ollama.ErrProviderTooLarge) {
 		t.Fatalf("err = %v, want the size limit of 1 MiB", err)
 	}
 	if calls.Load() != 1 {

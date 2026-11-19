@@ -39,18 +39,18 @@ func (c *Client) http() *http.Client {
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	req2, err := requestOf(req, false)
 	if err != nil {
-		return ai.Reply{}, err
+		return ai.Reply{}, ErrInvalidRequest.Wrap(err)
 	}
 	payload, err := json.Marshal(req2)
 	if err != nil {
-		return ai.Reply{}, fmt.Errorf("ai/ollama: encode request: %w", err)
+		return ai.Reply{}, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
 	}
 	out, err := send[chatResponse](ctx, c, exchange{path: "/api/chat", payload: payload, limit: replyLimit})
 	if err != nil {
 		return ai.Reply{}, err
 	}
 	if e := out.Error; e != "" {
-		return ai.Reply{}, fmt.Errorf("ai/ollama: %s", e)
+		return ai.Reply{}, ErrProviderError.Wrap(&statusDetail{status: http.StatusOK, length: len(e)})
 	}
 	if out.Message.Role != "" {
 		out.HasMessage = true
@@ -61,17 +61,17 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
 	req2, err := requestOf(req, true)
 	if err != nil {
-		yield ai.Chunk{}, err
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(err)
 		return
 	}
 	payload, err := json.Marshal(req2)
 	if err != nil {
-		yield ai.Chunk{}, fmt.Errorf("ai/ollama: encode request: %w", err)
+		yield ai.Chunk{}, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
 		return
 	}
 	status, body, err := c.do(ctx, "/api/chat", payload)
 	if err != nil {
-		yield ai.Chunk{}, err
+		yield ai.Chunk{}, ErrProviderError.Wrap(err)
 		return
 	}
 	defer closeBody(body)
@@ -95,7 +95,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 	copy(input, texts)
 	payload, err := json.Marshal(embedRequest{Model: c.Model, Input: input, Truncate: true})
 	if err != nil {
-		return nil, fmt.Errorf("ai/ollama: encode request: %w", err)
+		return nil, ErrInvalidRequest.Wrap(fmt.Errorf("encode request: %w", err))
 	}
 	limit := replyLimit + int64(len(texts))*embedVectorLimit
 	out, err := send[embedResponse](ctx, c, exchange{path: "/api/embed", payload: payload, limit: limit})
@@ -109,14 +109,11 @@ const replyLimit = 1 << 20
 
 const embedVectorLimit = 128 << 10
 
-var errOversize = errors.New("ai/ollama: response exceeds the size limit")
-
 type exchange struct {
 	path    string
 	payload []byte
 	limit   int64
 }
-
 func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	var zero T
 	return resilience.Do[T](ctx, c.Policy, func(actx context.Context) (T, error) {
@@ -124,7 +121,7 @@ func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 		if err == nil {
 			return value, nil
 		}
-		if callerFault(err) || errors.Is(err, errOversize) {
+		if callerFault(err) || errors.Is(err, ErrProviderTooLarge) || errors.Is(err, ErrInvalidRequest) {
 			return zero, resilience.Ignored(err)
 		}
 		return zero, err
@@ -132,19 +129,14 @@ func send[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 }
 
 func callerFault(err error) bool {
-	answer := &statusAnswer{}
-	if !errors.As(err, &answer) {
-		return false
-	}
-	s := answer.status
-	return s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests
+	return errors.Is(err, ErrProviderRejected)
 }
 
 func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	var zero T
 	status, body, err := c.do(ctx, x.path, x.payload)
 	if err != nil {
-		return zero, err
+		return zero, ErrProviderError.Wrap(err)
 	}
 	defer body.Close()?
 	if status < 200 || status > 299 {
@@ -152,24 +144,25 @@ func post[T any](ctx context.Context, c *Client, x exchange) (T, error) {
 	}
 	data, err := io.ReadAll(io.LimitReader(body, x.limit+1))
 	if int64(len(data)) > x.limit {
-		return zero, fmt.Errorf("%w of %d bytes", errOversize, x.limit)
+		return zero, ErrProviderTooLarge.Wrap(fmt.Errorf("response size %d exceeds the limit %d", len(data), x.limit))
 	}
 	if err != nil {
-		return zero, fmt.Errorf("ai/ollama: read response: %w", err)
+		return zero, ErrProviderError.Wrap(fmt.Errorf("read response: %w", err))
 	}
 	var out T
 	if err := json.Unmarshal(data, &out); err != nil {
-		return zero, fmt.Errorf("ai/ollama: decode response: %w", err)
+		return zero, ErrProviderError.Wrap(fmt.Errorf("decode response: %w", err))
 	}
 	return out, nil
 }
 
 func failure(status int, body io.Reader) error {
 	data, err := io.ReadAll(io.LimitReader(body, replyLimit))
+	detail := statusDetailOf(status, data)
 	if err != nil {
-		return fmt.Errorf("%w: body read ended early: %w", statusError(status, data), err)
+		return classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", detail, err))
 	}
-	return statusError(status, data)
+	return classifyStatus(status, detail)
 }
 
 func (c *Client) do(ctx context.Context, path string, payload []byte) (int, io.ReadCloser, error) {
@@ -183,19 +176,6 @@ func (c *Client) do(ctx context.Context, path string, payload []byte) (int, io.R
 		return 0, nil, fmt.Errorf("ai/ollama: %s: %w", path, err)
 	}
 	return resp.StatusCode, resp.Body, nil
-}
-
-type statusAnswer struct {
-	status int
-	body   string
-}
-
-func (a *statusAnswer) Error() string {
-	return fmt.Sprintf("ai/ollama: %d: %s", a.status, a.body)
-}
-
-func statusError(status int, body []byte) error {
-	return &statusAnswer{status: status, body: string(body)}
 }
 
 func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
@@ -213,11 +193,11 @@ func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error]
 			return
 		}
 		if ctx.Err() != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/ollama: /api/chat: %w", ctx.Err())
+			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(ctx.Err())
 			return
 		}
 		if err != nil {
-			yield ai.Chunk{}, fmt.Errorf("ai/ollama: stream ended before done")
+			yield ai.Chunk{}, ErrProviderStreamCut.Err()
 			return
 		}
 	}
@@ -235,11 +215,12 @@ func yieldLine(text string, indexer *partIndexer, done *bool) iter.Seq2[ai.Chunk
 func handleLine(text string, indexer *partIndexer, done *bool) iter.Seq2[ai.Chunk, error] {
 	var resp chatResponse
 	if err := json.Unmarshal([]byte(text), &resp); err != nil {
-		yield ai.Chunk{}, fmt.Errorf("ai/ollama: decode stream line: %w", err)
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(fmt.Errorf("decode stream line: %w", err))
 		return
 	}
 	if e := resp.Error; e != "" {
-		yield ai.Chunk{}, fmt.Errorf("ai/ollama: %s", e)
+		*done = true
+		yield ai.Chunk{}, ErrProviderError.Wrap(&statusDetail{status: http.StatusOK, length: len(e)})
 		return
 	}
 	if resp.Message.Role != "" {

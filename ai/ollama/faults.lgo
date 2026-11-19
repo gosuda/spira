@@ -1,0 +1,47 @@
+package ollama
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrProviderRejected = fault.New("ollama.provider_rejected", fault.Invalid, "The model provider rejected the request.")
+
+var ErrProviderRateLimited = fault.New("ollama.provider_rate_limited", fault.RateLimited, "The model provider rate limited the request.")
+
+var ErrProviderError = fault.New("ollama.provider_error", fault.Unavailable, "The model provider returned an error.")
+
+var ErrProviderTooLarge = fault.New("ollama.provider_too_large", fault.TooLarge, "The provider response is too large.")
+
+var ErrProviderStreamCut = fault.New("ollama.provider_stream_cut", fault.Unavailable, "The model provider stream was cut.")
+
+var ErrInvalidRequest = fault.New("ollama.invalid_request", fault.Invalid, "The model request is invalid.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrProviderRejected, ErrProviderRateLimited, ErrProviderError, ErrProviderTooLarge, ErrProviderStreamCut, ErrInvalidRequest}
+}
+
+type statusDetail struct {
+	status int
+	length int
+}
+
+func (d *statusDetail) Error() string {
+	return fmt.Sprintf("provider status %d, body length %d", d.status, d.length)
+}
+
+func statusDetailOf(status int, body []byte) *statusDetail {
+	return &statusDetail{status: status, length: len(body)}
+}
+
+func classifyStatus(status int, detail error) error {
+	if status == http.StatusTooManyRequests {
+		return ErrProviderRateLimited.Wrap(detail)
+	}
+	if status >= 400 && status < 500 && status != http.StatusRequestTimeout {
+		return ErrProviderRejected.Wrap(detail)
+	}
+	return ErrProviderError.Wrap(detail)
+}
