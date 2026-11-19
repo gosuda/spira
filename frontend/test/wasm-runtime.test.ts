@@ -21,7 +21,7 @@ const wasmPath = resolve(__dirname, "fixtures/wasm/ticker.wasm");
 const wasmExecPath = resolve(__dirname, "fixtures/wasm/wasm_exec.js");
 
 const BUILD_WASM =
-	"GOOS=js GOARCH=wasm logos build -o frontend/test/fixtures/wasm/ticker.wasm ./ (run inside frontend/test/fixtures/wasm/ticker)";
+	"GOOS=js GOARCH=wasm logos build -o ../ticker.wasm ./ (run inside frontend/test/fixtures/wasm/ticker)";
 const COPY_EXEC =
 	'cp "$GOROOT/lib/wasm/wasm_exec.js" frontend/test/fixtures/wasm/wasm_exec.js';
 
