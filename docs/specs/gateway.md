@@ -103,6 +103,7 @@ func Faults() []*fault.Error
 
 - `gateway: upstream answered <status>` is the cause of the `gateway.upstream_unavailable` fault for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
 - `gateway: upstream headers exceeded <timeout>` is the cause of the `gateway.upstream_unavailable` fault when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
+- `gateway: upstream answered without a response` is the cause of the `gateway.upstream_unavailable` fault when the transport returns no response and no error. The client sees the 502 problem, not this text.
 - `gateway: route <prefix>: path prefix must start with /` when `PathPrefix` does not start with `/`.
 - `gateway: route <prefix>: path prefix must not contain wildcards` when `PathPrefix` holds `{`, `}` or `*`.
 - `gateway: route <prefix>: no upstream` when `To` is empty.

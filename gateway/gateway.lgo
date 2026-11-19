@@ -183,30 +183,81 @@ func (rl *relay) send(req *http.Request, u *upstream) (*http.Response?, error) {
 	})
 }
 
+type delivery struct {
+	upstream *relay
+	demand   *http.Request
+	target   *url.URL
+	slot     context.Context
+	settled  chan struct{}
+	state    sync.Locked[deliveryState]
+	fired    sync.Locked[bool]
+}
+
+type deliveryState struct {
+	resp  *http.Response?
+	fault error
+}
+
 func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, error) {
 	outctx, cancel := context.WithCancel(req.Context())
-	timer := time.AfterFunc(rl.timeout, cancel)
-	resp, err := http.DefaultTransport.RoundTrip(rl.outbound(req, base, outctx))
-	missed := !timer.Stop() && req.Context().Err() == nil
-	if err != nil {
+	d := &delivery{upstream: rl, demand: req, target: base, slot: outctx, settled: make(chan struct{})}
+	go group (req.Context()) {
+		go d.fetchUpstream()
+		go d.watchTimeout(req.Context(), cancel)
+	}
+	var got deliveryState
+	d.state.WithLock(func(slot *deliveryState) { got = *slot })
+	exceeded := false
+	if req.Context().Err() == nil {
+		d.fired.WithLock(func(mark *bool) { exceeded = *mark })
+	}
+	if got.fault != nil {
 		cancel()
-		if missed {
+		if exceeded {
 			return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 		}
-		return nil, ErrBadGateway.Wrap(err)
+		return nil, ErrBadGateway.Wrap(got.fault)
 	}
-	if missed {
+	upstream := got.resp
+	if upstream == nil {
 		cancel()
-		resp.Body.Close()?
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered without a response"))
+	}
+	if exceeded {
+		cancel()
+		upstream.Body.Close()?
 		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 	}
-	if upstreamFailed(resp.StatusCode) {
+	if upstreamFailed(upstream.StatusCode) {
 		cancel()
-		resp.Body.Close()?
-		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered %d", resp.StatusCode))
+		upstream.Body.Close()?
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered %d", upstream.StatusCode))
 	}
-	resp.Body = &releasingBody{inner: resp.Body, cancel: cancel}
-	return resp, nil
+	upstream.Body = &releasingBody{inner: upstream.Body, cancel: cancel}
+	return upstream, nil
+}
+
+func (d *delivery) fetchUpstream() error {
+	defer close(d.settled)
+	resp, err := http.DefaultTransport.RoundTrip(d.upstream.outbound(d.demand, d.target, d.slot))
+	d.state.WithLock(func(slot *deliveryState) {
+		slot.resp = resp
+		slot.fault = err
+	})
+	return nil
+}
+
+func (d *delivery) watchTimeout(ctx context.Context, cancel context.CancelFunc) error {
+	timer := time.NewTimer(d.upstream.timeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		d.fired.WithLock(func(mark *bool) { *mark = true })
+		cancel()
+	case <-d.settled:
+	case <-ctx.Done():
+	}
+	return nil
 }
 
 type releasingBody struct {
