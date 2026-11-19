@@ -79,6 +79,8 @@ func Faults() []*fault.Error
 - `DELETE` of a known name MUST answer 204.
 - `DELETE` MUST match the `opsUrl` query value when present.
 - A mismatched `opsUrl` MUST answer 404 and keep the record.
+- A present but empty `opsUrl` MUST answer 404 and keep the record.
+- A malformed query string MUST answer 422.
 
 ### Console
 
@@ -146,6 +148,7 @@ func Faults() []*fault.Error
 - `TestAdminFaultInvalidInstanceURL` proves that a credentialed URL answers 422 without echo.
 - `TestAdminFaultMalformedBodyHidesSecret` proves that a malformed body answers 422 without echo.
 - `TestAdminFaultUnknownInstanceHidesName` proves that a missing delete answers 404 without echo.
+- `TestDeleteWithEmptySelectorKeepsTheRecord` proves that an empty selector answers 404, a malformed query answers 422, and the record survives both.
 - `TestAdminFaultRegistryFull` proves that a full registry answers 429 with its code.
 - `TestAdminFaultRegistryUnreachable` proves that a failing registry wraps without its body.
 - `TestAdminRegistryBound` proves that the registry refuses past `MaxInstances` and frees the slot on `DELETE`.

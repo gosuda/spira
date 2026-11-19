@@ -54,7 +54,7 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 
 ### Shutdown
 
-- `Stop` MUST close the UDP listener before it waits.
+- `Stop` MUST close the UDP listener before it returns, after the drain or the timeout ends it.
 - `Stop` MUST send GOAWAY on HTTP/3 connections, then wait for open requests until `ShutdownGrace` ends (RFC 9114).
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
 - `Stop` MUST close HTTP/3 connections when shutdown times out.
@@ -97,6 +97,9 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 - `TestH3AltSvcOnHTTPSOnly` proves the header value on HTTPS and its absence on cleartext and when `H3` is false.
 - `TestH3RequiresTLS13` proves that a pre-1.3 handshake on the UDP listener fails.
 - `TestH3StopDrainsWithinGrace` proves that `Stop` waits for a live HTTP/3 request.
+- `TestH3StopClosesUDPListener` proves that the UDP port rebinds right after `Stop`.
+- `TestH3StopShutsTCPWhileH3Drains` proves that TCP stops accepting while an HTTP/3 request drains.
+- `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
 - `TestH3RefusesEarlyData` proves that the QUIC config refuses 0-RTT.
 - `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.

@@ -1,6 +1,7 @@
 package openapi
 
 import (
+	"encoding/json/v2"
 	"net/http"
 	"slices"
 	"strconv"
@@ -19,6 +20,10 @@ type Doc struct {
 	OpenAPI string `json:"openapi"`
 	Info DocInfo `json:"info"`
 	Paths map[string]PathItem `json:"paths"`
+}
+func (d Doc) MarshalJSON() ([]byte, error) {
+	type rawDoc Doc
+	return json.Marshal(rawDoc(d), json.Deterministic(true))
 }
 
 type DocInfo struct {
@@ -81,7 +86,7 @@ func Mount(r *web.Router, info Info) {
 
 func addRoute(paths map[string]PathItem, ri web.RouteInfo) {
 	path := openapiPath(ri.Pattern)
-	if strings.HasSuffix(path, "/openapi.json") {
+	if path == "/openapi.json" && strings.ToUpper(ri.Method) == http.MethodGet {
 		return
 	}
 	item := paths[path] ?? PathItem{}
@@ -120,7 +125,18 @@ func openapiPath(pattern string) string {
 	if idx < 0 {
 		return "/"
 	}
-	return pattern[idx:]
+	path := pattern[idx:]
+	segs := strings.Split(path, "/")
+	for i, seg := range segs {
+		if len(seg) > 4 && seg[0] == '{' && strings.HasSuffix(seg, "...}") {
+			segs[i] = "{" + seg[1:len(seg)-4] + "}"
+		}
+	}
+	path = strings.Join(segs, "/")
+	if strings.HasSuffix(path, "/{$}") {
+		path = strings.TrimSuffix(path, "{$}")
+	}
+	return path
 }
 
 func operationOf(ri web.RouteInfo) Operation {

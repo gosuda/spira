@@ -369,3 +369,132 @@ func TestMountServesJSON(t *testing.T) {
 		t.Fatalf("served document differs from Document")
 	}
 }
+
+func TestDocumentBytesAreIdenticalAcrossCalls(t *testing.T) {
+	r := fixtureRouter()
+	openapi.Mount(r, fixtureInfo())
+	first, err := json.Marshal(openapi.Document(r, fixtureInfo()))
+	if err != nil {
+		t.Fatalf("marshal document: %v", err)
+		return
+	}
+	for i := 0; i < 25; i++ {
+		next, err := json.Marshal(openapi.Document(r, fixtureInfo()))
+		if err != nil {
+			t.Fatalf("marshal document at repetition %d: %v", i, err)
+			return
+		}
+		if string(next) != string(first) {
+			t.Fatalf("document bytes differ at repetition %d", i)
+			return
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/openapi.json", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("served status %d want 200", rec.Code)
+			return
+		}
+		if string(rec.Body.Bytes()) != string(first) {
+			t.Fatalf("served bytes differ at repetition %d", i)
+			return
+		}
+	}
+}
+
+func TestDefaultResponseDocumentsFaultFields(t *testing.T) {
+	doc := openapi.Document(fixtureRouter(), fixtureInfo())
+	collection := doc.Paths["/users"] ?? openapi.PathItem{}
+	op := collection.Post ?? &openapi.Operation{}
+	def, ok := op.Responses["default"]
+	if !ok {
+		t.Fatalf("post needs a default problem response")
+		return
+	}
+	prob, ok := def.Content["application/problem+json"]
+	if !ok {
+		t.Fatalf("default response needs problem json")
+		return
+	}
+	for _, name := range []string{"code", "message"} {
+		field, ok := prob.Schema.Properties[name]
+		if !ok || field.Type != "string" {
+			t.Fatalf("default problem schema needs string %q", name)
+			return
+		}
+	}
+}
+
+func TestWildcardSegmentsNormalizeToNamedParameters(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/files/{rest...}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Handle("GET", "/items/{$}", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := openapi.Document(r, fixtureInfo())
+	if _, bad := doc.Paths["/files/{rest...}"]; bad {
+		t.Fatalf("document keeps the raw multi wildcard key")
+		return
+	}
+	if _, bad := doc.Paths["/items/{$}"]; bad {
+		t.Fatalf("document keeps the raw anchor key")
+		return
+	}
+	files := doc.Paths["/files/{rest}"] ?? openapi.PathItem{}
+	if files.Get == nil {
+		t.Fatalf("document needs /files/{rest}")
+		return
+	}
+	op := files.Get ?? &openapi.Operation{}
+	found := false
+	for _, p := range op.Parameters {
+		if p.Name == "rest" && p.In == "path" && p.Required {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("files operation names no required path parameter rest")
+		return
+	}
+	items := doc.Paths["/items/"] ?? openapi.PathItem{}
+	if items.Get == nil {
+		t.Fatalf("document needs /items/")
+		return
+	}
+	anchor := items.Get ?? &openapi.Operation{}
+	if len(anchor.Parameters) != 0 {
+		t.Fatalf("anchor route documents %d parameters, want none", len(anchor.Parameters))
+		return
+	}
+}
+
+func TestDocEndpointExclusionKeepsUnrelatedRoutes(t *testing.T) {
+	r := web.NewRouter()
+	openapi.Mount(r, fixtureInfo())
+	r.Handle("POST", "/openapi.json", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Handle("GET", "/reports/openapi.json", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := openapi.Document(r, fixtureInfo())
+	if len(doc.Paths) != 2 {
+		t.Fatalf("document holds %d paths, want 2", len(doc.Paths))
+		return
+	}
+	posted := doc.Paths["/openapi.json"] ?? openapi.PathItem{}
+	if posted.Post == nil {
+		t.Fatalf("document drops POST /openapi.json")
+		return
+	}
+	if posted.Get != nil {
+		t.Fatalf("document keeps the served GET /openapi.json")
+		return
+	}
+	reports := doc.Paths["/reports/openapi.json"] ?? openapi.PathItem{}
+	if reports.Get == nil {
+		t.Fatalf("document drops GET /reports/openapi.json")
+		return
+	}
+}
