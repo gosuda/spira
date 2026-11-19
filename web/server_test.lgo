@@ -163,6 +163,99 @@ func TestSecondStartOnTakenPortFails(t *testing.T) {
 	}
 }
 
+func TestStartWithoutTLSCertificateFailsAndFreesThePort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+		return
+	}
+	addr := ln.Addr().String()
+	if cerr := ln.Close(); cerr != nil {
+		t.Fatalf("release the port: %v", cerr)
+		return
+	}
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "hi"}, nil
+	})
+	s := &web.Server{Addr: addr, Router: r, ShutdownGrace: time.Second, TLS: &tls.Config{}}
+	if err := s.Start(context.Background()); err == nil {
+		stopServer(t, s)
+		t.Fatal("Start without a certificate reported success")
+		return
+	}
+	probe, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("the port stays bound after the failed Start: %v", err)
+		return
+	}
+	if cerr := probe.Close(); cerr != nil {
+		t.Errorf("probe close: %v", cerr)
+	}
+}
+
+func TestStartWithDynamicCertificateConfigServes(t *testing.T) {
+	cert, _ := tlsPair(t)
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "hi"}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second, TLS: &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return &cert, nil
+	}}}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start with a dynamic certificate: %v", err)
+		return
+	}
+	stopServer(t, s)
+	if addr := s.BoundAddrForTest(); addr == "" {
+		t.Fatal("the started server bound no address")
+	}
+}
+
+func TestCloneTLSKeepsTheFloorOnDynamicConfigs(t *testing.T) {
+	inner := &tls.Config{MinVersion: tls.VersionTLS12}
+	s := &web.Server{TLS: &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		return inner, nil
+	}}}
+	got := web.CloneTLSForTest(s)
+	if got == nil {
+		t.Fatal("cloneTLS of a TLS server is absent")
+		return
+	}
+	wrapped := got.GetConfigForClient
+	if wrapped == nil {
+		t.Fatal("cloneTLS dropped GetConfigForClient")
+		return
+	}
+	out, err := wrapped(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("dynamic config: %v", err)
+		return
+	}
+	if out == nil || out.MinVersion != tls.VersionTLS13 {
+		t.Fatal("the dynamic config bypasses the TLS 1.3 floor")
+		return
+	}
+	if inner.MinVersion != tls.VersionTLS12 {
+		t.Fatal("cloneTLS mutated the dynamic config")
+		return
+	}
+	denyInner := &tls.Config{MinVersion: tls.VersionTLS12}
+	denied := &web.Server{TLS: &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		return denyInner, errors.New("no certificate")
+	}}}
+	deniedClone := web.CloneTLSForTest(denied)
+	if deniedClone == nil {
+		t.Fatal("cloneTLS of a denying server is absent")
+		return
+	}
+	if _, err := deniedClone.GetConfigForClient(&tls.ClientHelloInfo{}); err == nil {
+		t.Fatal("a failing dynamic config reports success")
+		return
+	}
+}
+
 type ctxProbe struct {
 	slowProbe
 	cancelled chan struct{}
@@ -275,6 +368,7 @@ type stuckProbe struct {
 	stopWithin time.Duration = time.Minute
 	stopErr    sync.Locked[error]
 	stopDur    sync.Locked[time.Duration]
+	fetchErr   sync.Locked[error]
 }
 
 func fetchStuck(url string) error {
@@ -387,10 +481,11 @@ func TestServerStopReturnsByTheCallerDeadline(t *testing.T) {
 }
 
 type closeProbe struct {
-	entered chan struct{}
-	ended   chan struct{}
-	stopErr sync.Locked[error]
-	closed  sync.Locked[bool]
+	entered  chan struct{}
+	ended    chan struct{}
+	stopErr  sync.Locked[error]
+	closed   sync.Locked[bool]
+	fetchErr sync.Locked[error]
 }
 
 func closeWatchingHandler(p *closeProbe) web.Handler {
@@ -868,7 +963,7 @@ type h2Target struct {
 func fetchH2(client *http.Client, url string) error {
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
@@ -881,7 +976,7 @@ func fetchH2(client *http.Client, url string) error {
 func fetchStuckH2(client *http.Client, url string) error {
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
@@ -891,26 +986,36 @@ func fetchStuckH2(client *http.Client, url string) error {
 	return nil
 }
 
+func recordFetchH2(target h2Target, p *closeProbe) error {
+	if err := fetchH2(target.client, target.url); err != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = err })
+	}
+	return nil
+}
+
+func recordFetchStuckH2(target h2Target, p *stuckProbe) error {
+	if err := fetchStuckH2(target.client, target.url); err != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = err })
+	}
+	return nil
+}
+
 func driveCloseH2(ctx context.Context, s *web.Server, target h2Target, p *closeProbe) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	go group (ctx) {
-		go {
-			fetchH2(target.client, target.url)
-		}
-		go {
-			stopAndWatch(ctx, s, p)
-		}
+		go recordFetchH2(target, p)
+		go stopAndWatch(ctx, s, p)
 	}
 	return nil
 }
 
 func driveStuckH2(ctx context.Context, s *web.Server, target h2Target, p *stuckProbe) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	go group (ctx) {
-		go {
-			fetchStuckH2(target.client, target.url)
-		}
-		go {
-			stopStuck(ctx, s, p)
-		}
+		go recordFetchStuckH2(target, p)
+		go stopStuck(ctx, s, p)
 	}
 	return nil
 }
@@ -1016,6 +1121,12 @@ func TestServerStopReturnsWithinGraceForH2WhenHandlerNeverReturns(t *testing.T) 
 		t.Fatalf("drive: %v", err)
 		return
 	}
+	select {
+	case <-p.entered:
+	default:
+		t.Fatal("the h2 request never reached the handler")
+		return
+	}
 	var err error
 	p.stopErr.WithLock(func(e *error) { err = *e })
 	if err == nil {
@@ -1052,6 +1163,12 @@ func TestServerStopClosesH2StreamWhenShutdownTimesOut(t *testing.T) {
 	target := h2Target{client: h2cClient(), url: "http://" + addr + "/stream"}
 	if err := driveCloseH2(context.Background(), s, target, p); err != nil {
 		t.Fatalf("drive: %v", err)
+		return
+	}
+	select {
+	case <-p.entered:
+	default:
+		t.Fatal("the h2 request never reached the handler")
 		return
 	}
 	var err error

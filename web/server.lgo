@@ -148,8 +148,32 @@ func (s *Server) cloneTLS() *tls.Config? {
 	if out.MinVersion < tls.VersionTLS13 {
 		out.MinVersion = tls.VersionTLS13
 	}
+	if inner := out.GetConfigForClient; inner != nil {
+		out.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			got, err := inner(chi)
+			if err != nil || got == nil {
+				return got, err
+			}
+			if got.MinVersion < tls.VersionTLS13 {
+				fixed := got.Clone()
+				fixed.MinVersion = tls.VersionTLS13
+				return fixed, nil
+			}
+			return got, nil
+		}
+	}
 	out.NextProtos = []string{"h2", "http/1.1"}
 	return out
+}
+
+func checkTLSConfig(cfg *tls.Config?) error {
+	if cfg == nil {
+		return nil
+	}
+	if len(cfg.Certificates) == 0 && cfg.GetCertificate == nil && cfg.GetConfigForClient == nil {
+		return errors.New("web: server TLS needs a certificate")
+	}
+	return nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -164,6 +188,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	if s.Router == nil {
 		return errors.New("web: server needs a router")
+	}
+	if err := checkTLSConfig(s.TLS); err != nil {
+		return err
 	}
 	l, err := net.Listen("tcp", s.Addr)
 	if err != nil {
@@ -205,6 +232,9 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 	if cfg != nil {
 		g.Go(func(_ context.Context) error {
 			if serr := srv.ServeTLS(l, "", ""); !errors.Is(serr, http.ErrServerClosed) {
+				if cerr := l.Close(); cerr != nil {
+					return fmt.Errorf("web: serve: %w (close listener: %w)", serr, cerr)
+				}
 				return fmt.Errorf("web: serve: %w", serr)
 			}
 			return nil
