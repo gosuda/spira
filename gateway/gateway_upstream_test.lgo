@@ -619,6 +619,21 @@ func TestHeadersLateComparesCompletionAgainstDeadline(t *testing.T) {
 	}
 }
 
+func waitForRefusalLog(t *testing.T, logs *lockedBuffer) {
+	t.Helper()
+	limit := time.Now().Add(10 * time.Second)
+	for {
+		if strings.Contains(logs.String(), "gateway: no upstream served the route") {
+			return
+		}
+		if time.Now().After(limit) {
+			t.Fatal("the gateway never logged the refused route")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestClientCancelNeverReportsAHeaderTimeout(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -669,6 +684,7 @@ func TestClientCancelNeverReportsAHeaderTimeout(t *testing.T) {
 	if gerr := g.Wait(); gerr != nil {
 		t.Fatalf("client group: %v", gerr)
 	}
+	waitForRefusalLog(t, logs)
 	if line := logs.String(); strings.Contains(line, "gateway: upstream headers exceeded") {
 		t.Fatalf("log %q reports a header timeout for a canceled client", line)
 	}
