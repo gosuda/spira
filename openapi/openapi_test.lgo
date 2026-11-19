@@ -369,3 +369,34 @@ func TestMountServesJSON(t *testing.T) {
 		t.Fatalf("served document differs from Document")
 	}
 }
+
+func TestDocumentBytesAreIdenticalAcrossCalls(t *testing.T) {
+	r := fixtureRouter()
+	openapi.Mount(r, fixtureInfo())
+	first, err := json.Marshal(openapi.Document(r, fixtureInfo()))
+	if err != nil {
+		t.Fatalf("marshal document: %v", err)
+		return
+	}
+	for i := 0; i < 25; i++ {
+		next, err := json.Marshal(openapi.Document(r, fixtureInfo()))
+		if err != nil {
+			t.Fatalf("marshal document at repetition %d: %v", i, err)
+			return
+		}
+		if string(next) != string(first) {
+			t.Fatalf("document bytes differ at repetition %d", i)
+			return
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/openapi.json", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("served status %d want 200", rec.Code)
+			return
+		}
+		if string(rec.Body.Bytes()) != string(first) {
+			t.Fatalf("served bytes differ at repetition %d", i)
+			return
+		}
+	}
+}
