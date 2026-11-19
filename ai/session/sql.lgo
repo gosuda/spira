@@ -12,7 +12,6 @@ package session
 import (
 	"context"
 	"encoding/json/v2"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -271,7 +270,7 @@ func (s *SQLStore) Ensure(id string) (*Session?, error) {
 		}
 		attempts++
 		if attempts >= maxEnsureAttempts {
-			return nil, errors.New("ai/session: ensure: too much contention")
+			return nil, ErrContention.Err()
 		}
 	}
 }
@@ -473,7 +472,7 @@ func activeRows(rows []eventRow) ([]ai.Message, error) {
 
 func (s *SQLStore) LastN(ctx context.Context, id string, n int) ([]Event, error) {
 	if n <= 0 {
-		return nil, errors.New("ai/session: LastN: n must be positive")
+		return nil, ErrInvalidCount.Err()
 	}
 	events, err := s.Events(ctx, id)
 	if err != nil {
@@ -490,17 +489,17 @@ func (s *SQLStore) Append(ctx context.Context, id string, version int64, events 
 		return false, overlongIDError(id, "session id")
 	}
 	if len(events) == 0 {
-		return false, errors.New("ai/session: Append: no events")
+		return false, ErrEmptyBatch.Err()
 	}
 	if err := checkEventIDs(events); err != nil {
 		return false, err
 	}
 	for _, e := range events {
 		if m := e.Message; m != nil && m.Role == ai.RoleSystem {
-			return false, errors.New("ai/session: Append: system messages are not stored in a session")
+			return false, ErrSystemMessage.Err()
 		}
 		if e.Session != id {
-			return false, fmt.Errorf("ai/session: Append: event belongs to session %q, not %q", e.Session, id)
+			return false, ErrForeignEvent.Wrap(fmt.Errorf("event belongs to session %q, not %q", e.Session, id))
 		}
 	}
 	stmts := stmtsFor(s.Pool.Dialect())
@@ -642,7 +641,7 @@ func encodeMessage(m ai.Message) (string, error) {
 	}
 	raw, err := json.Marshal(storedMessage{Role: string(m.Role), Parts: parts})
 	if err != nil {
-		return "", fmt.Errorf("ai/session: stored message: %w", err)
+		return "", ErrStoredMessage.Wrap(err)
 	}
 	return string(raw), nil
 }
@@ -658,7 +657,7 @@ func encodePart(p ai.Part) (storedPart, error) {
 	case ai.ToolResult:
 		return storedPart{Kind: "result", ID: v.ID, Name: v.Name, Content: v.Content, Skipped: v.Skipped}, nil
 	}
-	return storedPart{}, errors.New("ai/session: stored message: unknown part")
+	return storedPart{}, ErrStoredMessage.Err()
 }
 
 func decodeMessage(role string, raw string) (ai.Message?, error) {
@@ -667,7 +666,7 @@ func decodeMessage(role string, raw string) (ai.Message?, error) {
 	}
 	var stored storedMessage
 	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
-		return nil, fmt.Errorf("ai/session: stored message: %w", err)
+		return nil, ErrStoredMessage.Wrap(err)
 	}
 	var parts []ai.Part
 	if stored.Parts != nil {
@@ -694,5 +693,5 @@ func decodePart(p storedPart) (ai.Part, error) {
 	case "result":
 		return ai.ToolResult{ID: p.ID, Name: p.Name, Content: p.Content, Skipped: p.Skipped}, nil
 	}
-	return nil, fmt.Errorf("ai/session: stored message: unknown part %q", p.Kind)
+	return nil, ErrStoredMessage.Wrap(fmt.Errorf("unknown part %q", p.Kind))
 }

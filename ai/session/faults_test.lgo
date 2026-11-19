@@ -1,0 +1,236 @@
+package session_test
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/session"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestSessionFaultsMatchSpecTable(t *testing.T) {
+	faulttest.CheckTable(t, "../../docs/specs/ai-session.md", session.Faults())
+}
+
+func faultNoLeak(t *testing.T, err error, planted ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected a fault, got nil")
+		return
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, err), planted...)
+}
+
+func TestSessionFaultBlankID(t *testing.T) {
+	s := &session.Service{}
+	if _, err := s.Ensure(""); !errors.Is(err, session.ErrBlankID) {
+		t.Fatalf("Ensure blank id error = %v, want the blank id fault", err)
+		return
+	}
+	if _, err := s.Ensure("   "); !errors.Is(err, session.ErrBlankID) {
+		t.Fatalf("Ensure whitespace id error = %v, want the blank id fault", err)
+	}
+}
+
+func TestSessionFaultIDTooLarge(t *testing.T) {
+	s := &session.Service{}
+	long := strings.Repeat("k", 256)
+	if _, err := s.Ensure(long); !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("Ensure overlong id error = %v, want the id limit fault", err)
+		return
+	}
+	sqlEnsure(t, s, "a")
+	overlong := session.Event{ID: long + "/e1", Session: "a", At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("lost")}
+	if _, err := s.Append(t.Context(), "a", sqlVersion(t, s, "a"), overlong); !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("Append overlong event id error = %v, want the id limit fault", err)
+	}
+}
+
+func TestSessionFaultEmptyBatch(t *testing.T) {
+	s := &session.Service{}
+	sqlEnsure(t, s, "a")
+	if _, err := s.Append(t.Context(), "a", sqlVersion(t, s, "a")); !errors.Is(err, session.ErrEmptyBatch) {
+		t.Fatalf("Append empty batch error = %v, want the empty batch fault", err)
+	}
+}
+
+func TestSessionFaultSystemMessage(t *testing.T) {
+	s := &session.Service{}
+	sqlEnsure(t, s, "a")
+	system := session.Event{ID: "a/e1", Session: "a", At: sqlBaseTime(), Type: session.EventMessage, Message: ai.Message{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: "s"}}}}
+	if _, err := s.Append(t.Context(), "a", sqlVersion(t, s, "a"), system); !errors.Is(err, session.ErrSystemMessage) {
+		t.Fatalf("Append system message error = %v, want the system message fault", err)
+	}
+}
+
+func TestSessionFaultForeignEvent(t *testing.T) {
+	s := &session.Service{}
+	sqlEnsure(t, s, "a")
+	sqlEnsure(t, s, "b")
+	foreign := session.Event{ID: "b/e1", Session: "b", At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser("x")}
+	if _, err := s.Append(t.Context(), "a", sqlVersion(t, s, "a"), foreign); !errors.Is(err, session.ErrForeignEvent) {
+		t.Fatalf("Append foreign event error = %v, want the foreign event fault", err)
+	}
+}
+
+func TestSessionFaultInvalidCount(t *testing.T) {
+	s := &session.Service{}
+	sqlEnsure(t, s, "a")
+	if _, err := s.LastN(t.Context(), "a", 0); !errors.Is(err, session.ErrInvalidCount) {
+		t.Fatalf("LastN zero error = %v, want the count fault", err)
+	}
+}
+
+func TestSessionFaultAlreadyWrapped(t *testing.T) {
+	s := &session.Service{}
+	ensureSession(t, s, "s1")
+	client := serveModel(t, &scripted{chat: chatAnswer("Hi")})
+	wrapped := session.Remember(s, "s1")(client)
+	_, err := s.Run(t.Context(), "s1", session.Turn{
+		Model:   wrapped,
+		Request: ai.Request{Messages: []ai.Message{text("Hi")}},
+		Limits:  ai.Limits{},
+	})
+	if !errors.Is(err, session.ErrAlreadyWrapped) {
+		t.Fatalf("Run wrapped model error = %v, want the wrapped model fault", err)
+	}
+}
+
+func TestSessionFaultContention(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.db")
+	pool := sqlOpen(t, "sqlite", "file:"+path+"?_pragma=busy_timeout(0)")
+	sqlPrepare(t, pool)
+	sqlStop(t, pool)
+	store := sqlFixedStore(pool)
+	a := t.Name() + "/a"
+	sqlEnsure(t, store, a)
+	version := sqlVersion(t, store, a)
+	inserted := make(chan struct{})
+	release := make(chan struct{})
+	held := make(chan error, 1)
+	contended := make(chan error, 1)
+	ctx := t.Context()
+	if err := func() error {
+		go group (ctx) {
+			go {
+				held <- session.AppendHeld(ctx, session.HeldAppend{Store: store, ID: a, Version: version, Events: []session.Event{sqlMessageOf(a+"/e1", a, sqlUser("hold"))}, Inserted: inserted, Release: release})
+			}
+			go {
+				select {
+				case <-inserted:
+				case <-ctx.Done():
+				}
+				_, err := store.Ensure(t.Name() + "/b")
+				contended <- err
+				close(release)
+			}
+		}
+		return nil
+	}(); err != nil {
+		t.Fatalf("go group: %v", err)
+		return
+	}
+	if herr := <-held; herr != nil {
+		t.Fatalf("held append: %v", herr)
+		return
+	}
+	if cerr := <-contended; !errors.Is(cerr, session.ErrContention) {
+		t.Fatalf("Ensure under contention error = %v, want the contention fault", cerr)
+	}
+}
+
+func TestSessionFaultStoredMessage(t *testing.T) {
+	pool := sqlSQLitePool(t)
+	store := sqlFixedStore(pool)
+	a := t.Name() + "/a"
+	b := t.Name() + "/b"
+	sqlEnsure(t, store, a)
+	sqlEnsure(t, store, b)
+	broken := "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)"
+	if _, err := db.Exec(t.Context(), pool, broken, a+"/bad", a, 1, "MESSAGE", "user", "{oops"); err != nil {
+		t.Fatalf("plant broken row: %v", err)
+		return
+	}
+	if _, err := store.Events(t.Context(), a); !errors.Is(err, session.ErrStoredMessage) {
+		t.Fatalf("Events broken JSON error = %v, want the stored message fault", err)
+		return
+	}
+	smoke := "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)"
+	if _, err := db.Exec(t.Context(), pool, smoke, b+"/bad", b, 1, "MESSAGE", "user", "{\"role\":\"user\",\"parts\":[{\"kind\":\"smoke\"}]}"); err != nil {
+		t.Fatalf("plant unknown part row: %v", err)
+		return
+	}
+	if _, err := store.Events(t.Context(), b); !errors.Is(err, session.ErrStoredMessage) {
+		t.Fatalf("Events unknown part error = %v, want the stored message fault", err)
+	}
+}
+
+func TestSessionFaultDBPassthrough(t *testing.T) {
+	key := strings.NewReplacer("/", "_", "(", ")", " ", "_").Replace(t.Name())
+	pool := sqlOpen(t, "sqlite", fmt.Sprintf("file:spira_session_%s?mode=memory&cache=shared", key))
+	sqlStop(t, pool)
+	store := sqlFixedStore(pool)
+	_, err := store.Events(t.Context(), "a")
+	if !errors.Is(err, db.ErrStatementFailed) {
+		t.Fatalf("Events without tables error = %v, want the db fault", err)
+	}
+}
+
+func TestSessionFaultAdversarialNoLeak(t *testing.T) {
+	secret := "sid-9f2c-secret-value"
+	script := "<script>alert(1)</script>"
+	inject := "'; DROP TABLE x; --"
+	path := "/etc/passwd"
+	planted := []string{secret, script, inject, path}
+
+	s := &session.Service{}
+	long := strings.Repeat("k", 200) + secret + script + inject + path
+	_, err := s.Ensure(long)
+	if !errors.Is(err, session.ErrIDTooLarge) {
+		t.Fatalf("Ensure hostile overlong id error = %v, want the id limit fault", err)
+		return
+	}
+	faultNoLeak(t, err, planted...)
+
+	sqlEnsure(t, s, "victim")
+	foreign := session.Event{ID: "e1-" + secret, Session: script + inject, At: sqlBaseTime(), Type: session.EventMessage, Message: sqlUser(path)}
+	_, ferr := s.Append(t.Context(), "victim", sqlVersion(t, s, "victim"), foreign)
+	if !errors.Is(ferr, session.ErrForeignEvent) {
+		t.Fatalf("Append hostile foreign event error = %v, want the foreign event fault", ferr)
+		return
+	}
+	faultNoLeak(t, ferr, planted...)
+
+	hostile := session.Event{ID: "victim/e9", Session: "victim", At: sqlBaseTime(), Type: session.EventMessage, Message: ai.Message{Role: ai.RoleSystem, Parts: []ai.Part{ai.Text{Text: secret + script + inject + path}}}}
+	_, serr := s.Append(t.Context(), "victim", sqlVersion(t, s, "victim"), hostile)
+	if !errors.Is(serr, session.ErrSystemMessage) {
+		t.Fatalf("Append hostile system message error = %v, want the system message fault", serr)
+		return
+	}
+	faultNoLeak(t, serr, planted...)
+
+	pool := sqlSQLitePool(t)
+	store := sqlFixedStore(pool)
+	c := t.Name() + "/c"
+	sqlEnsure(t, store, c)
+	row := "INSERT INTO spira_session_events (id, session_id, at_nanos, event_type, msg_role, parts) VALUES (?, ?, ?, ?, ?, ?)"
+	if _, err := db.Exec(t.Context(), pool, row, c+"/bad", c, 1, "MESSAGE", "user", "{\"role\":\"user\",\"parts\":[{\"kind\":\"" + secret + script + "\"}]}"); err != nil {
+		t.Fatalf("plant hostile row: %v", err)
+		return
+	}
+	_, derr := store.Events(t.Context(), c)
+	if !errors.Is(derr, session.ErrStoredMessage) {
+		t.Fatalf("Events hostile row error = %v, want the stored message fault", derr)
+		return
+	}
+	faultNoLeak(t, derr, planted...)
+
+	if got := sqlEvents(t, s, "victim"); len(got) != 0 {
+		t.Fatalf("rejected hostile batches left %d events, want 0", len(got))
+	}
+}

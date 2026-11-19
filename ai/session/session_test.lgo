@@ -1357,7 +1357,7 @@ func TestRunRefusesAModelTheSessionAlreadyWrapped(t *testing.T) {
 		t.Fatalf("Run took an already wrapped model")
 		return
 	}
-	if !strings.Contains(err.Error(), "already wrapped") {
+	if !errors.Is(err, session.ErrAlreadyWrapped) {
 		t.Fatalf("Run error = %v, want the double-wrap refusal", err)
 	}
 }
