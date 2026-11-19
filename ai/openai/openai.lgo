@@ -32,6 +32,7 @@ type Client struct {
 	RandomSeed int?
 	HTTP       *http.Client
 	Policy     resilience.Policy
+	idleTimer  func(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool)
 }
 
 func (c *Client) http() *http.Client {
@@ -53,11 +54,17 @@ func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
 	return replyOf(&out), nil
 }
 
-var newIdleTimer = func(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool) {
+func (c *Client) newTimer(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool) {
+	if c.idleTimer != nil {
+		return c.idleTimer(limit, onIdle)
+	}
+	return realIdleTimer(limit, onIdle)
+}
+
+func realIdleTimer(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool) {
 	timer := time.AfterFunc(limit, onIdle)
 	return timer.Reset, timer.Stop
 }
-
 func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
 	payload, err := requestJSON(req, true, c)
 	if err != nil {
@@ -70,7 +77,7 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	}
 	bounded, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	reset, stop := newIdleTimer(limit, func() {
+	reset, stop := c.newTimer(limit, func() {
 		cancel(&stallError{limit: limit})
 	})
 	defer stop()
@@ -84,14 +91,27 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		yield ai.Chunk{}, failure(bounded, status, body)
 		return
 	}
-	for chunk, err := range streamEvents(bounded, body, func() { reset(limit) }) {
+	alive := &touchReader{source: body, touch: func() { reset(limit) }}
+	for chunk, err := range streamEvents(bounded, alive, func() { reset(limit) }) {
 		stop()
 		if err != nil {
 			yield chunk, streamDoError("/chat/completions", bounded, err)
 			return
 		}
+		if cause := context.Cause(bounded); cause != nil {
+			yield ai.Chunk{}, streamDoError("/chat/completions", bounded, cause)
+			return
+		}
 		yield chunk, nil
+		if cause := context.Cause(bounded); cause != nil {
+			yield ai.Chunk{}, streamDoError("/chat/completions", bounded, cause)
+			return
+		}
 		reset(limit)
+	}
+	if cause := context.Cause(bounded); cause != nil {
+		yield ai.Chunk{}, streamDoError("/chat/completions", bounded, cause)
+		return
 	}
 }
 
@@ -518,6 +538,19 @@ func streamEvents(ctx context.Context, body io.Reader, touch func()) iter.Seq2[a
 			return
 		}
 	}
+}
+
+type touchReader struct {
+	source io.Reader
+	touch  func()
+}
+
+func (r *touchReader) Read(p []byte) (int, error) {
+	n, err := r.source.Read(p)
+	if n > 0 {
+		r.touch()
+	}
+	return n, err
 }
 
 type lineReader struct {

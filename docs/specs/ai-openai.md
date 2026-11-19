@@ -62,7 +62,7 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - Any other `Format` MUST be an error before the request is sent.
 - A stream that ends before `data: [DONE]` MUST yield an error and no reply.
 - An error MUST name the package, the status and the body as `ai/openai: <status>: <body>`.
-- An error that `Stream` returns before response headers MUST name the package and the path.
+- An error that `Stream` returns before response headers MUST name the package and the path, except the stall error.
 - A caller cancel MUST carry the package prefix and satisfy errors.Is with context.Canceled.
 - A zero Policy.Timeout MUST fall back to the default idle bound.
 - A failing status MUST win over a failed error-body read, keeping bytes and cause.
@@ -94,9 +94,12 @@ func (c *Client) Embed(ctx context.Context, texts const []string) ([][]float32, 
 - `TestStreamResetsBeforeTheFirstChunk` proves resets precede the first yielded chunk.
 - `TestStreamCanceledBeforeHeadersKeepsThePackagePrefix` proves a canceled stream still names the package.
 - `TestStreamCancelBetweenChunksKeepsThePackagePrefix` proves a mid-stream cancel keeps the package prefix.
+- `TestStreamCancelBetweenBufferedChunksKeepsThePackagePrefix` proves a cancel over buffered chunks keeps the package prefix.
 - `TestStreamStallBeforeHeadersNamesTheStall` proves a stall before headers ends as the named stall error.
 - `TestStreamEndsWhenDoneHasNoTrailingNewline` proves a final line without a newline still ends the stream.
-- `TestZeroTimeoutStreamsWithoutAnIdleBound` proves a zero timeout still streams a full answer.
+- `TestZeroTimeoutStreamsWithoutAnIdleBound` proves a zero timeout still streams a full answer under a positive fallback bound.
+- `TestStreamTouchesTheTimerOnPartialReads` proves the idle bound refreshes on every provider read, also before the newline.
+- `TestIdleProbeAffectsOnlyItsOwnClient` proves the idle probe of one client never counts another client.
 - `TestStreamClosesTheBodyOfAFailingAnswer` proves the body of a failing answer closes when the caller stops.
 - `TestChatReportsFailingStatusWhenTheBodyStalls` proves a stalled 400 body ends after one request with the status error.
 - `TestStreamReportsFailingStatusWhenTheBodyStalls` proves a stalled 400 body ends the stream with the status error.

@@ -840,8 +840,7 @@ func askHello() ai.Request {
 }
 
 func TestStreamOfAStalledProviderEndsAtThePolicyTimeout(t *testing.T) {
-	probe, restore := openai.ArmIdleProbe()
-	t.Cleanup(restore)
+	ready := make(chan *openai.IdleProbe, 1)
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -851,6 +850,7 @@ func TestStreamOfAStalledProviderEndsAtThePolicyTimeout(t *testing.T) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
+		probe := <-ready
 		probe.Fire()
 		<-release
 	}))
@@ -858,9 +858,11 @@ func TestStreamOfAStalledProviderEndsAtThePolicyTimeout(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 	c := testClient(srv)
 	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	_, err := ai.Collect(c.Stream(ctx, askHello()))
 
 	if err == nil || !strings.Contains(err.Error(), "ai/openai: no stream event for") {
@@ -886,7 +888,7 @@ func TestStreamKeepsAProviderWhoseEventsStayInsideTheTimeout(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
-	probe, restore := openai.ArmIdleProbe()
+	probe, restore := openai.ArmIdleProbe(c)
 	t.Cleanup(restore)
 
 	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
@@ -1030,7 +1032,7 @@ func serveToolFragments(t *testing.T) *httptest.Server {
 func TestStreamKeepsReceivingToolFragments(t *testing.T) {
 	srv := serveToolFragments(t)
 	c := testClient(srv)
-	probe, restore := openai.ArmIdleProbe()
+	probe, restore := openai.ArmIdleProbe(c)
 	t.Cleanup(restore)
 
 	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
@@ -1065,7 +1067,7 @@ func TestStreamKeepsReceivingToolFragments(t *testing.T) {
 func TestStreamResetsBeforeTheFirstChunk(t *testing.T) {
 	srv := serveToolFragments(t)
 	c := testClient(srv)
-	probe, restore := openai.ArmIdleProbe()
+	probe, restore := openai.ArmIdleProbe(c)
 	t.Cleanup(restore)
 
 	resetsAtFirst := -1
@@ -1150,24 +1152,60 @@ func TestStreamCancelBetweenChunksKeepsThePackagePrefix(t *testing.T) {
 	}
 }
 
+func TestStreamCancelBetweenBufferedChunksKeepsThePackagePrefix(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	c := testClient(srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cancelErr error
+	canceled := false
+	for chunk, err := range c.Stream(ctx, askHello()) {
+		if err != nil {
+			cancelErr = err
+			break
+		}
+		_ = chunk
+		if !canceled {
+			canceled = true
+			cancel()
+		}
+	}
+	if !canceled {
+		t.Fatal("no chunk arrived before the cancel")
+	}
+	if cancelErr == nil {
+		t.Fatal("expected an error after the cancel of a buffered stream")
+	}
+	if !strings.HasPrefix(cancelErr.Error(), "ai/openai:") {
+		t.Fatalf("cancel error = %v, want the package prefix", cancelErr)
+	}
+	if !errors.Is(cancelErr, context.Canceled) {
+		t.Fatalf("cancel error = %v, want it to match context.Canceled", cancelErr)
+	}
+}
+
 func TestStreamStallBeforeHeadersNamesTheStall(t *testing.T) {
-	probe, restore := openai.ArmIdleProbe()
-	t.Cleanup(restore)
+	ready := make(chan *openai.IdleProbe, 1)
 	release := make(chan struct{})
 	rec := &recorder{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.add(r, "")
+		probe := <-ready
 		probe.Fire()
 		<-release
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(release) })
 	c := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	_, err := ai.Collect(c.Stream(ctx, askHello()))
-
 	if err == nil {
 		t.Fatal("expected the stall error")
 	}
@@ -1198,10 +1236,18 @@ func TestChatReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	t.Cleanup(srv.Close)
+	httpClient := srv.Client()
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpClient.Transport = &cancelOnHeaders{next: transport, cancel: cancel}
 	c := testClient(srv)
-	c.Policy = resilience.Policy{Timeout: 500 * time.Millisecond, Retry: resilience.Retry{Attempts: 3, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	c.HTTP = httpClient
 
-	_, err := c.Chat(context.Background(), askHello())
+	_, err := c.Chat(ctx, askHello())
 
 	if err == nil {
 		t.Fatal("expected the 400 answer")
@@ -1212,14 +1258,13 @@ func TestChatReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 	if !strings.Contains(err.Error(), "body read ended early") {
 		t.Fatalf("chat error = %v, want the read cause beside the status", err)
 	}
-	if !strings.Contains(err.Error(), "context deadline exceeded") {
-		t.Fatalf("chat error = %v, want the attempt timeout as the read cause", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("chat error = %v, want the cancel as the read cause", err)
 	}
 	if n := rec.count(); n != 1 {
 		t.Fatalf("the stalled 400 body cost %d requests, want 1", n)
 	}
 }
-
 type headerSignal struct {
 	next http.RoundTripper
 	seen chan struct{}
@@ -1231,10 +1276,23 @@ func (s *headerSignal) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
+type cancelOnHeaders struct {
+	next   http.RoundTripper
+	cancel context.CancelFunc
+}
+
+func (s *cancelOnHeaders) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := s.next.RoundTrip(r)
+	if err != nil {
+		return resp, err
+	}
+	s.cancel()
+	return resp, nil
+}
+
 func TestStreamReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 	stalled := strings.Repeat("e", 100)
-	probe, restore := openai.ArmIdleProbe()
-	t.Cleanup(restore)
+	ready := make(chan *openai.IdleProbe, 1)
 	release := make(chan struct{})
 	seen := make(chan struct{})
 	rec := &recorder{}
@@ -1249,6 +1307,7 @@ func TestStreamReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 			f.Flush()
 		}
 		<-seen
+		probe := <-ready
 		probe.Fire()
 		<-release
 	}))
@@ -1266,6 +1325,9 @@ func TestStreamReportsFailingStatusWhenTheBodyStalls(t *testing.T) {
 		HTTP:    httpClient,
 		Policy:  resilience.Policy{Timeout: 2 * time.Second},
 	}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1293,6 +1355,8 @@ func TestZeroTimeoutStreamsWithoutAnIdleBound(t *testing.T) {
 	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
 	c := testClient(srv)
 	c.Policy = resilience.Policy{Timeout: 0}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
 
 	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
 
@@ -1305,6 +1369,9 @@ func TestZeroTimeoutStreamsWithoutAnIdleBound(t *testing.T) {
 	}
 	if got := textOf(reply); got != "Hello" {
 		t.Fatalf("stream text = %q, want the replayed answer", got)
+	}
+	if probe.Limit() <= 0 {
+		t.Errorf("the idle bound for a zero timeout is %s, want a positive fallback bound", probe.Limit())
 	}
 }
 
@@ -1324,5 +1391,91 @@ func TestStreamEndsWhenDoneHasNoTrailingNewline(t *testing.T) {
 	}
 	if got := textOf(reply); got != "Hello" {
 		t.Fatalf("stream text = %q, want the replayed answer", got)
+	}
+}
+
+type byteAtATime struct {
+	body io.ReadCloser
+}
+
+func (b *byteAtATime) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return b.body.Read(p)
+}
+
+func (b *byteAtATime) Close() error {
+	return b.body.Close()
+}
+
+type chunkTransport struct {
+	next http.RoundTripper
+}
+
+func (s *chunkTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := s.next.RoundTrip(r)
+	if err != nil {
+		return resp, err
+	}
+	resp.Body = &byteAtATime{body: resp.Body}
+	return resp, nil
+}
+
+func TestStreamTouchesTheTimerOnPartialReads(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	httpClient := srv.Client()
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &chunkTransport{next: transport}
+	c := &openai.Client{
+		BaseURL: srv.URL,
+		Model:   "gpt-6-astra",
+		HTTP:    httpClient,
+		Policy:  resilience.Policy{Timeout: 2 * time.Second},
+	}
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if got := textOf(reply); got != "Hello" {
+		t.Fatalf("stream text = %q, want the replayed answer", got)
+	}
+	if probe.Fired {
+		t.Errorf("the idle timer fired although every byte arrived")
+	}
+	if probe.Resets < len(ssePlain) {
+		t.Errorf("the idle timer reset %d times for %d body bytes, want at least one reset per byte read", probe.Resets, len(ssePlain))
+	}
+}
+
+func TestIdleProbeAffectsOnlyItsOwnClient(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
+	first := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(first)
+	t.Cleanup(restore)
+
+	if _, err := ai.Collect(first.Stream(context.Background(), askHello())); err != nil {
+		t.Fatalf("collect on the probed client: %v", err)
+		return
+	}
+	resets := probe.Resets
+	second := testClient(srv)
+
+	if _, err := ai.Collect(second.Stream(context.Background(), askHello())); err != nil {
+		t.Fatalf("collect on the unprobed client: %v", err)
+		return
+	}
+	if probe.Resets != resets {
+		t.Fatalf("the probe counted %d resets after another client streamed, want %d", probe.Resets, resets)
 	}
 }
