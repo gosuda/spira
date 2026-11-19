@@ -90,16 +90,13 @@ func BindRecord[In any](ctx *Context, row *In) (In, error) {
 		LogRejected(rejected)
 		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "request", Rule: "request", Message: "web: bind needs a request"}})
 	}
-	if err := req.ParseForm(); err != nil {
-		rawQuery := ""
-		if req.URL != nil {
-			rawQuery = req.URL.RawQuery
+	if ferr := ParseFormBody(ctx, req, CountForm[In]() > 0); ferr != nil {
+		rejected.Add("form", "form", ferr.Error())
+		LogRejected(rejected)
+		if errors.Is(ferr, ErrBodyTooLarge) {
+			return zero, BindProblem(ErrBodyTooLarge, nil)
 		}
-		if _, qerr := url.ParseQuery(rawQuery); qerr == nil {
-			rejected.Add("form", "form", err.Error())
-			LogRejected(rejected)
-			return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "form", Rule: "form", Message: "web: bind form cannot be read"}})
-		}
+		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "form", Rule: "form", Message: "web: bind form cannot be read"}})
 	}
 	const if comptime.IsStruct[In]() {
 		if CountBody[In]() > 1 {
@@ -187,25 +184,15 @@ func LogRejected(rejected *RejectLog) {
 	slog.Debug("web: bind rejected", "rejected", rejected.Text())
 }
 
-func unknownMember(body []byte, err error) (string, bool) {
-	var probe any
-	if lenient := json.Unmarshal(body, &probe); lenient != nil {
+func unknownMember(err error) (string, bool) {
+	serr := &json.SemanticError{}
+	if !errors.As(err, &serr) {
 		return "", false
 	}
-	text := err.Error()
-	for _, marker := range []string{`unknown object member name "`, `unknown field "`} {
-		start := strings.Index(text, marker)
-		if start < 0 {
-			continue
-		}
-		rest := text[start+len(marker):]
-		end := strings.Index(rest, `"`)
-		if end <= 0 {
-			continue
-		}
-		return rest[:end], true
+	if !errors.Is(serr.Err, json.ErrUnknownName) {
+		return "", false
 	}
-	return "", false
+	return serr.JSONPointer.LastToken(), true
 }
 
 func noteFormat(spec BindSpec, errs *validate.Errors, err error) {
@@ -238,6 +225,47 @@ func BindSources[In any](bctx BindCtx, row *In, errs *validate.Errors) {
 	}
 }
 
+func CountForm[In any]() int {
+	n := 0
+	const for _, f := range comptime.Fields[In]() {
+		if f.Tag.Get("form") != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func hasFormBody(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	method := req.Method
+	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch {
+		return false
+	}
+	ct := req.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "application/x-www-form-urlencoded")
+}
+
+func ParseFormBody(ctx *Context, req *http.Request, want bool) error {
+	if !want || !hasFormBody(req) {
+		return nil
+	}
+	data, rerr := ReadBody(req, ctx.root.MaxBody)
+	if rerr != nil {
+		return rerr
+	}
+	values, perr := url.ParseQuery(string(data))
+	if perr != nil {
+		return perr
+	}
+	req.PostForm = values
+	return nil
+}
+
 func BindBodies[In any](row *In, body []byte, errs *validate.Errors, rejected *RejectLog) {
 	const for _, f := range comptime.Fields[In]() {
 		if f.Tag.Get("body") == "json" {
@@ -252,7 +280,12 @@ func BindOneField[F any](bctx BindCtx, dst *(F), tags FieldTags, errs *validate.
 	if source == "" || source == "body" {
 		return
 	}
-	raw, present := LookupSource(bctx.Req, source, key)
+	raw, present, malformed := LookupSource(bctx.Req, source, key)
+	if malformed != nil {
+		bctx.Rejected.Add(tags.Name, "format", malformed.Error())
+		errs.Require(false, tags.Name, "format", $"web: bind {tags.Name} has the wrong format")
+		return
+	}
 	spec := BindSpec{Field: tags.Name, Source: source, Key: key, Raw: raw, Present: present, Rejected: bctx.Rejected}
 	if present {
 		if BindPlain(any(dst), spec, errs) {
@@ -324,13 +357,13 @@ func BindLeafBranch(dst any, spec BindSpec, errs *validate.Errors) {
 	}
 }
 
-func LookupSource(req *http.Request, source string, key string) (string, bool) {
+func LookupSource(req *http.Request, source string, key string) (string, bool, error) {
 	if req == nil || req.URL == nil {
-		return "", false
+		return "", false, nil
 	}
 	if source == "path" {
 		v := req.PathValue(key)
-		return v, v != ""
+		return v, v != "", nil
 	}
 	if source == "query" {
 		return lookupQuery(req.URL.RawQuery, key)
@@ -338,21 +371,24 @@ func LookupSource(req *http.Request, source string, key string) (string, bool) {
 	if source == "header" {
 		vals, ok := req.Header[http.CanonicalHeaderKey(key)]
 		if !ok || len(vals) == 0 {
-			return "", false
+			return "", false, nil
 		}
-		return vals[0], true
+		return vals[0], true, nil
 	}
 	if source == "form" {
-		return req.Form.Get(key), req.Form.Has(key)
+		if hasFormBody(req) {
+			return req.PostForm.Get(key), req.PostForm.Has(key), nil
+		}
+		return lookupQuery(req.URL.RawQuery, key)
 	}
 	c, err := req.Cookie(key)
 	if err != nil {
-		return "", false
+		return "", false, nil
 	}
-	return c.Value, true
+	return c.Value, true, nil
 }
 
-func lookupQuery(raw string, key string) (string, bool) {
+func lookupQuery(raw string, key string) (string, bool, error) {
 	for _, pair := range strings.Split(raw, "&") {
 		if pair == "" {
 			continue
@@ -364,11 +400,11 @@ func lookupQuery(raw string, key string) (string, bool) {
 		}
 		text, err := url.QueryUnescape(value)
 		if err != nil {
-			continue
+			return "", true, err
 		}
-		return text, true
+		return text, true, nil
 	}
-	return "", false
+	return "", false, nil
 }
 
 func ReadBody(req *http.Request, max int64) ([]byte, error) {
@@ -392,7 +428,7 @@ func BindJSONField(dst any, spec BindSpec, body []byte, errs *validate.Errors) {
 		return
 	}
 	if err := json.Unmarshal(body, dst, json.RejectUnknownMembers(true)); err != nil {
-		if name, ok := unknownMember(body, err); ok {
+		if name, ok := unknownMember(err); ok {
 			spec.Rejected.Add(name, "unknown", err.Error())
 			errs.Require(false, name, "unknown", $"web: bind {name} is not a known field")
 			return

@@ -336,3 +336,132 @@ func TestDescribeUnknownRoutePanics(t *testing.T) {
 	}()
 	r.Describe("GET", "/missing", web.Doc{Summary: "Absent"})
 }
+
+func TestMalformedFormWithSemicolonQueryIsRejected(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	bad := httptest.NewRequest(http.MethodPost, "/login?note=a;b", strings.NewReader("username=ada&password=secret123&%zz"))
+	bad.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	doc := assertProblemJSON(t, call(t, r, bad), http.StatusBadRequest)
+	if len(doc.Errors) != 1 || doc.Errors[0].Field != "form" {
+		t.Fatalf("malformed form errors %+v want one form entry", doc.Errors)
+	}
+}
+
+func TestSemicolonQueryAloneKeepsTheForm(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/login?note=a;b", strings.NewReader("username=ada&password=secret123"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := call(t, r, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("semicolon query status %d want 200 body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFormFieldMissingFromBodyIsRequired(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/login?password=secret123", strings.NewReader("username=ada"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	doc := assertProblemJSON(t, call(t, r, req), http.StatusBadRequest)
+	found := false
+	for _, e := range doc.Errors {
+		if e.Field == "Password" && e.Rule == "required" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("bind errors %+v lack the required Password entry", doc.Errors)
+	}
+}
+
+func TestGetFormFieldsBindFromTheQuery(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/login?username=ada&password=secret123", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get form status %d want 200 body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ada") {
+		t.Fatalf("get form echo %q lacks the username", rec.Body.String())
+	}
+}
+
+func TestJSONRouteSkipsFormParsing(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "POST", "/doc", func(ctx *web.Context, in BindDocIn) (web.Reply, error) {
+		return web.Data{Value: in.Doc.Term}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/doc", strings.NewReader(`{"term":"go"}`))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := call(t, r, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json under form content type status %d want 200 body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "go") {
+		t.Fatalf("json echo %q lacks the term", rec.Body.String())
+	}
+}
+
+func TestFormBodyOverMaxBodyIsRejected(t *testing.T) {
+	r := web.NewRouter()
+	r.MaxBody = 16
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=ada&password=secret123"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	assertProblemJSON(t, call(t, r, req), http.StatusRequestEntityTooLarge)
+}
+
+func TestMalformedOptionQueryValueIsAFieldError(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/opt", func(ctx *web.Context, in BindOptIn) (web.Reply, error) {
+		if in.Q != nil {
+			rest := in.Q ?? ""
+			return web.Data{Value: $"has:{rest}"}, nil
+		}
+		return web.Data{Value: "none"}, nil
+	})
+	doc := assertProblemJSON(t, call(t, r, httptest.NewRequest(http.MethodGet, "/opt?q=%ZZ", nil)), http.StatusBadRequest)
+	found := false
+	for _, e := range doc.Errors {
+		if e.Field == "Q" && e.Rule == "format" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("bind errors %+v lack the format Q entry", doc.Errors)
+	}
+}
+
+func TestBindUnknownJSONMemberNamesAreExact(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "POST", "/doc", func(ctx *web.Context, in BindDocIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	cases := []struct {
+		body  string
+		field string
+	}{
+		{`{"term":"go","":1}`, ""},
+		{`{"term":"go","a\"b":1}`, `a"b`},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/doc", strings.NewReader(c.body))
+		req.Header.Set("Content-Type", "application/json")
+		doc := assertProblemJSON(t, call(t, r, req), http.StatusBadRequest)
+		if len(doc.Errors) != 1 || doc.Errors[0].Field != c.field || doc.Errors[0].Rule != "unknown" {
+			t.Fatalf("unknown member errors %+v want one unknown entry for field %q", doc.Errors, c.field)
+		}
+	}
+}
