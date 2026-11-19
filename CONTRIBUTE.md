@@ -30,6 +30,18 @@ The [specifications](docs/specs/README.md) hold the contract of each package.
 6. Run `just eject` at the end of the unit of work. An eject failure is a finding. See "Findings".
 7. Start engine tests from a clean tree. Run them only through `just engines`. Do not call `scripts/engines.sh` directly for a test run. The recipe sets the engine DSNs. The script pins each image by digest and removes its containers on exit.
 
+## Specify a package
+
+1. Change the package specification in the same commit as its code. Use only `Interface`, `Requirements`, `Errors`, `Proof`, and `Not in scope` as level-two headings. Keep that order. Include `Interface`, `Requirements`, and `Proof`.
+2. Write one requirement in each bullet. Include an RFC 2119 keyword. Keep each requirement sentence to 20 words or fewer. Make the `Interface` block match the exported declarations of the package.
+3. Start a spec for an absent package with `Status: specified; the package is not in the tree yet.` Remove that line when the package enters the tree.
+4. Declare each boundary fault once in `faults.lgo`. Return every declaration from `Faults()`. Use a code of the form `<package>.<condition>`. The fixed `internal` code is the exception.
+5. Return `ErrX.Wrap(cause)` when an error path has a cause. Return `ErrX.Err()` when it has no cause. Do not return `*fault.Error` in an `error` result.
+6. Keep each fault message constant and safe for a client. Keep cause text in operator logs only. Give failures with the same public meaning one code. Leave the mapping from `fault.Kind` to an HTTP status in `web`.
+7. Add a `### Code table` section to the package spec. Compare it with `Faults()` through `faulttest.CheckTable`. Plant a secret and hostile text in the adversarial tests.
+8. Use `db.unavailable` only for connection-class failures. Use `db.statement_failed` for otherwise unclassified driver statement failures.
+9. Treat each schema in `RouteInfo.In` as read-only. Do not treat the new slice from `web.Router.Routes()` as a copy of that schema.
+
 ## Commits
 
 1. Write the subject as a capitalized imperative line of up to 72 characters.
