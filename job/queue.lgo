@@ -2,16 +2,12 @@ package job
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
 	"logos/rt"
 	"logos/sync"
 )
-
-var errQueueClosed = errors.New("job: queue closed")
-var errQueueStopped = errors.New("job: queue stopped")
 
 type queueRun[T any] struct {
 	items      chan T
@@ -56,11 +52,11 @@ func (q *Queue[T]) Start(ctx context.Context) error {
 	var startErr error
 	q.life.WithLock(func(l *queueLife[T]) {
 		if l.stopped {
-			startErr = errQueueStopped
+			startErr = ErrQueueStopped.Err()
 			return
 		}
 		if l.started {
-			startErr = fmt.Errorf("job: queue already started")
+			startErr = ErrQueueStarted.Err()
 			return
 		}
 		l.started = true
@@ -164,12 +160,12 @@ func (q *Queue[T]) Enqueue(ctx context.Context, item T) error {
 		case run.items <- item:
 			return nil
 		case <-run.stop:
-			return errQueueClosed
+			return ErrQueueClosed.Err()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	return errQueueClosed
+	return ErrQueueClosed.Err()
 }
 
 func (q *Queue[T]) broadcast() {

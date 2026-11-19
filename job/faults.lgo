@@ -1,0 +1,19 @@
+package job
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrQueueClosed = fault.New("job.queue_closed", fault.Unavailable, "The job queue is closed.")
+
+var ErrQueueStopped = fault.New("job.queue_stopped", fault.Canceled, "The job queue was stopped.")
+
+var ErrSchedulerStarted = fault.New("job.scheduler_already_started", fault.Internal, "The scheduler is already started.")
+
+var ErrQueueStarted = fault.New("job.queue_already_started", fault.Internal, "The queue is already started.")
+
+var ErrChunkFailed = fault.New("job.chunk_failed", fault.Internal, "The chunk job failed.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrQueueClosed, ErrQueueStopped, ErrSchedulerStarted, ErrQueueStarted, ErrChunkFailed}
+}

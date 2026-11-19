@@ -66,7 +66,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	var startErr error
 	s.life.WithLock(func(l *schedLife) {
 		if l.started {
-			startErr = fmt.Errorf("job: scheduler already started")
+			startErr = ErrSchedulerStarted.Err()
 			return
 		}
 		l.started = true

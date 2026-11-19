@@ -381,6 +381,9 @@ func TestEnqueueAfterStopFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("Enqueue after Stop returned nil, want an error")
 	}
+	if !errors.Is(err, job.ErrQueueClosed) {
+		t.Fatalf("Enqueue after Stop = %v, want queue_closed", err)
+	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		t.Fatalf("Enqueue after Stop blocked until %v, want an immediate queue-closed error", err)
 	}
@@ -391,8 +394,8 @@ func TestStartTwiceFails(t *testing.T) {
 	if err := s.Start(t.Context()); err != nil {
 		t.Fatalf("scheduler Start: %v", err)
 	}
-	if err := s.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "already started") {
-		t.Fatalf("second scheduler Start = %v, want an already-started error", err)
+	if err := s.Start(t.Context()); !errors.Is(err, job.ErrSchedulerStarted) {
+		t.Fatalf("second scheduler Start = %v, want scheduler_already_started", err)
 	}
 	if err := s.Stop(t.Context()); err != nil {
 		t.Fatalf("scheduler Stop: %v", err)
@@ -401,8 +404,8 @@ func TestStartTwiceFails(t *testing.T) {
 	if err := q.Start(t.Context()); err != nil {
 		t.Fatalf("queue Start: %v", err)
 	}
-	if err := q.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "already started") {
-		t.Fatalf("second queue Start = %v, want an already-started error", err)
+	if err := q.Start(t.Context()); !errors.Is(err, job.ErrQueueStarted) {
+		t.Fatalf("second queue Start = %v, want queue_already_started", err)
 	}
 	if err := q.Stop(t.Context()); err != nil {
 		t.Fatalf("queue Stop: %v", err)
@@ -439,6 +442,10 @@ func TestChunkWriteFailureStopsRun(t *testing.T) {
 		t.Fatal("Run error = nil, want boom")
 		return
 	}
+	if !errors.Is(err, job.ErrChunkFailed) {
+		t.Fatalf("Run error = %v, want chunk_failed", err)
+		return
+	}
 	if !errors.Is(err, boom) {
 		t.Fatalf("Run error = %v, want boom", err)
 		return
@@ -451,7 +458,7 @@ func TestChunkWriteFailureStopsRun(t *testing.T) {
 	if ce.Stats.Items != 2 || ce.Stats.Chunks != 1 {
 		t.Fatalf("ChunkError stats = %+v, want Items=2 Chunks=1 for the chunks written before the failure", ce.Stats)
 	}
-	if got := err.Error(); got != "job: chunk failed after 2 items in 1 chunks: boom" {
+	if got := err.Error(); got != "job.chunk_failed: The chunk job failed.: job: chunk failed after 2 items in 1 chunks: boom" {
 		t.Fatalf("Run error text = %q, want the chunk-failed form", got)
 	}
 	if !slices.Equal(written, []int{0, 2}) {
@@ -656,7 +663,7 @@ func TestQueueStopRacingStartLeavesNoLiveRun(t *testing.T) {
 		if stopErr != nil {
 			return fmt.Errorf("Stop: %w", stopErr)
 		}
-		if startErr != nil && startErr.Error() != "job: queue stopped" {
+		if startErr != nil && !errors.Is(startErr, job.ErrQueueStopped) {
 			return fmt.Errorf("Start: %w", startErr)
 		}
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
