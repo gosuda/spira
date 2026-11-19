@@ -63,6 +63,9 @@ func upgradeStatus(err error) int {
 	if err == errHandshakeMethod {
 		return http.StatusMethodNotAllowed
 	}
+	if err == errHandshakeOrigin {
+		return http.StatusForbidden
+	}
 	return http.StatusBadRequest
 }
 

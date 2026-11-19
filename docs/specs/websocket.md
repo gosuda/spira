@@ -1,8 +1,10 @@
 # websocket
 
-Package `websocket` holds the unexported building blocks of RFC 6455: the frame codec, the opening-handshake checks, the close-code rules and the message-assembly engine. There is no public API yet and no transport.
+Package `websocket` speaks RFC 6455 over HTTP/1.1 on `net/http` types. It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
 
-The package follows RFC 6455. The present scope is the frame codec, the opening-handshake checks, the close-code rules and the message-assembly engine, all unexported. The connection type, the upgrade entry point and any public API wait for design decisions.
+The package owns the server side of one WebSocket connection: the handshake answer, the frame loop and the close handshake. It starts no goroutine and holds no global state.
+
+The package follows RFC 6455. The unexported blocks are the frame codec, the opening-handshake checks, the origin check, the close-code rules and the message-assembly engine. `Conn` is the only public transport; HTTP/2 extended CONNECT stays with `web`.
 
 ## Interface
 
@@ -110,11 +112,49 @@ func (e *engine) acceptData(h header) error
 func (e *engine) appendData(h header) error
 func controlKind(opcode uint8) kind
 func (e *engine) readControl(h header) ([]byte, error)
-func (e *engine) reserve(length int64) error
 func checkTail(buf []byte, valid int, fin bool) (int, error)
+
+var errHandshakeOrigin = errors.New("websocket: handshake origin not allowed")
+
+func checkOrigin(r *http.Request, allowed []string) error
+func sameOrigin(r *http.Request, origin string) bool
+
+type Kind uint8
+
+const (
+	Text Kind = 1
+	Binary Kind = 2
+	Ping Kind = 3
+	Pong Kind = 4
+	Close Kind = 5
+)
+
+type Config struct {
+	Limit int64 = 1 << 20
+	Subprotocols []string
+	AllowedOrigins []string
+}
+
+type Conn struct {
+	// unexported fields
+}
+
+var ErrClosed = errors.New("websocket: connection closed")
+
+func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error)
+func ServeHijacked(conn net.Conn, rw *bufio.ReadWriter, subprotocol string, limit int64) *Conn
+func (c *Conn) NetConn() net.Conn
+func (c *Conn) Subprotocol() string
+func ParseClose(payload []byte) (uint16, string, error)
+func (c *Conn) Next(ctx context.Context) (Kind, []byte, error)
+func (c *Conn) WriteText(ctx context.Context, payload []byte) error
+func (c *Conn) WriteBinary(ctx context.Context, payload []byte) error
+func (c *Conn) Ping(ctx context.Context, payload []byte) error
+func (c *Conn) CloseWithCode(ctx context.Context, code uint16, reason string) error
+func (c *Conn) Close() error
 ```
 
-`header` moves no payload bytes and opens no connection. `readHeader` reads 2 to 14 header bytes and never reads payload bytes. `acceptKey`, `checkUpgrade`, `upgradeStatus`, `handshakeFailureHeaders`, `upgradeHeaders` and `pickSubprotocol` are pure header checks. `parseClose`, `validCloseCode` and `appendClose` move no frame bytes. `engine` reads frames from a `*bufio.Reader` and assembles messages; it opens no connection and starts no goroutine. External tests reach every name above only through the `Exposed` probes in `export_test.lgo`, `handshake_export_test.lgo` and `close_export_test.lgo`.
+`header` moves no payload bytes and opens no connection. `readHeader` reads 2 to 14 header bytes and never reads payload bytes. `acceptKey`, `checkUpgrade`, `upgradeStatus`, `handshakeFailureHeaders`, `upgradeHeaders`, `pickSubprotocol`, `checkOrigin` and `sameOrigin` are pure header checks. `parseClose`, `validCloseCode` and `appendClose` move no frame bytes. `engine` reads frames from a `*bufio.Reader` and assembles messages; it opens no connection and starts no goroutine. `Conn` owns one hijacked connection, answers pings, echoes one close and ends. External tests reach each unexported name above through the `Exposed` probes in `export_test.lgo`, `handshake_export_test.lgo` and `close_export_test.lgo`; the public names are tested directly.
 
 ## Requirements
 
@@ -162,9 +202,39 @@ func checkTail(buf []byte, valid int, fin bool) (int, error)
 - `pickSubprotocol` MUST return empty text when no offered name matches.
 - `pickSubprotocol` MUST NOT return a name the client did not offer.
 - `upgradeStatus` MUST map a nil error to 101 and the version error to 426.
-- `upgradeStatus` MUST map the method error to 405 and each other error to 400.
+- `upgradeStatus` MUST map the method error to 405, the origin error to 403, and each other error to 400.
 - `handshakeFailureHeaders` MUST set `Sec-WebSocket-Version: 13` for the version error only.
 - The 426 caller MUST send `Sec-WebSocket-Version: 13` with the response.
+
+### Origin check (RFC 6455 section 4.1, RFC 6454 section 7)
+
+- `checkOrigin` MUST allow a request with no `Origin` header.
+- `checkOrigin` MUST allow an origin that matches `AllowedOrigins` exactly.
+- `checkOrigin` MUST allow an `http` or `https` origin whose host equals the request host.
+- `checkOrigin` MUST reject any other origin with `errHandshakeOrigin`.
+- `Upgrade` MUST answer that rejection with HTTP 403 and no close code.
+
+### Connection (RFC 6455 sections 5.4, 5.5, 5.6, 6, 7)
+
+- `Upgrade` MUST write each handshake failure status itself and return the cause.
+- `Upgrade` MUST answer 101 with `Upgrade`, `Connection`, `Accept` and the subprotocol.
+- `Upgrade` MUST hijack the connection and return a `Conn` over it.
+- `ServeHijacked` MUST panic on a nil connection or buffer.
+- A limit of 0 MUST select 1048576 bytes.
+- A negative limit MUST panic.
+- `Next` MUST return each text and binary message assembled from fragments.
+- `Next` MUST answer a ping with a pong of the same payload.
+- `Next` MUST return ping, pong and close events to the caller.
+- `Next` MUST echo a valid peer close once and end the connection.
+- `Next` after the close MUST return `ErrClosed`.
+- `Next` and each write method MUST observe the closed state before touching the connection.
+- `Next` MUST send 1009 for a message past the limit, 1007 for bad UTF-8, 1002 otherwise.
+- `Next` MUST derive read and write deadlines from the context deadline.
+- Concurrent writes MUST serialize through the one connection gate.
+- The caller MUST NOT call `Next` beside another `Next`.
+- `CloseWithCode` MUST send one close frame and end the connection.
+- `Close` MUST close the connection so later calls return `ErrClosed`.
+- `ParseClose` MUST decode a close payload exactly like `parseClose`.
 
 ### Close payload and codes (RFC 6455 sections 5.5.1, 7.1.5, 7.1.6, 7.4)
 
@@ -217,15 +287,22 @@ func checkTail(buf []byte, valid int, fin bool) (int, error)
 - `errHandshakeVersion`: `websocket: handshake requires Sec-WebSocket-Version 13`, answered with HTTP 426, header `Sec-WebSocket-Version: 13`, and no close code.
 - `errHandshakeKey`: `websocket: handshake requires Sec-WebSocket-Key with base64 of 16 bytes`, answered with HTTP 400 and no close code.
 - `errHandshakeSubprotocol`: `websocket: Sec-WebSocket-Protocol must be an RFC 7230 token`, answered with HTTP 400 and no close code.
+- `errHandshakeOrigin`: `websocket: handshake origin not allowed` for a foreign origin, answered with HTTP 403 and no close code.
 - `ErrClosePayload`: `websocket: close payload too short` for a one-byte close payload; a protocol error, close code 1002.
 - `ErrCloseUTF8`: `websocket: close reason not UTF-8` for a close reason outside valid UTF-8; close code 1007.
-- `ErrCloseCode`: `websocket: close code not allowed` for a code `validCloseCode` rejects; local only, no close code sent.
+- `ErrCloseCode`: `websocket: close code not allowed` for a code `validCloseCode` rejects; a peer code sends 1002, a local call sends nothing.
 - `ErrCloseTooLong`: `websocket: close reason too long` when code plus reason exceeds 125 bytes; local only, no close code sent.
 - `ErrStrayContinuation`: `websocket: unexpected continuation frame` for a continuation with no open message; a protocol error, close code 1002.
 - `ErrFragmentInProgress`: `websocket: new data frame while fragmented message is open` for a data frame while a message stays open; a protocol error, close code 1002.
 - `ErrMaskMismatch`: `websocket: mask bit does not match endpoint role` for a frame with the wrong mask bit; a protocol error, close code 1002.
 - `ErrMessageTooLarge`: `websocket: message exceeds size limit` for a message past the size limit; close code 1009.
 - `ErrInvalidUTF8`: `websocket: text message is not valid UTF-8` for a text message outside valid UTF-8; close code 1007.
+- `ErrClosed`: `websocket: connection closed` after the close handshake; local only, no close code sent.
+- `websocket: hijack: <cause>` when the upgrade cannot take over the connection.
+- `websocket: write upgrade status`, `write upgrade header`, `write upgrade end` and `flush upgrade` when the 101 reply fails.
+- `websocket: write frame header`, `write frame payload` and `flush frame` when a data, ping or close frame fails.
+- `websocket: set read deadline` and `set write deadline` when the connection rejects the context deadline.
+- `websocket: close after failed upgrade` and `websocket: close: <cause>` when the connection fails to close.
 
 ## Proof
 
@@ -302,10 +379,22 @@ func checkTail(buf []byte, valid int, fin bool) (int, error)
 - `TestEngineRefusesLoneSurrogate` proves that a lone surrogate fails with `ErrInvalidUTF8`.
 - `TestEngineAcceptsSplitFourByteRune` proves that a rune split across fragments passes once completed.
 - `TestEngineNextZeroAllocs` proves that a warmed `next` allocates nothing per message.
+- `TestPeerCloseEchoedOnceThenEnds` proves that a peer close with code 1000 is echoed once and the connection ends.
+- `TestFaultFrameOverLimitSends1009` proves that a message past the limit fails with `ErrMessageTooLarge` and sends 1009.
+- `TestFaultInvalidUTF8Sends1007` proves that invalid UTF-8 text fails with `ErrInvalidUTF8` and sends 1007.
+- `TestFaultReservedBitSends1002` proves that a set reserved bit fails with `ErrReservedBits` and sends 1002.
+- `TestPingAnsweredWithPong` proves that a ping arrives as an event and the peer gets its pong.
+- `TestBinaryEchoRoundTrip1KiB` proves that a 1024-byte binary message echoes back byte for byte.
+- `TestExpiredContextFailsFast` proves that an expired context fails a read and a write.
+- `TestCloseWithCodeEndsConnection` proves that `CloseWithCode` sends 1000 and ends the connection.
+- `TestUpgradeAnswers101WithRFCVector` proves that the RFC 6455 section 1.3 sample key answers 101 with its accept value.
+- `TestUpgradeOriginPolicy` proves that foreign origins get 403 while same, absent and listed origins get 101.
+- `TestUpgradeSelectsSubprotocolInServerOrder` proves that the first supported offered subprotocol wins.
+- `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
 
 ## Not in scope
 
 - Extensions such as permessage-deflate. No requirement names them.
-- The transport: the connection type and the upgrade entry point. They wait for design decisions.
 - A client handshake builder. The code checks requests only.
-- Keep-alive pings and the close echo. No loop owns them yet.
+- A background keep-alive loop. The application sends `Ping` itself.
+- HTTP/2 extended CONNECT. That handshake stays with `web`, which hands `Conn` a stream through `ServeHijacked`.
