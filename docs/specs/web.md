@@ -147,17 +147,19 @@ func (l *RejectLog) Add(field string, rule string, cause string)
 func (l *RejectLog) Empty() bool
 func (l *RejectLog) Text() string
 func LogRejected(rejected *RejectLog)
-func unknownMember(body []byte, err error) (string, bool)
+func unknownMember(err error) (string, bool)
 
 func CountBody[In any]() int
+func CountForm[In any]() int
 func BindSources[In any](bctx BindCtx, row *In, errs *validate.Errors)
 func BindBodies[In any](row *In, body []byte, errs *validate.Errors, rejected *RejectLog)
 func BindOneField[F any](bctx BindCtx, dst *(F), tags FieldTags, errs *validate.Errors)
 func BindStructBranch[F any](dst *(F), spec BindSpec, errs *validate.Errors)
 func BindStructValue(dst any, spec BindSpec, state *StructBindState)
 func BindLeafBranch(dst any, spec BindSpec, errs *validate.Errors)
-func LookupSource(req *http.Request, source string, key string) (string, bool)
-func lookupQuery(raw string, key string) (string, bool)
+func LookupSource(req *http.Request, source string, key string) (string, bool, error)
+func lookupQuery(raw string, key string) (string, bool, error)
+func ParseFormBody(ctx *Context, req *http.Request, want bool) error
 func ReadBody(req *http.Request, max int64) ([]byte, error)
 func BindJSONField(dst any, spec BindSpec, body []byte, errs *validate.Errors)
 func SetStringAny(dst any, raw string) error
@@ -255,6 +257,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - A `Use` after `Group` MUST NOT apply to a route inside that group.
 - `Routes` MUST list each route in registration order.
 - `Routes` MUST return a new slice on each call.
+- `Routes` MUST copy each `Doc` response list.
 - A caller MUST NOT change a schema that a route record holds.
 - A route inside a group MUST use the parent prefix plus the inner pattern.
 - When the inner pattern starts with a host, the parent prefix MUST follow that host.
@@ -302,6 +305,11 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Bind` MUST convert each present value to the field type.
 - `Bind` MUST collect every field failure before it answers.
 - `Bind` MUST keep `;` as data when it reads query values.
+- A `form` field MUST bind from the form body when the request carries one, and from the query otherwise.
+- `Bind` MUST parse a form body only for inputs with `form` fields.
+- A form body that does not parse MUST fail the bind even when the query parses.
+- `Bind` MUST apply `MaxBody` to a form body and answer 413 past the limit.
+- A present value that does not decode MUST fail with rule `format`.
 - `Bind` MUST leave untagged fields alone.
 - `Bind` MUST decode one `body:"json"` field under `MaxBody`.
 - `Bind` MUST reject an unknown JSON member in the body.
@@ -317,6 +325,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Route` MUST store that schema in the `RouteInfo`.
 - `Route` MUST run `Bind` before it calls the handler.
 - `Describe` MUST attach the `Doc` to the named route.
+- `Describe` MUST resolve the pattern against the calling router's group prefix.
 - `Describe` MUST panic when the route is unknown.
 - A field failure message MUST name only the field and the rule.
 - An unknown JSON member MUST fail with rule `unknown`.
@@ -366,6 +375,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - The internal problem MUST use title `Internal Server Error` and status 500.
 - The internal problem MUST NOT include the panic text or the error text.
 - An unknown error MUST be logged as `web: handler failed`.
+- A fault that answers 500 or above MUST be logged as `web: handler failed`.
 - `Fail` MUST be written as its problem, including a wrapped or joined error.
 - `ProblemError.Error` MUST return `web: ` plus `Problem.Title`.
 - The answer status MUST be 400 for `invalid`, 422 for `unprocessable` and 401 for `unauthenticated`.
@@ -400,6 +410,8 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Stop` of a server that is not started MUST return a nil error.
 - `TLS` MUST stay nil for cleartext or hold the server TLS config.
 - When `TLS` is set, the server MUST serve HTTPS with TLS 1.3 as the minimum version.
+- The minimum MUST also hold for a config returned by `GetConfigForClient`.
+- `Start` MUST fail before binding when `TLS` holds no certificate, `GetCertificate` or `GetConfigForClient`.
 - When `TLS` is set, the server MUST advertise `h2` and `http/1.1` through ALPN.
 - `H2C` MUST stay false unless prior-knowledge cleartext HTTP/2 is wanted.
 - When `H2C` is true, the server MUST accept prior-knowledge cleartext HTTP/2.
@@ -429,6 +441,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `web: request id entropy: <cause>` when the replacement id cannot be drawn.
 - `web: server already started` when `Start` runs on a live server.
 - `web: server needs a router` when `Router` is nil.
+- `web: server TLS needs a certificate` when `TLS` holds no certificate, `GetCertificate` or `GetConfigForClient`.
 - `web: listen <addr>: <cause>` when the listen fails.
 - `web: serve: <cause>` when `Serve` or `ServeTLS` fails with an error other than `http.ErrServerClosed`.
 - `web: shutdown: <cause>` when `Shutdown` fails. `Stop` then closes the listener and joins that error.
@@ -453,6 +466,8 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestStageOrderFollowsRegistration` and `TestStageAfterGroupSkipsInnerRoutes` prove stage order.
 - `TestRedirectUnderHtmxAndPlain` proves `HX-Redirect` and `Location`.
 - `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped or joined fault.
+- `TestInternalFaultIsLoggedOnce` proves that a 500 fault is logged once while a 409 fault stays quiet.
+- `TestWrappedLegacyProblemKeepsTheProblem` proves that a wrapped `Fail` keeps its problem.
 - `TestUnknownErrorAndPanicStayHidden` proves that an unknown error answers the fixed internal view and that both omit their text.
 - `TestErrAbortHandlerAbortsACutStream` proves that a cut stream ends in a body read error.
 - `TestAccessLogRecordsAnAbortedStream` proves the log record for an aborted stream.
@@ -484,6 +499,9 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*` and the root stage header.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
+- `TestStartWithoutTLSCertificateFailsAndFreesThePort` proves that a missing certificate fails `Start` before binding and leaves the port free.
+- `TestStartWithDynamicCertificateConfigServes` proves that a dynamic certificate config still starts.
+- `TestCloneTLSKeepsTheFloorOnDynamicConfigs` proves the TLS 1.3 floor on `GetConfigForClient` configs.
 - `TestServerServesAfterStartContextCancel` proves that a cancelled start context does not stop the server.
 - `TestServerAnswersOptionsAsteriskWith400` proves that `OPTIONS *` reaches the router.
 - `TestServerStopReturnsWithinGraceWhenHandlerNeverReturns` proves the grace deadline.
@@ -505,13 +523,23 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestBindRequiredFieldMissing` proves the `required` rule.
 - `TestBindCheckerFailureAnswers422` proves the 422 answer and the pass-through.
 - `TestBindUnknownJSONMemberRejected` proves an unknown member fails with rule `unknown` and its name.
+- `TestBindUnknownJSONMemberNamesAreExact` proves exact names for empty and escaped unknown members.
 - `TestBindHostileValueNeverEchoed` proves submitted values never reach the response.
 - `TestBindDurationAndNamedString` proves durations and named strings.
 - `TestRouteBindsBodyField` proves JSON body decoding.
 - `TestBindBodyOverMaxBody` proves the 413 answer.
+- `TestMalformedFormWithSemicolonQueryIsRejected` proves that a malformed form body fails even when the query parses.
+- `TestSemicolonQueryAloneKeepsTheForm` proves that a semicolon query does not disturb a valid form.
+- `TestFormFieldMissingFromBodyIsRequired` proves that a form field missing from the body fails instead of reading the query.
+- `TestGetFormFieldsBindFromTheQuery` proves that form fields without a form body bind from the query.
+- `TestJSONRouteSkipsFormParsing` proves that a JSON-only route leaves a form-labeled body unread.
+- `TestFormBodyOverMaxBodyIsRejected` proves the 413 answer for an oversized form body.
+- `TestMalformedOptionQueryValueIsAFieldError` proves that a malformed query value fails with rule `format` instead of absence.
 - `TestRouteInfoCarriesSchemaAndDoc` proves the stored `Wire`, the stored `Source` and the attached `Doc`.
 - `TestRoutesReturnsACopy` proves that mutating one call leaves the next call unchanged.
 - `TestDescribeUnknownRoutePanics` proves the unknown-route panic.
+- `TestDescribeInsideAGroupAttachesTheDoc` proves that `Describe` in a group finds the prefixed route.
+- `TestRoutesDeepCopiesDocReturns` proves that mutating a returned `Doc` leaves the next call unchanged.
 - `TestWebFaultsMatchSpecCodeTable` proves the declared set equals the code table.
 - `TestFaultKindMapsToStatusAndCode` proves one status and public code per kind.
 - `TestWrappedAndJoinedFaultsMapByOutermost` proves a wrapped or joined fault keeps its outermost fault.
