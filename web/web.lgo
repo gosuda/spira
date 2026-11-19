@@ -30,11 +30,21 @@ type routeList struct {
 	items sync.Locked[[]RouteInfo]
 }
 
+type routeCell struct {
+	handler Handler
+	current http.Handler
+}
+
+func (c *routeCell) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	c.current.ServeHTTP(w, req)
+}
+
 type Router struct {
 	mux         *http.ServeMux
 	prefix      string
 	root        *Router?
 	stages      []Stage
+	registered  []*routeCell
 	routes      *routeList
 	unmatched   func(c *Context)
 	Layout      func(ctx *Context, p Page) view.Node
@@ -60,6 +70,9 @@ func (r *Router) Use(stages ...Stage) {
 	if r.root == nil {
 		r.unmatched = chain(r, r.stages, delegateUnrouted)
 	}
+	for _, cell := range r.registered {
+		cell.current = served(r.rootRouter(), r.stages, cell.handler)
+	}
 }
 
 func (r *Router) Group(prefix string, build func(g *Router)) {
@@ -73,10 +86,17 @@ func (r *Router) Group(prefix string, build func(g *Router)) {
 	build(g)
 }
 
+func (r *Router) remember(h Handler) *routeCell {
+	cell := &routeCell{handler: h}
+	cell.current = served(r.rootRouter(), r.stages, h)
+	r.registered = append(r.registered, cell)
+	return cell
+}
+
 func (r *Router) Handle(method string, pattern string, h Handler) {
 	full := fullPattern(r.prefix, pattern)
 	r.record(method, full)
-	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
+	r.mux.Handle(method+" "+full, r.remember(h))
 }
 func (r *Router) record(method string, pattern string) {
 	r.recordRoute(method, pattern, nil, nil)

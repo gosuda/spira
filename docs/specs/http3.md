@@ -98,6 +98,7 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - `TestH3ServesHTTP3OverUDP` proves that a request over UDP gets the router answer with ALPN `h3`.
 - `TestH3SharesRouterWithTCP` proves that the same route answers over both listeners.
 - `TestH3AltSvcOnHTTPSOnly` proves the header value on HTTPS and its absence on cleartext and when `H3` is false.
+- `TestH3AltSvcIgnoresRegistrationOrder` proves that discovery works whether the stage is added before or after route registration.
 - `TestH3RequiresTLS13` proves that a pre-1.3 handshake on the UDP listener fails.
 - `TestH3StopDrainsWithinGrace` proves that `Stop` waits for a live HTTP/3 request.
 - `TestH3StopClosesUDPListener` proves that the UDP port rebinds right after `Stop`.

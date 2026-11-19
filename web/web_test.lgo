@@ -1396,3 +1396,24 @@ func TestUnmatchedRequestsRunRootStages(t *testing.T) {
 		t.Fatal("group stage ran for a request outside its prefix")
 	}
 }
+
+func lateStage() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			ctx.ResponseHeader().Set("X-Late-Stage", "ran")
+			return next(ctx)
+		}
+	}
+}
+
+func TestLateUseAppliesToEarlierRoutes(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", okReply)
+	if early := call(t, r, httptest.NewRequest(http.MethodGet, "/hello", nil)); early.Header().Get("X-Late-Stage") != "" {
+		t.Fatal("stage ran before it was registered")
+	}
+	r.Use(lateStage())
+	if late := call(t, r, httptest.NewRequest(http.MethodGet, "/hello", nil)); late.Header().Get("X-Late-Stage") != "ran" {
+		t.Fatal("a stage added after route registration did not run")
+	}
+}

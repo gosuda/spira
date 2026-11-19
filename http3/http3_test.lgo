@@ -792,3 +792,44 @@ func TestH3RefusesExtendedConnect(t *testing.T) {
 		return
 	}
 }
+
+func h3AltSvcValue(t *testing.T, late bool) (string, string) {
+	t.Helper()
+	r := web.NewRouter()
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return "", ""
+	}
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	if !late {
+		r.Use(s.AltSvc())
+	}
+	r.Handle("GET", "/hello", h3Hello)
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return "", ""
+	}
+	defer stopH3Server(t, s)
+	if late {
+		r.Use(s.AltSvc())
+	}
+	tcpAddr := s.BoundTCPAddrForTest()
+	udpAddr := s.BoundUDPAddrForTest()
+	if tcpAddr == "" || udpAddr == "" {
+		t.Fatal("missing bound address")
+		return "", ""
+	}
+	return httpsGetHeader(t, pool, "https://"+tcpAddr+"/hello", "Alt-Svc"), udpAddr
+}
+
+func TestH3AltSvcIgnoresRegistrationOrder(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		header, udpAddr := h3AltSvcValue(t, late)
+		want := "h3=\":" + udpPortOf(t, udpAddr) + "\"; ma=2592000"
+		if header != want {
+			t.Fatalf("late=%v Alt-Svc %q want %q", late, header, want)
+			return
+		}
+	}
+}
