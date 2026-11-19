@@ -498,6 +498,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestUnmatchedChainWrapsAStageOnlyAtUse` proves that an unmatched request wraps no stage and that a later `Use` still applies.
 - `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*` and the root stage header.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
+- `TestServerClosesSlowHeadersWithinReadHeaderTimeout` proves that the TCP listener closes stalled headers within the timeout.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
 - `TestStartWithoutTLSCertificateFailsAndFreesThePort` proves that a missing certificate fails `Start` before binding and leaves the port free.
 - `TestStartWithDynamicCertificateConfigServes` proves that a dynamic certificate config still starts.

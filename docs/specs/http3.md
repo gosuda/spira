@@ -29,7 +29,7 @@ var ErrH3Shutdown = fault.New("http3.h3_shutdown", fault.Internal, "The HTTP/3 s
 func Faults() []*fault.Error
 ```
 
-The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP/3 on.
+The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on.
 
 ## Requirements
 
@@ -41,6 +41,7 @@ The other fields keep the meaning that [web](web.md) gives them. `H3` turns HTTP
 - When `H3` is true and `TLS` is nil, `Start` MUST fail and MUST NOT listen.
 - The UDP listener MUST negotiate only ALPN `h3`.
 - The UDP listener MUST use TLS 1.3 with no older version.
+- `ReadHeaderTimeout` MUST bound the TCP listener header reads only. It MUST NOT be presented as bounding HTTP/3 header reads: `quic-go` v0.65.0 parses HEADERS with no per-stream deadline (a size cap only, through `MaxHeaderBytes`), so a stalled header block outlives the setting while other streams keep the connection alive.
 - The TCP listener MUST keep the ALPN list that [web](web.md) fixes.
 - Each HTTPS response MUST carry `Alt-Svc: h3=":<port>"; ma=2592000` while the UDP listener is open, with the actual UDP port.
 - A cleartext response MUST NOT carry that header.
