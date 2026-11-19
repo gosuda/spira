@@ -14,6 +14,8 @@ type Route struct {
 }
 
 func Mount(r *web.Router, routes []Route, policy resilience.Policy)
+
+func Faults() []*fault.Error
 ```
 
 ## Requirements
@@ -87,17 +89,25 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.
 - The body MUST NOT contain an upstream address.
 - A refusal MUST carry a fresh body for each client.
+- Each failure that ends the upstream chain MUST be the `gateway.upstream_unavailable` fault.
+- The 502 answer MUST carry the constant problem, not the cause text.
 - Breaker admission and open duration MUST follow [resilience](resilience.md).
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `gateway.upstream_unavailable` | unavailable | "The gateway could not reach an upstream." |
 
 ## Errors
 
+- `gateway: upstream answered <status>` is the cause of the `gateway.upstream_unavailable` fault for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
+- `gateway: upstream headers exceeded <timeout>` is the cause of the `gateway.upstream_unavailable` fault when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
 - `gateway: route <prefix>: path prefix must start with /` when `PathPrefix` does not start with `/`.
 - `gateway: route <prefix>: path prefix must not contain wildcards` when `PathPrefix` holds `{`, `}` or `*`.
 - `gateway: route <prefix>: no upstream` when `To` is empty.
 - `gateway: route <prefix>: upstream <raw> is not an absolute http or https URL` when an upstream is not an absolute `http` or `https` URL with a host.
 - `gateway: encode bad gateway problem: <cause>` when the 502 problem body cannot be encoded.
-- `gateway: upstream answered <status>` is the failure cause for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
-- `gateway: upstream headers exceeded <timeout>` when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
 
 ## Proof
 
@@ -134,6 +144,9 @@ func Mount(r *web.Router, routes []Route, policy resilience.Policy)
 - `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
 - `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
 - `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
+- `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.
+- `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.
+- `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 
 ## Not in scope
 

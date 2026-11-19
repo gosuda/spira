@@ -1,0 +1,81 @@
+package gateway_test
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/gateway"
+)
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/gateway.md", gateway.Faults())
+}
+
+func TestBadGatewayThroughDeadUpstream(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	srv := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{deadURL}}}, plainPolicy())
+	resp, err := srv.Client().Get(srv.URL + "/shop/items?page=1")
+	if err != nil {
+		t.Fatalf("GET through gateway: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("client close body: %v", cerr)
+		}
+	}()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type = %q, want application/problem+json", ct)
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, "Bad Gateway") {
+		t.Fatalf("body %q lacks the problem title", body)
+	}
+	if strings.Contains(body, deadURL) {
+		t.Fatalf("body %q names the dead upstream address", body)
+	}
+	if !errors.Is(gateway.ErrBadGateway.Wrap(errors.New("dial refused")), gateway.ErrBadGateway) {
+		t.Fatal("wrapped dial failure does not match gateway.ErrBadGateway")
+	}
+	faulttest.RefuseLeak(t, []byte(body), deadURL)
+}
+
+func TestBadGatewayRefusalHidesUpstreamSecrets(t *testing.T) {
+	planted := []string{"hunter2", "<script>alert(1)</script>", "'; DROP TABLE x; --", "/etc/passwd"}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, err := io.WriteString(w, "upstream says password=hunter2 <script>alert(1)</script> '; DROP TABLE x; --' /etc/passwd"); err != nil {
+			t.Errorf("upstream write body: %v", err)
+		}
+	}))
+	t.Cleanup(up.Close)
+	srv := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, plainPolicy())
+	resp, err := srv.Client().Get(srv.URL + "/shop/items")
+	if err != nil {
+		t.Fatalf("GET through gateway: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("client close body: %v", cerr)
+		}
+	}()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	faulttest.RefuseLeak(t, []byte(body), planted...)
+	cause := fmt.Errorf("gateway: upstream answered %d", http.StatusServiceUnavailable)
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, gateway.ErrBadGateway.Wrap(cause)), planted...)
+}
