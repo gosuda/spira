@@ -4,12 +4,7 @@ Spring's server-side ideas, rebuilt in LoGOs with no container and no reflection
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-spira is a web framework for applications written in [LoGOs](https://github.com/gosuda/loGos), a fork of the Go toolchain that compiles `.lgo` files. It covers what a Spring application uses on the server: routing, HTML views, htmx fragments, browser islands, SQL access, sessions, metrics and model calls. An application is ordinary statements in `main`. No container resolves parts and nothing scans annotations. Where Spring asks a type a question at run time through `reflect` or a proxy, spira asks at compile time with a LoGOs comptime generic.
-
-- **No reflection.** No `.lgo` file in the module imports `reflect`. `app.Run` walks the fields of the application struct at compile time.
-- **One runtime dependency.** `golang.org/x/crypto`, for Argon2id password hashing. The other direct modules in `go.mod` are four database drivers (`modernc.org/sqlite`, `github.com/jackc/pgx/v5`, `github.com/go-sql-driver/mysql`, `github.com/microsoft/go-mssqldb`), and only tests import them.
-- **Plain Go out.** `logos eject` turns the module into Go source that upstream Go 1.27.4 builds. `just eject` checks this.
-- **Page or fragment from one handler.** A `web.Page` reply writes the whole document, or only the body when htmx asks for it.
+spira is a web framework for applications written in [LoGOs](https://github.com/gosuda/loGos), a fork of the Go toolchain that compiles `.lgo` files. It is for a team that wants the server behavior Spring gives (routing, HTML views, htmx fragments, browser islands, checked SQL, sessions, metrics and model calls) without dependency injection or run-time proxies. An application is ordinary statements in `main`. Where Spring asks a type a question at run time through `reflect`, spira asks at compile time with a LoGOs comptime generic.
 
 ```lgo
 func index(ctx *web.Context) (web.Reply, error) {
@@ -23,45 +18,23 @@ r.Handle("GET", "/", index)
 // GET / with HX-Request: true  -> <p>Hello from spira</p>
 ```
 
-Contents: [Install](#install) · [Quick start](#quick-start) · [Features](#features) · [Usage](#usage) · [Development](#development) · [License](#license)
+- **No reflection.** No `.lgo` file in the module imports `reflect`; `grep -R '"reflect"' --include='*.lgo' .` prints nothing.
+- **No container.** `app.Run` only orders the start and stop of the `app.Part` fields of one struct. Nothing resolves or wires parts.
+- **One runtime module.** `golang.org/x/crypto` for Argon2id. The four database drivers in `go.mod` are imported only by tests.
+- **Plain Go out.** `logos eject` writes the module as Go source that upstream Go 1.27.4 builds. `just eject` checks this.
+- **One handler, page or fragment.** `web.Page` writes the whole document, or only its body when htmx asks.
 
-## Install
-
-The system `go` cannot build this module. You need a LoGOs toolchain built from source.
-
-1. Clone and build LoGOs. Go 1.27.3 is known to work as the bootstrap compiler.
-
-   ```sh
-   git clone https://github.com/gosuda/loGos.git
-   cd loGos
-   unset GOROOT GOTOOLCHAIN
-   bootstrap_root=$(go env GOROOT)
-   (cd src && GOROOT_BOOTSTRAP="$bootstrap_root" ./make.bash)
-   ```
-
-2. Put the toolchain on your `PATH` for every later command.
-
-   ```sh
-   export GOROOT="$PWD"
-   export PATH="$GOROOT/bin:$PATH"
-   export GOTOOLCHAIN=local
-   ```
-
-3. Check the install. The output starts with `logos version go1.27.4`.
-
-   ```sh
-   logos version
-   ```
-
-4. Create a module and add spira. `logos get` resolves the version and writes it into `go.mod`.
-
-   ```sh
-   mkdir hello && cd hello
-   logos mod init example.com/hello
-   logos get github.com/gosuda/spira@main
-   ```
+Contents: [Quick start](#quick-start) · [Installation](#installation) · [Why spira](#why-spira) · [Usage](#usage) · [What main ships](#what-main-ships) · [Development](#development) · [License](#license)
 
 ## Quick start
+
+With a LoGOs toolchain already on `PATH` (see [Installation](#installation)), this app runs in under two minutes. Create a module and add spira:
+
+```sh
+mkdir hello && cd hello
+logos mod init example.com/hello
+logos get github.com/gosuda/spira@main
+```
 
 Write `main.lgo` in the module directory:
 
@@ -106,9 +79,7 @@ func main() {
 }
 ```
 
-`layout` wraps each page in the document shell. `app.Run` starts every field of `App` that implements `app.Part`, in field order, and stops them in reverse order on `SIGINT` or `SIGTERM`.
-
-LoGOs audits what a dependency can reach and denies network access by default. Allow the one spira package that opens sockets. Write `logos.toml` next to `go.mod`:
+Allow the one package that opens sockets by writing `logos.toml` next to `go.mod`:
 
 ```toml
 [capabilities]
@@ -122,7 +93,7 @@ logos build -o hello-bin .
 ./hello-bin
 ```
 
-The build prints warnings named `capabilities::unauthorized_reflect`. They do not stop the build. Standard library packages that spira imports, such as `fmt`, use `reflect`; spira's own code does not.
+The build prints `capabilities::unauthorized_reflect` warnings. They are warnings, not errors: the module code imports no `reflect`, while standard library packages such as `fmt` reach it.
 
 In a second terminal:
 
@@ -138,28 +109,53 @@ Vary: HX-Request, HX-Boosted, HX-History-Restore-Request
 <!doctype html><html><head><title>Hello</title></head><body><h1>Hello</h1><p>Hello from spira</p></body></html>
 ```
 
-## Features
+`layout` wraps each page in the document shell. `app.Run` starts every field of `App` that implements `app.Part`, in field order, and stops them in reverse order on `SIGINT` or `SIGTERM`.
 
-Each package has a specification under [docs/specs](docs/specs/README.md). The last column says what this tree holds today.
+## Installation
 
-| Package | What you get | In the tree |
-|---|---|---|
-| `app` | `app.Run` starts and stops the `app.Part` fields of one struct in declaration order | yes |
-| `config` | `config.Load[T]` fills a struct from environment, map, file and remote sources, with `required` tags and an error per key | yes |
-| `web` | `net/http.ServeMux` patterns, ordered `web.Stage` lists, typed context keys, the closed `web.Reply` union, RFC 9457 problems, `web.Server` | yes; typed `Bind` and `Route` wait for `schema` |
-| `validate` | `validate.Errors` and the `validate.Checker` interface; a rule is code in `Check` | yes |
-| `view` | HTML as values from node functions: escaping, a URL scheme filter, `Island` custom elements, `Later` streamed slots; no template language | yes |
-| `asset`, `frontend/` | Vite manifest tags in document order; island adapters for React, Svelte 5 and Solid; the slot mover; htmx with `allowEval` off | yes |
-| `bus`, `live` | `bus.Topic[T]` fans events out in process and never blocks a publisher; `live.Events` streams HTML fragments as server-sent events | yes |
-| `db` | `db.Open` over `database/sql` for SQLite, PostgreSQL, MySQL and SQL Server; `db.InTx`; `db.Query` and `db.One` scan by `col` tag; a 256-entry statement cache | yes; option fields (`string?`) wait for a LoGOs fix |
-| `migrate` | `*.up.sql` and `*.down.sql` pairs; `migrate.CheckReversible` proves that each `down` restores the schema | yes |
-| `auth` | Argon2id passwords, cookie sessions over a `SessionStore`, `auth.Authenticate` and `auth.Require` stages, `auth.Bearer`, cross-origin and security headers | yes |
-| `meter`, `ops` | Prometheus counters, gauges and histograms capped at 1000 series per metric; `/ops` health, info, metrics and routes behind a guard you must pass | yes |
-| `client`, `resilience`, `cache` | A typed JSON client under a timeout, retry and circuit-breaker policy; an LRU cache that runs one load per key | yes |
-| `gateway`, `job` | Reverse proxy to static upstream lists with a breaker per upstream; a scheduler, a queue and chunked batch runs | yes |
-| `ai`, `ai/ollama`, `ai/mcp` | Messages, tools, the `ai.Run` tool loop, `ai.Collect` stream merge, `ai.Wrap` layers, tool search; the Ollama provider with chat, streaming and embeddings; a Model Context Protocol client over stdio or HTTP and a server mount for your tools | yes; the other providers and the session and retrieval packages are specified |
-| `cmd/spira` | `spira dev` runs Vite and `logos run` together and restarts the server when an `.lgo` file changes | `dev` yes; `new` is specified |
-| `schema`, `openapi`, `admin`, `orm`, `cmd/sqlc-gen-spira` | Type descriptions, an OpenAPI 3.1 document, an admin console, entity sessions, SQL checked by `sqlc` before run time | specified, not yet in the tree |
+The system `go` cannot build this module. You need a LoGOs toolchain built from source; the `loGos` repository's default branch is `release-branch.go1.27`.
+
+1. Clone and build LoGOs. Go 1.27.4 is known to work as the bootstrap compiler.
+
+   ```sh
+   git clone https://github.com/gosuda/loGos.git
+   cd loGos
+   unset GOROOT GOTOOLCHAIN
+   bootstrap_root=$(go env GOROOT)
+   (cd src && GOROOT_BOOTSTRAP="$bootstrap_root" ./make.bash)
+   ```
+
+2. Put the toolchain on `PATH` for every later command.
+
+   ```sh
+   export GOROOT="$PWD"
+   export PATH="$GOROOT/bin:$PATH"
+   export GOTOOLCHAIN=local
+   ```
+
+3. Check the install. The output starts with `logos version go1.27.4`.
+
+   ```sh
+   logos version
+   ```
+
+4. In an application module, add spira. `logos get` resolves the version and writes it into `go.mod`.
+
+   ```sh
+   mkdir hello && cd hello
+   logos mod init example.com/hello
+   logos get github.com/gosuda/spira@main
+   ```
+
+The two repository commands are build-time tools, not runtime dependencies. From a spira checkout, `logos build -o /tmp/spira ./cmd/spira` builds the dev loop, and `logos build -o /tmp/sqlc-gen-spira ./cmd/sqlc-gen-spira` builds the sqlc plugin.
+
+## Why spira
+
+- **Behavior stays explicit.** A route, a stage, a cache and a guard are values in code. There is no annotation, scan, interceptor registry or proxy.
+- **Compile-time answers.** `app.Run`, `schema.Of`, `db.Query` and the generated SQL functions inspect types at compile time or before a row is scanned, without `reflect`.
+- **Bounded by construction.** `meter` folds a metric past 1000 series into `overflow`, `bus.Topic` drops for a slow subscriber instead of blocking, and `web.Server` has read and shutdown deadlines in its fields.
+- **Errors keep a public boundary.** `fault` gives each failure a stable code and a client-safe message; the cause stays in logs.
+- **The exit is real.** If the experiment does not fit, `just eject` leaves ordinary Go that upstream Go builds.
 
 ## Usage
 
@@ -172,17 +168,46 @@ curl -s localhost:18080/                        # the whole document
 curl -s -H 'HX-Request: true' localhost:18080/  # <p>Hello from spira</p>
 ```
 
-The other replies follow the same rule. `web.Fragment` writes HTML with `HX-Retarget`, `HX-Reswap`, `HX-Push-Url` or `HX-Trigger`. `web.Data` writes JSON. `web.Redirect` answers `HX-Redirect` for htmx and `Location` otherwise. `web.Problem` writes RFC 9457 problem details.
+The other replies follow the same rule. `web.Fragment` writes HTML with `HX-Retarget`, `HX-Reswap`, `HX-Push-Url` or `HX-Trigger`. `web.Data` writes JSON. `web.Redirect` answers `HX-Redirect` for htmx and `Location` otherwise. `web.Problem` writes RFC 9457 problem details. `web.Delegate` hands a request to any `http.Handler`.
 
-Where to read next:
+### Data and migrations
 
+`example/shop/db` holds the migration pairs and annotated queries of the sample schema; `docs/specs/example-shop.md` specifies the application around them. `db.Open` takes the driver name and DSN, `db.InTx` hands a transaction to the work function, and `db.Query`/`db.One` scan rows by `col` tag. `migrate.Apply` runs `*.up.sql`/`*.down.sql` pairs in order, and `migrate.CheckReversible` proves that each `down` restores the schema.
+
+`cmd/sqlc-gen-spira` is a sqlc process plugin. It reads sqlc's `GenerateRequest` and writes table structs plus typed functions for `:one`, `:many`, `:exec`, `:execrows` and `:execlastid` queries. The accepted engines are SQLite, PostgreSQL, MySQL and SQL Server. `tools/go.mod` pins sqlc with a Go `tool` directive.
+
+### Commands
+
+- `spira dev <main-package>` starts `logos run` for the application and `pnpm --dir frontend run dev`, gives the server `SPIRA_VITE_ORIGIN=http://localhost:5173`, and restarts the server when an `.lgo` file changes.
+- `sqlc-gen-spira` runs under sqlc as a `process` plugin; it also accepts `generate` for manual use and reads a request from standard input.
+
+## What main ships
+
+Each package has a specification under [docs/specs](docs/specs/README.md). These directories exist on `main` today.
+
+| Area | Packages | What you get |
+|---|---|---|
+| Lifecycle and configuration | `app`, `config` | `app.Run` over one struct; `config.Load[T]` over ordered environment, map, file and remote sources |
+| HTTP core | `web`, `schema`, `validate` | `ServeMux` method patterns, ordered `web.Stage` lists, typed context keys, the closed `web.Reply` union, RFC 9457 problems, `web.Server`, type schemas, field checks |
+| Pages and browser | `view`, `asset`, `frontend/`, `live`, `bus`, `websocket` | HTML as values with escaping and a URL scheme filter; Vite manifest tags; React, Svelte 5, Solid and WASM island adapters; server-sent events; in-process topics; RFC 6455 connections |
+| Data | `db`, `migrate`, `cmd/sqlc-gen-spira` | Pools and transactions for four engines, checked scans, a 256-entry statement cache, reversible migration pairs, generated table types and query functions |
+| Security and operations | `auth`, `fault`, `meter`, `ops`, `admin` | Argon2id passwords, cookie sessions, bearer and guard stages, a stable public error vocabulary, Prometheus text, guarded `/ops` endpoints, an admin console |
+| Outbound and background | `client`, `resilience`, `cache`, `gateway`, `job` | Typed JSON calls under timeout, retry and a breaker; one-flight LRU cache; reverse proxy; scheduler, queue and chunked batch |
+| Model calls | `ai`, `ai/openai`, `ai/anthropic`, `ai/ollama`, `ai/session`, `ai/rag`, `ai/mcp` | Messages, tools, `ai.Run`, `ai.Collect` stream merge, layers, structured output, OpenAI-compatible, Anthropic and Ollama providers, sessions, retrieval, an MCP client and server mount |
+| Tools | `cmd/spira`, `fault/faulttest` | `spira dev`; the spec-backed fault disclosure test kit |
+
+`orm`, `openapi` and `spira new` are specified but not in the tree yet. Generated code that uses keyed tables imports `orm.Table`, so leave `tables` entries empty until `orm` lands. The full map from Spring concepts to spira packages, including what spira does not build, is in [scope and lexicon](docs/specs/scope-and-lexicon.md).
+
+## Documentation
+
+- Package contracts: [docs/specs](docs/specs/README.md)
 - HTTP: [web](docs/specs/web.md)
 - Pages and islands: [view](docs/specs/view.md), [frontend](docs/specs/frontend.md), [wire contract](docs/specs/wire-contract.md)
-- Data: [db](docs/specs/db.md), [migrate](docs/specs/migrate.md)
+- Data: [db](docs/specs/db.md), [migrate](docs/specs/migrate.md), [sqlc-gen-spira](docs/specs/sqlc-gen-spira.md)
 - Login and sessions: [auth](docs/specs/auth.md)
-- What maps to which Spring concept, and what spira does not build: [scope and lexicon](docs/specs/scope-and-lexicon.md)
-
-`example/shop/db` holds the migrations and queries of the sample shop. The rest of the sample is specified in [example-shop](docs/specs/example-shop.md).
+- Model calls: [ai](docs/specs/ai.md)
+- Scope and exclusions: [scope and lexicon](docs/specs/scope-and-lexicon.md)
+- Sample schema contract: [example-shop](docs/specs/example-shop.md)
 
 ## Development
 
@@ -191,13 +216,13 @@ The module builds with `logos`, not `go`. The `justfile` sets the toolchain envi
 ```sh
 just build    # logos build ./...
 just lint     # logos lint ./...
-just test     # logos test -count=1 ./...
-just web      # pnpm install, biome + tsc + vitest, vite build
+just test     # logos test -race -count=1 ./...
+just web      # wasm fixture, pnpm install, biome + tsc + vitest, vite build
 just gate     # build lint test web
 just eject    # logos eject to /tmp/spira-eject, then upstream go build
 ```
 
-`logos.toml` forbids cgo, so tests run without the race detector.
+`just engines` runs the engine-tagged tests against digest-pinned PostgreSQL, MySQL and SQL Server containers through `scripts/engines.sh`; it requires Docker. `logos.toml` forbids cgo, and the test recipe keeps `-race`.
 
 ### Contributing
 
