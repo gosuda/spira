@@ -165,14 +165,19 @@ func (s *Server) handlePost(ctx *web.Context) (web.Reply, error) {
 
 func (s *Server) handleDelete(ctx *web.Context) (web.Reply, error) {
 	name := ctx.Request.PathValue("name")
-	want := ctx.Request.URL.Query().Get("opsUrl")
+	query, qerr := url.ParseQuery(ctx.Request.URL.RawQuery)
+	if qerr != nil {
+		return nil, ErrInvalidInstance.WithFields(fault.Field{Name: "opsUrl", Rule: "url", Message: "The instance ops URL is invalid."}).Wrap(fmt.Errorf("admin: parse delete query: %w", qerr))
+	}
+	guarded := query.Has("opsUrl")
+	want := query.Get("opsUrl")
 	removed := false
 	s.state.WithLock(func(st *serverState) {
 		rec, ok := st.entries[name]
 		if !ok {
 			return
 		}
-		if want != "" && rec.inst.OpsURL != want {
+		if guarded && rec.inst.OpsURL != want {
 			return
 		}
 		delete(st.entries, name)

@@ -986,3 +986,39 @@ func TestAdminRefusesCredentialedAndForeignSchemeURLs(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteWithEmptySelectorKeepsTheRecord(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
+	r := newAdminRouter(srv, openGuard())
+	good := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "https://shop.example/base")})
+	if good.Code != http.StatusCreated {
+		t.Fatalf("POST valid instance status = %d, want 201: %s", good.Code, good.Body.String())
+		return
+	}
+	blank := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/shop?opsUrl="})
+	if blank.Code != http.StatusNotFound {
+		t.Fatalf("DELETE with an empty selector status = %d, want 404", blank.Code)
+		return
+	}
+	if !strings.Contains(blank.Body.String(), "admin.unknown_instance") {
+		t.Fatalf("DELETE with an empty selector body %q holds no fault code", blank.Body.String())
+		return
+	}
+	malformed := httptest.NewRequest(http.MethodDelete, "/admin/instances/shop", nil)
+	malformed.URL.RawQuery = "opsUrl=%zz"
+	mrec := httptest.NewRecorder()
+	r.ServeHTTP(mrec, malformed)
+	if mrec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("DELETE with a malformed selector status = %d, want 422", mrec.Code)
+		return
+	}
+	if !strings.Contains(mrec.Body.String(), "admin.invalid_instance") {
+		t.Fatalf("DELETE with a malformed selector body %q holds no fault code", mrec.Body.String())
+		return
+	}
+	kept := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/shop?opsUrl=https://shop.example/base"})
+	if kept.Code != http.StatusNoContent {
+		t.Fatalf("DELETE with the matching selector status = %d, want 204: the record must survive the bad selectors", kept.Code)
+		return
+	}
+}
