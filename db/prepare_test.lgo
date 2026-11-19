@@ -23,8 +23,8 @@ func TestPrepareRejectsAMissingTable(t *testing.T) {
 	if err == nil {
 		t.Fatal("Prepare accepted a statement against a missing table")
 	}
-	if !strings.HasPrefix(err.Error(), "db: prepare:") {
-		t.Fatalf("Prepare error = %q, want the db: prepare: prefix", err.Error())
+	if !errors.Is(err, db.ErrStatementFailed) || !strings.Contains(err.Error(), "db: prepare:") {
+		t.Fatalf("Prepare error = %q, want db.ErrStatementFailed", err.Error())
 	}
 }
 
@@ -110,7 +110,7 @@ func TestPrepareChecksCachedTextAgainstTheSchema(t *testing.T) {
 		t.Fatalf("Prepare error = %v, want the engine rejection, not a context error", err)
 		return
 	}
-	if !strings.HasPrefix(err.Error(), "db: prepare:") {
-		t.Fatalf("Prepare error = %q, want the db: prepare: prefix", err.Error())
+	if !errors.Is(err, db.ErrStatementFailed) || !strings.Contains(err.Error(), "db: prepare:") {
+		t.Fatalf("Prepare error = %q, want db.ErrStatementFailed with the db: prepare: cause", err.Error())
 	}
 }

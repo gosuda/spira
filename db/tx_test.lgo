@@ -373,7 +373,7 @@ func TestInTxCommitFailureReturnsCommitErrorAlone(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the commit error")
 	}
-	if !strings.HasPrefix(err.Error(), "db: commit:") {
+	if !errors.Is(err, db.ErrConstraintViolation) || !strings.Contains(err.Error(), "db: commit:") {
 		t.Fatalf("InTx error = %q, want the commit error", err)
 	}
 	if errors.Unwrap(err) == nil {

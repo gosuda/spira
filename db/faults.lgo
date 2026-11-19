@@ -1,0 +1,144 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"io"
+	"net"
+	"strings"
+
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrUnknownDriver = fault.New("db.unknown_driver", fault.Internal, "The database driver is unknown.")
+
+var ErrMissingParseTime = fault.New("db.missing_parse_time", fault.Internal, "The database configuration is invalid.")
+
+var ErrShapeMismatch = fault.New("db.shape_mismatch", fault.Internal, "A database result does not match the expected type.")
+var ErrStatementFailed = fault.New("db.statement_failed", fault.Internal, "The database statement failed.")
+var ErrNullInNonOptional = fault.New("db.null_in_non_optional", fault.Internal, "A database value does not match the expected type.")
+
+var ErrConstraintViolation = fault.New("db.constraint_violation", fault.Conflict, "The record conflicts with an existing record.")
+
+var ErrUnavailable = fault.New("db.unavailable", fault.Unavailable, "The database is unavailable.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrUnknownDriver, ErrMissingParseTime, ErrShapeMismatch, ErrStatementFailed, ErrNullInNonOptional, ErrConstraintViolation, ErrUnavailable}
+}
+
+func ClassifyDriverError(d Dialect, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	if fault.Of(cause) != nil {
+		return cause
+	}
+	if isConstraintViolation(d, cause) {
+		return ErrConstraintViolation.Wrap(cause)
+	}
+	if errors.Is(cause, sql.ErrNoRows) {
+		return cause
+	}
+	if errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	if isConnectionFailure(cause) {
+		return ErrUnavailable.Wrap(cause)
+	}
+	return ErrStatementFailed.Wrap(cause)
+}
+
+func isConnectionFailure(err error) bool {
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
+}
+
+func isConstraintViolation(d Dialect, err error) bool {
+	if isCodeConstraint(err) {
+		return true
+	}
+	if !isMySQLDialect(d) {
+		return false
+	}
+	return isMySQLConstraint(err)
+}
+
+func isCodeConstraint(err error) bool {
+	var sqliteCode interface{ Code() int }
+	if errors.As(err, &sqliteCode) {
+		if sqliteCode.Code()&0xFF == 19 {
+			return true
+		}
+	}
+	var state interface{ SQLState() string }
+	if errors.As(err, &state) {
+		if code := state.SQLState(); code == "23505" || code == "23503" {
+			return true
+		}
+	}
+	var number interface{ SQLErrorNumber() int32 }
+	if errors.As(err, &number) {
+		if n := number.SQLErrorNumber(); n == 2627 || n == 2601 || n == 547 {
+			return true
+		}
+	}
+	return false
+}
+
+func isMySQLDialect(d Dialect) bool {
+	_, ok := d.(MySQL)
+	return ok
+}
+
+func isMySQLConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, inner := range joined.Unwrap() {
+			if isMySQLConstraint(inner) {
+				return true
+			}
+		}
+		return false
+	}
+	if next := errors.Unwrap(err); next != nil {
+		return isMySQLConstraint(next)
+	}
+	if n, ok := parseMySQLErrorPrefix(err.Error()); ok {
+		return n == 1062 || n == 1451 || n == 1452
+	}
+	return false
+}
+
+func parseMySQLErrorPrefix(text string) (int, bool) {
+	rest, found := strings.CutPrefix(text, "Error ")
+	if !found {
+		return 0, false
+	}
+	n := 0
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		n = n*10 + int(rest[digits]-'0')
+		digits++
+	}
+	if digits == 0 || digits > 5 {
+		return 0, false
+	}
+	tail := rest[digits:]
+	if strings.HasPrefix(tail, " (") || strings.HasPrefix(tail, ":") {
+		return n, true
+	}
+	return 0, false
+}

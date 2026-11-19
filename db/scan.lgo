@@ -9,6 +9,8 @@ import (
 	"logos/rt"
 	"strings"
 	"time"
+
+	"github.com/gosuda/spira/fault"
 )
 
 type ScanPlan struct {
@@ -21,7 +23,7 @@ type ScanPlan struct {
 func Query[T any](ctx context.Context, q Querier, query string, args ...any) ([]T, error) {
 	rows := q.QueryContext(ctx, query, args...)?
 	if rows == nil {
-		return nil, errors.New("db: query returned no rows handle")
+		return nil, ErrStatementFailed.Wrap(errors.New("db: query returned no rows handle"))
 	}
 	defer rows.Close()?
 	cols := rows.Columns()?
@@ -43,7 +45,7 @@ func Query[T any](ctx context.Context, q Querier, query string, args ...any) ([]
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("db: scan %s: %w", plan.Type, err)
+		return nil, ClassifyDriverError(SQLite{}, fmt.Errorf("db: scan %s: %w", plan.Type, err))
 	}
 	return out, nil
 }
@@ -51,7 +53,7 @@ func Query[T any](ctx context.Context, q Querier, query string, args ...any) ([]
 func One[T any](ctx context.Context, q Querier, query string, args ...any) (found T?, err error) {
 	rows := q.QueryContext(ctx, query, args...)?
 	if rows == nil {
-		return nil, errors.New("db: query returned no rows handle")
+		return nil, ErrStatementFailed.Wrap(errors.New("db: query returned no rows handle"))
 	}
 	defer rows.Close()?
 	cols := rows.Columns()?
@@ -70,7 +72,7 @@ func One[T any](ctx context.Context, q Querier, query string, args ...any) (foun
 	seen := false
 	for rows.Next() {
 		if seen {
-			return nil, fmt.Errorf("db: %s: query returned more than one row", plan.Type)
+			return nil, ErrShapeMismatch.Wrap(fmt.Errorf("db: %s: query returned more than one row", plan.Type))
 		}
 		var row T
 		ScanRow[T](&row, rows, plan)?
@@ -78,7 +80,7 @@ func One[T any](ctx context.Context, q Querier, query string, args ...any) (foun
 		seen = true
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("db: scan %s: %w", plan.Type, err)
+		return nil, ClassifyDriverError(SQLite{}, fmt.Errorf("db: scan %s: %w", plan.Type, err))
 	}
 	return out, nil
 }
@@ -128,10 +130,10 @@ func ScanRow[T any](row *(T), rows *sql.Rows, plan ScanPlan) error {
 		ScanField[T](row, plan.Type, &dests)?
 	}
 	if err := rows.Scan(dests...); err != nil {
-		if cause := errors.Unwrap(err); cause != nil {
-			return cause
+		if fault.Of(err) != nil {
+			return err
 		}
-		return err
+		return ClassifyDriverError(SQLite{}, err)
 	}
 	return nil
 }
@@ -155,7 +157,7 @@ func ScanField[F any](dst *(F), path string, dests *[]any) error {
 		before := len(*dests)
 		AppendNamed[F](dst, path, dests)
 		if len(*dests) != before+1 {
-			return fmt.Errorf("db: %s: unsupported type", path)
+			return ErrShapeMismatch.Wrap(fmt.Errorf("db: %s: unsupported type", path))
 		}
 		return nil
 	}
@@ -164,6 +166,22 @@ func ScanField[F any](dst *(F), path string, dests *[]any) error {
 func AppendNamed[F any](dst *(F), path string, dests *[]any) {
 	const switch F {
 	case ~string:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~bool:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~int:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~int8:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~int16:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~int32:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~int64:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~float32:
+		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
+	case ~float64:
 		*dests = append(*dests, &NotNullDest[F]{dst: dst, path: path})
 	}
 }
@@ -239,11 +257,11 @@ func ScanOption(dst any, path string, dests *[]any) bool {
 
 func CheckScan(cols []string, plan ScanPlan) error {
 	if len(cols) != plan.Count {
-		return fmt.Errorf("db: %s has %d fields, query returned %d columns", plan.Type, plan.Count, len(cols))
+		return ErrShapeMismatch.Wrap(fmt.Errorf("db: %s has %d fields, query returned %d columns", plan.Type, plan.Count, len(cols)))
 	}
 	for i, name := range plan.Names {
 		if cols[i] != name {
-			return fmt.Errorf("db: column %d is %q, field %s expects %q", i, cols[i], plan.Paths[i], name)
+			return ErrShapeMismatch.Wrap(fmt.Errorf("db: column %d is %q, field %s expects %q", i, cols[i], plan.Paths[i], name))
 		}
 	}
 	return nil
@@ -287,11 +305,20 @@ type NotNullDest[V any] struct {
 
 func (d *NotNullDest[V]) Scan(src any) error {
 	if src == nil {
-		return fmt.Errorf("db: NULL in non-optional %s", d.path)
+		return ErrNullInNonOptional.Wrap(fmt.Errorf("db: NULL in non-optional %s", d.path))
+	}
+	if rt.TildeIs[V, bool]() {
+		p := rt.UnderPtrAs[bool, V](d.dst)
+		var n sql.Null[bool]
+		if err := n.Scan(src); err != nil {
+			return ErrShapeMismatch.Wrap(fmt.Errorf("db: scan %s: %w", d.path, err))
+		}
+		*p = n.V
+		return nil
 	}
 	var n sql.Null[V]
 	if err := n.Scan(src); err != nil {
-		return fmt.Errorf("db: scan %s: %w", d.path, err)
+		return ErrShapeMismatch.Wrap(fmt.Errorf("db: scan %s: %w", d.path, err))
 	}
 	*d.dst = n.V
 	return nil
@@ -310,7 +337,7 @@ func (d *OptionDest[V]) Scan(src any) error {
 	}
 	var n sql.Null[V]
 	if err := n.Scan(src); err != nil {
-		return fmt.Errorf("db: scan %s: %w", d.path, err)
+		return ErrShapeMismatch.Wrap(fmt.Errorf("db: scan %s: %w", d.path, err))
 	}
 	*d.dst = rt.Option[V]{Value: n.V, Present: true}
 	return nil

@@ -78,6 +78,9 @@ type OptionDest[V any] struct {
 }
 
 func (d *OptionDest[V]) Scan(src any) error
+
+func Faults() []*fault.Error
+func ClassifyDriverError(d Dialect, cause error) error
 ```
 
 ## Requirements
@@ -159,35 +162,53 @@ func (d *OptionDest[V]) Scan(src any) error
 - `ScanField` MUST accept `time.Time`, `[]byte`, `string` and `bool`.
 - `ScanField` MUST accept `int`, `int8`, `int16`, `int32` and `int64`.
 - `ScanField` MUST accept `float32` and `float64`.
-- `ScanField` MUST accept a named type whose underlying type is `string`.
+- `ScanField` MUST accept a named type whose underlying type is `bool`, `int`, `int8`, `int16`, `int32`, `int64`, `float32`, `float64` or `string`.
 - `ScanField` MUST accept `time.Time?`, `string?`, `bool?`, `int16?`, `int32?` and `int64?`.
 - `ScanField` MUST accept `float32?` and `float64?`.
 
-## Errors
+### Constraint violations
 
-- `db: unknown driver "<name>"` when the driver name is not one of the four names above.
-- `db: mysql DSN needs parseTime=true` when the query part of a `mysql` DSN does not turn `parseTime` on.
-- `db: stop: <cause>` when the context of `Stop` ends before the close finishes. `<cause>` is the context error.
-- `db: open <driver>: <cause>` when `sql.Open` fails.
-- `db: ping: <cause>` when `Start` cannot ping.
-- `db: close: <cause>` when the handle close fails. The cause joins the statement close error and the handle error.
-- If the handle close succeeds, `Stop` returns the statement close error, or nil.
-- `db: begin: <cause>` when the transaction does not start.
-- `db: commit: <cause>` when commit fails.
-- `db: prepare: <cause>` when prepare fails. The cause is the engine error.
-- `db: prepare close: <cause>` when a direct prepare cannot close its statement.
-- `db: prepared statement missing` when the cache returns no statement.
-- `db: prepared statement cache full` when the cache cannot store one more held statement.
-- `db: query: <cause>` when a query fails.
-- `db: exec: <cause>` when exec fails.
-- `db: query returned no rows` when a prepared statement returns no row handle.
-- `db: query returned no rows handle` when `Query` or `One` gets no row handle.
-- `db: <Type> has <n> fields, query returned <m> columns` when the column count differs. The word `columns` stays plural for every count, including 1. `<Type>` is the `%T` text of `T`.
-- `db: column <i> is "<name>", field <path> expects "<col>"` when a column name differs. The index starts at 0. `<path>` is the `%T` text, a dot, and each field name.
-- `db: NULL in non-optional <path>` when a field that is not an option receives NULL.
-- `db: <path>: unsupported type` for a field type that the scan does not accept.
-- `db: <Type>: query returned more than one row` when `One` sees a second row.
-- `db: scan <Type>: <cause>` when row iteration fails.
+- The pool MUST map unique and foreign-key failures to `db.constraint_violation`.
+- SQLite MUST count a `Code()` low byte of 19.
+- `Postgres` MUST count `SQLState()` `23505` and `23503`.
+- `MSSQL` MUST count `SQLErrorNumber()` `2627`, `2601` and `547`.
+- `MySQL` MUST count `1062`, `1451` and `1452`.
+- The MySQL check MUST read only the fixed `Error <number>` prefix.
+- The check MUST run only when the pool dialect is `MySQL`.
+- The check MUST NOT inspect text after the prefix.
+- The prefix MUST serve as the code because `MySQL` exposes no accessor.
+- Scan errors without a dialect MUST use only the method checks.
+- The pool MUST map other driver failures to `db.statement_failed`.
+- Only connection failures MUST map to `db.unavailable`.
+- `driver.ErrBadConn`, `sql.ErrConnDone` and transport errors MUST mean the connection failed.
+- Context errors MUST pass through unclassified for callers to match.
+- `sql.ErrNoRows` MUST pass through unchanged.
+- `ClassifyDriverError` MUST return declared faults with the legacy cause text.
+- Declared faults MUST pass through without another wrap.
+
+### Code table
+
+| Code | Kind | Message |
+| --- | --- | --- |
+| `db.unknown_driver` | internal | "The database driver is unknown." |
+| `db.missing_parse_time` | internal | "The database configuration is invalid." |
+| `db.shape_mismatch` | internal | "A database result does not match the expected type." |
+| `db.null_in_non_optional` | internal | "A database value does not match the expected type." |
+| `db.statement_failed` | internal | "The database statement failed." |
+| `db.constraint_violation` | conflict | "The record conflicts with an existing record." |
+| `db.unavailable` | unavailable | "The database is unavailable." |
+
+## Errors
+- Unknown drivers MUST map to `db.unknown_driver` with the name in the cause.
+- A `mysql` DSN without `parseTime=true` MUST map to `db.missing_parse_time`.
+- Column count and name mismatches MUST map to `db.shape_mismatch`.
+- A NULL in a non-option field MUST map to `db.null_in_non_optional`.
+- Unique and foreign-key failures MUST map to `db.constraint_violation`.
+- Other driver failures MUST map to `db.statement_failed`, except connection failures.
+- Connection failures MUST map to `db.unavailable`.
+- `InTx` MUST return the work error without a wrap.
+- Causes MUST keep the legacy `db: <operation>:` prefix text.
+- Public views MUST NOT carry table names, column names or values.
 
 ## Proof
 
@@ -199,7 +220,7 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
 - `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
 - `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.
-- `TestInTxCommitFailureReturnsCommitErrorAlone` proves that a commit failure returns only `db: commit`.
+- `TestInTxCommitFailureReturnsCommitErrorAlone` proves that a commit failure returns `db.constraint_violation` with the `db: commit` cause.
 - `TestStatementCacheNeverExceedsCapacity` proves the limit of 256 statements.
 - `TestInExpandsTheMarker` proves marker replacement, `NULL`, and a second marker left unchanged.
 - `TestInRunsThroughThePoolUncached` and `TestPrepareOfMarkedTextStaysUncached` prove that `In` text does not enter the cache.
@@ -222,9 +243,24 @@ func (d *OptionDest[V]) Scan(src any) error
 - `TestOneRoundTripsAnOptionField` proves `One` returns absent option fields for a NULL row.
 - `TestQueryKeepsOptionPosition` proves an option field scans between plain fields.
 - `TestQueryScansNamedStringBesideOption` proves a named string field scans beside an option field.
+- `TestQueryScansNamedScalars` proves named fields scan like their types, with `NULL` to an option read as absent.
+- `TestQueryRejectsNullInNamedScalar` proves `NULL` in a named plain field is an error.
 - `TestQueryRejectsUnsupportedFieldBeforeRows` proves the unsupported-type error before a row is read.
 - `TestQueryServesSixteenConcurrentReaders` proves concurrent reads on one pool.
 - `TestEnginePostgres`, `TestEngineMySQL` and `TestEngineMSSQL` prove a round trip, a commit, a rollback and `Prepare` on each engine. `just engines` starts the three engines. Each test skips when its DSN variable is not set.
+- `TestFaultUnknownDriver` proves `db.Open` rejects an unknown driver with `db.unknown_driver`.
+- `TestFaultMissingParseTime` proves `db.Open` rejects a `mysql` DSN without `parseTime=true`.
+- `TestFaultShapeMismatch` proves a column mismatch returns `db.shape_mismatch`.
+- `TestFaultNullInNonOptional` proves a NULL returns `db.null_in_non_optional`.
+- `TestFaultConstraintViolation` proves a duplicate insert returns `db.constraint_violation`.
+- `TestFaultStatementFailed` proves a missing table returns `db.statement_failed` and not `db.unavailable`.
+- `TestFaultPrefixParserTable` proves the `MySQL` prefix parser accepts and rejects its table.
+- `TestFaultConstraintDialectGate` proves the gate blocks other dialects and hostile text.
+- `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
+- `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
+- `TestEnginePostgresConstraintViolation`, `TestEngineMySQLConstraintViolation` and `TestEngineMSSQLConstraintViolation` prove a duplicate insert returns `db.constraint_violation` on each engine.
+- `TestFaultConnectionClass` proves connection failures return `db.unavailable` and context errors pass through.
+- `TestEngineMySQLRefusedPort` proves a refused port returns `db.unavailable` without a DSN.
 
 ## Not in scope
 

@@ -248,8 +248,8 @@ func TestOpenRejectsUnknownDriver(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open accepted the unknown driver oracle")
 	}
-	if err.Error() != `db: unknown driver "oracle"` {
-		t.Fatalf("error = %q, want db: unknown driver \"oracle\"", err.Error())
+	if !errors.Is(err, db.ErrUnknownDriver) || !strings.Contains(err.Error(), `unknown driver "oracle"`) {
+		t.Fatalf("error = %v, want db.ErrUnknownDriver with the driver name", err)
 	}
 }
 
@@ -258,8 +258,8 @@ func TestOpenRejectsMysqlWithoutParseTime(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open accepted a mysql DSN without parseTime=true")
 	}
-	if err.Error() != "db: mysql DSN needs parseTime=true" {
-		t.Fatalf("error = %q, want db: mysql DSN needs parseTime=true", err.Error())
+	if !errors.Is(err, db.ErrMissingParseTime) || !strings.Contains(err.Error(), "db: mysql DSN needs parseTime=true") {
+		t.Fatalf("error = %v, want db.ErrMissingParseTime", err)
 	}
 }
 
@@ -268,8 +268,8 @@ func TestDialectOfRejectsParseTimeInThePassword(t *testing.T) {
 	if err == nil {
 		t.Fatal("DialectOf accepted parseTime in the password")
 	}
-	if err.Error() != "db: mysql DSN needs parseTime=true" {
-		t.Fatalf("error = %q, want db: mysql DSN needs parseTime=true", err.Error())
+	if !errors.Is(err, db.ErrMissingParseTime) || !strings.Contains(err.Error(), "db: mysql DSN needs parseTime=true") {
+		t.Fatalf("error = %v, want db.ErrMissingParseTime", err)
 	}
 }
 
@@ -307,7 +307,7 @@ func checkStopShutdown(t *testing.T, ctx context.Context, pool *db.Pool, stop *s
 	t.Helper()
 	var serr error
 	stop.err.WithLock(func(e *error) { serr = *e })
-	if !errors.Is(serr, context.DeadlineExceeded) || !strings.HasPrefix(serr.Error(), "db: stop:") {
+	if !errors.Is(serr, context.DeadlineExceeded) || !strings.Contains(serr.Error(), "db: stop:") {
 		t.Fatalf("Stop error = %v, want db: stop: context deadline exceeded", serr)
 	}
 	closed := false
@@ -391,10 +391,10 @@ func TestDialectOfMatchesEachDriverName(t *testing.T) {
 			t.Fatalf("DialectOf(%s) = %s, want %s", c.driver, got, c.want)
 		}
 	}
-	if _, err := db.DialectOf("mysql", "user@/db"); err == nil || err.Error() != "db: mysql DSN needs parseTime=true" {
+	if _, err := db.DialectOf("mysql", "user@/db"); err == nil || !errors.Is(err, db.ErrMissingParseTime) {
 		t.Fatalf("DialectOf(mysql, missing parseTime) error = %v", err)
 	}
-	if _, err := db.DialectOf("oracle", "x"); err == nil || err.Error() != `db: unknown driver "oracle"` {
+	if _, err := db.DialectOf("oracle", "x"); err == nil || !errors.Is(err, db.ErrUnknownDriver) {
 		t.Fatalf("DialectOf(oracle) error = %v", err)
 	}
 }
@@ -559,27 +559,24 @@ func pairPool(t *testing.T) *db.Pool {
 func TestQueryRejectsWrongColumnOrder(t *testing.T) {
 	pool := pairPool(t)
 	_, err := db.Query[pairRow](t.Context(), pool, "SELECT b, a FROM pairs")
-	want := `db: column 0 is "b", field db_test.pairRow.A expects "a"`
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), `column 0 is "b"`) {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
 func TestQueryRejectsExtraColumn(t *testing.T) {
 	pool := pairPool(t)
 	_, err := db.Query[pairRow](t.Context(), pool, "SELECT a, b, a AS c FROM pairs")
-	want := "db: db_test.pairRow has 2 fields, query returned 3 columns"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), "has 2 fields, query returned 3 columns") {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
 func TestQueryRejectsMissingColumn(t *testing.T) {
 	pool := pairPool(t)
 	_, err := db.Query[pairRow](t.Context(), pool, "SELECT a FROM pairs")
-	want := "db: db_test.pairRow has 2 fields, query returned 1 columns"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), "has 2 fields, query returned 1 columns") {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
@@ -587,9 +584,8 @@ func TestQueryRejectsMismatchedColumnsWithoutRows(t *testing.T) {
 	pool := openPool(t)
 	mustExec(t, pool, "CREATE TABLE pairs (a TEXT, b TEXT)")
 	_, err := db.Query[pairRow](t.Context(), pool, "SELECT a, b, a AS c FROM pairs")
-	want := "db: db_test.pairRow has 2 fields, query returned 3 columns"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), "has 2 fields, query returned 3 columns") {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
@@ -597,9 +593,8 @@ func TestOneRejectsMismatchedColumnsWithoutRows(t *testing.T) {
 	pool := openPool(t)
 	mustExec(t, pool, "CREATE TABLE pairs (a TEXT, b TEXT)")
 	_, err := db.One[pairRow](t.Context(), pool, "SELECT b, a FROM pairs")
-	want := `db: column 0 is "b", field db_test.pairRow.A expects "a"`
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), `column 0 is "b"`) {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
@@ -613,9 +608,8 @@ func TestQueryRejectsNullInNonOptional(t *testing.T) {
 	mustExec(t, pool, "CREATE TABLE strict (id INTEGER PRIMARY KEY, s TEXT)")
 	mustExec(t, pool, "INSERT INTO strict (id, s) VALUES (1, NULL)")
 	_, err := db.Query[strictRow](t.Context(), pool, "SELECT id, s FROM strict")
-	want := "db: NULL in non-optional db_test.strictRow.S"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrNullInNonOptional) || !strings.Contains(err.Error(), "NULL in non-optional") {
+		t.Fatalf("error = %v, want db.ErrNullInNonOptional", err)
 	}
 }
 
@@ -673,9 +667,8 @@ func TestQueryFlattensNestedStructs(t *testing.T) {
 func TestQueryRejectsWrongNestedOrder(t *testing.T) {
 	pool := nestedPool(t)
 	_, err := db.Query[outerRow](t.Context(), pool, "SELECT a, c, b, d FROM nested")
-	want := `db: column 1 is "c", field db_test.outerRow.Inner.B expects "b"`
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), `column 1 is "c"`) {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
@@ -736,9 +729,8 @@ func TestOneRejectsTwoRows(t *testing.T) {
 	insertThingRow(t, pool)
 	insertThingRow(t, pool)
 	_, err := db.One[int64](t.Context(), pool, "SELECT n FROM things")
-	want := "db: int64: query returned more than one row"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), "query returned more than one row") {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
@@ -751,9 +743,8 @@ func TestQueryRejectsUnsupportedFieldBeforeRows(t *testing.T) {
 	pool := openPool(t)
 	mustExec(t, pool, "CREATE TABLE maps (id INTEGER, m TEXT)")
 	_, err := db.Query[mapRow](t.Context(), pool, "SELECT id, m FROM maps")
-	want := "db: db_test.mapRow.M: unsupported type"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %v, want %q", err, want)
+	if !errors.Is(err, db.ErrShapeMismatch) || !strings.Contains(err.Error(), "unsupported type") {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", err)
 	}
 }
 
@@ -802,9 +793,8 @@ func TestQueryExpectsSnakeCaseWithoutTag(t *testing.T) {
 		t.Fatalf("Query = %+v, want one row 9/4.5", got)
 	}
 	_, aerr := db.Query[snakeRow](t.Context(), pool, "SELECT order_total, product_id FROM snake")
-	want := `db: column 0 is "order_total", field db_test.snakeRow.ProductID expects "product_id"`
-	if aerr == nil || aerr.Error() != want {
-		t.Fatalf("error = %v, want %q", aerr, want)
+	if !errors.Is(aerr, db.ErrShapeMismatch) || !strings.Contains(aerr.Error(), `column 0 is "order_total"`) {
+		t.Fatalf("error = %v, want db.ErrShapeMismatch", aerr)
 	}
 }
 
@@ -1031,5 +1021,72 @@ func TestQueryScansNamedStringBesideOption(t *testing.T) {
 	}
 	if value := rows[1].Note ?? ""; value != "x" {
 		t.Fatalf("second note = %q, want x", value)
+	}
+}
+
+type OrderID int64
+
+type Flag bool
+
+type Ratio float64
+
+type namedScalarRow struct {
+	ID     OrderID `col:"id"`
+	Active Flag    `col:"active"`
+	Score  Ratio   `col:"score"`
+	Note   int64?  `col:"note"`
+}
+
+func TestQueryScansNamedScalars(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE named_scalars (id INTEGER, active INTEGER, score REAL, note INTEGER)")
+	mustExec(t, pool, "INSERT INTO named_scalars (id, active, score, note) VALUES (7, 1, 2.5, 42)")
+	mustExec(t, pool, "INSERT INTO named_scalars (id, active, score, note) VALUES (8, 0, 3.25, NULL)")
+	rows, err := db.Query[namedScalarRow](t.Context(), pool, "SELECT id, active, score, note FROM named_scalars ORDER BY id")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: query named scalars: %v", err))
+	}
+	if len(rows) != 2 {
+		t.Fatalf("Query returned %d rows, want 2", len(rows))
+		return
+	}
+	if rows[0].ID != 7 || rows[0].Active != true || rows[0].Score != 2.5 {
+		t.Fatalf("first row = %+v, want id=7 active=true score=2.5", rows[0])
+		return
+	}
+	if value := rows[0].Note ?? 0; value != 42 {
+		t.Fatalf("first note = %d, want 42", value)
+		return
+	}
+	if rows[1].ID != 8 || rows[1].Active != false || rows[1].Score != 3.25 {
+		t.Fatalf("second row = %+v, want id=8 active=false score=3.25", rows[1])
+		return
+	}
+	if rows[1].Note != nil {
+		t.Fatalf("second note holds a value, want absent")
+		return
+	}
+	got, err := db.One[namedScalarRow](t.Context(), pool, "SELECT id, active, score, note FROM named_scalars WHERE id = 8")
+	if err != nil {
+		panic(fmt.Sprintf("db_test: one named scalar: %v", err))
+	}
+	if got == nil {
+		t.Fatalf("One returned no row")
+		return
+	}
+	var absent namedScalarRow
+	one := got ?? absent
+	if one.ID != 8 || one.Active != false || one.Score != 3.25 || one.Note != nil {
+		t.Fatalf("one row = %+v, want id=8 active=false score=3.25 note absent", one)
+	}
+}
+
+func TestQueryRejectsNullInNamedScalar(t *testing.T) {
+	pool := openPool(t)
+	mustExec(t, pool, "CREATE TABLE named_null (id INTEGER, active INTEGER, score REAL, note INTEGER)")
+	mustExec(t, pool, "INSERT INTO named_null (id, active, score, note) VALUES (NULL, 1, 2.5, 9)")
+	_, err := db.Query[namedScalarRow](t.Context(), pool, "SELECT id, active, score, note FROM named_null")
+	if !errors.Is(err, db.ErrNullInNonOptional) || !strings.Contains(err.Error(), "NULL in non-optional") {
+		t.Fatalf("error = %v, want db.ErrNullInNonOptional", err)
 	}
 }

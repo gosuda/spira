@@ -1,0 +1,191 @@
+package db_test
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func faultExec(t *testing.T, pool *db.Pool, statement string) {
+	t.Helper()
+	if _, err := db.Exec(t.Context(), pool, statement); err != nil {
+		t.Fatalf("faultExec %q: %v", statement, err)
+		return
+	}
+}
+
+func TestFaultUnknownDriver(t *testing.T) {
+	_, err := db.Open("oracle", "x")
+	if !errors.Is(err, db.ErrUnknownDriver) {
+		t.Fatalf("Open error = %v, want db.ErrUnknownDriver", err)
+		return
+	}
+}
+
+func TestFaultMissingParseTime(t *testing.T) {
+	_, err := db.Open("mysql", "user:pass@/dbname")
+	if !errors.Is(err, db.ErrMissingParseTime) {
+		t.Fatalf("Open error = %v, want db.ErrMissingParseTime", err)
+		return
+	}
+}
+
+type faultPair struct {
+	A string `col:"a"`
+	B string `col:"b"`
+}
+
+func TestFaultShapeMismatch(t *testing.T) {
+	pool := openPool(t)
+	faultExec(t, pool, "CREATE TABLE fault_pairs (a TEXT, b TEXT)")
+	_, err := db.Query[faultPair](t.Context(), pool, "SELECT b, a FROM fault_pairs")
+	if !errors.Is(err, db.ErrShapeMismatch) {
+		t.Fatalf("Query error = %v, want db.ErrShapeMismatch", err)
+		return
+	}
+}
+
+type faultStrict struct {
+	ID int64  `col:"id"`
+	S  string `col:"s"`
+}
+
+func TestFaultNullInNonOptional(t *testing.T) {
+	pool := openPool(t)
+	faultExec(t, pool, "CREATE TABLE fault_strict (id INTEGER PRIMARY KEY, s TEXT)")
+	faultExec(t, pool, "INSERT INTO fault_strict (id, s) VALUES (1, NULL)")
+	_, err := db.Query[faultStrict](t.Context(), pool, "SELECT id, s FROM fault_strict")
+	if !errors.Is(err, db.ErrNullInNonOptional) {
+		t.Fatalf("Query error = %v, want db.ErrNullInNonOptional", err)
+		return
+	}
+}
+
+type faultUniq struct {
+	N int64 `col:"n"`
+}
+
+func TestFaultConstraintViolation(t *testing.T) {
+	pool := openPool(t)
+	faultExec(t, pool, "CREATE TABLE fault_uniq (n INTEGER NOT NULL UNIQUE)")
+	faultExec(t, pool, "INSERT INTO fault_uniq (n) VALUES (7)")
+	_, err := db.Exec(t.Context(), pool, "INSERT INTO fault_uniq (n) VALUES (7)")
+	if !errors.Is(err, db.ErrConstraintViolation) {
+		t.Fatalf("Exec error = %v, want db.ErrConstraintViolation", err)
+		return
+	}
+	if errors.Is(err, db.ErrUnavailable) {
+		t.Fatalf("Exec error = %v, must not be db.ErrUnavailable", err)
+		return
+	}
+}
+
+func TestFaultStatementFailed(t *testing.T) {
+	pool := openPool(t)
+	_, err := db.Query[faultUniq](t.Context(), pool, "SELECT n FROM no_such_fault_table")
+	if !errors.Is(err, db.ErrStatementFailed) {
+		t.Fatalf("Query error = %v, want db.ErrStatementFailed", err)
+		return
+	}
+	if errors.Is(err, db.ErrUnavailable) {
+		t.Fatalf("Query error = %v, must not be db.ErrUnavailable", err)
+		return
+	}
+}
+
+func TestFaultConnectionClass(t *testing.T) {
+	dialErr := func() error {
+		_, err := net.DialTimeout("tcp", "127.0.0.1:1", time.Second)
+		return err
+	}()
+	if dialErr == nil {
+		t.Fatal("loopback port 1 accepted a connection")
+		return
+	}
+	for _, cause := range []error{driver.ErrBadConn, sql.ErrConnDone, io.ErrUnexpectedEOF, dialErr} {
+		if !errors.Is(db.ClassifyDriverError(db.SQLite{}, cause), db.ErrUnavailable) {
+			t.Errorf("cause %v does not map to db.ErrUnavailable", cause)
+		}
+	}
+	if perr := db.ClassifyDriverError(db.SQLite{}, context.DeadlineExceeded); !errors.Is(perr, context.DeadlineExceeded) || errors.Is(perr, db.ErrUnavailable) || errors.Is(perr, db.ErrStatementFailed) {
+		t.Errorf("context error = %v, want it passed through unclassified", perr)
+	}
+	if nerr := db.ClassifyDriverError(db.SQLite{}, sql.ErrNoRows); !errors.Is(nerr, sql.ErrNoRows) {
+		t.Errorf("ErrNoRows = %v, want it passed through unchanged", nerr)
+	}
+}
+
+func TestFaultPrefixParserTable(t *testing.T) {
+	cases := []struct {
+		text  string
+		want  int
+		match bool
+	}{
+		{"Error 1062 (23000): Duplicate entry '7' for key 'n'", 1062, true},
+		{"Error 1062: Duplicate entry", 1062, true},
+		{"Error 1451 (23000): Cannot delete a parent row", 1451, true},
+		{"Error 1452: Cannot add or update a child row", 1452, true},
+		{"Error 1045 (28000): Access denied", 1045, true},
+		{"no such table: fault_pairs", 0, false},
+		{"Error : missing number", 0, false},
+		{"Error 1062", 0, false},
+		{"Error 123456: too many digits", 0, false},
+		{"no such table: Error 1062 bogus", 0, false},
+		{"Error abc: not a number", 0, false},
+		{"Error 1062x: trailing letter", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := db.ParseMySQLPrefixForTest(c.text)
+		if ok != c.match || (ok && got != c.want) {
+			t.Errorf("prefix %q = (%d, %v), want (%d, %v)", c.text, got, ok, c.want, c.match)
+		}
+	}
+}
+
+func TestFaultConstraintDialectGate(t *testing.T) {
+	dup := errors.New("Error 1062 (23000): Duplicate entry '7' for key 'n'")
+	if !db.ConstraintViolationForTest(db.MySQL{}, dup) {
+		t.Fatal("mysql duplicate entry is not a constraint violation")
+		return
+	}
+	if db.ConstraintViolationForTest(db.SQLite{}, dup) {
+		t.Fatal("non-mysql dialect parsed the mysql prefix")
+		return
+	}
+	later := errors.New("no such table: Error 1062 bogus")
+	if db.ConstraintViolationForTest(db.MySQL{}, later) {
+		t.Fatal("hostile text later in the message matched the prefix")
+		return
+	}
+	wrapped := errors.Join(errors.New("seed"), dup)
+	if !db.ConstraintViolationForTest(db.MySQL{}, wrapped) {
+		t.Fatal("joined duplicate entry is not a constraint violation")
+		return
+	}
+}
+
+func TestFaultsMatchSpecTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/db.md", db.Faults())
+}
+func TestFaultPublicHidesSecretsAndHostile(t *testing.T) {
+	hostile := "<script>alert(1)</script>"
+	_, derr := db.Open(hostile, "x")
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, derr), hostile)
+	_, perr := db.Open("mysql", "user:hunter2-secret@/db")
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, perr), "hunter2-secret")
+	pool := openPool(t)
+	_, qerr := db.Query[faultUniq](t.Context(), pool, "SELECT n FROM "+hostile)
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, qerr), hostile)
+	faultExec(t, pool, "CREATE TABLE fault_secret (k TEXT NOT NULL UNIQUE)")
+	faultExec(t, pool, "INSERT INTO fault_secret (k) VALUES ('sk-live-secret-value')")
+	_, serr := db.Exec(t.Context(), pool, "INSERT INTO fault_secret (k) VALUES ('sk-live-secret-value')")
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, serr), "sk-live-secret-value")
+}
