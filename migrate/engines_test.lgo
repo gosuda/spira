@@ -100,6 +100,18 @@ func engineScratchPool(t *testing.T, driver string, dsnVar string) *db.Pool? {
 		t.Fatalf("migrate_test: start admin %s: %v", driver, serr)
 		return nil
 	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer ccancel()
+		for _, q := range teardown {
+			if _, err := db.Exec(cctx, admin, q); err != nil {
+				t.Errorf("teardown %q: %v", q, err)
+			}
+		}
+		if serr := admin.Stop(cctx); serr != nil {
+			t.Errorf("stop admin: %v", serr)
+		}
+	})
 	for _, q := range setup {
 		if _, err := db.Exec(ctx, admin, q); err != nil {
 			t.Fatalf("migrate_test: setup %s: %v", q, err)
@@ -124,14 +136,6 @@ func engineScratchPool(t *testing.T, driver string, dsnVar string) *db.Pool? {
 		defer ccancel()
 		if serr := pool.Stop(cctx); serr != nil {
 			t.Errorf("stop: %v", serr)
-		}
-		for _, q := range teardown {
-			if _, err := db.Exec(cctx, admin, q); err != nil {
-				t.Errorf("teardown %q: %v", q, err)
-			}
-		}
-		if serr := admin.Stop(cctx); serr != nil {
-			t.Errorf("stop admin: %v", serr)
 		}
 	})
 	return pool
