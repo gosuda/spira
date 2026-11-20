@@ -17,6 +17,7 @@ test:
     logos test -count=1 ./...
 
 sql:
+    logos mod download github.com/gosuda/spira
     logos build -o bin/sqlc-gen-spira github.com/gosuda/spira/cmd/sqlc-gen-spira
     cd tools && go mod tidy && go tool sqlc generate -f ../sqlc.yaml
 
