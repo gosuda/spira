@@ -46,7 +46,10 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - When `H3` is true and `TLS` is nil, `Start` MUST fail and MUST NOT listen.
 - The UDP listener MUST negotiate only ALPN `h3`.
 - The UDP listener MUST use TLS 1.3 with no older version.
-- `ReadHeaderTimeout` MUST bound the TCP listener header reads only. It MUST NOT be presented as bounding HTTP/3 header reads: `quic-go` v0.65.0 parses HEADERS with no per-stream deadline (a size cap only, through `MaxHeaderBytes`), so a stalled header block outlives the setting while other streams keep the connection alive.
+- `ReadHeaderTimeout` MUST bound the TCP listener header reads only.
+- `ReadHeaderTimeout` MUST NOT be presented as bounding HTTP/3 header reads.
+- `quic-go` v0.65.0 parses HEADERS with no per-stream deadline, only a `MaxHeaderBytes` size cap.
+- A stalled header block therefore outlives the setting while other streams keep the connection alive.
 - The TCP listener MUST keep the ALPN list that [web](web.md) fixes.
 - Each HTTPS response MUST carry `Alt-Svc: h3=":<port>"; ma=2592000` while the UDP listener is open, with the actual UDP port.
 - A cleartext response MUST NOT carry that header.
@@ -71,7 +74,10 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - Extended CONNECT over HTTP/3 MUST stay unbuilt, as [web](web.md) states for HTTP/2.
 - The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
-- `quic-go` v0.65.0 sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` on every connection: `http3.Server.settings` hardcodes `ExtendedConnect: true` with no knob, and `AdditionalSettings` refuses RFC 9114 ids. Peers may therefore attempt extended CONNECT, and the 501 boundary above is the enforcement.
+- `quic-go` v0.65.0 sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` on every connection.
+- `http3.Server.settings` hardcodes `ExtendedConnect: true` with no knob.
+- `AdditionalSettings` MUST refuse RFC 9114 ids.
+- Peers may therefore attempt extended CONNECT; the 501 boundary above is the enforcement.
 
 ### Faults
 
