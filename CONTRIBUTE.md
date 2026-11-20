@@ -9,9 +9,10 @@ The [specifications](docs/specs/README.md) hold the contract of each package.
 1. Follow [AGENTS.md](AGENTS.md), section "Toolchain environment". It names the LoGOs worktree that serves as the toolchain and gives the export line.
 2. Every `just` recipe sets the toolchain environment. Set `LOGOS_ROOT` to use a different worktree root.
 3. The `web` gate needs `pnpm`. Run `pnpm --dir frontend install --frozen-lockfile` once, or run `just web`.
-4. Read [AGENTS.md](AGENTS.md) before your first change. Load the logos skills that it names.
-5. Read the specification of the package that you touch under `docs/specs/`.
-6. Install the pre-commit hook. Git does not copy hooks with a clone. Write this file as `.git/hooks/pre-commit` and make it executable:
+4. The `slop` gate needs `sloplint` ([gosuda/sloplint](https://github.com/gosuda/sloplint), Rust). Install it once with `cargo install --git https://github.com/gosuda/sloplint --locked` and keep `~/.cargo/bin` on `PATH`.
+5. Read [AGENTS.md](AGENTS.md) before your first change. Load the logos skills that it names.
+6. Read the specification of the package that you touch under `docs/specs/`.
+7. Install the pre-commit hook. Git does not copy hooks with a clone. Write this file as `.git/hooks/pre-commit` and make it executable:
 
    ```sh
    #!/usr/bin/env bash
