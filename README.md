@@ -4,6 +4,8 @@ Spring's server-side ideas, rebuilt in LoGOs with no container and no reflection
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+[![Built with Depot](https://depot.dev/badges/built-with-depot.svg)](https://depot.dev?utm_source=gosuda)
+
 spira is a web framework for applications written in [LoGOs](https://github.com/gosuda/loGos), a fork of the Go toolchain that compiles `.lgo` files. It is for a team that wants the server behavior Spring gives (routing, HTML views, htmx fragments, browser islands, checked SQL, sessions, metrics and model calls) without dependency injection or run-time proxies. An application is ordinary statements in `main`. Where Spring asks a type a question at run time through `reflect`, spira asks at compile time with a LoGOs comptime generic.
 
 ```lgo
