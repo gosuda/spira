@@ -15,9 +15,11 @@ usage: spira dev <main-package>
 
 ### Arguments
 
-- The command MUST accept `new`, an optional `-engine` flag, an optional `-spira-dir` flag, and two arguments: a directory and a module path.
+- The command MUST accept `new`, an optional `-engine` flag and an optional `-spira-dir` flag.
+- `new` MUST take two arguments: a directory and a module path.
 - The command MUST accept `dev` and one main-package argument.
-- On any other arguments, the command MUST write `usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>` or `usage: spira dev <main-package>` to stderr.
+- On any other arguments, the command MUST write a usage line to stderr.
+- That line MUST be `usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>` or `usage: spira dev <main-package>`.
 - The command MUST then exit 2.
 
 ### spira new
@@ -56,8 +58,10 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - A bad session user id MUST wrap the account fault.
 - `spira new` MUST refuse a non-empty `<dir>`.
 - `spira new` MUST accept only `sqlite`, `postgresql`, `mysql` and `mssql` for `-engine`.
-- With `-spira-dir <path>`, `spira new` MUST write a `replace github.com/gosuda/spira => <path>` line into the generated `go.mod` and require `spira` at `v0.0.0`.
-- Without `-spira-dir`, `spira new` MUST require `spira` at the pseudo-version of the binary build revision, or refuse with a message that names `-spira-dir` when no revision is available.
+- With `-spira-dir <path>`, the generated `go.mod` MUST hold a `replace github.com/gosuda/spira => <path>` line.
+- `spira new` MUST then require `spira` at `v0.0.0`.
+- Without `-spira-dir`, `spira new` MUST require `spira` at the pseudo-version of the binary build revision.
+- When no revision is available, the command MUST refuse with a message that names `-spira-dir`.
 - After `just sql` in the generated directory, `logos build ./...` MUST pass.
 - After `just sql` in the generated directory, `logos test ./...` MUST pass.
 
