@@ -1417,3 +1417,38 @@ func TestLateUseAppliesToEarlierRoutes(t *testing.T) {
 		t.Fatal("a stage added after route registration did not run")
 	}
 }
+
+func TestUseWhileServingDoesNotRace(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", okReply)
+	if err := driveServeAndUse(t.Context(), r); err != nil {
+		t.Fatalf("concurrent use and serve: %v", err)
+	}
+}
+
+func driveServeAndUse(ctx context.Context, r *web.Router) error {
+	go group (ctx) {
+		go serveHello(ctx, r)
+		go serveHello(ctx, r)
+		go addLateStages(ctx, r)
+	}
+	return nil
+}
+
+func serveHello(ctx context.Context, r *web.Router) error {
+	for i := 0; i < 200 && ctx.Err() == nil; i++ {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/hello", nil))
+		if rec.Code != http.StatusNoContent {
+			return fmt.Errorf("web test: status %d", rec.Code)
+		}
+	}
+	return nil
+}
+
+func addLateStages(ctx context.Context, r *web.Router) error {
+	for i := 0; i < 50 && ctx.Err() == nil; i++ {
+		r.Use(lateStage())
+	}
+	return nil
+}

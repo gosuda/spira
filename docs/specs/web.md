@@ -470,6 +470,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestPageReplyRespectsHtmxHeaders` proves the full page, the fragment and the boosted page, plus `Vary`.
 - `TestStageOrderFollowsRegistration` and `TestStageAfterGroupSkipsInnerRoutes` prove stage order.
 - `TestLateUseAppliesToEarlierRoutes` proves that a stage added after route registration still runs.
+- `TestUseWhileServingDoesNotRace` proves that `Use` under live traffic does not race.
 - `TestRedirectUnderHtmxAndPlain` proves `HX-Redirect` and `Location`.
 - `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped or joined fault.
 - `TestInternalFaultIsLoggedOnce` proves that a 500 fault is logged once while a 409 fault stays quiet.
