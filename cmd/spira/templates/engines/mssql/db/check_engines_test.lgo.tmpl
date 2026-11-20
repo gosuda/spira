@@ -59,6 +59,13 @@ func TestEngineCheckReversibleAndPrepareAll(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 		return
 	}
+	defer func() {
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer rbCancel()
+		if rerr := migrate.Rollback(rbCtx, pool, steps, len(steps)); rerr != nil {
+			t.Errorf("rollback cleanup: %v", rerr)
+		}
+	}()
 	if err := store.PrepareAll(ctx, pool); err != nil {
 		t.Fatalf("prepare: %v", err)
 		return
