@@ -46,6 +46,7 @@ type Router struct {
 	prefix      string
 	root        *Router?
 	stages      sync.Locked[[]Stage]
+	install     sync.Locked[struct{}]
 	registered  sync.Locked[[]*routeCell]
 	routes      *routeList
 	unmatched   sync.Locked[func(c *Context)]
@@ -68,11 +69,14 @@ func (r *Router) rootRouter() *Router {
 }
 
 func (r *Router) Use(stages ...Stage) {
-	r.stages.WithLock(func(list *[]Stage) {
-		*list = append(*list, stages...)
-		now := append([]Stage(nil), (*list)...)
+	r.install.WithLock(func(*struct{}) {
+		var now []Stage
 		var cells []*routeCell
-		r.registered.WithLock(func(registered *[]*routeCell) { cells = append(cells, (*registered)...) })
+		r.stages.WithLock(func(list *[]Stage) {
+			*list = append(*list, stages...)
+			now = append(now, (*list)...)
+			r.registered.WithLock(func(registered *[]*routeCell) { cells = append(cells, (*registered)...) })
+		})
 		if r.root == nil {
 			r.unmatched.WithLock(func(u *func(c *Context)) { *u = chain(r, now, delegateUnrouted) })
 		}

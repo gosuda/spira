@@ -1431,6 +1431,7 @@ func driveServeAndUse(ctx context.Context, r *web.Router) error {
 		go serveHello(ctx, r)
 		go serveHello(ctx, r)
 		go addLateStages(ctx, r)
+		go addLateStages(ctx, r)
 	}
 	return nil
 }
