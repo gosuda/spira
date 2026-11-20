@@ -27,17 +27,17 @@ export type IslandModule = { default: unknown }
 export type IslandLoader = () => Promise<IslandModule>
 export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export type IslandTable = Record<string, IslandLoader>
+export type IslandCleanup = () => void
 export type IslandMount = (
 	target: HTMLElement,
 	component: unknown,
 	props: Record<string, unknown>,
-) => void
+) => IslandCleanup | undefined
 export class SpiraIslandElement extends HTMLElement
 export function defineIslands(table: IslandTable): void
-export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export function installSlotMover(root?: ParentNode): void
  // src/adapters/react.ts, src/adapters/svelte.ts and src/adapters/solid.ts
- export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
+ export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): IslandCleanup
  // src/adapters/wasm.ts
  export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): undefined
  export function loader(entry: string): () => Promise<{ default: unknown }>

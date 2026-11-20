@@ -205,14 +205,6 @@ export class SpiraIslandElement extends HTMLElement {
 		}
 	}
 }
-export function tableFromGlob(modules: Record<string, unknown>): IslandTable {
-	const table: IslandTable = {};
-	for (const [path, loader] of Object.entries(modules)) {
-		const entry = path.replace(/^\.\.\/\.\.\//, "");
-		table[entry] = loader as IslandLoader;
-	}
-	return table;
-}
 
 const islandTable = new Map<string, IslandLoader>();
 
