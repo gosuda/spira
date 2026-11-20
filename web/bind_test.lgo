@@ -382,6 +382,27 @@ func TestFormFieldMissingFromBodyIsRequired(t *testing.T) {
 	}
 }
 
+func TestBindKeepsTheFormAStageParsed(t *testing.T) {
+	r := web.NewRouter()
+	r.Use(func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if err := ctx.Request.ParseForm(); err != nil {
+				return nil, err
+			}
+			return next(ctx)
+		}
+	})
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=ada&password=secret123"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := call(t, r, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ada") {
+		t.Fatalf("status %d body %q, want 200 with the parsed username", rec.Code, rec.Body.String())
+	}
+}
+
 func TestGetFormFieldsBindFromTheQuery(t *testing.T) {
 	r := web.NewRouter()
 	web.Route(r, "GET", "/login", func(ctx *web.Context, in BindLoginIn) (web.Reply, error) {

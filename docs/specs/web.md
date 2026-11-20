@@ -309,6 +309,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Bind` MUST keep `;` as data when it reads query values.
 - A `form` field MUST bind from the form body when the request carries one, and from the query otherwise.
 - `Bind` MUST parse a form body only for inputs with `form` fields.
+- `Bind` MUST keep a `PostForm` that a stage parsed before the bind.
 - A form body that does not parse MUST fail the bind even when the query parses.
 - `Bind` MUST apply `MaxBody` to a form body and answer 413 past the limit.
 - A present value that does not decode MUST fail with rule `format`.
@@ -540,6 +541,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestSemicolonQueryAloneKeepsTheForm` proves that a semicolon query does not disturb a valid form.
 - `TestFormFieldMissingFromBodyIsRequired` proves that a form field missing from the body fails instead of reading the query.
 - `TestGetFormFieldsBindFromTheQuery` proves that form fields without a form body bind from the query.
+- `TestBindKeepsTheFormAStageParsed` proves that a `PostForm` parsed by an earlier stage survives the bind.
 - `TestJSONRouteSkipsFormParsing` proves that a JSON-only route leaves a form-labeled body unread.
 - `TestFormBodyOverMaxBodyIsRejected` proves the 413 answer for an oversized form body.
 - `TestMalformedOptionQueryValueIsAFieldError` proves that a malformed query value fails with rule `format` instead of absence.

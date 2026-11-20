@@ -254,6 +254,9 @@ func ParseFormBody(ctx *Context, req *http.Request, want bool) error {
 	if !want || !hasFormBody(req) {
 		return nil
 	}
+	if req.PostForm != nil {
+		return nil
+	}
 	data, rerr := ReadBody(req, ctx.root.MaxBody)
 	if rerr != nil {
 		return rerr
