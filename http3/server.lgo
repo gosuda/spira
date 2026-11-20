@@ -38,7 +38,6 @@ type serverRun struct {
 	h3         *http3.Server?
 	udpConn    net.PacketConn?
 	join       *joinState
-	joinCancel context.CancelFunc
 	tcpAddr    string
 	udpAddr    string
 	udpPort    int
@@ -263,14 +262,15 @@ func (s *Server) serve(startCtx context.Context, inner *web.Server, tcpAddr stri
 		})
 	}
 	js := &joinState{done: make(chan struct{})}
-	joinCtx, joinCancel := context.WithCancel(context.Background())
-	context.AfterFunc(joinCtx, func() {
+	waiter, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
+	waiter.Go(func(_ context.Context) error {
 		js.err.WithLock(func(e *error) {
 			*e = g.Wait()
 		})
 		close(js.done)
+		return nil
 	})
-	return &serverRun{inner: inner, h3: h3srv, udpConn: udpConn, join: js, joinCancel: joinCancel, tcpAddr: tcpAddr, udpAddr: udpAddr, udpPort: udpPort}
+	return &serverRun{inner: inner, h3: h3srv, udpConn: udpConn, join: js, tcpAddr: tcpAddr, udpAddr: udpAddr, udpPort: udpPort}
 }
 
 func (s *Server) Stop(ctx context.Context) error {
@@ -293,7 +293,6 @@ func (r *serverRun) stop(ctx context.Context, grace time.Duration) error {
 		return r.stopH3(ctx, sctx, h)
 	}
 	shutdownErr := r.inner.Stop(sctx)
-	r.joinCancel()
 	select {
 	case <-r.join.done:
 	case <-ctx.Done():
@@ -318,24 +317,21 @@ func (r *serverRun) stopH3(ctx context.Context, sctx context.Context, h *http3.S
 	})
 	var waitErr sync.Locked[error]
 	shutDone := make(chan struct{})
-	shutCtx, shutCancel := context.WithCancel(context.Background())
-	defer shutCancel()
-	context.AfterFunc(shutCtx, func() {
+	waiter, _ := rt.NewGroup(context.WithoutCancel(sctx), 0)
+	waiter.Go(func(_ context.Context) error {
 		waitErr.WithLock(func(e *error) {
 			*e = sg.Wait()
 		})
 		close(shutDone)
+		return nil
 	})
-	shutCancel()
 	select {
 	case <-shutDone:
 	case <-ctx.Done():
 		cerr := r.closeConn()
-		r.joinCancel()
 		return errors.Join(ctx.Err(), cerr)
 	}
 	shutdownErr := collectStop(&waitErr, &herr, &terr)
-	r.joinCancel()
 	var joinErr error
 	select {
 	case <-r.join.done:

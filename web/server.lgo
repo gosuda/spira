@@ -32,7 +32,6 @@ type serverState struct {
 type serverRun struct {
 	srv        *http.Server
 	join       *joinState
-	joinCancel context.CancelFunc
 	upgrades   *upgrades
 	listener   net.Listener
 }
@@ -266,14 +265,15 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 		})
 	}
 	js := &joinState{done: make(chan struct{})}
-	joinCtx, joinCancel := context.WithCancel(context.Background())
-	context.AfterFunc(joinCtx, func() {
+	waiter, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
+	waiter.Go(func(_ context.Context) error {
 		js.err.WithLock(func(e *error) {
 			*e = g.Wait()
 		})
 		close(js.done)
+		return nil
 	})
-	return &serverRun{srv: srv, join: js, joinCancel: joinCancel, upgrades: ups, listener: l}
+	return &serverRun{srv: srv, join: js, upgrades: ups, listener: l}
 }
 
 func (s *Server) Stop(ctx context.Context) error {
@@ -297,7 +297,6 @@ func (r *serverRun) stop(ctx context.Context, grace time.Duration) error {
 		shutdownErr = errors.Join(fmt.Errorf("web: shutdown: %w", shutdownErr), r.srv.Close())
 	}
 	shutdownErr = errors.Join(shutdownErr, r.upgrades.closeAll())
-	r.joinCancel()
 	select {
 	case <-r.join.done:
 	case <-ctx.Done():
