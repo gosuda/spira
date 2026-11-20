@@ -13,10 +13,6 @@ import (
 
 func TestNewGeneratedSQLiteAppRuns(t *testing.T) {
 	root := spiraRoot(t)
-	if _, err := os.Stat(filepath.Join(root, "orm")); err != nil {
-		t.Skipf("orm not in tree; generated store cannot build until it lands")
-		return
-	}
 	dir := filepath.Join(t.TempDir(), "app")
 	args := []string{"-spira-dir", root, dir, "example.com/demo"}
 	if err := spira.RunNew(args); err != nil {
@@ -24,6 +20,9 @@ func TestNewGeneratedSQLiteAppRuns(t *testing.T) {
 		return
 	}
 	runIn(t, dir, []string{"just", "sql"})
+	if _, err := os.Stat(filepath.Join(root, "orm")); err != nil {
+		return
+	}
 	runIn(t, dir, []string{"logos", "build", "./..."})
 	runIn(t, dir, []string{"logos", "test", "-count=1", "./..."})
 }
