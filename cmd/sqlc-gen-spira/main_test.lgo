@@ -960,31 +960,26 @@ func TestSliceQuery(t *testing.T) {
 }
 
 func TestQueryFileOmitsTimeImportForEntityRows(t *testing.T) {
-	entity := []QueryDef{{
-		Name: "ListProducts", Cmd: ":many",
-		RowGoType: "Product",
-		Fields: []Field{{Name: "created_at", GoName: "CreatedAt", GoType: "time.Time"}},
-		Params: []ParamDef{{GoName: "ID", GoType: "ProductID"}},
-	}}
-	for _, imp := range queryStdImports(entity) {
-		if imp == "time" {
-			t.Fatalf("entity row imports = %q, want no time import", queryStdImports(entity))
-			return
-		}
+	req := patchRequest(t, "sqlite", func(req *Request) {
+		req.PluginOptions = pluginOptions(t, map[string]any{
+			"tables": map[string]any{
+				"items": map[string]any{"type": "Item", "key": "id", "key_type": "ItemID"},
+			},
+		})
+	})
+	src := queryFile(t, req, "items.sql.lgo")
+	if !strings.Contains(src, "(Item?, error)") {
+		t.Fatalf("entity query file holds no Item return:\n%s", src)
+		return
 	}
-	declared := []QueryDef{{
-		Name: "GetSession", Cmd: ":one",
-		RowGoType: goName("GetSession") + "Row",
-		Fields: []Field{{Name: "expires_at", GoName: "ExpiresAt", GoType: "time.Time"}},
-	}}
-	found := false
-	for _, imp := range queryStdImports(declared) {
-		if imp == "time" {
-			found = true
-		}
+	if strings.Contains(src, "\"time\"") {
+		t.Fatalf("entity query file imports time:\n%s", src)
+		return
 	}
-	if !found {
-		t.Fatalf("declared row imports = %q, want the time import", queryStdImports(declared))
+	models := generateFile(t, req)
+	if !strings.Contains(models, "\"time\"") {
+		t.Fatalf("entity models file holds no time import:\n%s", models)
+		return
 	}
 }
 
