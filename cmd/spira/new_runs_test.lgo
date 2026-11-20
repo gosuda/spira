@@ -21,7 +21,7 @@ func TestNewGeneratedSQLiteAppRuns(t *testing.T) {
 	}
 	runIn(t, dir, []string{"just", "sql"})
 	if _, err := os.Stat(filepath.Join(root, "orm")); err != nil {
-		return
+		t.Skip("orm package not in this checkout")
 	}
 	runIn(t, dir, []string{"logos", "build", "./..."})
 	runIn(t, dir, []string{"logos", "test", "-race", "-count=1", "./..."})
