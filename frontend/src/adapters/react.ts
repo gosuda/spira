@@ -6,8 +6,10 @@ export function mount(
 	target: HTMLElement,
 	component: unknown,
 	props: Record<string, unknown>,
-): void {
-	createRoot(target).render(
-		createElement(component as ComponentType<unknown>, props),
-	);
+): () => void {
+	const root = createRoot(target);
+	root.render(createElement(component as ComponentType<unknown>, props));
+	return () => {
+		root.unmount();
+	};
 }

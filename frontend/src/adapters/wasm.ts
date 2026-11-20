@@ -81,7 +81,7 @@ export function mount(
 	target: HTMLElement,
 	component: unknown,
 	props: Record<string, unknown>,
-): void {
+): undefined {
 	if (!isWasmHandle(component)) {
 		throw new Error(
 			"spira-island: wasm island module is not a loaded instance",
@@ -99,4 +99,7 @@ export function mount(
 		child.remove();
 	}
 	void component.go.run(component.instance);
+	// The Go program runs until the page goes away and go.run() cannot be
+	// cancelled, so a removed wasm island has no per-island resource to release.
+	return undefined;
 }

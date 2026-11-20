@@ -25,6 +25,7 @@ Exported TypeScript names:
 ```ts
 export type IslandModule = { default: unknown }
 export type IslandLoader = () => Promise<IslandModule>
+export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export type IslandTable = Record<string, IslandLoader>
 export type IslandMount = (
 	target: HTMLElement,
@@ -35,16 +36,14 @@ export class SpiraIslandElement extends HTMLElement
 export function defineIslands(table: IslandTable): void
 export function tableFromGlob(modules: Record<string, unknown>): IslandTable
 export function installSlotMover(root?: ParentNode): void
-// src/adapters/react.ts and src/adapters/svelte.ts
-export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): void
-// src/adapters/solid.ts
-export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
-// src/adapters/wasm.ts
-export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): void
-export function loader(entry: string): () => Promise<{ default: unknown }>
-```
-
-`mount` is exported from each adapter. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`. Solid `mount` returns the dispose function of `render`.
+ // src/adapters/react.ts, src/adapters/svelte.ts and src/adapters/solid.ts
+ export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): () => void
+ // src/adapters/wasm.ts
+ export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): undefined
+ export function loader(entry: string): () => Promise<{ default: unknown }>
+ ```
+ 
+ `mount` is exported from each adapter. The React, Svelte and Solid adapters return a cleanup that releases the mount. The wasm adapter returns `undefined` because a started Go program has no per-island release. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`.
 
 ## Requirements
 
@@ -79,7 +78,11 @@ export function loader(entry: string): () => Promise<{ default: unknown }>
 - `when="idle"` MUST start the load in `requestIdleCallback`.
 - A missing table entry MUST log one error that names the entry.
 - A missing table entry MUST leave the fallback in place.
-- Before a successful mount, the element MUST remove its child nodes.
+ - Before a successful mount, the element MUST remove its child nodes.
+ - A removed island MUST dispose its mount in a microtask unless it reconnects first.
+ - A moved island MUST keep its mount without remounting and without disposing.
+ - A stale load that resolves after its island moved MUST NOT mount.
+ - A moved wasm island MUST NOT start a second Go program.
 - The React adapter MUST call `createRoot(target).render(createElement(component, props))`.
 - The Svelte adapter MUST call Svelte 5 `mount` with `target` and `props`.
 - The Solid adapter MUST call `render` with the component and `target`.
