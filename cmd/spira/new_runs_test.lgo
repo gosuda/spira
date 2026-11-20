@@ -24,7 +24,7 @@ func TestNewGeneratedSQLiteAppRuns(t *testing.T) {
 		return
 	}
 	runIn(t, dir, []string{"logos", "build", "./..."})
-	runIn(t, dir, []string{"logos", "test", "-count=1", "./..."})
+	runIn(t, dir, []string{"logos", "test", "-race", "-count=1", "./..."})
 }
 
 func TestNewPseudoVersion(t *testing.T) {
