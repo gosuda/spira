@@ -68,20 +68,19 @@ func (r *Router) rootRouter() *Router {
 }
 
 func (r *Router) Use(stages ...Stage) {
-	var now []Stage
-	var cells []*routeCell
 	r.stages.WithLock(func(list *[]Stage) {
 		*list = append(*list, stages...)
-		now = append(now, (*list)...)
-		r.registered.WithLock(func(list *[]*routeCell) { cells = append(cells, (*list)...) })
+		now := append([]Stage(nil), (*list)...)
+		var cells []*routeCell
+		r.registered.WithLock(func(registered *[]*routeCell) { cells = append(cells, (*registered)...) })
+		if r.root == nil {
+			r.unmatched.WithLock(func(u *func(c *Context)) { *u = chain(r, now, delegateUnrouted) })
+		}
+		for _, cell := range cells {
+			fresh := served(r.rootRouter(), now, cell.handler)
+			cell.current.WithLock(func(h *http.Handler) { *h = fresh })
+		}
 	})
-	if r.root == nil {
-		r.unmatched.WithLock(func(u *func(c *Context)) { *u = chain(r, now, delegateUnrouted) })
-	}
-	for _, cell := range cells {
-		fresh := served(r.rootRouter(), now, cell.handler)
-		cell.current.WithLock(func(h *http.Handler) { *h = fresh })
-	}
 }
 
 func (r *Router) Group(prefix string, build func(g *Router)) {
