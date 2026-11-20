@@ -1,0 +1,6 @@
+CREATE TABLE sessions (
+    id_hash    NVARCHAR(255) PRIMARY KEY,
+    user_id    INT NOT NULL REFERENCES users (id),
+    roles      NVARCHAR(MAX) NOT NULL DEFAULT '',
+    expires_at DATETIME2 NOT NULL
+);

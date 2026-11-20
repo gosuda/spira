@@ -1,0 +1,90 @@
+package web
+
+import (
+	"comptime"
+	"strings"
+
+	"github.com/gosuda/spira/schema"
+)
+
+type Doc struct {
+	Summary string
+	Returns []Response
+}
+
+type Response struct {
+	Status int
+	Body   schema.Schema?
+}
+
+func Route[In any](r *Router, method string, pattern string, h func(ctx *Context, in In) (Reply, error)) {
+	wrapped := func(ctx *Context) (Reply, error) {
+		in, err := Bind[In](ctx)
+		if err != nil {
+			return nil, err
+		}
+		return h(ctx, in)
+	}
+	const if comptime.IsStruct[In]() {
+		r.MountRoute(method, pattern, RouteSchema[In](), wrapped)
+	} else {
+		r.MountRoute(method, pattern, schema.Of[In](), wrapped)
+	}
+}
+
+func fullPattern(prefix string, pattern string) string {
+	host := pattern[:max(strings.IndexByte(pattern, '/'), 0)]
+	return host + prefix + pattern[len(host):]
+}
+
+func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler) {
+	full := fullPattern(r.prefix, pattern)
+	r.recordRoute(method, full, in, nil)
+	r.mux.Handle(method+" "+full, r.remember(h))
+}
+
+func RouteSchema[In any]() schema.Schema {
+	found := schema.Of[In]()
+	obj, ok := found.(schema.Object)
+	if !ok {
+		return found
+	}
+	const for _, f := range comptime.Fields[In]() {
+		tags := FieldTags{
+			Name:   f.Name,
+			Body:   f.Tag.Get("body"),
+			Path:   f.Tag.Get("path"),
+			Query:  f.Tag.Get("query"),
+			Header: f.Tag.Get("header"),
+			Form:   f.Tag.Get("form"),
+			Cookie: f.Tag.Get("cookie"),
+		}
+		key, source := BindingTag(tags)
+		for i := range obj.Fields {
+			match := obj.Fields[i].Name == f.Name
+			if match && key != "" {
+				obj.Fields[i].Wire = key
+			}
+			if match {
+				obj.Fields[i].Source = source
+			}
+		}
+	}
+	return obj
+}
+
+func (r *Router) Describe(method string, pattern string, doc Doc) {
+	full := fullPattern(r.prefix, pattern)
+	found := false
+	r.routes.items.WithLock(func(list *[]RouteInfo) {
+		for i := range *list {
+			if (*list)[i].Method == method && (*list)[i].Pattern == full {
+				(*list)[i].Doc = doc
+				found = true
+			}
+		}
+	})
+	if !found {
+		panic($"web: describe {method} {pattern}: no such route")
+	}
+}

@@ -198,15 +198,15 @@ func await(ctx context.Context, what string, budget time.Duration, probe func() 
 
 func backstop(t *testing.T) time.Duration {
 	t.Helper()
-	deadline, ok := t.Deadline()
-	if !ok {
-		return 2 * time.Minute
+	if deadline, ok := t.Deadline(); ok {
+		if budget := time.Until(deadline) - 10*time.Second; budget < 30*time.Second {
+			if budget < 5*time.Second {
+				return 5 * time.Second
+			}
+			return budget
+		}
 	}
-	budget := time.Until(deadline) - 30*time.Second
-	if budget < 10*time.Second {
-		return 10 * time.Second
-	}
-	return budget
+	return 30 * time.Second
 }
 
 func settle(ctx context.Context, label string, interval time.Duration, bad func() bool) error {
@@ -369,6 +369,19 @@ func TestWatchRestartReapsPreviousServerBeforeNextStart(t *testing.T) {
 		if err := await(sctx, "restart after .lgo change", backstop(t), func() bool { return lineCount(startsLog) == 2 }); err != nil {
 			return err
 		}
+		info, statErr := os.Stat(seed)
+		if statErr != nil {
+			return statErr
+		}
+		if err := os.WriteFile(seed, []byte("package main\n// bigger\n"), 0o644); err != nil {
+			return err
+		}
+		if err := os.Chtimes(seed, info.ModTime(), info.ModTime()); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart after a size-only change", backstop(t), func() bool { return lineCount(startsLog) == 3 }); err != nil {
+			return err
+		}
 		cancel()
 		return nil
 	}
@@ -491,23 +504,22 @@ func assertNoChildren(t *testing.T) {
 func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	t.Setenv("SPIRA_VITE_ORIGIN", "inherited")
 	dir := t.TempDir()
-	seen := filepath.Join(dir, "server.env")
-	frontSeen := filepath.Join(dir, "frontend.env")
-	script := fmt.Sprintf("printf '%%s\\n' \"$SPIRA_VITE_ORIGIN\" > '%s'\nsleep 300\n", seen)
-	frontScript := fmt.Sprintf("printf 'started\\n' > '%s'\nsleep 300\n", frontSeen)
+	started := make(chan spira.Start, 4)
 	cfg := spira.Loop{
-		ServerCmd:   []string{"sh", "-c", script},
-		FrontendCmd: []string{"sh", "-c", frontScript},
+		ServerCmd:   []string{"sh", "-c", "sleep 300"},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
 		Root:        dir,
 		Interval:    20 * time.Millisecond,
+		Started:     started,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		if err := await(sctx, "the server to record its environment", backstop(t), func() bool { return lineCount(seen) == 1 }); err != nil {
+		serverEnv, err := waitForStarts(sctx, started, backstop(t))
+		if err != nil {
 			return err
 		}
-		if err := await(sctx, "the frontend to start", backstop(t), func() bool { return lineCount(frontSeen) == 1 }); err != nil {
-			return err
+		if lastViteOrigin(serverEnv) != "SPIRA_VITE_ORIGIN=http://localhost:5173" {
+			return fmt.Errorf("cmd/spira test: server SPIRA_VITE_ORIGIN = %q, want http://localhost:5173", lastViteOrigin(serverEnv))
 		}
 		cancel()
 		return nil
@@ -516,14 +528,41 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 		t.Fatalf("watch loop: %v", err)
 		return
 	}
-	data, err := os.ReadFile(seen)
-	if err != nil {
-		t.Fatalf("read %s: %v", seen, err)
-		return
+}
+
+func waitForStarts(ctx context.Context, started <-chan spira.Start, budget time.Duration) ([]string, error) {
+	sawServer := false
+	sawFrontend := false
+	serverEnv := []string{}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	for !sawServer || !sawFrontend {
+		select {
+		case ev := <-started:
+			if ev.Role == "server" {
+				sawServer = true
+				serverEnv = ev.Env
+			}
+			if ev.Role == "frontend" {
+				sawFrontend = true
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("cmd/spira test: cancelled while waiting for server and frontend start")
+		case <-timer.C:
+			return nil, fmt.Errorf("cmd/spira test: backstop expired waiting for server and frontend start")
+		}
 	}
-	if got := strings.TrimSpace(string(data)); got != "http://localhost:5173" {
-		t.Fatalf("server SPIRA_VITE_ORIGIN = %q, want http://localhost:5173", got)
+	return serverEnv, nil
+}
+
+func lastViteOrigin(env []string) string {
+	last := ""
+	for _, e := range env {
+		if strings.HasPrefix(e, "SPIRA_VITE_ORIGIN=") {
+			last = e
+		}
 	}
+	return last
 }
 
 func TestFrontendCancelDuringStartupReturnsNil(t *testing.T) {

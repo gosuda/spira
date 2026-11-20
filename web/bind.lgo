@@ -1,0 +1,858 @@
+package web
+
+import (
+	"comptime"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"logos/rt"
+
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/validate"
+)
+
+type BindCtx struct {
+	Req      *http.Request
+	Body     []byte
+	Rejected *RejectLog
+}
+
+type FieldTags struct {
+	Name   string
+	Body   string
+	Path   string
+	Query  string
+	Header string
+	Form   string
+	Cookie string
+}
+
+type BindSpec struct {
+	Field    string
+	Source   string
+	Key      string
+	Raw      string
+	Present  bool
+	Rejected *RejectLog
+}
+
+type StructBindState struct {
+	Set    bool
+	Failed bool
+	Cause  string
+	Bad    bool
+}
+
+func BindingTag(tags FieldTags) (string, string) {
+	if tags.Body == "json" {
+		return "", "body"
+	}
+	if tags.Path != "" {
+		return tags.Path, "path"
+	}
+	if tags.Query != "" {
+		return tags.Query, "query"
+	}
+	if tags.Header != "" {
+		return tags.Header, "header"
+	}
+	if tags.Form != "" {
+		return tags.Form, "form"
+	}
+	if tags.Cookie != "" {
+		return tags.Cookie, "cookie"
+	}
+	return "", ""
+}
+
+func Bind[In any](ctx *Context) (In, error) {
+	var row In
+	const if comptime.IsStruct[In]() {
+		return BindRecord[In](ctx, &row)
+	} else {
+		return row, BindProblem(ErrBindInvalid, validate.Errors{{Field: "in", Rule: "type", Message: "web: bind needs a struct input"}})
+	}
+}
+
+func BindRecord[In any](ctx *Context, row *In) (In, error) {
+	var zero In
+	req := ctx.Request
+	rejected := &RejectLog{}
+	if req == nil {
+		LogRejected(rejected)
+		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "request", Rule: "request", Message: "web: bind needs a request"}})
+	}
+	if ferr := ParseFormBody(ctx, req, CountForm[In]() > 0); ferr != nil {
+		rejected.Add("form", "form", ferr.Error())
+		LogRejected(rejected)
+		if errors.Is(ferr, ErrBodyTooLarge) {
+			return zero, BindProblem(ErrBodyTooLarge, nil)
+		}
+		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "form", Rule: "form", Message: "web: bind form cannot be read"}})
+	}
+	const if comptime.IsStruct[In]() {
+		if CountBody[In]() > 1 {
+			LogRejected(rejected)
+			return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "body", Rule: "body", Message: "web: bind needs one body field"}})
+		}
+		var errs validate.Errors
+		body, berr := BindBodyBytes(ctx, req, CountBody[In]() > 0, rejected)
+		if berr != nil {
+			LogRejected(rejected)
+			return zero, berr
+		}
+		bctx := BindCtx{Req: req, Body: body, Rejected: rejected}
+		BindSources[In](bctx, row, &errs)
+		BindBodies[In](row, body, &errs, rejected)
+		if cerr := CheckBound(any(row), errs, rejected); cerr != nil {
+			LogRejected(rejected)
+			return zero, cerr
+		}
+		return *row, nil
+	} else {
+		LogRejected(rejected)
+		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "in", Rule: "type", Message: "web: bind needs a struct input"}})
+	}
+}
+
+func BindProblem(base *fault.Error, errs validate.Errors) error {
+	var fields []fault.Field
+	for _, e := range errs {
+		fields = append(fields, fault.Field{Name: e.Field, Rule: e.Rule, Message: e.Message})
+	}
+	return base.WithFields(fields...).Err()
+}
+
+func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectLog) ([]byte, error) {
+	if !want {
+		return nil, nil
+	}
+	body, rerr := ReadBody(req, ctx.root.MaxBody)
+	if rerr == nil {
+		return body, nil
+	}
+	rejected.Add("body", "body", rerr.Error())
+	if errors.Is(rerr, ErrBodyTooLarge) {
+		return nil, BindProblem(ErrBodyTooLarge, nil)
+	}
+	return nil, BindProblem(ErrBindInvalid, validate.Errors{{Field: "body", Rule: "body", Message: "web: bind body cannot be read"}})
+}
+
+func CheckBound(row any, errs validate.Errors, rejected *RejectLog) error {
+	if len(errs) > 0 {
+		return BindProblem(ErrBindInvalid, errs)
+	}
+	if checker, ok := row.(validate.Checker); ok {
+		if found := checker.Check(); len(found) > 0 {
+			for _, e := range found {
+				rejected.Add(e.Field, e.Rule, e.Message)
+			}
+			return BindProblem(ErrBindUnprocessable, found)
+		}
+	}
+	return nil
+}
+
+type RejectLog struct {
+	lines []string
+}
+
+func (l *RejectLog) Add(field string, rule string, cause string) {
+	l.lines = append(l.lines, field+" "+rule+": "+cause)
+}
+
+func (l *RejectLog) Empty() bool {
+	return len(l.lines) == 0
+}
+
+func (l *RejectLog) Text() string {
+	return strings.Join(l.lines, "; ")
+}
+
+func LogRejected(rejected *RejectLog) {
+	if rejected.Empty() {
+		return
+	}
+	slog.Debug("web: bind rejected", "rejected", rejected.Text())
+}
+
+func unknownMember(err error) (string, bool) {
+	serr := &json.SemanticError{}
+	if !errors.As(err, &serr) {
+		return "", false
+	}
+	if !errors.Is(serr.Err, json.ErrUnknownName) {
+		return "", false
+	}
+	return serr.JSONPointer.LastToken(), true
+}
+
+func noteFormat(spec BindSpec, errs *validate.Errors, err error) {
+	spec.Rejected.Add(spec.Field, "format", err.Error())
+	errs.Require(false, spec.Field, "format", $"web: bind {spec.Field} has the wrong format")
+}
+
+func CountBody[In any]() int {
+	n := 0
+	const for _, f := range comptime.Fields[In]() {
+		if f.Tag.Get("body") == "json" {
+			n++
+		}
+	}
+	return n
+}
+
+func BindSources[In any](bctx BindCtx, row *In, errs *validate.Errors) {
+	const for _, f := range comptime.Fields[In]() {
+		tags := FieldTags{
+			Name:   f.Name,
+			Body:   f.Tag.Get("body"),
+			Path:   f.Tag.Get("path"),
+			Query:  f.Tag.Get("query"),
+			Header: f.Tag.Get("header"),
+			Form:   f.Tag.Get("form"),
+			Cookie: f.Tag.Get("cookie"),
+		}
+		BindOneField[f.Type](bctx, &row.[f], tags, errs)
+	}
+}
+
+func CountForm[In any]() int {
+	n := 0
+	const for _, f := range comptime.Fields[In]() {
+		if f.Tag.Get("form") != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func hasFormBody(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	method := req.Method
+	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch {
+		return false
+	}
+	ct := req.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "application/x-www-form-urlencoded")
+}
+
+func ParseFormBody(ctx *Context, req *http.Request, want bool) error {
+	if !want || !hasFormBody(req) {
+		return nil
+	}
+	if req.PostForm != nil {
+		return nil
+	}
+	data, rerr := ReadBody(req, ctx.root.MaxBody)
+	if rerr != nil {
+		return rerr
+	}
+	values, perr := url.ParseQuery(string(data))
+	if perr != nil {
+		return perr
+	}
+	req.PostForm = values
+	return nil
+}
+
+func BindBodies[In any](row *In, body []byte, errs *validate.Errors, rejected *RejectLog) {
+	const for _, f := range comptime.Fields[In]() {
+		if f.Tag.Get("body") == "json" {
+			spec := BindSpec{Field: f.Name, Source: "body", Key: "json", Rejected: rejected}
+			BindJSONField(any(&row.[f]), spec, body, errs)
+		}
+	}
+}
+
+func BindOneField[F any](bctx BindCtx, dst *(F), tags FieldTags, errs *validate.Errors) {
+	key, source := BindingTag(tags)
+	if source == "" || source == "body" {
+		return
+	}
+	raw, present, malformed := LookupSource(bctx.Req, source, key)
+	if malformed != nil {
+		bctx.Rejected.Add(tags.Name, "format", malformed.Error())
+		errs.Require(false, tags.Name, "format", $"web: bind {tags.Name} has the wrong format")
+		return
+	}
+	spec := BindSpec{Field: tags.Name, Source: source, Key: key, Raw: raw, Present: present, Rejected: bctx.Rejected}
+	if present {
+		if BindPlain(any(dst), spec, errs) {
+			return
+		}
+		if BindOption(any(dst), spec, errs) {
+			return
+		}
+	} else if BindAbsentOption(any(dst)) {
+		return
+	}
+	const if comptime.IsStruct[F]() {
+		BindStructBranch[F](dst, spec, errs)
+	} else {
+		BindLeafBranch(any(dst), spec, errs)
+	}
+}
+
+func BindStructBranch[F any](dst *(F), spec BindSpec, errs *validate.Errors) {
+	state := StructBindState{}
+	seen := false
+	const for _, g := range comptime.Fields[F]() {
+		seen = true
+		BindStructField(any(&dst.[g]), g.Name, spec, &state)
+	}
+	if !seen || state.Bad {
+		errs.Require(false, spec.Field, "type", $"web: bind {spec.Field} has an unsupported type")
+	} else if state.Failed {
+		spec.Rejected.Add(spec.Field, "format", state.Cause)
+		errs.Require(false, spec.Field, "format", $"web: bind {spec.Field} has the wrong format")
+	} else if spec.Present && !state.Set {
+		errs.Require(false, spec.Field, "type", $"web: bind {spec.Field} has an unsupported type")
+	}
+}
+
+func BindStructField(dst any, name string, spec BindSpec, state *StructBindState) {
+	if name == "Value" {
+		if spec.Present {
+			BindStructValue(dst, spec, state)
+		}
+		return
+	}
+	if name == "Present" {
+		if spec.Present {
+			SetPresentAny(dst)
+		}
+		return
+	}
+	state.Bad = true
+}
+
+func BindStructValue(dst any, spec BindSpec, state *StructBindState) {
+	if serr := SetStringAny(dst, spec.Raw); serr != nil {
+		state.Failed = true
+		state.Cause = serr.Error()
+	} else {
+		state.Set = true
+	}
+}
+
+func BindLeafBranch(dst any, spec BindSpec, errs *validate.Errors) {
+	if !spec.Present {
+		errs.Require(false, spec.Field, "required", $"web: bind {spec.Field} is required")
+		return
+	}
+	if err := SetStringAny(dst, spec.Raw); err != nil {
+		spec.Rejected.Add(spec.Field, "format", err.Error())
+		errs.Require(false, spec.Field, "format", $"web: bind {spec.Field} has the wrong format")
+	}
+}
+
+func LookupSource(req *http.Request, source string, key string) (string, bool, error) {
+	if req == nil || req.URL == nil {
+		return "", false, nil
+	}
+	if source == "path" {
+		v := req.PathValue(key)
+		return v, v != "", nil
+	}
+	if source == "query" {
+		return lookupQuery(req.URL.RawQuery, key)
+	}
+	if source == "header" {
+		vals, ok := req.Header[http.CanonicalHeaderKey(key)]
+		if !ok || len(vals) == 0 {
+			return "", false, nil
+		}
+		return vals[0], true, nil
+	}
+	if source == "form" {
+		if hasFormBody(req) {
+			return req.PostForm.Get(key), req.PostForm.Has(key), nil
+		}
+		return lookupQuery(req.URL.RawQuery, key)
+	}
+	c, err := req.Cookie(key)
+	if err != nil {
+		return "", false, nil
+	}
+	return c.Value, true, nil
+}
+
+func lookupQuery(raw string, key string) (string, bool, error) {
+	for _, pair := range strings.Split(raw, "&") {
+		if pair == "" {
+			continue
+		}
+		name, value, _ := strings.Cut(pair, "=")
+		decoded, err := url.QueryUnescape(name)
+		if err != nil || decoded != key {
+			continue
+		}
+		text, err := url.QueryUnescape(value)
+		if err != nil {
+			return "", true, err
+		}
+		return text, true, nil
+	}
+	return "", false, nil
+}
+
+func ReadBody(req *http.Request, max int64) ([]byte, error) {
+	if req == nil || req.Body == nil {
+		return nil, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(req.Body, max+1))
+	if err != nil {
+		return nil, fmt.Errorf("web: bind body: %w", err)
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("%w (%d bytes)", ErrBodyTooLarge, max)
+	}
+	return data, nil
+}
+
+func BindJSONField(dst any, spec BindSpec, body []byte, errs *validate.Errors) {
+	if len(body) == 0 {
+		spec.Rejected.Add(spec.Field, "body", "empty body")
+		errs.Require(false, spec.Field, "body", $"web: bind {spec.Field} needs a JSON body")
+		return
+	}
+	if err := json.Unmarshal(body, dst, json.RejectUnknownMembers(true)); err != nil {
+		if name, ok := unknownMember(err); ok {
+			spec.Rejected.Add(name, "unknown", err.Error())
+			errs.Require(false, name, "unknown", $"web: bind {name} is not a known field")
+			return
+		}
+		spec.Rejected.Add(spec.Field, "body", err.Error())
+		errs.Require(false, spec.Field, "body", "web: bind body is not valid JSON for this request")
+	}
+}
+
+func SetStringAny(dst any, raw string) error {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("web: bind value: %w", err)
+	}
+	if err := json.Unmarshal(data, dst, json.RejectUnknownMembers(true)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func SetPresentAny(dst any) {
+	if p, ok := dst.(*bool); ok {
+		*p = true
+	}
+}
+
+func BindPlain(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *string:
+		*p = spec.Raw
+		return true
+	case *bool:
+		v, err := strconv.ParseBool(spec.Raw)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	}
+	return bindPlainFloatTime(dst, spec, errs)
+}
+
+func bindPlainFloatTime(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *float32:
+		v, err := parseFloat[float32](spec.Raw, 32)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *float64:
+		v, err := parseFloat[float64](spec.Raw, 64)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *time.Duration:
+		v, err := time.ParseDuration(spec.Raw)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	}
+	return BindPlainInt(dst, spec, errs)
+}
+
+func BindPlainInt(dst any, spec BindSpec, errs *validate.Errors) bool {
+	if handled := bindPlainIntNarrow(dst, spec, errs); handled {
+		return true
+	}
+	return bindPlainIntWide(dst, spec, errs)
+}
+
+func bindPlainIntNarrow(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *int:
+		v, err := parseInt[int](spec.Raw, strconv.IntSize)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *int8:
+		v, err := parseInt[int8](spec.Raw, 8)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *int16:
+		v, err := parseInt[int16](spec.Raw, 16)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	}
+	return false
+}
+
+func bindPlainIntWide(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *int32:
+		v, err := parseInt[int32](spec.Raw, 32)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *int64:
+		v, err := parseInt[int64](spec.Raw, 64)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	}
+	return BindPlainUint(dst, spec, errs)
+}
+
+func BindPlainUint(dst any, spec BindSpec, errs *validate.Errors) bool {
+	if handled := bindPlainUintNarrow(dst, spec, errs); handled {
+		return true
+	}
+	return bindPlainUintWide(dst, spec, errs)
+}
+
+func bindPlainUintNarrow(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *uint:
+		v, err := parseUint[uint](spec.Raw, strconv.IntSize)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *uint8:
+		v, err := parseUint[uint8](spec.Raw, 8)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *uint16:
+		v, err := parseUint[uint16](spec.Raw, 16)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	}
+	return false
+}
+
+func bindPlainUintWide(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *uint32:
+		v, err := parseUint[uint32](spec.Raw, 32)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	case *uint64:
+		v, err := parseUint[uint64](spec.Raw, 64)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = v
+		return true
+	}
+	return false
+}
+
+func BindOption(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *rt.Option[string]:
+		*p = rt.Option[string]{Value: spec.Raw, Present: true}
+		return true
+	case *rt.Option[bool]:
+		v, err := strconv.ParseBool(spec.Raw)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[bool]{Value: v, Present: true}
+		return true
+	}
+	return bindOptionFloatTime(dst, spec, errs)
+}
+
+func bindOptionFloatTime(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *rt.Option[float32]:
+		v, err := parseFloat[float32](spec.Raw, 32)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[float32]{Value: v, Present: true}
+		return true
+	case *rt.Option[float64]:
+		v, err := parseFloat[float64](spec.Raw, 64)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[float64]{Value: v, Present: true}
+		return true
+	case *rt.Option[time.Duration]:
+		v, err := time.ParseDuration(spec.Raw)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[time.Duration]{Value: v, Present: true}
+		return true
+	}
+	return BindOptionInt(dst, spec, errs)
+}
+
+func BindOptionInt(dst any, spec BindSpec, errs *validate.Errors) bool {
+	if handled := bindOptionIntNarrow(dst, spec, errs); handled {
+		return true
+	}
+	return bindOptionIntWide(dst, spec, errs)
+}
+
+func bindOptionIntNarrow(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *rt.Option[int]:
+		v, err := parseInt[int](spec.Raw, strconv.IntSize)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[int]{Value: v, Present: true}
+		return true
+	case *rt.Option[int8]:
+		v, err := parseInt[int8](spec.Raw, 8)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[int8]{Value: v, Present: true}
+		return true
+	case *rt.Option[int16]:
+		v, err := parseInt[int16](spec.Raw, 16)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[int16]{Value: v, Present: true}
+		return true
+	}
+	return false
+}
+
+func bindOptionIntWide(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *rt.Option[int32]:
+		v, err := parseInt[int32](spec.Raw, 32)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[int32]{Value: v, Present: true}
+		return true
+	case *rt.Option[int64]:
+		v, err := parseInt[int64](spec.Raw, 64)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[int64]{Value: v, Present: true}
+		return true
+	}
+	return BindOptionUint(dst, spec, errs)
+}
+
+func BindOptionUint(dst any, spec BindSpec, errs *validate.Errors) bool {
+	if handled := bindOptionUintNarrow(dst, spec, errs); handled {
+		return true
+	}
+	return bindOptionUintWide(dst, spec, errs)
+}
+
+func bindOptionUintNarrow(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *rt.Option[uint]:
+		v, err := parseUint[uint](spec.Raw, strconv.IntSize)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[uint]{Value: v, Present: true}
+		return true
+	case *rt.Option[uint8]:
+		v, err := parseUint[uint8](spec.Raw, 8)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[uint8]{Value: v, Present: true}
+		return true
+	case *rt.Option[uint16]:
+		v, err := parseUint[uint16](spec.Raw, 16)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[uint16]{Value: v, Present: true}
+		return true
+	}
+	return false
+}
+
+func bindOptionUintWide(dst any, spec BindSpec, errs *validate.Errors) bool {
+	switch p := dst.(type) {
+	case *rt.Option[uint32]:
+		v, err := parseUint[uint32](spec.Raw, 32)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[uint32]{Value: v, Present: true}
+		return true
+	case *rt.Option[uint64]:
+		v, err := parseUint[uint64](spec.Raw, 64)
+		if err != nil {
+			noteFormat(spec, errs, err)
+			return true
+		}
+		*p = rt.Option[uint64]{Value: v, Present: true}
+		return true
+	}
+	return false
+}
+
+func BindAbsentOption(dst any) bool {
+	switch dst.(type) {
+	case *rt.Option[string]:
+		return true
+	case *rt.Option[bool]:
+		return true
+	case *rt.Option[int]:
+		return true
+	case *rt.Option[int8]:
+		return true
+	case *rt.Option[int16]:
+		return true
+	case *rt.Option[int32]:
+		return true
+	case *rt.Option[int64]:
+		return true
+	case *rt.Option[float32]:
+		return true
+	}
+	return BindAbsentMore(dst)
+}
+
+func BindAbsentMore(dst any) bool {
+	switch dst.(type) {
+	case *rt.Option[float64]:
+		return true
+	case *rt.Option[time.Duration]:
+		return true
+	case *rt.Option[uint]:
+		return true
+	case *rt.Option[uint8]:
+		return true
+	case *rt.Option[uint16]:
+		return true
+	case *rt.Option[uint32]:
+		return true
+	case *rt.Option[uint64]:
+		return true
+	}
+	return false
+}
+
+func parseInt[D ~int | ~int8 | ~int16 | ~int32 | ~int64](raw string, size int) (D, error) {
+	v, err := strconv.ParseInt(raw, 10, size)
+	if err != nil {
+		var zero D
+		return zero, err
+	}
+	return D(v), nil
+}
+
+func parseUint[D ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64](raw string, size int) (D, error) {
+	v, err := strconv.ParseUint(raw, 10, size)
+	if err != nil {
+		var zero D
+		return zero, err
+	}
+	return D(v), nil
+}
+
+func parseFloat[D ~float32 | ~float64](raw string, size int) (D, error) {
+	v, err := strconv.ParseFloat(raw, size)
+	if err != nil {
+		var zero D
+		return zero, err
+	}
+	return D(v), nil
+}

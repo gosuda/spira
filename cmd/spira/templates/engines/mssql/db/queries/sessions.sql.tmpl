@@ -1,0 +1,12 @@
+-- name: GetSession :one
+SELECT id_hash, user_id, roles, expires_at
+FROM sessions
+WHERE id_hash = @id_hash AND expires_at > @now;
+
+-- name: SaveSession :exec
+INSERT INTO sessions (id_hash, user_id, roles, expires_at)
+VALUES (@id_hash, @user_id, @roles, @expires_at);
+
+-- name: DeleteSession :exec
+DELETE FROM sessions
+WHERE id_hash = @id_hash;

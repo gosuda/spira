@@ -73,6 +73,8 @@ func Faults() []*fault.Error
 - A nil `Policy.Breaker` MUST leave the upstream with no breaker.
 - `Mount` MUST NOT apply `Policy.Retry`.
 - `Policy.Timeout` MUST bound the wait for response headers.
+- `Policy.Timeout` MUST be measured from the start of the delivery: a response completed after the deadline counts as missed.
+- When the response and the timeout settle together, the response MUST win.
 - `Policy.Timeout` MUST NOT end the body read after the headers arrive.
 - The proxy MUST write the first body chunk before the upstream finishes the body.
 - The proxy MUST cancel the upstream request when the client context ends.
@@ -84,6 +86,8 @@ func Faults() []*fault.Error
 - A request with no body MUST try the later upstreams after a failure.
 - A request whose body is nil or `http.NoBody` MUST count as a request with no body.
 - A request with a body MUST stop after its first upstream.
+- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`: end of stream counts as no body and retries, and a byte counts as a body that is pushed back and stops after the first upstream.
+- A wait that yields no byte and no end of stream MUST answer 502 without trying an upstream.
 - When every tried upstream fails, the proxy MUST answer 502.
 - That answer MUST use the content type `application/problem+json`.
 - The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.
@@ -103,6 +107,7 @@ func Faults() []*fault.Error
 
 - `gateway: upstream answered <status>` is the cause of the `gateway.upstream_unavailable` fault for an upstream status of 502, 503 or 504. The client sees the 502 problem, not this text.
 - `gateway: upstream headers exceeded <timeout>` is the cause of the `gateway.upstream_unavailable` fault when the headers miss `Policy.Timeout`. The client sees the 502 problem, not this text.
+- `gateway: upstream answered without a response` is the cause of the `gateway.upstream_unavailable` fault when the transport returns no response and no error. The client sees the 502 problem, not this text.
 - `gateway: route <prefix>: path prefix must start with /` when `PathPrefix` does not start with `/`.
 - `gateway: route <prefix>: path prefix must not contain wildcards` when `PathPrefix` holds `{`, `}` or `*`.
 - `gateway: route <prefix>: no upstream` when `To` is empty.
@@ -132,6 +137,8 @@ func Faults() []*fault.Error
 - `TestClientErrorsAndInternalErrorsPassThroughWithoutOpeningBreaker` proves that 404 and 500 pass through and do not open the breaker.
 - `TestServiceUnavailableCountsAsFailedAndAnswersProblem` proves that status 503 counts as a failure.
 - `TestTimeoutBeforeHeadersCountsAsFailed` proves that the header wait is bounded.
+- `TestHeadersLateComparesCompletionAgainstDeadline` proves that a completion after the deadline counts as late and a completion at or before it does not.
+- `TestClientCancelNeverReportsAHeaderTimeout` proves that a canceled client is never reported as a header timeout.
 - `TestFirstChunkStreamsBeforeUpstreamFinishes` proves that the first chunk arrives before the upstream finishes.
 - `TestClientCancelReachesUpstream` proves that a client cancel ends the upstream request.
 - `TestSlashEndingPrefixServesSubpathsWithoutARedirect` proves that a prefix ending in a slash serves subpaths without a redirect.
@@ -143,6 +150,10 @@ func Faults() []*fault.Error
 - `TestClientForwardedHeaderNeverReachesTheUpstream` proves that a client `Forwarded` header does not ride along.
 - `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
 - `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
+- `TestUnknownLengthEmptyBodyFailsOver` proves that an empty body of unknown length fails over.
+- `TestUnknownLengthNonemptyBodyIsPreserved` proves that a nonempty body of unknown length reaches the upstream whole.
+- `TestPeekEmptyFailsClosedOnStalledBody` proves that a stalled body of unknown length answers 502 without an upstream.
+- `TestPeekEmptyPushesBackReadyByte` proves that the empty-proof read hands the byte back.
 - `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
 - `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.
 - `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.

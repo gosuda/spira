@@ -16,23 +16,39 @@ import (
 
 const viteOrigin = "SPIRA_VITE_ORIGIN=http://localhost:5173"
 
+type Start struct {
+	Role    string
+	Command []string
+	Env     []string
+}
+
 type Loop struct {
 	ServerCmd   []string
 	FrontendCmd []string
 	Root        string
 	Interval    time.Duration
+	Started     chan Start
+}
+type fileMark struct {
+	Mod  int64
+	Size int64
 }
 
 func watch(ctx context.Context, cfg Loop) error {
 	if err := requireRoot(cfg.Root); err != nil {
 		return err
 	}
+	base, err := snapshot(cfg.Root)
+	if err != nil {
+		return err
+	}
 	restarts := make(chan struct{}, 1)
 	go group (ctx) {
 		go frontend(ctx, cfg)
-		go scanLoop(ctx, cfg, restarts)
+		go scanLoop(ctx, cfg, restarts, base)
 		for ctx.Err() == nil {
-			cmd, startErr := startProc(ctx, cfg.ServerCmd, []string{viteOrigin})
+			serverEnv := []string{viteOrigin}
+			cmd, startErr := startProc(ctx, cfg.ServerCmd, serverEnv)
 			if startErr != nil {
 				if !reportExit(ctx, startErr, restarts) {
 					return nil
@@ -42,6 +58,7 @@ func watch(ctx context.Context, cfg Loop) error {
 			if cmd == nil {
 				return fmt.Errorf("cmd/spira: start %s: no process", cfg.ServerCmd[0])
 			}
+			go notifyStart(ctx, cfg, Start{Role: "server", Command: cfg.ServerCmd, Env: cmd.Env})
 			exited := make(chan error, 1)
 			go reap(ctx, cmd, exited)
 			if !superviseExit(ctx, cmd, exited, restarts) {
@@ -114,17 +131,32 @@ func frontend(ctx context.Context, cfg Loop) error {
 	if cmd == nil {
 		return fmt.Errorf("cmd/spira: start %s: no process", cfg.FrontendCmd[0])
 	}
+	go group (ctx) {
+		go notifyStart(ctx, cfg, Start{Role: "frontend", Command: cfg.FrontendCmd, Env: cmd.Env})
+		go frontendWait(ctx, cmd)
+	}
+	return nil
+}
+
+func frontendWait(ctx context.Context, cmd *exec.Cmd) error {
 	if runErr := cmd.Wait(); runErr != nil && ctx.Err() == nil {
 		slog.Warn("cmd/spira: frontend exited", "error", runErr)
 	}
 	return nil
 }
 
-func scanLoop(ctx context.Context, cfg Loop, restarts chan<- struct{}) error {
-	prev, err := snapshot(cfg.Root)
-	if err != nil {
-		return err
+func notifyStart(ctx context.Context, cfg Loop, s Start) error {
+	if cfg.Started == nil {
+		return nil
 	}
+	select {
+	case cfg.Started <- s:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+func scanLoop(ctx context.Context, cfg Loop, restarts chan<- struct{}, prev map[string]fileMark) error {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -142,7 +174,7 @@ func scanLoop(ctx context.Context, cfg Loop, restarts chan<- struct{}) error {
 	}
 }
 
-func queueRestart(prev const map[string]int64, now const map[string]int64, restarts chan<- struct{}) {
+func queueRestart(prev const map[string]fileMark, now const map[string]fileMark, restarts chan<- struct{}) {
 	if differs(prev, now) {
 		select {
 		case restarts <- struct{}{}:
@@ -151,8 +183,8 @@ func queueRestart(prev const map[string]int64, now const map[string]int64, resta
 	}
 }
 
-func snapshot(root string) (map[string]int64, error) {
-	files := map[string]int64{}
+func snapshot(root string) (map[string]fileMark, error) {
+	files := map[string]fileMark{}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -170,15 +202,15 @@ func snapshot(root string) (map[string]int64, error) {
 		if infoErr != nil {
 			return nil
 		}
-		files[path] = info.ModTime().UnixNano()
+		files[path] = fileMark{Mod: info.ModTime().UnixNano(), Size: info.Size()}
 		return nil
 	})
 	return files, walkErr
 }
 
-func differs(prev const map[string]int64, now const map[string]int64) bool {
-	for path, mod := range now {
-		if had, ok := prev[path]; !ok || had != mod {
+func differs(prev const map[string]fileMark, now const map[string]fileMark) bool {
+	for path, mark := range now {
+		if had, ok := prev[path]; !ok || had != mark {
 			return true
 		}
 	}

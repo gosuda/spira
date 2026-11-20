@@ -1,0 +1,359 @@
+package main
+
+import (
+	"embed"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"time"
+)
+
+//go:embed templates
+var newTemplates embed.FS
+
+const newUsage = "usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>"
+
+type usageError struct {
+	text string
+}
+
+func (e *usageError) Error() string {
+	return e.text
+}
+
+type engineSpec struct {
+	Name             string
+	DriverImport     string
+	DriverModule     string
+	DriverVersion    string
+	DriverName       string
+	SQLCEngine       string
+	DSN              string
+	DSNEnv           string
+	IndirectRequires []string
+}
+
+type filePair struct {
+	src string
+	dst string
+}
+
+type appModel struct {
+	module       string
+	spec         engineSpec
+	spiraVersion string
+	spiraDir     string
+}
+
+func engineOf(name string) (engineSpec, error) {
+	switch name {
+	case "sqlite":
+		return engineSQLite(), nil
+	case "postgresql":
+		return enginePostgreSQL(), nil
+	case "mysql":
+		return engineMySQL(), nil
+	case "mssql":
+		return engineMSSQL(), nil
+	}
+	return engineSpec{}, &usageError{text: newUsage}
+}
+
+func engineSQLite() engineSpec {
+	return engineSpec{Name: "sqlite", DriverImport: "modernc.org/sqlite", DriverModule: "modernc.org/sqlite", DriverVersion: "v1.62.0", DriverName: "sqlite", SQLCEngine: "sqlite", DSN: "file:demo.db?_pragma=foreign_keys(1)", IndirectRequires: []string{"github.com/dustin/go-humanize v1.1.0", "github.com/google/uuid v1.6.0", "github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec", "golang.org/x/crypto v0.59.0", "golang.org/x/sys v0.50.0", "modernc.org/libc v1.80.1", "modernc.org/mathutil v1.7.1", "modernc.org/memory v1.12.1"}}
+}
+
+func enginePostgreSQL() engineSpec {
+	return engineSpec{Name: "postgresql", DriverImport: "github.com/jackc/pgx/v5/stdlib", DriverModule: "github.com/jackc/pgx/v5", DriverVersion: "v5.13.0", DriverName: "pgx", SQLCEngine: "postgresql", DSN: "postgres://postgres:postgres@127.0.0.1:5432/demo?sslmode=disable", DSNEnv: "SPIRA_TEST_POSTGRES_DSN", IndirectRequires: []string{"github.com/jackc/pgpassfile v1.0.0", "github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761", "github.com/jackc/puddle/v2 v2.2.3", "golang.org/x/crypto v0.59.0", "golang.org/x/sync v0.25.0", "golang.org/x/sys v0.50.0", "golang.org/x/text v0.44.0"}}
+}
+
+func engineMySQL() engineSpec {
+	return engineSpec{Name: "mysql", DriverImport: "github.com/go-sql-driver/mysql", DriverModule: "github.com/go-sql-driver/mysql", DriverVersion: "v1.10.2", DriverName: "mysql", SQLCEngine: "mysql", DSN: "demo:demo@tcp(127.0.0.1:3306)/demo?parseTime=true", DSNEnv: "SPIRA_TEST_MYSQL_DSN", IndirectRequires: []string{"filippo.io/edwards25519 v1.2.0", "golang.org/x/crypto v0.59.0", "golang.org/x/sys v0.50.0"}}
+}
+
+func engineMSSQL() engineSpec {
+	return engineSpec{Name: "mssql", DriverImport: "github.com/microsoft/go-mssqldb", DriverModule: "github.com/microsoft/go-mssqldb", DriverVersion: "v1.12.0", DriverName: "sqlserver", SQLCEngine: "mssql", DSN: "sqlserver://sa:Passw0rd1@127.0.0.1:1433?database=demo", DSNEnv: "SPIRA_TEST_MSSQL_DSN", IndirectRequires: []string{"github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9", "github.com/golang-sql/sqlexp v0.1.0", "github.com/google/uuid v1.6.0", "github.com/shopspring/decimal v1.4.0", "golang.org/x/crypto v0.59.0", "golang.org/x/sys v0.50.0", "golang.org/x/text v0.44.0"}}
+}
+
+func RunNew(args []string) error {
+	engine, spiraDir, dir, module := parseNewArgs(args)?
+	spec := engineOf(engine)?
+	if err := checkModulePath(module); err != nil {
+		return err
+	}
+	if err := checkEmptyDir(dir); err != nil {
+		return err
+	}
+	version := spiraVersionFor(spiraDir)?
+	return generate(dir, appModel{module: module, spec: spec, spiraVersion: version, spiraDir: spiraDir})
+}
+
+func parseNewArgs(args []string) (string, string, string, string, error) {
+	engine := "sqlite"
+	spiraDir := ""
+	rest := args
+	for len(rest) >= 2 && strings.HasPrefix(rest[0], "-") {
+		switch rest[0] {
+		case "-engine":
+			engine = rest[1]
+		case "-spira-dir":
+			spiraDir = rest[1]
+		default:
+			return "", "", "", "", &usageError{text: newUsage}
+		}
+		rest = rest[2:]
+	}
+	if len(rest) != 2 {
+		return "", "", "", "", &usageError{text: newUsage}
+	}
+	return engine, spiraDir, rest[0], rest[1], nil
+}
+
+func spiraVersionFor(dir string) (string, error) {
+	if dir != "" {
+		return "v0.0.0", nil
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", fmt.Errorf("spira: cannot determine own revision; pass -spira-dir <path>")
+	}
+	if isRelease(bi.Main.Version) {
+		return bi.Main.Version, nil
+	}
+	rev, stamp, modified := vcsInfo(bi)
+	if rev == "" || modified {
+		return "", fmt.Errorf("spira: cannot determine own revision; pass -spira-dir <path>")
+	}
+	return pseudoVersion(rev, stamp)
+}
+
+func isRelease(version string) bool {
+	return version != "" && version != "(devel)"
+}
+
+func vcsInfo(bi *debug.BuildInfo) (string, string, bool) {
+	rev := ""
+	stamp := ""
+	modified := false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.time":
+			stamp = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	return rev, stamp, modified
+}
+
+func pseudoVersion(rev string, stamp string) (string, error) {
+	moment := time.Parse(time.RFC3339, stamp)?
+	if len(rev) < 12 {
+		return "", fmt.Errorf("spira: short revision %q", rev)
+	}
+	return "v0.0.0-" + moment.UTC().Format("20060102150405") + "-" + rev[:12], nil
+}
+
+func checkModulePath(path string) error {
+	if !validModulePath(path) {
+		return fmt.Errorf("spira: invalid module path %q", path)
+	}
+	return nil
+}
+
+func validModulePath(path string) bool {
+	if path == "" || len(path) > 255 {
+		return false
+	}
+	if strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") || strings.Contains(path, "//") {
+		return false
+	}
+	for _, elem := range strings.Split(path, "/") {
+		if !validModuleElem(elem) {
+			return false
+		}
+	}
+	return true
+}
+
+func validModuleElem(elem string) bool {
+	if elem == "" || elem == "." || elem == ".." {
+		return false
+	}
+	if !isLowerAlnum(elem[0]) || !isLowerAlnum(elem[len(elem)-1]) {
+		return false
+	}
+	for i := 0; i < len(elem); i++ {
+		if !validModuleByte(elem[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func validModuleByte(c byte) bool {
+	if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+		return true
+	}
+	switch c {
+	case '.', '-', '_', '~':
+		return true
+	}
+	return false
+}
+
+func isLowerAlnum(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+}
+
+func checkEmptyDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("spira: read %s: %w", dir, err)
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("spira: %s is not empty", dir)
+	}
+	return nil
+}
+
+func generate(dir string, model appModel) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("spira: create %s: %w", dir, err)
+	}
+	for _, p := range sharedFiles() {
+		if err := renderFile(dir, model, p); err != nil {
+			return err
+		}
+	}
+	if err := renderEngineTree(dir, model); err != nil {
+		return err
+	}
+	return appendSpiraReplace(dir, model)
+}
+
+func appendSpiraReplace(dir string, model appModel) error {
+	if model.spiraDir == "" {
+		return nil
+	}
+	abs := filepath.Abs(model.spiraDir)?
+	path := filepath.Join(dir, "go.mod")
+	prior, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("spira: read %s: %w", path, err)
+	}
+	line := "\nreplace github.com/gosuda/spira => " + strconv.Quote(abs) + "\n"
+	if err := os.WriteFile(path, append(prior, []byte(line)...), 0o644); err != nil {
+		return fmt.Errorf("spira: write %s: %w", path, err)
+	}
+	return nil
+}
+
+func renderFile(dir string, model appModel, p filePair) error {
+	data, err := newTemplates.ReadFile(p.src)
+	if err != nil {
+		return fmt.Errorf("spira: read template %s: %w", p.src, err)
+	}
+	return writeRendered(dir, p.dst, renderText(string(data), model))
+}
+
+func renderEngineTree(dir string, model appModel) error {
+	root := "templates/engines/" + model.spec.Name
+	return fs.WalkDir(newTemplates, root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		dst := strings.TrimSuffix(strings.TrimPrefix(path, root+"/"), ".tmpl")
+		data, rerr := newTemplates.ReadFile(path)
+		if rerr != nil {
+			return fmt.Errorf("spira: read template %s: %w", path, rerr)
+		}
+		return writeRendered(dir, dst, renderText(string(data), model))
+	})
+}
+func renderText(text string, model appModel) string {
+	replacer := strings.NewReplacer(
+		"{{MODULE}}", model.module,
+		"{{APP_NAME}}", appName(model.module),
+		"{{SPIRA_VERSION}}", model.spiraVersion,
+		"{{DRIVER_IMPORT}}", model.spec.DriverImport,
+		"{{DRIVER_MODULE}}", model.spec.DriverModule,
+		"{{DRIVER_VERSION}}", model.spec.DriverVersion,
+		"{{DRIVER_NAME}}", model.spec.DriverName,
+		"{{SQLC_ENGINE}}", model.spec.SQLCEngine,
+		"{{DSN}}", model.spec.DSN,
+		"{{DSN_ENV}}", model.spec.DSNEnv,
+		"{{INDIRECT_REQUIRES}}", indirectBlock(model.spec),
+	)
+	return replacer.Replace(text)
+}
+
+func indirectBlock(spec engineSpec) string {
+	if len(spec.IndirectRequires) == 0 {
+		return ""
+	}
+	return "\t" + strings.Join(spec.IndirectRequires, " // indirect\n\t") + " // indirect\n"
+}
+
+func appName(module string) string {
+	base := module
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	return base
+}
+
+func writeRendered(dir string, dst string, text string) error {
+	path := filepath.Join(dir, filepath.FromSlash(dst))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("spira: create %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		return fmt.Errorf("spira: write %s: %w", path, err)
+	}
+	return nil
+}
+
+func sharedFiles() []filePair {
+	return []filePair{
+		{"templates/go.mod.tmpl", "go.mod"},
+		{"templates/go.sum.tmpl", "go.sum"},
+		{"templates/logos.toml.tmpl", "logos.toml"},
+		{"templates/justfile.tmpl", "justfile"},
+		{"templates/sqlc.yaml.tmpl", "sqlc.yaml"},
+		{"templates/tools-go.mod.tmpl", "tools/go.mod"},
+		{"templates/tools-go.sum.tmpl", "tools/go.sum"},
+		{"templates/main.lgo.tmpl", "main.lgo"},
+		{"templates/db-migrations.lgo.tmpl", "db/migrations.lgo"},
+		{"templates/home-home.lgo.tmpl", "features/home/home.lgo"},
+		{"templates/home-views.lgo.tmpl", "features/home/views.lgo"},
+		{"templates/greet.svelte.tmpl", "features/home/islands/greet.svelte"},
+		{"templates/account-account.lgo.tmpl", "features/account/account.lgo"},
+		{"templates/account-faults.lgo.tmpl", "features/account/faults.lgo"},
+		{"templates/account-views.lgo.tmpl", "features/account/views.lgo"},
+		{"templates/account-store.lgo.tmpl", "features/account/store.lgo"},
+		{"templates/frontend-package.json.tmpl", "frontend/package.json"},
+		{"templates/frontend-vite.config.ts.tmpl", "frontend/vite.config.ts"},
+		{"templates/frontend-tsconfig.json.tmpl", "frontend/tsconfig.json"},
+		{"templates/frontend-biome.json.tmpl", "frontend/biome.json"},
+		{"templates/frontend-src-entry.ts.tmpl", "frontend/src/entry.ts"},
+		{"templates/frontend-src-island.ts.tmpl", "frontend/src/island.ts"},
+		{"templates/frontend-src-slots.ts.tmpl", "frontend/src/slots.ts"},
+		{"templates/frontend-src-adapters-react.ts.tmpl", "frontend/src/adapters/react.ts"},
+		{"templates/frontend-src-adapters-solid.ts.tmpl", "frontend/src/adapters/solid.ts"},
+		{"templates/frontend-src-adapters-svelte.ts.tmpl", "frontend/src/adapters/svelte.ts"},
+		{"templates/frontend-src-adapters-wasm.ts.tmpl", "frontend/src/adapters/wasm.ts"},
+	}
+}

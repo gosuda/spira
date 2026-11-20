@@ -1,0 +1,56 @@
+package account
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+
+	"{{MODULE}}/db/store"
+)
+
+type DBStore struct {
+	DB *db.Pool
+}
+
+func (s *DBStore) Load(ctx context.Context, id string) (auth.Principal?, error) {
+	row := store.GetSession(ctx, s.DB, store.SessionID(id), time.Now())?
+	if row == nil {
+		return nil, nil
+	}
+	sess := row ?? store.Session{}
+	return auth.Principal{ID: principalID(sess.UserID), Roles: splitRoles(sess.Roles)}, nil
+}
+
+func (s *DBStore) Save(ctx context.Context, id string, p auth.Principal, ttl time.Duration) error {
+	uid := parseUserID(p.ID)?
+	args := store.SaveSessionArgs{IDHash: store.SessionID(id), UserID: store.UserID(uid), Roles: strings.Join(p.Roles, ","), ExpiresAt: time.Now().Add(ttl)}
+	return store.SaveSession(ctx, s.DB, args)
+}
+
+func (s *DBStore) Delete(ctx context.Context, id string) error {
+	return store.DeleteSession(ctx, s.DB, store.SessionID(id))
+}
+
+func principalID(id store.UserID) string {
+	return strconv.FormatInt(int64(id), 10)
+}
+
+func parseUserID(raw string) (int64, error) {
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, ErrAccountFailed.Wrap(fmt.Errorf("account: bad user id: %w", err))
+	}
+	return n, nil
+}
+
+func splitRoles(raw string) []string {
+	if raw == "" {
+		return []string{}
+	}
+	return strings.Split(raw, ",")
+}

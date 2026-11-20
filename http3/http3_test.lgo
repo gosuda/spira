@@ -1,0 +1,893 @@
+package http3_test
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/web"
+	"github.com/quic-go/quic-go"
+	qhttp3 "github.com/quic-go/quic-go/http3"
+	"logos/sync"
+)
+
+func h3Hello(ctx *web.Context) (web.Reply, error) {
+	return web.Data{Value: "hi"}, nil
+}
+
+func testCert(t *testing.T) (tls.Certificate, *x509.CertPool?) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+		return tls.Certificate{}, nil
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "example.com"}, NotBefore: now.Add(-1 * time.Hour), NotAfter: now.Add(24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true, DNSNames: []string{"example.com"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}}
+	der, derr := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if derr != nil {
+		t.Fatalf("create certificate: %v", derr)
+		return tls.Certificate{}, nil
+	}
+	leaf, lerr := x509.ParseCertificate(der)
+	if lerr != nil {
+		t.Fatalf("parse certificate: %v", lerr)
+		return tls.Certificate{}, nil
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	return cert, pool
+}
+
+func startH3Server(t *testing.T, r *web.Router, cert tls.Certificate, grace time.Duration) *http3.Server? {
+	t.Helper()
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: grace, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return nil
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.Stop(cctx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
+	return s
+}
+
+func closeH3Transport(t *testing.T, tr *qhttp3.Transport) {
+	t.Helper()
+	if err := tr.Close(); err != nil {
+		t.Errorf("close transport: %v", err)
+	}
+}
+
+func h3Get(t *testing.T, tr *qhttp3.Transport, url string) (int, string, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if rerr != nil {
+		t.Fatalf("build request: %v", rerr)
+		return 0, "", ""
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+		return 0, "", ""
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	bs, berr := io.ReadAll(resp.Body)
+	if berr != nil {
+		t.Fatalf("read body %s: %v", url, berr)
+		return 0, "", ""
+	}
+	return resp.StatusCode, resp.Proto, string(bs)
+}
+
+func httpsGetHeader(t *testing.T, pool *x509.CertPool, url string, name string) string {
+	t.Helper()
+	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+		return ""
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	return resp.Header.Get(name)
+}
+
+func httpGetHeader(t *testing.T, url string, name string) string {
+	t.Helper()
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+		return ""
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	return resp.Header.Get(name)
+}
+
+func udpPortOf(t *testing.T, addr string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split %s: %v", addr, err)
+		return ""
+	}
+	return port
+}
+
+func assertH3ALPN(t *testing.T, udpAddr string, pool *x509.CertPool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, derr := quic.DialAddr(ctx, udpAddr, &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}}, &quic.Config{})
+	if derr != nil {
+		t.Fatalf("quic dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.CloseWithError(0, ""); cerr != nil {
+			return
+		}
+	}()
+	if got := conn.ConnectionState().TLS.NegotiatedProtocol; got != "h3" {
+		t.Fatalf("negotiated protocol %q want h3", got)
+		return
+	}
+}
+
+func TestH3NeedsTLSFailsStart(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	probe, perr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if perr != nil {
+		t.Fatalf("reserve udp port: %v", perr)
+		return
+	}
+	udpAddr := probe.LocalAddr().(*net.UDPAddr)
+	if cerr := probe.Close(); cerr != nil {
+		t.Fatalf("release udp port: %v", cerr)
+		return
+	}
+	s := &http3.Server{Addr: udpAddr.String(), Router: r, H3: true}
+	err := s.Start(context.Background())
+	if err == nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := s.Stop(cctx); serr != nil {
+			t.Errorf("stop leaked server: %v", serr)
+		}
+		t.Fatal("start without TLS succeeded")
+		return
+	}
+	if !errors.Is(err, http3.ErrH3NeedsTLS) {
+		t.Fatalf("start error = %v, want ErrH3NeedsTLS", err)
+		return
+	}
+	if addr := s.BoundUDPAddrForTest(); addr != "" {
+		t.Fatalf("UDP bound after failed start: %s", addr)
+		return
+	}
+	rebind, rerr := net.ListenUDP("udp", udpAddr)
+	if rerr != nil {
+		t.Fatalf("UDP listener survived the failed start: %v", rerr)
+		return
+	}
+	if cerr := rebind.Close(); cerr != nil {
+		t.Fatalf("close probe: %v", cerr)
+		return
+	}
+}
+
+func TestH3ListenUDPFailsOnTakenPort(t *testing.T) {
+	raddr, rerr := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if rerr != nil {
+		t.Fatalf("resolve: %v", rerr)
+		return
+	}
+	squat, serr := net.ListenUDP("udp", raddr)
+	if serr != nil {
+		t.Fatalf("squat: %v", serr)
+		return
+	}
+	defer func() {
+		if cerr := squat.Close(); cerr != nil {
+			t.Errorf("close squat: %v", cerr)
+		}
+	}()
+	addr := squat.LocalAddr().String()
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := &http3.Server{Addr: addr, Router: r, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	err := s.Start(context.Background())
+	if err == nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := s.Stop(cctx); serr != nil {
+			t.Errorf("stop leaked server: %v", serr)
+		}
+		t.Fatal("start on a taken UDP port succeeded")
+		return
+	}
+	if !errors.Is(err, http3.ErrListenUDP) {
+		t.Fatalf("start error = %v, want ErrListenUDP", err)
+		return
+	}
+	if got := s.BoundUDPAddrForTest(); got != "" {
+		t.Fatalf("UDP bound after failed start: %s", got)
+		return
+	}
+}
+
+func TestH3StartFailsWhenTCPPortTaken(t *testing.T) {
+	squat, serr := net.Listen("tcp", "127.0.0.1:0")
+	if serr != nil {
+		t.Fatalf("squat: %v", serr)
+		return
+	}
+	defer func() {
+		if cerr := squat.Close(); cerr != nil {
+			t.Errorf("close squat: %v", cerr)
+		}
+	}()
+	addr := squat.Addr().String()
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, _ := testCert(t)
+	s := &http3.Server{Addr: addr, Router: r, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	err := s.Start(context.Background())
+	if err == nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := s.Stop(cctx); serr != nil {
+			t.Errorf("stop leaked server: %v", serr)
+		}
+		t.Fatal("start on a taken TCP port succeeded")
+		return
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("start error = %v, want the TCP listen failure", err)
+		return
+	}
+	if got := s.BoundUDPAddrForTest(); got != "" {
+		t.Fatalf("UDP bound after failed start: %s", got)
+		return
+	}
+}
+
+func TestH3ServesHTTP3OverUDP(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	status, proto, body := h3Get(t, tr, "https://"+udpAddr+"/hello")
+	if status != http.StatusOK {
+		t.Fatalf("status %d want 200", status)
+		return
+	}
+	if proto != "HTTP/3.0" {
+		t.Fatalf("proto %q want HTTP/3.0", proto)
+		return
+	}
+	if !strings.Contains(body, `"hi"`) {
+		t.Fatalf("body %q lacks the value", body)
+		return
+	}
+	assertH3ALPN(t, udpAddr, pool)
+}
+
+func TestH3SharesRouterWithTCP(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	tcpAddr := s.BoundTCPAddrForTest()
+	udpAddr := s.BoundUDPAddrForTest()
+	if tcpAddr == "" || udpAddr == "" {
+		t.Fatal("missing bound address")
+		return
+	}
+	if udpPortOf(t, tcpAddr) != udpPortOf(t, udpAddr) {
+		t.Fatalf("tcp %s and udp %s use different ports", tcpAddr, udpAddr)
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	status, proto, body := h3Get(t, tr, "https://"+udpAddr+"/hello")
+	if status != http.StatusOK || proto != "HTTP/3.0" || !strings.Contains(body, `"hi"`) {
+		t.Fatalf("udp answer status %d proto %q body %q", status, proto, body)
+		return
+	}
+	tcode, tbody, tproto := httpsGetFull(t, pool, "https://"+tcpAddr+"/hello")
+	if tcode != http.StatusOK || !strings.Contains(tbody, `"hi"`) {
+		t.Fatalf("tcp answer status %d body %q", tcode, tbody)
+		return
+	}
+	if tproto != "HTTP/2.0" && tproto != "HTTP/1.1" {
+		t.Fatalf("tcp proto %q want HTTP/2.0 or HTTP/1.1", tproto)
+		return
+	}
+}
+
+func httpsGetFull(t *testing.T, pool *x509.CertPool, url string) (int, string, string) {
+	t.Helper()
+	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+		return 0, "", ""
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	bs, berr := io.ReadAll(resp.Body)
+	if berr != nil {
+		t.Fatalf("read body %s: %v", url, berr)
+		return 0, "", ""
+	}
+	return resp.StatusCode, string(bs), resp.Proto
+}
+
+func TestH3AltSvcOnHTTPSOnly(t *testing.T) {
+	r := web.NewRouter()
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	r.Use(s.AltSvc())
+	r.Handle("GET", "/hello", h3Hello)
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	defer stopH3Server(t, s)
+	tcpAddr := s.BoundTCPAddrForTest()
+	udpAddr := s.BoundUDPAddrForTest()
+	if tcpAddr == "" || udpAddr == "" {
+		t.Fatal("missing bound address")
+		return
+	}
+	want := "h3=\":" + udpPortOf(t, udpAddr) + "\"; ma=2592000"
+	if got := httpsGetHeader(t, pool, "https://"+tcpAddr+"/hello", "Alt-Svc"); got != want {
+		t.Fatalf("Alt-Svc %q want %q", got, want)
+		return
+	}
+	plain := web.NewRouter()
+	plain.Use(s.AltSvc())
+	plain.Handle("GET", "/hello", h3Hello)
+	srv := httptest.NewServer(plain)
+	defer srv.Close()
+	if got := httpGetHeader(t, srv.URL+"/hello", "Alt-Svc"); got != "" {
+		t.Fatalf("cleartext Alt-Svc %q want empty", got)
+		return
+	}
+}
+
+func TestH3AltSvcAbsentWhenH3False(t *testing.T) {
+	r := web.NewRouter()
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r}
+	r.Use(s.AltSvc())
+	r.Handle("GET", "/hello", h3Hello)
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	defer stopH3Server(t, s)
+	tcpAddr := s.BoundTCPAddrForTest()
+	if tcpAddr == "" {
+		t.Fatal("missing bound TCP address")
+		return
+	}
+	if got := httpGetHeader(t, "http://"+tcpAddr+"/hello", "Alt-Svc"); got != "" {
+		t.Fatalf("Alt-Svc %q want empty without H3", got)
+		return
+	}
+}
+
+func stopH3Server(t *testing.T, s *http3.Server) {
+	t.Helper()
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Stop(cctx); err != nil {
+		t.Errorf("stop: %v", err)
+	}
+}
+
+func TestH3RequiresTLS13(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MaxVersion: tls.VersionTLS12}}
+	defer closeH3Transport(t, tr)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+udpAddr+"/hello", nil)
+	if rerr != nil {
+		t.Fatalf("build request: %v", rerr)
+		return
+	}
+	resp, err := tr.RoundTrip(req)
+	if err == nil {
+		defer func() {
+			if cerr := resp.Body.Close(); cerr != nil {
+				return
+			}
+		}()
+		t.Fatal("pre-1.3 handshake on the UDP listener succeeded")
+		return
+	}
+}
+
+func TestH3RefusesEarlyData(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	h := s.H3ForTest()
+	if h == nil {
+		t.Fatal("H3 server missing after start")
+		return
+	}
+	if h.QUICConfig == nil {
+		t.Fatal("QUIC config missing")
+		return
+	}
+	if h.QUICConfig.Allow0RTT {
+		t.Fatal("QUIC config allows 0-RTT")
+		return
+	}
+}
+
+type h3SlowProbe struct {
+	entered  chan struct{}
+	release  chan struct{}
+	status   sync.Locked[int]
+	fetchErr sync.Locked[error]
+	stopErr  sync.Locked[error]
+	stopDur  sync.Locked[time.Duration]
+}
+
+type h3StuckProbe struct {
+	entered    chan struct{}
+	release    chan struct{}
+	stopWithin time.Duration = time.Minute
+	stopErr    sync.Locked[error]
+	stopDur    sync.Locked[time.Duration]
+}
+
+func h3SlowHandler(p *h3SlowProbe) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Ctx().Done():
+			return nil, fmt.Errorf("http3 test: request context ended: %w", ctx.Ctx().Err())
+		}
+		return web.Empty{}, nil
+	}
+}
+
+func h3StuckHandler(p *h3StuckProbe) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Ctx().Done():
+			return nil, fmt.Errorf("http3 test: request context ended: %w", ctx.Ctx().Err())
+		}
+		return web.Empty{}, nil
+	}
+}
+
+func waitH3Entered(ctx context.Context, entered chan struct{}) error {
+	select {
+	case <-entered:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func fetchH3Slow(ctx context.Context, tr *qhttp3.Transport, url string, p *h3SlowProbe) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: build: %w", err) })
+		return nil
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: do: %w", err) })
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, rerr := io.ReadAll(resp.Body); rerr != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: read: %w", rerr) })
+		return nil
+	}
+	p.status.WithLock(func(v *int) { *v = resp.StatusCode })
+	if cerr := tr.Close(); cerr != nil {
+		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: close transport: %w", cerr) })
+	}
+	return nil
+}
+
+func stopH3Slow(ctx context.Context, s *http3.Server, p *h3SlowProbe) error {
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		return err
+	}
+	start := time.Now()
+	p.stopErr.WithLock(func(e *error) { *e = s.Stop(ctx) })
+	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
+	return nil
+}
+
+func releaseH3Slow(ctx context.Context, p *h3SlowProbe) error {
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		return err
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(p.release)
+	return nil
+}
+
+type h3Target struct {
+	tr  *qhttp3.Transport
+	url string
+}
+
+func driveH3Slow(ctx context.Context, target h3Target, s *http3.Server, p *h3SlowProbe) error {
+	go group (ctx) {
+		go fetchH3Slow(ctx, target.tr, target.url, p)
+		go stopH3Slow(ctx, s, p)
+		go releaseH3Slow(ctx, p)
+	}
+	return nil
+}
+
+func fetchH3Stuck(ctx context.Context, tr *qhttp3.Transport, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	return nil
+}
+
+func stopH3Stuck(ctx context.Context, s *http3.Server, p *h3StuckProbe) error {
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		p.stopErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: wait entered: %w", err) })
+		return nil
+	}
+	time.Sleep(50 * time.Millisecond)
+	stopCtx, cancel := context.WithTimeout(ctx, p.stopWithin)
+	defer cancel()
+	start := time.Now()
+	p.stopErr.WithLock(func(e *error) { *e = s.Stop(stopCtx) })
+	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
+	close(p.release)
+	return nil
+}
+
+func driveH3Stuck(ctx context.Context, target h3Target, s *http3.Server, p *h3StuckProbe) error {
+	go group (ctx) {
+		go fetchH3Stuck(ctx, target.tr, target.url)
+		go stopH3Stuck(ctx, s, p)
+	}
+	return nil
+}
+
+func TestH3StopDrainsWithinGrace(t *testing.T) {
+	r := web.NewRouter()
+	p := &h3SlowProbe{entered: make(chan struct{}), release: make(chan struct{})}
+	r.Handle("GET", "/slow", h3SlowHandler(p))
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 5*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	if err := driveH3Slow(context.Background(), h3Target{tr: tr, url: "https://"+udpAddr+"/slow"}, s, p); err != nil {
+		t.Fatalf("drive: %v", err)
+		return
+	}
+	var status int
+	p.status.WithLock(func(v *int) { status = *v })
+	if status != http.StatusNoContent {
+		t.Fatalf("in-flight status %d want 204", status)
+		return
+	}
+	var ferr error
+	p.fetchErr.WithLock(func(e *error) { ferr = *e })
+	if ferr != nil {
+		t.Fatalf("in-flight request failed: %v", ferr)
+		return
+	}
+	var serr error
+	p.stopErr.WithLock(func(e *error) { serr = *e })
+	if serr != nil {
+		t.Fatalf("Stop during a live H3 request: %v", serr)
+		return
+	}
+	var dur time.Duration
+	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
+	if dur < 40*time.Millisecond {
+		t.Fatalf("Stop returned after %v, before the in-flight request ended", dur)
+		return
+	}
+}
+
+func TestH3StopClosesOnTimeout(t *testing.T) {
+	r := web.NewRouter()
+	p := &h3StuckProbe{entered: make(chan struct{}), release: make(chan struct{})}
+	r.Handle("GET", "/stuck", h3StuckHandler(p))
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 500*time.Millisecond)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	if err := driveH3Stuck(context.Background(), h3Target{tr: tr, url: "https://"+udpAddr+"/stuck"}, s, p); err != nil {
+		t.Fatalf("drive: %v", err)
+		return
+	}
+	var err error
+	p.stopErr.WithLock(func(e *error) { err = *e })
+	if err == nil {
+		t.Fatal("Stop of a never-returning H3 request reported success")
+		return
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("Stop error %q does not name the grace deadline", err.Error())
+		return
+	}
+	var dur time.Duration
+	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
+	if dur < 400*time.Millisecond {
+		t.Fatalf("Stop returned after %v without waiting out the grace period", dur)
+		return
+	}
+	if dur > 5*time.Second {
+		t.Fatalf("Stop returned after %v, beyond the grace period", dur)
+		return
+	}
+}
+
+func TestFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/http3.md", http3.Faults())
+}
+
+func TestFaultPublicHidesSecrets(t *testing.T) {
+	err := http3.ErrListenUDP.Wrap(fmt.Errorf("listen udp 127.0.0.1:9: sk-secret-abc123 evil.example <script> '; DROP TABLE x; --"))
+	raw := faulttest.PublicJSON(t, err)
+	faulttest.RefuseLeak(t, raw, "sk-secret-abc123", "evil.example", "<script>", "'; DROP TABLE x; --", "127.0.0.1")
+}
+func h3ExtendedConnect(t *testing.T, tr *qhttp3.Transport, url string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodConnect, url, nil)
+	if rerr != nil {
+		t.Fatalf("build request: %v", rerr)
+		return 0
+	}
+	req.Proto = "websocket"
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("extended CONNECT: %v", err)
+		return 0
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, derr := io.ReadAll(resp.Body); derr != nil {
+		t.Fatalf("read body: %v", derr)
+		return 0
+	}
+	return resp.StatusCode
+}
+
+func TestH3RefusesExtendedConnect(t *testing.T) {
+	reached := sync.Locked[bool]{}
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	r.Handle("CONNECT", "/tunnel", func(ctx *web.Context) (web.Reply, error) {
+		reached.WithLock(func(v *bool) { *v = true })
+		return web.Data{Value: "tunneled"}, nil
+	})
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	if status := h3ExtendedConnect(t, tr, "https://"+udpAddr+"/tunnel"); status != http.StatusNotImplemented {
+		t.Fatalf("extended CONNECT status %d want 501", status)
+		return
+	}
+	hit := false
+	reached.WithLock(func(v *bool) { hit = *v })
+	if hit {
+		t.Fatal("extended CONNECT reached the router")
+		return
+	}
+	status, proto, body := h3Get(t, tr, "https://"+udpAddr+"/hello")
+	if status != http.StatusOK || proto != "HTTP/3.0" || !strings.Contains(body, `"hi"`) {
+		t.Fatalf("plain GET over H3 broke: status %d proto %q body %q", status, proto, body)
+		return
+	}
+}
+
+func h3AltSvcValue(t *testing.T, late bool) (string, string) {
+	t.Helper()
+	r := web.NewRouter()
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return "", ""
+	}
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, ShutdownGrace: 2 * time.Second, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+	if !late {
+		r.Use(s.AltSvc())
+	}
+	r.Handle("GET", "/hello", h3Hello)
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return "", ""
+	}
+	defer stopH3Server(t, s)
+	if late {
+		r.Use(s.AltSvc())
+	}
+	tcpAddr := s.BoundTCPAddrForTest()
+	udpAddr := s.BoundUDPAddrForTest()
+	if tcpAddr == "" || udpAddr == "" {
+		t.Fatal("missing bound address")
+		return "", ""
+	}
+	return httpsGetHeader(t, pool, "https://"+tcpAddr+"/hello", "Alt-Svc"), udpAddr
+}
+
+func TestH3AltSvcIgnoresRegistrationOrder(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		header, udpAddr := h3AltSvcValue(t, late)
+		want := "h3=\":" + udpPortOf(t, udpAddr) + "\"; ma=2592000"
+		if header != want {
+			t.Fatalf("late=%v Alt-Svc %q want %q", late, header, want)
+			return
+		}
+	}
+}

@@ -1,5 +1,19 @@
 package gateway
 
+import (
+	"io"
+	"net/http"
+	"time"
+)
+
 func CutEscapedSuffixForTest(path string, mounted string) string {
 	return cutEscapedSuffix(path, mounted)
+}
+
+func HeadersLateForTest(done time.Time, deadline time.Time) bool {
+	return headersLate(done, deadline)
+}
+
+func PeekEmptyForTest(req *http.Request, wait time.Duration) (bool, io.ReadCloser, error?) {
+	return peekEmpty(req, wait)
 }

@@ -1,0 +1,292 @@
+package http3_test
+
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"net/http"
+	"strconv"
+	"syscall"
+	"testing"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/web"
+	qhttp3 "github.com/quic-go/quic-go/http3"
+)
+
+func TestH3StopClosesUDPListener(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, _ := testCert(t)
+	s := startH3Server(t, r, cert, 5*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
+		return
+	}
+	if got := s.BoundUDPAddrForTest(); got != "" {
+		t.Fatalf("UDP bound address %q survives Stop", got)
+		return
+	}
+	_, portStr, serr := net.SplitHostPort(udpAddr)
+	if serr != nil {
+		t.Fatalf("split %s: %v", udpAddr, serr)
+		return
+	}
+	port64, perr := strconv.ParseUint(portStr, 10, 16)
+	if perr != nil {
+		t.Fatalf("port %s: %v", portStr, perr)
+		return
+	}
+	// Bind without SO_REUSEADDR: Go's ListenUDP sets reuse, which would
+	// succeed even with the old socket still open and hide the leak.
+	fd, ferr := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if ferr != nil {
+		t.Fatalf("socket: %v", ferr)
+		return
+	}
+	defer func() {
+		if cerr := syscall.Close(fd); cerr != nil {
+			return
+		}
+	}()
+	if berr := syscall.Bind(fd, &syscall.SockaddrInet4{Port: int(port64)}); berr != nil {
+		t.Fatalf("bind %s without reuse after Stop: %v", udpAddr, berr)
+		return
+	}
+}
+
+type drainProbe struct {
+	entered chan struct{}
+	release chan struct{}
+	tr      *qhttp3.Transport
+	url     string
+	tcpAddr string
+	srv     *http3.Server
+	refused sync.Locked[bool]
+	stopErr sync.Locked[error]
+}
+
+func drainHandler(entered chan struct{}, release chan struct{}) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(entered)
+		select {
+		case <-release:
+			return web.Empty{}, nil
+		case <-ctx.Ctx().Done():
+			return nil, ctx.Ctx().Err()
+		}
+	}
+}
+
+func fetchDrain(ctx context.Context, p *drainProbe) error {
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+	if rerr != nil {
+		return nil
+	}
+	resp, err := p.tr.RoundTrip(req)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	return nil
+}
+
+func stopDrainAfterEntered(ctx context.Context, p *drainProbe) error {
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		p.stopErr.WithLock(func(e *error) { *e = err })
+		return nil
+	}
+	p.stopErr.WithLock(func(e *error) { *e = p.srv.Stop(context.Background()) })
+	return nil
+}
+
+func pollTCPRefused(addr string, timeout time.Duration) bool {
+	end := time.Now().Add(timeout)
+	for time.Now().Before(end) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return true
+		}
+		if cerr := conn.Close(); cerr != nil {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+func pollAndRelease(ctx context.Context, p *drainProbe) error {
+	refused := pollTCPRefused(p.tcpAddr, 3*time.Second)
+	p.refused.WithLock(func(b *bool) { *b = refused })
+	close(p.release)
+	return nil
+}
+
+func driveDrain(ctx context.Context, p *drainProbe) error {
+	go group (ctx) {
+		go fetchDrain(ctx, p)
+		go stopDrainAfterEntered(ctx, p)
+		go pollAndRelease(ctx, p)
+	}
+	return nil
+}
+
+func TestH3StopShutsTCPWhileH3Drains(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	r := web.NewRouter()
+	r.Handle("GET", "/slow", drainHandler(entered, release))
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 10*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	tcpAddr := s.BoundTCPAddrForTest()
+	if udpAddr == "" || tcpAddr == "" {
+		t.Fatal("server bound no address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	p := &drainProbe{entered: entered, release: release, tr: tr, url: "https://" + udpAddr + "/slow", tcpAddr: tcpAddr, srv: s}
+	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bcancel()
+	if err := driveDrain(bctx, p); err != nil {
+		t.Fatalf("drive: %v", err)
+		return
+	}
+	var refused bool
+	p.refused.WithLock(func(b *bool) { refused = *b })
+	if !refused {
+		t.Fatalf("TCP %s still accepts while the HTTP/3 request drains", tcpAddr)
+		return
+	}
+	var serr error
+	p.stopErr.WithLock(func(e *error) { serr = *e })
+	if serr != nil {
+		t.Fatalf("Stop during the drain: %v", serr)
+		return
+	}
+}
+
+type deadlineProbe struct {
+	entered chan struct{}
+	tr      *qhttp3.Transport
+	url     string
+	srv     *http3.Server
+	stopErr sync.Locked[error]
+	stopDur sync.Locked[time.Duration]
+}
+
+func syncHandler(entered chan struct{}) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		close(entered)
+		time.Sleep(2 * time.Second)
+		return web.Empty{}, nil
+	}
+}
+
+func fetchSyncDeadline(ctx context.Context, p *deadlineProbe) error {
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+	if rerr != nil {
+		return nil
+	}
+	resp, err := p.tr.RoundTrip(req)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			return
+		}
+	}()
+	return nil
+}
+
+func stopSyncAfterEntered(ctx context.Context, p *deadlineProbe) error {
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		p.stopErr.WithLock(func(e *error) { *e = err })
+		return nil
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	p.stopErr.WithLock(func(e *error) { *e = p.srv.Stop(stopCtx) })
+	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
+	return nil
+}
+
+func driveSyncDeadline(ctx context.Context, p *deadlineProbe) error {
+	go group (ctx) {
+		go fetchSyncDeadline(ctx, p)
+		go stopSyncAfterEntered(ctx, p)
+	}
+	return nil
+}
+
+func TestH3StopMeetsCallerDeadline(t *testing.T) {
+	entered := make(chan struct{})
+	r := web.NewRouter()
+	r.Handle("GET", "/sync", syncHandler(entered))
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 5*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	defer closeH3Transport(t, tr)
+	p := &deadlineProbe{entered: entered, tr: tr, url: "https://" + udpAddr + "/sync", srv: s}
+	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bcancel()
+	if err := driveSyncDeadline(bctx, p); err != nil {
+		t.Fatalf("drive: %v", err)
+		return
+	}
+	var dur time.Duration
+	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
+	var serr error
+	p.stopErr.WithLock(func(e *error) { serr = *e })
+	t.Logf("Stop with sync handler returned after %v with error %v", dur, serr)
+	if serr == nil {
+		t.Fatalf("Stop past the caller deadline reported success")
+		return
+	}
+	if dur > 1500*time.Millisecond {
+		t.Fatalf("Stop blocked %v past the 300ms caller deadline", dur)
+		return
+	}
+}

@@ -90,7 +90,7 @@ type wireChoice struct {
 }
 
 type wireRespMessage struct {
-	Content          *wireContent `json:"content"`
+	Content          *wireContent? `json:"content"`
 	ReasoningContent string       `json:"reasoning_content"`
 	Reasoning        string       `json:"reasoning"`
 	ToolCalls        []wireCall   `json:"tool_calls"`
@@ -262,9 +262,8 @@ func (r *chatResponse) parts() []ai.Part {
 	}
 	msg := r.Choices[0].Message
 	var out []ai.Part
-	if msg.Content != nil {
-		out = append(out, msg.Content.parts()...)
-	}
+	var emptyContent wireContent
+	out = append(out, (msg.Content ?? &emptyContent).parts()...)
 	if msg.ReasoningContent != "" {
 		out = append(out, ai.Reasoning{Text: msg.ReasoningContent})
 	}

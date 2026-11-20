@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"logos/rt"
 	"logos/sync"
 
 	"github.com/gosuda/spira/resilience"
@@ -150,8 +152,13 @@ func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
 		start = *next
 		*next = (start + 1) % len(rl.hops)
 	})
-	again := replays(req)
+	again, failed := rl.replayable(req)
 	var cause error
+	if failed != nil {
+		cause = failed
+		slog.Error("gateway: no upstream served the route", "prefix", rl.prefix, "error", cause)
+		return rl.refusal(), nil
+	}
 	for i := range rl.hops {
 		resp, err := rl.send(req, &rl.hops[(start+i)%len(rl.hops)])
 		if err != nil {
@@ -169,11 +176,84 @@ func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
 	return rl.refusal(), nil
 }
 
-func replays(req *http.Request) bool {
+// replayable decides whether a failed first upstream may be followed by a
+// second. A body of unknown length is never assumed empty: the first byte is
+// read under the relay timeout, and only an immediate end of stream proves
+// the body empty. A proved byte is pushed back so the stream, and the
+// trailers after it, stay intact.
+
+func (rl *relay) replayable(req *http.Request) (bool, error?) {
 	if req.Body == nil || req.Body == http.NoBody {
-		return true
+		return true, nil
 	}
-	return false
+	if req.ContentLength >= 0 {
+		return false, nil
+	}
+	empty, body, expired := peekEmpty(req, rl.timeout)
+	if expired != nil {
+		return false, expired
+	}
+	req.Body = body
+	if empty {
+		req.ContentLength = 0
+		return true, nil
+	}
+	return false, nil
+}
+
+type pushedBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *pushedBody) Close() error {
+	return b.closer.Close()
+}
+
+type peekOutcome struct {
+	first [1]byte
+	n     int
+	err   error
+}
+
+// peekEmpty reads the first byte of an unknown-length body. It returns the
+// body with that byte pushed back, so the attempt that follows sees the whole
+// stream. A timeout or a cancelled request ends the wait: the body may hold a
+// late byte that no one owns afterward, so the caller must not reuse the body
+// and answers without trying an upstream.
+func peekEmpty(req *http.Request, wait time.Duration) (bool, io.ReadCloser, error?) {
+	seen := make(chan peekOutcome, 1)
+	g, _ := rt.NewGroup(req.Context(), 0)
+	g.Go(func(gctx context.Context) error {
+		var first [1]byte
+		for {
+			n, err := req.Body.Read(first[:])
+			if n > 0 || err != nil {
+				select {
+				case seen <- peekOutcome{first: first, n: n, err: err}:
+				case <-gctx.Done():
+				}
+				return nil
+			}
+		}
+	})
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case got := <-seen:
+		if got.n > 0 {
+			kept := bytes.NewReader(got.first[:got.n])
+			return false, &pushedBody{Reader: io.MultiReader(kept, req.Body), closer: req.Body}, nil
+		}
+		if errors.Is(got.err, io.EOF) {
+			return true, http.NoBody, nil
+		}
+		return false, req.Body, nil
+	case <-timer.C:
+		return false, nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: body of unknown length yielded nothing in %s", wait))
+	case <-req.Context().Done():
+		return false, nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: body of unknown length wait ended: %w", req.Context().Err()))
+	}
 }
 
 func (rl *relay) send(req *http.Request, u *upstream) (*http.Response?, error) {
@@ -183,30 +263,93 @@ func (rl *relay) send(req *http.Request, u *upstream) (*http.Response?, error) {
 	})
 }
 
+type delivery struct {
+	upstream *relay
+	demand   *http.Request
+	target   *url.URL
+	slot     context.Context
+	settled  chan struct{}
+	deadline time.Time
+	state    sync.Locked[deliveryState]
+	fired    sync.Locked[bool]
+}
+
+type deliveryState struct {
+	resp  *http.Response?
+	fault error
+	done  time.Time
+}
+
 func (rl *relay) deliver(req *http.Request, base *url.URL) (*http.Response?, error) {
 	outctx, cancel := context.WithCancel(req.Context())
-	timer := time.AfterFunc(rl.timeout, cancel)
-	resp, err := http.DefaultTransport.RoundTrip(rl.outbound(req, base, outctx))
-	missed := !timer.Stop() && req.Context().Err() == nil
-	if err != nil {
+	deadline := time.Now().Add(rl.timeout)
+	d := &delivery{upstream: rl, demand: req, target: base, slot: outctx, settled: make(chan struct{}), deadline: deadline}
+	go group (req.Context()) {
+		go d.fetchUpstream()
+		go d.watchTimeout(req.Context(), cancel)
+	}
+	var got deliveryState
+	d.state.WithLock(func(slot *deliveryState) { got = *slot })
+	exceeded := false
+	if req.Context().Err() == nil {
+		d.fired.WithLock(func(mark *bool) { exceeded = *mark })
+	}
+	if got.fault != nil {
 		cancel()
-		if missed {
+		if exceeded {
 			return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 		}
-		return nil, ErrBadGateway.Wrap(err)
+		return nil, ErrBadGateway.Wrap(got.fault)
 	}
-	if missed {
+	upstream := got.resp
+	if upstream == nil {
 		cancel()
-		resp.Body.Close()?
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered without a response"))
+	}
+	if exceeded || headersLate(got.done, deadline) {
+		cancel()
+		upstream.Body.Close()?
 		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream headers exceeded %s", rl.timeout))
 	}
-	if upstreamFailed(resp.StatusCode) {
+	if upstreamFailed(upstream.StatusCode) {
 		cancel()
-		resp.Body.Close()?
-		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered %d", resp.StatusCode))
+		upstream.Body.Close()?
+		return nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: upstream answered %d", upstream.StatusCode))
 	}
-	resp.Body = &releasingBody{inner: resp.Body, cancel: cancel}
-	return resp, nil
+	upstream.Body = &releasingBody{inner: upstream.Body, cancel: cancel}
+	return upstream, nil
+}
+
+func headersLate(done time.Time, deadline time.Time) bool {
+	return done.After(deadline)
+}
+
+func (d *delivery) fetchUpstream() error {
+	defer close(d.settled)
+	resp, err := http.DefaultTransport.RoundTrip(d.upstream.outbound(d.demand, d.target, d.slot))
+	d.state.WithLock(func(slot *deliveryState) {
+		slot.resp = resp
+		slot.fault = err
+		slot.done = time.Now()
+	})
+	return nil
+}
+
+func (d *delivery) watchTimeout(ctx context.Context, cancel context.CancelFunc) error {
+	timer := time.NewTimer(d.upstream.timeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		select {
+		case <-d.settled:
+		default:
+			d.fired.WithLock(func(mark *bool) { *mark = true })
+			cancel()
+		}
+	case <-d.settled:
+	case <-ctx.Done():
+	}
+	return nil
 }
 
 type releasingBody struct {

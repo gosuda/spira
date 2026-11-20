@@ -1,0 +1,92 @@
+package main_test
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	spira "github.com/gosuda/spira/cmd/spira"
+)
+
+func TestNewGeneratedSQLiteAppRuns(t *testing.T) {
+	root := spiraRoot(t)
+	dir := filepath.Join(t.TempDir(), "app")
+	args := []string{"-spira-dir", root, dir, "example.com/demo"}
+	if err := spira.RunNew(args); err != nil {
+		t.Fatalf("RunNew: %v", err)
+		return
+	}
+	runIn(t, dir, []string{"just", "sql"})
+	if _, err := os.Stat(filepath.Join(root, "orm")); err != nil {
+		t.Skip("orm package not in this checkout")
+	}
+	runIn(t, dir, []string{"logos", "build", "./..."})
+	runIn(t, dir, []string{"logos", "test", "-race", "-count=1", "./..."})
+}
+
+func TestNewPseudoVersion(t *testing.T) {
+	got := mustPseudo(t, "be3f670010ab1234567890abcdef1234567890abcd", "2026-11-19T08:00:00Z")
+	if got != "v0.0.0-20261119080000-be3f670010ab" {
+		t.Fatalf("pseudo = %q", got)
+		return
+	}
+	if _, err := spira.PseudoVersion("short", "2026-11-19T08:00:00Z"); err == nil {
+		t.Fatalf("PseudoVersion(short) = nil, want error")
+		return
+	}
+	if _, err := spira.PseudoVersion("be3f670010ab1234567890abcdef1234567890abcd", "not-a-time"); err == nil {
+		t.Fatalf("PseudoVersion(bad time) = nil, want error")
+		return
+	}
+	version := mustSpiraVersion(t, t.TempDir())
+	if version != "v0.0.0" {
+		t.Fatalf("spiraVersionFor(dir) = %q, want v0.0.0", version)
+		return
+	}
+}
+
+func mustPseudo(t *testing.T, rev string, stamp string) string {
+	t.Helper()
+	got, err := spira.PseudoVersion(rev, stamp)
+	if err != nil {
+		t.Fatalf("PseudoVersion: %v", err)
+		return ""
+	}
+	return got
+}
+
+func mustSpiraVersion(t *testing.T, dir string) string {
+	t.Helper()
+	version, err := spira.SpiraVersionFor(dir)
+	if err != nil {
+		t.Fatalf("SpiraVersionFor: %v", err)
+		return ""
+	}
+	return version
+}
+
+func spiraRoot(t *testing.T) string {
+	t.Helper()
+	abs, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("repo root: %v", err)
+		return ""
+	}
+	return abs
+}
+
+func runIn(t *testing.T, dir string, argv []string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v in %s: %v\n%s", argv, dir, err, out)
+		return
+	}
+}

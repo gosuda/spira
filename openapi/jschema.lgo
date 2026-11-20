@@ -1,0 +1,98 @@
+package openapi
+
+import (
+	"github.com/gosuda/spira/schema"
+)
+
+type Schema struct {
+	Type string `json:"type,omitzero"`
+	Format string `json:"format,omitzero"`
+	Items *Schema? `json:"items,omitzero"`
+	Properties map[string]Schema `json:"properties,omitzero"`
+	Required []string `json:"required,omitzero"`
+}
+
+func schemaOf(s schema.Schema) Schema {
+	if s == nil {
+		return Schema{}
+	}
+	switch v := s.(type) {
+	case schema.Object:
+		return objectSchema(v)
+	case schema.Array:
+		return arraySchema(v)
+	case schema.Optional:
+		return optionalSchema(v)
+	case schema.String:
+		return Schema{Type: "string", Format: v.Format}
+	case schema.Integer:
+		return Schema{Type: "integer"}
+	case schema.Number:
+		return Schema{Type: "number"}
+	case schema.Boolean:
+		return Schema{Type: "boolean"}
+	case nil:
+		return Schema{}
+	}
+	return Schema{}
+}
+
+func objectSchema(o schema.Object) Schema {
+	out := Schema{Type: "object"}
+	for _, f := range o.Fields {
+		if f.Wire != "" {
+			addProperty(&out, f)
+		}
+	}
+	return out
+}
+
+func addProperty(out *Schema, f schema.Field) {
+	if out.Properties == nil {
+		out.Properties = map[string]Schema{}
+	}
+	out.Properties[f.Wire] = schemaOf(f.Schema.Value)
+	if !isOptional(f.Schema.Value) {
+		out.Required = append(out.Required, f.Wire)
+	}
+}
+
+func arraySchema(a schema.Array) Schema {
+	inner := schemaOf(a.Items.Value)
+	return Schema{Type: "array", Items: &inner}
+}
+
+func optionalSchema(o schema.Optional) Schema {
+	return schemaOf(o.Items.Value)
+}
+
+func isOptional(s schema.Schema) bool {
+	_, ok := s.(schema.Optional)
+	return ok
+}
+
+func problemSchema() Schema {
+	out := Schema{Type: "object"}
+	out.Properties = map[string]Schema{
+		"type": {Type: "string"},
+		"title": {Type: "string"},
+		"status": {Type: "integer"},
+		"detail": {Type: "string"},
+		"instance": {Type: "string"},
+		"code": {Type: "string"},
+		"message": {Type: "string"},
+		"errors": errorListSchema(),
+	}
+	return out
+}
+
+func errorListSchema() Schema {
+	field := Schema{Type: "string"}
+	item := Schema{Type: "object"}
+	item.Properties = map[string]Schema{
+		"field": field,
+		"rule": field,
+		"message": field,
+	}
+	return Schema{Type: "array", Items: &item}
+}

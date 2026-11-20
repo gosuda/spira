@@ -1,0 +1,21 @@
+package admin
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrInvalidInstance = fault.New("admin.invalid_instance", fault.Unprocessable, "The instance registration is invalid.")
+
+var ErrOpsHostRefused = fault.New("admin.ops_host_refused", fault.Unprocessable, "The instance ops host is not allowed.")
+
+var ErrNotReady = fault.New("admin.not_ready", fault.Internal, "The admin service is not ready.")
+
+var ErrRegistryFull = fault.New("admin.registry_full", fault.RateLimited, "The instance registry is full.")
+
+var ErrRegistryUnreachable = fault.New("admin.registry_unreachable", fault.Unavailable, "The admin registry is unreachable.")
+
+var ErrUnknownInstance = fault.New("admin.unknown_instance", fault.NotFound, "The instance was not found.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrInvalidInstance, ErrOpsHostRefused, ErrNotReady, ErrRegistryFull, ErrRegistryUnreachable, ErrUnknownInstance}
+}

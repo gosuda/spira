@@ -3,37 +3,53 @@ package web
 import (
 	"bufio"
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 
 	"logos/sync"
 
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/schema"
 	"github.com/gosuda/spira/view"
 )
 
 type Handler func(ctx *Context) (Reply, error)
 
 type Stage func(next Handler) Handler
-
 type RouteInfo struct {
 	Method  string
 	Pattern string
+	In      schema.Schema
+	Doc     Doc?
 }
 
 type routeList struct {
 	items sync.Locked[[]RouteInfo]
 }
 
+type routeCell struct {
+	handler Handler
+	current sync.Locked[http.Handler]
+}
+
+func (c *routeCell) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	var current http.Handler
+	c.current.WithLock(func(h *http.Handler) { current = *h })
+	current.ServeHTTP(w, req)
+}
+
 type Router struct {
 	mux         *http.ServeMux
 	prefix      string
 	root        *Router?
-	stages      []Stage
+	stages      sync.Locked[[]Stage]
+	install     sync.Locked[struct{}]
+	registered  sync.Locked[[]*routeCell]
 	routes      *routeList
-	unmatched   func(c *Context)
+	unmatched   sync.Locked[func(c *Context)]
 	Layout      func(ctx *Context, p Page) view.Node
 	ProblemView func(p Problem) view.Node?
 	MaxBody     int64 = 1 << 20
@@ -41,7 +57,7 @@ type Router struct {
 
 func NewRouter() *Router {
 	r := &Router{mux: http.NewServeMux(), routes: &routeList{}}
-	r.unmatched = chain(r, nil, delegateUnrouted)
+	r.unmatched.WithLock(func(u *func(c *Context)) { *u = chain(r, nil, delegateUnrouted) })
 	return r
 }
 
@@ -53,43 +69,81 @@ func (r *Router) rootRouter() *Router {
 }
 
 func (r *Router) Use(stages ...Stage) {
-	r.stages = append(r.stages, stages...)
-	if r.root == nil {
-		r.unmatched = chain(r, r.stages, delegateUnrouted)
-	}
+	r.install.WithLock(func(*struct{}) {
+		var now []Stage
+		var cells []*routeCell
+		r.stages.WithLock(func(list *[]Stage) {
+			*list = append(*list, stages...)
+			now = append(now, (*list)...)
+			r.registered.WithLock(func(registered *[]*routeCell) { cells = append(cells, (*registered)...) })
+		})
+		if r.root == nil {
+			r.unmatched.WithLock(func(u *func(c *Context)) { *u = chain(r, now, delegateUnrouted) })
+		}
+		for _, cell := range cells {
+			fresh := served(r.rootRouter(), now, cell.handler)
+			cell.current.WithLock(func(h *http.Handler) { *h = fresh })
+		}
+	})
 }
 
 func (r *Router) Group(prefix string, build func(g *Router)) {
 	g := &Router{
 		mux:    r.mux,
 		prefix: r.prefix + prefix,
-		stages: append([]Stage(nil), r.stages...),
 		routes: r.routes,
 		root:   r.rootRouter(),
 	}
+	r.stages.WithLock(func(list *[]Stage) {
+		g.stages.WithLock(func(glist *[]Stage) { *glist = append(*glist, (*list)...) })
+	})
 	build(g)
 }
 
-func (r *Router) Handle(method string, pattern string, h Handler) {
-	host := pattern[:max(strings.IndexByte(pattern, '/'), 0)]
-	full := host + r.prefix + pattern[len(host):]
-	r.record(method, full)
-	r.mux.Handle(method+" "+full, served(r.rootRouter(), r.stages, h))
+func (r *Router) remember(h Handler) *routeCell {
+	cell := &routeCell{handler: h}
+	r.install.WithLock(func(*struct{}) {
+		var now []Stage
+		r.stages.WithLock(func(list *[]Stage) {
+			now = append(now, (*list)...)
+			r.registered.WithLock(func(registered *[]*routeCell) { *registered = append(*registered, cell) })
+		})
+		cell.current.WithLock(func(cur *http.Handler) { *cur = served(r.rootRouter(), now, h) })
+	})
+	return cell
 }
 
+func (r *Router) Handle(method string, pattern string, h Handler) {
+	full := fullPattern(r.prefix, pattern)
+	r.record(method, full)
+	r.mux.Handle(method+" "+full, r.remember(h))
+}
 func (r *Router) record(method string, pattern string) {
+	r.recordRoute(method, pattern, nil, nil)
+}
+
+func (r *Router) recordRoute(method string, pattern string, in schema.Schema, doc Doc?) {
 	r.routes.items.WithLock(func(list *[]RouteInfo) {
-		*list = append(*list, RouteInfo{Method: method, Pattern: pattern})
+		*list = append(*list, RouteInfo{Method: method, Pattern: pattern, In: in, Doc: doc})
 	})
 }
 
-func (r *Router) Routes() const []RouteInfo {
+func (r *Router) Routes() []RouteInfo {
 	var out []RouteInfo
 	r.routes.items.WithLock(func(list *[]RouteInfo) {
-		out = append(out, (*list)...)
+		for i := range *list {
+			info := (*list)[i]
+			if info.Doc != nil {
+				held := info.Doc ?? Doc{}
+				fresh := make([]Response, len(held.Returns))
+				copy(fresh, held.Returns)
+				held.Returns = fresh
+				info.Doc = held
+			}
+			out = append(out, info)
+		}
 	})
-	var snapshot const []RouteInfo = out
-	return snapshot
+	return out
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -102,7 +156,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := newContext(w, req, root)
 	unrouted, _ := root.mux.Handler(req)
 	c.fallback = unrouted
-	root.unmatched(c)
+	var unmatched func(c *Context)
+	root.unmatched.WithLock(func(u *func(c *Context)) { unmatched = *u })
+	unmatched(c)
 }
 
 func delegateUnrouted(c *Context) (Reply, error) {
@@ -170,8 +226,66 @@ func (r *Router) answerError(c *Context, err error) {
 		r.answerProblem(c, pe.Problem)
 		return
 	}
+	if f := fault.Of(err); f != nil {
+		status := statusForKind(f.Kind)
+		if status >= http.StatusInternalServerError {
+			slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
+		}
+		r.answerFault(c, err, status)
+		return
+	}
 	slog.Error("web: handler failed", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
-	r.answerProblem(c, internalProblem())
+	r.answerFault(c, err, http.StatusInternalServerError)
+}
+
+const statusClientClosed = 499
+
+func statusForKind(k fault.Kind) int {
+	switch k {
+	case fault.Invalid:
+		return http.StatusBadRequest
+	case fault.Unprocessable:
+		return http.StatusUnprocessableEntity
+	case fault.Unauthenticated:
+		return http.StatusUnauthorized
+	case fault.Forbidden:
+		return http.StatusForbidden
+	case fault.NotFound:
+		return http.StatusNotFound
+	case fault.Conflict:
+		return http.StatusConflict
+	case fault.TooLarge:
+		return http.StatusRequestEntityTooLarge
+	case fault.RateLimited:
+		return http.StatusTooManyRequests
+	case fault.Canceled:
+		return statusClientClosed
+	case fault.Timeout:
+		return http.StatusGatewayTimeout
+	case fault.Unavailable:
+		return http.StatusServiceUnavailable
+	case fault.Internal:
+		return http.StatusInternalServerError
+	}
+	return http.StatusInternalServerError
+}
+
+func (r *Router) answerFault(c *Context, err error, status int) {
+	if c.writer.wrote {
+		return
+	}
+	b, merr := json.Marshal(fault.Public(err))
+	if merr != nil {
+		slog.Error("web: encode fault", "error", merr)
+		r.answerProblem(c, internalProblem())
+		return
+	}
+	w := c.writer
+	w.Header().Set("Content-Type", "application/problem+json")
+	writeHead(c, status)
+	if _, werr := w.Write(b); werr != nil {
+		slog.Error("web: write fault", "error", werr)
+	}
 }
 
 func (r *Router) answerProblem(c *Context, p Problem) {

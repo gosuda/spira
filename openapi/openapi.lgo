@@ -1,0 +1,269 @@
+package openapi
+
+import (
+	"encoding/json/v2"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/schema"
+	"github.com/gosuda/spira/web"
+)
+
+type Info struct {
+	Title string
+	Version string
+}
+
+type Doc struct {
+	OpenAPI string `json:"openapi"`
+	Info DocInfo `json:"info"`
+	Paths map[string]PathItem `json:"paths"`
+}
+func (d Doc) MarshalJSON() ([]byte, error) {
+	type rawDoc Doc
+	return json.Marshal(rawDoc(d), json.Deterministic(true))
+}
+
+type DocInfo struct {
+	Title string `json:"title"`
+	Version string `json:"version"`
+}
+
+type PathItem struct {
+	Get *Operation? `json:"get,omitzero"`
+	Put *Operation? `json:"put,omitzero"`
+	Post *Operation? `json:"post,omitzero"`
+	Delete *Operation? `json:"delete,omitzero"`
+	Patch *Operation? `json:"patch,omitzero"`
+	Head *Operation? `json:"head,omitzero"`
+	Options *Operation? `json:"options,omitzero"`
+	Trace *Operation? `json:"trace,omitzero"`
+}
+
+type Operation struct {
+	Summary string `json:"summary,omitzero"`
+	Parameters []Parameter `json:"parameters,omitzero"`
+	RequestBody *RequestBody? `json:"requestBody,omitzero"`
+	Responses map[string]ResponseItem `json:"responses"`
+}
+
+type Parameter struct {
+	Name string `json:"name"`
+	In string `json:"in"`
+	Required bool `json:"required"`
+	Schema Schema `json:"schema"`
+}
+
+type RequestBody struct {
+	Required bool `json:"required"`
+	Content map[string]MediaType `json:"content"`
+}
+
+type ResponseItem struct {
+	Description string `json:"description"`
+	Content map[string]MediaType `json:"content,omitzero"`
+}
+
+type MediaType struct {
+	Schema Schema `json:"schema"`
+}
+
+func Document(r *web.Router, info Info) Doc {
+	paths := map[string]PathItem{}
+	for _, ri := range r.Routes() {
+		addRoute(paths, ri)
+	}
+	return Doc{OpenAPI: "3.1.0", Info: DocInfo{Title: info.Title, Version: info.Version}, Paths: paths}
+}
+
+func Mount(r *web.Router, info Info) {
+	r.Handle("GET", "/openapi.json", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: Document(r, info)}, nil
+	})
+}
+
+func addRoute(paths map[string]PathItem, ri web.RouteInfo) {
+	path := openapiPath(ri.Pattern)
+	if path == "/openapi.json" && strings.ToUpper(ri.Method) == http.MethodGet {
+		return
+	}
+	item := paths[path] ?? PathItem{}
+	if !setSlot(&item, strings.ToLower(ri.Method), operationOf(ri)) {
+		return
+	}
+	paths[path] = item
+}
+
+func setSlot(item *PathItem, method string, op Operation) bool {
+	switch method {
+	case "get":
+		item.Get = &op
+	case "put":
+		item.Put = &op
+	case "post":
+		item.Post = &op
+	case "delete":
+		item.Delete = &op
+	case "patch":
+		item.Patch = &op
+	case "head":
+		item.Head = &op
+	case "options":
+		item.Options = &op
+	case "trace":
+		item.Trace = &op
+	default:
+		return false
+	}
+	return true
+}
+
+func openapiPath(pattern string) string {
+	idx := strings.Index(pattern, "/")
+	if idx < 0 {
+		return "/"
+	}
+	path := pattern[idx:]
+	segs := strings.Split(path, "/")
+	for i, seg := range segs {
+		if len(seg) > 4 && seg[0] == '{' && strings.HasSuffix(seg, "...}") {
+			segs[i] = "{" + seg[1:len(seg)-4] + "}"
+		}
+	}
+	path = strings.Join(segs, "/")
+	if strings.HasSuffix(path, "/{$}") {
+		path = strings.TrimSuffix(path, "{$}")
+	}
+	return path
+}
+
+func operationOf(ri web.RouteInfo) Operation {
+	op := Operation{Responses: responsesOf(routeReturns(ri))}
+	if d := ri.Doc; d != nil {
+		op.Summary = d.Summary
+	}
+	op.Parameters = routeParameters(ri)
+	op.RequestBody = routeBody(ri.In)
+	return op
+}
+
+func routeReturns(ri web.RouteInfo) []web.Response {
+	if d := ri.Doc; d != nil {
+		return d.Returns
+	}
+	return nil
+}
+
+func routeParameters(ri web.RouteInfo) []Parameter {
+	out := pathParameters(openapiPath(ri.Pattern), ri.In)
+	return append(out, queryParameters(ri.In)...)
+}
+
+func pathParameters(path string, in schema.Schema) []Parameter {
+	var out []Parameter
+	for _, name := range pathNames(path) {
+		out = append(out, Parameter{Name: name, In: "path", Required: true, Schema: pathField(in, name)})
+	}
+	return out
+}
+
+func pathNames(path string) []string {
+	var out []string
+	for _, seg := range strings.Split(path, "/") {
+		name := paramName(seg)
+		if name == "" || slices.Contains(out, name) {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+func paramName(seg string) string {
+	if len(seg) < 3 || seg[0] != '{' || seg[len(seg)-1] != '}' {
+		return ""
+	}
+	name := strings.TrimSuffix(seg[1:len(seg)-1], "...")
+	if name == "" || name == "$" {
+		return ""
+	}
+	return name
+}
+
+func pathField(in schema.Schema, name string) Schema {
+	obj, ok := in.(schema.Object)
+	if !ok {
+		return Schema{Type: "string"}
+	}
+	for _, f := range obj.Fields {
+		if f.Source == "path" && f.Wire == name {
+			return schemaOf(f.Schema.Value)
+		}
+	}
+	return Schema{Type: "string"}
+}
+
+func queryParameters(in schema.Schema) []Parameter {
+	obj, ok := in.(schema.Object)
+	if !ok {
+		return nil
+	}
+	var out []Parameter
+	for _, f := range obj.Fields {
+		out = appendLocation(out, f)
+	}
+	return out
+}
+
+func appendLocation(out []Parameter, f schema.Field) []Parameter {
+	if f.Source == "query" || f.Source == "header" || f.Source == "cookie" {
+		return append(out, Parameter{Name: f.Wire, In: f.Source, Required: !isOptional(f.Schema.Value), Schema: schemaOf(f.Schema.Value)})
+	}
+	return out
+}
+
+func routeBody(in schema.Schema) *RequestBody? {
+	obj, ok := in.(schema.Object)
+	if !ok {
+		return nil
+	}
+	for _, f := range obj.Fields {
+		if f.Source == "body" {
+			return bodyOf(f)
+		}
+	}
+	return nil
+}
+
+func bodyOf(f schema.Field) *RequestBody? {
+	media := MediaType{Schema: schemaOf(f.Schema.Value)}
+	return &RequestBody{Required: !isOptional(f.Schema.Value), Content: map[string]MediaType{"application/json": media}}
+}
+
+func responsesOf(returns []web.Response) map[string]ResponseItem {
+	out := map[string]ResponseItem{}
+	for _, ret := range returns {
+		out[strconv.Itoa(ret.Status)] = responseOf(ret)
+	}
+	out["default"] = problemResponse()
+	return out
+}
+
+func responseOf(ret web.Response) ResponseItem {
+	desc := http.StatusText(ret.Status)
+	if desc == "" {
+		desc = "response " + strconv.Itoa(ret.Status)
+	}
+	item := ResponseItem{Description: desc}
+	if b := ret.Body; b != nil {
+		item.Content = map[string]MediaType{"application/json": {Schema: schemaOf(b)}}
+	}
+	return item
+}
+
+func problemResponse() ResponseItem {
+	media := MediaType{Schema: problemSchema()}
+	return ResponseItem{Description: "Unexpected error", Content: map[string]MediaType{"application/problem+json": media}}
+}

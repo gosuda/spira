@@ -1,0 +1,122 @@
+package web_test
+
+import (
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/web"
+)
+
+var errTestForbidden = fault.New("webtest.forbidden", fault.Forbidden, "Test forbidden fault.")
+
+var errTestConflict = fault.New("webtest.conflict", fault.Conflict, "Test conflict fault.")
+
+var errTestInternal = fault.New("webtest.internal", fault.Internal, "Test internal fault.")
+
+type faultDoc struct {
+	Code    string          `json:"code"`
+	Message string          `json:"message"`
+	Errors  []problemMember `json:"errors"`
+}
+
+func TestWebFaultsMatchSpecCodeTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/web.md", web.Faults())
+}
+
+func assertFault(t *testing.T, rec *httptest.ResponseRecorder, status int, code string) faultDoc {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status %d want %d body %s", rec.Code, status, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type %q want application/problem+json", ct)
+	}
+	var doc faultDoc
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode fault body %q: %v", rec.Body.String(), err)
+	}
+	if doc.Code != code {
+		t.Fatalf("fault code %q want %q body %s", doc.Code, code, rec.Body.String())
+	}
+	return doc
+}
+
+func TestFaultKindMapsToStatusAndCode(t *testing.T) {
+	local := func(kind fault.Kind) *fault.Error {
+		return fault.New(fault.Code($"webtest.{kind.String()}"), kind, $"Test {kind.String()} fault.")
+	}
+	cases := []struct {
+		kind   fault.Kind
+		code   string
+		status int
+		err    *fault.Error
+	}{
+		{fault.Invalid, "web.bind_invalid", http.StatusBadRequest, web.ErrBindInvalid},
+		{fault.Unprocessable, "web.bind_unprocessable", http.StatusUnprocessableEntity, web.ErrBindUnprocessable},
+		{fault.TooLarge, "web.body_too_large", http.StatusRequestEntityTooLarge, web.ErrBodyTooLarge},
+		{fault.Unauthenticated, "webtest.unauthenticated", http.StatusUnauthorized, local(fault.Unauthenticated)},
+		{fault.Forbidden, "webtest.forbidden", http.StatusForbidden, local(fault.Forbidden)},
+		{fault.NotFound, "webtest.not_found", http.StatusNotFound, local(fault.NotFound)},
+		{fault.Conflict, "webtest.conflict", http.StatusConflict, local(fault.Conflict)},
+		{fault.RateLimited, "webtest.rate_limited", http.StatusTooManyRequests, local(fault.RateLimited)},
+		{fault.Canceled, "webtest.canceled", 499, local(fault.Canceled)},
+		{fault.Timeout, "webtest.timeout", http.StatusGatewayTimeout, local(fault.Timeout)},
+		{fault.Unavailable, "webtest.unavailable", http.StatusServiceUnavailable, local(fault.Unavailable)},
+		{fault.Internal, "internal", http.StatusInternalServerError, local(fault.Internal)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			r := web.NewRouter()
+			caught := tc.err
+			r.Handle("GET", "/faulty", func(ctx *web.Context) (web.Reply, error) {
+				return nil, caught.Err()
+			})
+			doc := assertFault(t, call(t, r, httptest.NewRequest(http.MethodGet, "/faulty", nil)), tc.status, tc.code)
+			if tc.kind != fault.Internal && doc.Message == "" {
+				t.Fatalf("fault message for %q is empty", tc.code)
+			}
+		})
+	}
+}
+
+func TestWrappedAndJoinedFaultsMapByOutermost(t *testing.T) {
+	const secret = "SECRET-FAULT-77124"
+	probes := []struct {
+		name string
+		err  error
+	}{
+		{"wrap", fmt.Errorf("handler: %w", errTestConflict.Wrap(errors.New(secret)))},
+		{"joinFirst", errors.Join(errTestConflict.Err(), errors.New(secret))},
+		{"joinLast", errors.Join(errors.New(secret), errTestConflict.Err())},
+	}
+	for _, probe := range probes {
+		t.Run(probe.name, func(t *testing.T) {
+			r := web.NewRouter()
+			r.Handle("GET", "/faulty", func(ctx *web.Context) (web.Reply, error) {
+				return nil, probe.err
+			})
+			rec := call(t, r, httptest.NewRequest(http.MethodGet, "/faulty", nil))
+			assertFault(t, rec, http.StatusConflict, "webtest.conflict")
+			faulttest.RefuseLeak(t, rec.Body.Bytes(), secret)
+		})
+	}
+}
+
+func TestFaultCauseNeverReachesClient(t *testing.T) {
+	const secret = "SECRET-CAUSE-55231"
+	r := web.NewRouter()
+	r.Handle("GET", "/faulty", func(ctx *web.Context) (web.Reply, error) {
+		return nil, web.ErrBindInvalid.Wrap(errors.New(secret))
+	})
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/faulty", nil))
+	assertFault(t, rec, http.StatusBadRequest, "web.bind_invalid")
+	faulttest.RefuseLeak(t, rec.Body.Bytes(), secret)
+	raw := faulttest.PublicJSON(t, web.ErrBindInvalid.Wrap(errors.New(secret)))
+	faulttest.RefuseLeak(t, raw, secret)
+}

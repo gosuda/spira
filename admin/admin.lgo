@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/gosuda/spira/bus"
 	"github.com/gosuda/spira/client"
+	"github.com/gosuda/spira/fault"
 	"github.com/gosuda/spira/job"
 	"github.com/gosuda/spira/live"
 	"github.com/gosuda/spira/resilience"
@@ -35,11 +38,12 @@ type Instance struct {
 	Name   string `json:"name"`
 	OpsURL string `json:"opsUrl"`
 }
-
 type Server struct {
 	Interval     time.Duration = 10 * time.Second
 	Now          (func() time.Time)?
 	MaxInstances int = 100
+	ProbeToken   string?
+	AllowedHosts []string
 	state  sync.Locked[serverState]
 	events *bus.Topic[live.Event]?
 	sched  job.Scheduler
@@ -48,6 +52,7 @@ type Server struct {
 type Client struct {
 	Server string
 	Self   Instance
+	Token  string?
 }
 
 
@@ -140,14 +145,17 @@ func (s *Server) handlePost(ctx *web.Context) (web.Reply, error) {
 		return nil, err
 	}
 	if !validName(inst.Name) {
-		return nil, web.Fail(web.Problem{Title: "Unprocessable Entity", Status: http.StatusUnprocessableEntity, Detail: "admin: invalid instance name"})
+		return nil, ErrInvalidInstance.WithFields(fault.Field{Name: "name", Rule: "format", Message: "The instance name is invalid."}).Err()
 	}
 	if !validOpsURL(inst.OpsURL) {
-		return nil, web.Fail(web.Problem{Title: "Unprocessable Entity", Status: http.StatusUnprocessableEntity, Detail: "admin: invalid ops URL"})
+		return nil, ErrInvalidInstance.WithFields(fault.Field{Name: "opsUrl", Rule: "url", Message: "The instance ops URL is invalid."}).Err()
+	}
+	if !s.hostAllowed(inst.OpsURL) {
+		return nil, ErrOpsHostRefused.WithFields(fault.Field{Name: "opsUrl", Rule: "allowlist", Message: "The instance ops host is not allowed."}).Err()
 	}
 	stored, created := s.store(inst)
 	if !stored {
-		return nil, web.Fail(web.Problem{Title: "Too Many Requests", Status: http.StatusTooManyRequests, Detail: "admin: registry full"})
+		return nil, ErrRegistryFull.Err()
 	}
 	code := http.StatusOK
 	if created {
@@ -158,15 +166,26 @@ func (s *Server) handlePost(ctx *web.Context) (web.Reply, error) {
 
 func (s *Server) handleDelete(ctx *web.Context) (web.Reply, error) {
 	name := ctx.Request.PathValue("name")
+	query, qerr := url.ParseQuery(ctx.Request.URL.RawQuery)
+	if qerr != nil {
+		return nil, ErrInvalidInstance.WithFields(fault.Field{Name: "opsUrl", Rule: "url", Message: "The instance ops URL is invalid."}).Wrap(fmt.Errorf("admin: parse delete query: %w", qerr))
+	}
+	guarded := query.Has("opsUrl")
+	want := query.Get("opsUrl")
 	removed := false
 	s.state.WithLock(func(st *serverState) {
-		if _, ok := st.entries[name]; ok {
-			delete(st.entries, name)
-			removed = true
+		rec, ok := st.entries[name]
+		if !ok {
+			return
 		}
+		if guarded && rec.inst.OpsURL != want {
+			return
+		}
+		delete(st.entries, name)
+		removed = true
 	})
 	if !removed {
-		return nil, web.Fail(web.Problem{Title: "Not Found", Status: http.StatusNotFound, Detail: $"admin: unknown instance {name}"})
+		return nil, ErrUnknownInstance.Err()
 	}
 	return web.Empty{}, nil
 }
@@ -178,7 +197,7 @@ func (s *Server) handlePage(ctx *web.Context) (web.Reply, error) {
 func (s *Server) handleEvents(ctx *web.Context) (web.Reply, error) {
 	topic := s.events
 	if topic == nil {
-		return nil, web.Fail(web.Problem{Title: "Internal Server Error", Status: http.StatusInternalServerError, Detail: "admin: events not ready"})
+		return nil, ErrNotReady.Err()
 	}
 	return live.Events(ctx, topic.Subscribe(ctx.Ctx())), nil
 }
@@ -186,23 +205,26 @@ func (s *Server) handleEvents(ctx *web.Context) (web.Reply, error) {
 func decodeInstance(ctx *web.Context) (Instance, error) {
 	body, err := io.ReadAll(io.LimitReader(ctx.Request.Body, 1<<20+1))
 	if err != nil {
-		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: $"admin: read instance: {err}"})
+		return Instance{}, ErrInvalidInstance.WithFields(fault.Field{Name: "body", Rule: "readable", Message: "The request body could not be read."}).Wrap(fmt.Errorf("admin: read instance: %w", err))
 	}
 	if cerr := ctx.Request.Body.Close(); cerr != nil {
-		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: $"admin: close instance body: {cerr}"})
+		return Instance{}, ErrInvalidInstance.WithFields(fault.Field{Name: "body", Rule: "readable", Message: "The request body could not be read."}).Wrap(fmt.Errorf("admin: close instance body: %w", cerr))
 	}
 	if len(body) > 1<<20 {
-		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: "admin: instance body too large"})
+		return Instance{}, ErrInvalidInstance.WithFields(fault.Field{Name: "body", Rule: "too_large", Message: "The request body is too large."}).Wrap(fmt.Errorf("admin: instance body of %d bytes exceeds the limit", len(body)))
 	}
 	var inst Instance
 	if uerr := json.Unmarshal(body, &inst); uerr != nil {
-		return Instance{}, web.Fail(web.Problem{Title: "Bad Request", Status: http.StatusBadRequest, Detail: $"admin: decode instance: {uerr}"})
+		return Instance{}, ErrInvalidInstance.WithFields(fault.Field{Name: "body", Rule: "json", Message: "The request body must be valid JSON."}).Wrap(fmt.Errorf("admin: decode instance: %w", uerr))
 	}
 	return inst, nil
 }
 
 func validName(name string) bool {
 	if name == "" || len(name) > 128 {
+		return false
+	}
+	if name == "." || name == ".." {
 		return false
 	}
 	return !strings.ContainsAny(name, "/\n\r")
@@ -224,6 +246,53 @@ func validOpsURL(raw string) bool {
 		return false
 	}
 	return u.User == nil
+}
+
+var errRedirectRefused = errors.New("admin: redirects are not followed")
+
+func (s *Server) hostAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u == nil {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	if host == "" {
+		return false
+	}
+	for _, entry := range s.AllowedHosts {
+		e := strings.ToLower(entry)
+		if strings.ContainsAny(e, "*/") {
+			continue
+		}
+		if e == host {
+			return true
+		}
+	}
+	return false
+}
+
+func tokenHostAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return false
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return true
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }
 
 func (s *Server) store(inst Instance) (bool, bool) {
@@ -273,12 +342,13 @@ func (s *Server) snapshot() []rowView {
 
 func (s *Server) pollOnce(ctx context.Context) error {
 	items := s.snapshotPoll()
-	results := make([]pollResult, 0, len(items))
-	for _, it := range items {
-		results = append(results, pollResult{name: it.name, up: s.probe(ctx, it.opsURL, it.breaker)})
+	if len(items) == 0 {
+		return nil
 	}
-	for _, changed := range s.applyPoll(results) {
-		s.publish(changed.name, changed.status)
+	go group (ctx, limit = 8) {
+		for _, it := range items {
+			go { s.probeOne(ctx, it) }
+		}
 	}
 	return nil
 }
@@ -293,32 +363,53 @@ func (s *Server) snapshotPoll() []pollItem {
 	return items
 }
 
-func (s *Server) applyPoll(results []pollResult) []rowView {
-	var changed []rowView
+func (s *Server) probeOne(ctx context.Context, item pollItem) error {
+	up := s.probe(ctx, item.opsURL, item.breaker)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if changed, ok := s.applyOne(pollResult{name: item.name, up: up}); ok {
+		s.publish(changed.name, changed.status)
+	}
+	return nil
+}
+
+type probeRequest struct{}
+
+func (s *Server) applyOne(result pollResult) (rowView, bool) {
+	var changed rowView
+	applied := false
 	s.state.WithLock(func(st *serverState) {
-		for _, r := range results {
-			rec, ok := st.entries[r.name]
-			if !ok {
-				continue
-			}
-			want := statusDown
-			if r.up {
-				want = statusUp
-			}
-			if rec.status == want {
-				continue
-			}
-			rec.status = want
-			changed = append(changed, rowView{name: r.name, status: want})
+		rec, ok := st.entries[result.name]
+		if !ok {
+			return
 		}
+		want := statusDown
+		if result.up {
+			want = statusUp
+		}
+		if rec.status == want {
+			return
+		}
+		rec.status = want
+		changed = rowView{name: result.name, status: want}
+		applied = true
 	})
-	return changed
+	return changed, applied
 }
 
 func (s *Server) probe(ctx context.Context, opsURL string, breaker *resilience.Breaker) bool {
+	if !s.hostAllowed(opsURL) {
+		return false
+	}
 	breaker.Now = s.Now
+	header := http.Header{}
+	if token := s.ProbeToken ?? ""; token != "" && tokenHostAllowed(opsURL) {
+		header.Set("Authorization", "Bearer "+token)
+	}
 	c := client.New(strings.TrimSuffix(opsURL, "/"), resilience.Policy{Timeout: 5 * time.Second, Breaker: breaker})
-	report, err := client.Get[healthReport](ctx, c, "/ops/health")
+	c.HTTP = &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errRedirectRefused }}
+	report, err := client.Send[probeRequest, healthReport](ctx, c, client.Request[probeRequest]{Method: http.MethodGet, Path: "/ops/health", Header: header})
 	if err != nil {
 		return false
 	}
@@ -358,16 +449,19 @@ func (c *Client) Stop(ctx context.Context) error {
 func (c *Client) post(ctx context.Context) error {
 	data, err := json.Marshal(c.Self)
 	if err != nil {
-		return fmt.Errorf("admin: encode instance %s: %w", c.Self.Name, err)
+		return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: encode instance %s: %w", c.Self.Name, err))
 	}
 	return c.send(ctx, http.MethodPost, "/admin/instances", data)
 }
 
 func (c *Client) remove(ctx context.Context) error {
-	return c.send(ctx, http.MethodDelete, "/admin/instances/"+url.PathEscape(c.Self.Name), nil)
+	return c.send(ctx, http.MethodDelete, "/admin/instances/"+url.PathEscape(c.Self.Name)+"?opsUrl="+url.QueryEscape(c.Self.OpsURL), nil)
 }
 
 func (c *Client) send(ctx context.Context, method string, path string, body []byte) error {
+	if token := c.Token ?? ""; token != "" && !tokenHostAllowed(c.Server) {
+		return ErrRegistryUnreachable.Wrap(errors.New("admin: refuses to send a token over plaintext HTTP to a non-loopback host"))
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var reader io.Reader
@@ -376,14 +470,18 @@ func (c *Client) send(ctx context.Context, method string, path string, body []by
 	}
 	req, err := http.NewRequestWithContext(reqCtx, method, strings.TrimSuffix(c.Server, "/")+path, reader)
 	if err != nil {
-		return fmt.Errorf("admin: %s %s: %w", method, path, err)
+		return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: %s %s: %w", method, path, err))
+	}
+	if token := c.Token ?? ""; token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errRedirectRefused }}
+	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("admin: %s %s: %w", method, path, err)
+		return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: %s %s: %w", method, path, err))
 	}
 	defer resp.Body.Close()?
 	if resp.StatusCode == http.StatusNotFound && method == http.MethodDelete {
@@ -392,12 +490,12 @@ func (c *Client) send(ctx context.Context, method string, path string, body []by
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		note, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if rerr != nil {
-			return fmt.Errorf("admin: %s %s: status %d", method, path, resp.StatusCode)
+			return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: %s %s: status %d: %w", method, path, resp.StatusCode, rerr))
 		}
-		return fmt.Errorf("admin: %s %s: status %d: %s", method, path, resp.StatusCode, string(note))
+		return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: %s %s: status %d with %d response bytes", method, path, resp.StatusCode, len(note)))
 	}
 	if _, cerr := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); cerr != nil {
-		return fmt.Errorf("admin: %s %s: drain: %w", method, path, cerr)
+		return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: %s %s: drain: %w", method, path, cerr))
 	}
 	return nil
 }

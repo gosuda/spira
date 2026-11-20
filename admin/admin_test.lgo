@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/auth"
 	"github.com/gosuda/spira/admin"
 	"github.com/gosuda/spira/view"
 	"github.com/gosuda/spira/web"
@@ -24,7 +26,7 @@ func tokenGuard() web.Stage {
 	return func(next web.Handler) web.Handler {
 		return func(ctx *web.Context) (web.Reply, error) {
 			if ctx.Request.Header.Get("Authorization") != "Bearer "+testToken {
-				return nil, web.Fail(web.Problem{Status: http.StatusUnauthorized, Title: "Unauthorized"})
+				return nil, auth.ErrInvalidCredentials.Err()
 			}
 			return next(ctx)
 		}
@@ -76,6 +78,16 @@ func postInstance(t *testing.T, ts *httptest.Server, name string, opsURL string)
 		return 0
 	}
 	return resp.StatusCode
+}
+
+func hostOf(t *testing.T, raw string) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse URL %q: %v", raw, err)
+		return ""
+	}
+	return u.Host
 }
 
 func getPage(t *testing.T, ts *httptest.Server, path string) (int, string) {
@@ -215,9 +227,9 @@ func (s *sseTap) next(ctx context.Context, wait time.Duration) (string, bool) {
 	}
 }
 
-func openEvents(t *testing.T, ts *httptest.Server) *http.Response? {
+func openEvents(t *testing.T, ts *httptest.Server, ctx context.Context) *http.Response? {
 	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/admin/events", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/admin/events", nil)
 	if err != nil {
 		t.Fatalf("new events request: %v", err)
 		return nil
@@ -296,7 +308,18 @@ func driveRecovery(ctx context.Context, tap *sseTap, stream *http.Response, flip
 func TestAdminListsStatusesAndEmitsSingleRecoveryEvent(t *testing.T) {
 	var nowNanos atomic.Int64
 	nowNanos.Store(time.Now().UnixNano())
-	srv := &admin.Server{Interval: 10 * time.Millisecond, Now: func() time.Time { return time.Unix(0, nowNanos.Load()) }, MaxInstances: 100}
+	up := fixedHealth(http.StatusOK, "ok")
+	defer up.Close()
+	var flakyCode atomic.Int64
+	flakyCode.Store(http.StatusServiceUnavailable)
+	flaky := flakyHealth(t, &flakyCode)
+	defer flaky.Close()
+	srv := &admin.Server{
+		Interval: 10 * time.Millisecond,
+		Now: func() time.Time { return time.Unix(0, nowNanos.Load()) },
+		MaxInstances: 100,
+		AllowedHosts: []string{hostOf(t, up.URL), hostOf(t, flaky.URL)},
+	}
 	r := newAdminRouter(srv, tokenGuard())
 	if err := srv.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -310,15 +333,9 @@ func TestAdminListsStatusesAndEmitsSingleRecoveryEvent(t *testing.T) {
 	}()
 	ts := httptest.NewServer(r)
 	defer ts.Close()
-	up := fixedHealth(http.StatusOK, "ok")
-	defer up.Close()
-	var flakyCode atomic.Int64
-	flakyCode.Store(http.StatusServiceUnavailable)
-	flaky := flakyHealth(t, &flakyCode)
-	defer flaky.Close()
 	registerInstances(t, ts, up.URL, flaky.URL)
 	waitForPage(t, ts, "/admin", []string{"shop", "billing", "up", "down"})
-	stream := openEvents(t, ts)
+	stream := openEvents(t, ts, t.Context())
 	if stream == nil {
 		t.Fatal("events stream did not open")
 		return
@@ -377,7 +394,7 @@ func instanceBody(t *testing.T, name string, opsURL string) []byte {
 }
 
 func TestAdminGuardRefusesWithoutCredentials(t *testing.T) {
-	srv := &admin.Server{MaxInstances: 10}
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
 	r := newAdminRouter(srv, tokenGuard())
 	targets := []call{
 		{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example")},
@@ -400,7 +417,7 @@ func TestAdminGuardRefusesWithoutCredentials(t *testing.T) {
 }
 
 func TestAdminRejectsBadOpsURL(t *testing.T) {
-	srv := &admin.Server{MaxInstances: 10}
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example", "shop.example:8443", "dot.example", "dotdot.example"}}
 	r := newAdminRouter(srv, tokenGuard())
 	bad := []struct {
 		name   string
@@ -411,6 +428,8 @@ func TestAdminRejectsBadOpsURL(t *testing.T) {
 		{"nohost", "http:///ops"},
 		{"relative", "/ops/health"},
 		{"blank", ""},
+		{".", "http://dot.example/"},
+		{"..", "http://dotdot.example/"},
 		{"", "http://shop.example/"},
 	}
 	for _, tc := range bad {
@@ -423,10 +442,18 @@ func TestAdminRejectsBadOpsURL(t *testing.T) {
 			t.Fatalf("POST %q %q body %q must name the bad field", tc.name, tc.opsURL, rec.Body.String())
 			return
 		}
+		if !strings.Contains(rec.Body.String(), "admin.invalid_instance") {
+			t.Fatalf("POST %q %q body %q holds no fault code", tc.name, tc.opsURL, rec.Body.String())
+			return
+		}
 	}
 	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: []byte("{broken"), token: true})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("POST malformed JSON status = %d, want 400", rec.Code)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST malformed JSON status = %d, want 422", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "admin.invalid_instance") {
+		t.Fatalf("POST malformed JSON body %q holds no fault code", rec.Body.String())
 		return
 	}
 	good := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "https://shop.example:8443/base"), token: true})
@@ -437,7 +464,7 @@ func TestAdminRejectsBadOpsURL(t *testing.T) {
 }
 
 func TestAdminRegistryBound(t *testing.T) {
-	srv := &admin.Server{MaxInstances: 1}
+	srv := &admin.Server{MaxInstances: 1, AllowedHosts: []string{"a.example", "b.example"}}
 	r := newAdminRouter(srv, tokenGuard())
 	first := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "a", "http://a.example"), token: true})
 	if first.Code != http.StatusCreated {
@@ -449,8 +476,12 @@ func TestAdminRegistryBound(t *testing.T) {
 		t.Fatalf("second POST status = %d, want 429", second.Code)
 		return
 	}
-	if !strings.Contains(second.Body.String(), "registry full") {
+	if !strings.Contains(second.Body.String(), "registry is full") {
 		t.Fatalf("second POST body %q must name the full registry", second.Body.String())
+		return
+	}
+	if !strings.Contains(second.Body.String(), "admin.registry_full") {
+		t.Fatalf("second POST body %q holds no fault code", second.Body.String())
 		return
 	}
 	remove := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/a", token: true})
@@ -468,10 +499,18 @@ func TestAdminRegistryBound(t *testing.T) {
 		t.Fatalf("DELETE missing status = %d, want 404", missing.Code)
 		return
 	}
+	if !strings.Contains(missing.Body.String(), "admin.unknown_instance") {
+		t.Fatalf("DELETE missing body %q holds no fault code", missing.Body.String())
+		return
+	}
+	if strings.Contains(missing.Body.String(), "gone") {
+		t.Fatalf("DELETE missing body echoes the name: %q", missing.Body.String())
+		return
+	}
 }
 
 func TestAdminClientRegistersAndDeregisters(t *testing.T) {
-	srv := &admin.Server{MaxInstances: 10}
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
 	r := newAdminRouter(srv, openGuard())
 	ts := httptest.NewServer(r)
 	defer ts.Close()
@@ -540,21 +579,624 @@ func TestAdminRejectsBadConfig(t *testing.T) {
 }
 
 func TestAdminReRegisterSameURLKeepsStatus(t *testing.T) {
-	srv := &admin.Server{MaxInstances: 10}
+	up := fixedHealth(http.StatusOK, "ok")
+	defer up.Close()
+	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, up.URL), "other.example"}}
 	r := newAdminRouter(srv, tokenGuard())
-	first := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example"), token: true})
-	if first.Code != http.StatusCreated {
-		t.Fatalf("first POST status = %d, want 201", first.Code)
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+	if err := srv.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
 		return
 	}
-	again := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example"), token: true})
+	if code := postInstance(t, ts, "shop", up.URL); code != http.StatusCreated {
+		t.Fatalf("first POST status = %d, want 201", code)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "up"})
+	if err := srv.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+		return
+	}
+	again := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", up.URL), token: true})
 	if again.Code != http.StatusOK {
 		t.Fatalf("repeat POST status = %d, want 200", again.Code)
+		return
+	}
+	if code, body := getPage(t, ts, "/admin"); !pageHolds(body, []string{"shop", "up"}) {
+		t.Fatalf("page after identical re-register status = %d, body %q must keep shop up", code, body)
 		return
 	}
 	moved := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://other.example"), token: true})
 	if moved.Code != http.StatusOK {
 		t.Fatalf("changed URL POST status = %d, want 200", moved.Code)
+		return
+	}
+	if code, body := getPage(t, ts, "/admin"); !pageHolds(body, []string{"shop", "unknown"}) {
+		t.Fatalf("page after URL change status = %d, body %q must reset shop to unknown", code, body)
+		return
+	}
+}
+
+func stopServer(t *testing.T, srv *admin.Server) {
+	t.Helper()
+	if err := srv.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func servePolled(t *testing.T, srv *admin.Server) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(newAdminRouter(srv, tokenGuard()))
+	t.Cleanup(ts.Close)
+	if err := srv.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return ts
+}
+
+func guardedHealth(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer "+testToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+			return
+		}
+	}))
+}
+
+func waitForRow(t *testing.T, ts *httptest.Server, wants []string, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		code, body := getPage(t, ts, "/admin")
+		if code == http.StatusOK && pageHolds(body, wants) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("page never held %v within %v", wants, budget)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestAdminClientAgainstGuard(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
+	ts := servePolled(t, srv)
+	defer stopServer(t, srv)
+	bare := &admin.Client{Server: ts.URL, Self: admin.Instance{Name: "shop", OpsURL: "http://shop.example"}}
+	if err := bare.Start(t.Context()); err == nil {
+		t.Fatalf("Client.Start without token: want error, got nil")
+		return
+	} else if !strings.Contains(err.Error(), "status 401") {
+		t.Fatalf("Client.Start without token = %v, want status 401", err)
+		return
+	}
+	withToken := &admin.Client{Server: ts.URL, Self: admin.Instance{Name: "shop", OpsURL: "http://shop.example"}, Token: testToken}
+	if err := withToken.Start(t.Context()); err != nil {
+		t.Fatalf("Client.Start with token: %v", err)
+		return
+	}
+	if code, body := getPage(t, ts, "/admin"); code != http.StatusOK || !strings.Contains(body, "shop") {
+		t.Fatalf("console status = %d, body %q must list shop", code, body)
+		return
+	}
+	if err := withToken.Stop(t.Context()); err != nil {
+		t.Fatalf("Client.Stop with token: %v", err)
+		return
+	}
+	if _, after := getPage(t, ts, "/admin"); strings.Contains(after, "shop") {
+		t.Fatalf("console page %q must not list shop after stop", after)
+		return
+	}
+}
+
+func TestAdminPollGuardedHealth(t *testing.T) {
+	guarded := guardedHealth(t)
+	defer guarded.Close()
+	blind := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, guarded.URL)}}
+	blindTS := servePolled(t, blind)
+	defer stopServer(t, blind)
+	if code := postInstance(t, blindTS, "shop", guarded.URL); code != http.StatusCreated {
+		t.Fatalf("blind POST status = %d, want 201", code)
+		return
+	}
+	waitForPage(t, blindTS, "/admin", []string{"shop", "down"})
+	fed := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, ProbeToken: testToken, AllowedHosts: []string{hostOf(t, guarded.URL)}}
+	fedTS := servePolled(t, fed)
+	defer stopServer(t, fed)
+	if code := postInstance(t, fedTS, "shop", guarded.URL); code != http.StatusCreated {
+		t.Fatalf("fed POST status = %d, want 201", code)
+		return
+	}
+	waitForPage(t, fedTS, "/admin", []string{"shop", "up"})
+}
+
+func TestAdminHandoff(t *testing.T) {
+	old := fixedHealth(http.StatusServiceUnavailable, "unavailable")
+	defer old.Close()
+	next := fixedHealth(http.StatusOK, "ok")
+	defer next.Close()
+	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, old.URL), hostOf(t, next.URL)}}
+	ts := servePolled(t, srv)
+	defer stopServer(t, srv)
+	former := &admin.Client{Server: ts.URL, Self: admin.Instance{Name: "shop", OpsURL: old.URL}, Token: testToken}
+	if err := former.Start(t.Context()); err != nil {
+		t.Fatalf("former Start: %v", err)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "down"})
+	replacement := &admin.Client{Server: ts.URL, Self: admin.Instance{Name: "shop", OpsURL: next.URL}, Token: testToken}
+	if err := replacement.Start(t.Context()); err != nil {
+		t.Fatalf("replacement Start: %v", err)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "up"})
+	if err := former.Stop(t.Context()); err != nil {
+		t.Fatalf("former Stop: %v", err)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "up"})
+	if err := replacement.Stop(t.Context()); err != nil {
+		t.Fatalf("replacement Stop: %v", err)
+		return
+	}
+	if _, after := getPage(t, ts, "/admin"); strings.Contains(after, "shop") {
+		t.Fatalf("console page %q must not list shop after replacement stop", after)
+		return
+	}
+}
+
+func TestAdminPollConcurrent(t *testing.T) {
+	ok := fixedHealth(http.StatusOK, "ok")
+	defer ok.Close()
+	release := make(chan struct{})
+	defer close(release)
+	black := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		select {
+		case <-release:
+		case <-req.Context().Done():
+		}
+	}))
+	defer black.Close()
+	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, black.URL), hostOf(t, ok.URL)}}
+	ts := httptest.NewServer(newAdminRouter(srv, tokenGuard()))
+	t.Cleanup(ts.Close)
+	if code := postInstance(t, ts, "slow-a", black.URL); code != http.StatusCreated {
+		t.Fatalf("slow-a POST status = %d, want 201", code)
+		return
+	}
+	if code := postInstance(t, ts, "slow-b", black.URL); code != http.StatusCreated {
+		t.Fatalf("slow-b POST status = %d, want 201", code)
+		return
+	}
+	if code := postInstance(t, ts, "fast", ok.URL); code != http.StatusCreated {
+		t.Fatalf("fast POST status = %d, want 201", code)
+		return
+	}
+	if err := srv.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+		return
+	}
+	defer stopServer(t, srv)
+	waitForRow(t, ts, []string{"fast", "up"}, 2*time.Second)
+}
+
+func holdForRelease(release chan struct{}, req *http.Request) {
+	select {
+	case <-release:
+	case <-req.Context().Done():
+	}
+}
+
+func TestAdminStopPreservesStatus(t *testing.T) {
+	var mode atomic.Int64
+	var entered atomic.Int64
+	release := make(chan struct{})
+	defer close(release)
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if mode.Load() == 1 {
+			entered.Store(1)
+			holdForRelease(release, req)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+			return
+		}
+	}))
+	defer health.Close()
+	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, health.URL)}}
+	ts := servePolled(t, srv)
+	if code := postInstance(t, ts, "shop", health.URL); code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want 201", code)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "up"})
+	sctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	stream := openEvents(t, ts, sctx)
+	if stream == nil {
+		t.Fatal("events stream did not open")
+		return
+	}
+	mode.Store(1)
+	readyBy := time.Now().Add(5 * time.Second)
+	for entered.Load() == 0 {
+		if time.Now().After(readyBy) {
+			t.Fatalf("blocked probe never started")
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopServer(t, srv)
+	if code, body := getPage(t, ts, "/admin"); !pageHolds(body, []string{"shop", "up"}) {
+		t.Fatalf("page after stop status = %d, body %q must keep shop up", code, body)
+		return
+	}
+	frame := make([]byte, 4096)
+	n, rerr := stream.Body.Read(frame)
+	if rerr == nil && strings.Contains(string(frame[:n]), "event:") {
+		t.Fatalf("stopped poller published an event: %q", string(frame[:n]))
+		return
+	}
+	if cerr := stream.Body.Close(); cerr != nil {
+		t.Fatalf("close stream body: %v", cerr)
+		return
+	}
+}
+
+func TestAdminRefusesUnlistedHostWithoutOutboundRequest(t *testing.T) {
+	var hits atomic.Int64
+	counting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+			return
+		}
+	}))
+	defer counting.Close()
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"listed.example"}}
+	r := newAdminRouter(srv, tokenGuard())
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", counting.URL), token: true})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST unlisted host status = %d, want 422", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "admin.ops_host_refused") {
+		t.Fatalf("POST unlisted host body %q holds no fault code", body)
+		return
+	}
+	if strings.Contains(body, hostOf(t, counting.URL)) {
+		t.Fatalf("POST unlisted host body echoes the URL: %q", body)
+		return
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("refused registration reached the ops host %d times, want none", hits.Load())
+		return
+	}
+	page := directCall(r, call{method: http.MethodGet, target: "/admin", token: true})
+	if strings.Contains(page.Body.String(), "shop") {
+		t.Fatalf("console page %q lists a refused instance", page.Body.String())
+		return
+	}
+}
+
+func TestAdminEmptyAllowlistRefuses(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10}
+	r := newAdminRouter(srv, tokenGuard())
+	rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "http://shop.example/"), token: true})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST with empty allowlist status = %d, want 422", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "admin.ops_host_refused") {
+		t.Fatalf("POST with empty allowlist body %q holds no fault code", rec.Body.String())
+		return
+	}
+	if strings.Contains(rec.Body.String(), "shop.example") {
+		t.Fatalf("POST with empty allowlist body echoes the URL: %q", rec.Body.String())
+		return
+	}
+}
+
+func TestAdminListedHostAcceptedAndPolled(t *testing.T) {
+	up := fixedHealth(http.StatusOK, "ok")
+	defer up.Close()
+	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, up.URL)}}
+	ts := servePolled(t, srv)
+	defer stopServer(t, srv)
+	if code := postInstance(t, ts, "shop", up.URL); code != http.StatusCreated {
+		t.Fatalf("POST listed host status = %d, want 201", code)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "up"})
+}
+
+func TestAdminRedirectOutsideAllowlistMakesNoSecondRequest(t *testing.T) {
+	var secondHits atomic.Int64
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		secondHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+			return
+		}
+	}))
+	defer second.Close()
+	var firstHits atomic.Int64
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		firstHits.Add(1)
+		http.Redirect(w, req, second.URL+"/ops/health", http.StatusFound)
+	}))
+	defer first.Close()
+	srv := &admin.Server{Interval: 10 * time.Millisecond, MaxInstances: 10, AllowedHosts: []string{hostOf(t, first.URL)}}
+	ts := servePolled(t, srv)
+	defer stopServer(t, srv)
+	if code := postInstance(t, ts, "shop", first.URL); code != http.StatusCreated {
+		t.Fatalf("POST listed host status = %d, want 201", code)
+		return
+	}
+	waitForPage(t, ts, "/admin", []string{"shop", "down"})
+	if firstHits.Load() == 0 {
+		t.Fatal("poller never reached the listed host")
+		return
+	}
+	if secondHits.Load() != 0 {
+		t.Fatalf("poller followed a redirect outside the allowlist %d times, want none", secondHits.Load())
+		return
+	}
+}
+
+func TestAdminClientRefusesRedirectWithToken(t *testing.T) {
+	var secondHits atomic.Int64
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		secondHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, second.URL+"/admin/instances", http.StatusFound)
+	}))
+	defer first.Close()
+	c := &admin.Client{Server: first.URL, Self: admin.Instance{Name: "shop", OpsURL: "http://127.0.0.1/ops"}, Token: "secret-token"}
+	if err := c.Start(context.Background()); err == nil {
+		t.Fatal("Start followed the redirect, want the redirect refused")
+		return
+	}
+	if secondHits.Load() != 0 {
+		t.Fatalf("redirect target saw %d requests, want none", secondHits.Load())
+	}
+}
+
+func TestAdminRefusesCredentialedAndForeignSchemeURLs(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"listed"}}
+	r := newAdminRouter(srv, tokenGuard())
+	bad := []struct {
+		name   string
+		opsURL string
+		secret string
+	}{
+		{"creds", "http://user:pass@listed/", "user:pass"},
+		{"file", "file:///etc/passwd", "/etc/passwd"},
+		{"gopher", "gopher://listed/", "gopher://listed/"},
+	}
+	for _, tc := range bad {
+		rec := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, tc.name, tc.opsURL), token: true})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("POST %q status = %d, want 422", tc.opsURL, rec.Code)
+			return
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "admin.invalid_instance") {
+			t.Fatalf("POST %q body %q holds no fault code", tc.opsURL, body)
+			return
+		}
+		if strings.Contains(body, tc.secret) {
+			t.Fatalf("POST %q body echoes the secret: %q", tc.opsURL, body)
+			return
+		}
+	}
+}
+
+func TestDeleteWithEmptySelectorKeepsTheRecord(t *testing.T) {
+	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"shop.example"}}
+	r := newAdminRouter(srv, openGuard())
+	good := directCall(r, call{method: http.MethodPost, target: "/admin/instances", body: instanceBody(t, "shop", "https://shop.example/base")})
+	if good.Code != http.StatusCreated {
+		t.Fatalf("POST valid instance status = %d, want 201: %s", good.Code, good.Body.String())
+		return
+	}
+	blank := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/shop?opsUrl="})
+	if blank.Code != http.StatusNotFound {
+		t.Fatalf("DELETE with an empty selector status = %d, want 404", blank.Code)
+		return
+	}
+	if !strings.Contains(blank.Body.String(), "admin.unknown_instance") {
+		t.Fatalf("DELETE with an empty selector body %q holds no fault code", blank.Body.String())
+		return
+	}
+	malformed := httptest.NewRequest(http.MethodDelete, "/admin/instances/shop", nil)
+	malformed.URL.RawQuery = "opsUrl=%zz"
+	mrec := httptest.NewRecorder()
+	r.ServeHTTP(mrec, malformed)
+	if mrec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("DELETE with a malformed selector status = %d, want 422", mrec.Code)
+		return
+	}
+	if !strings.Contains(mrec.Body.String(), "admin.invalid_instance") {
+		t.Fatalf("DELETE with a malformed selector body %q holds no fault code", mrec.Body.String())
+		return
+	}
+	kept := directCall(r, call{method: http.MethodDelete, target: "/admin/instances/shop?opsUrl=https://shop.example/base"})
+	if kept.Code != http.StatusNoContent {
+		t.Fatalf("DELETE with the matching selector status = %d, want 204: the record must survive the bad selectors", kept.Code)
+		return
+	}
+}
+func TestTokenHostAllowedScope(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"https://registry.example/", true},
+		{"https://registry.example:8443/admin", true},
+		{"http://127.0.0.1:8080/", true},
+		{"http://127.1.2.3:8080/", true},
+		{"http://[::1]:8080/", true},
+		{"http://localhost:8080/", true},
+		{"http://LOCALHOST:8080/", true},
+		{"http://203.0.113.7/", false},
+		{"http://registry.example/", false},
+		{"http://[2001:db8::1]/", false},
+		{"http://refused.invalid/", false},
+		{"http://without-port", false},
+		{"://bad", false},
+	}
+	for _, tc := range cases {
+		if got := admin.TokenHostAllowedForTest(tc.url); got != tc.want {
+			t.Fatalf("token host %q allowed = %v, want %v", tc.url, got, tc.want)
+			return
+		}
+	}
+}
+
+func TestAdminClientRefusesTokenOverPlaintextRemote(t *testing.T) {
+	remote := &admin.Client{Server: "http://refused.invalid", Self: admin.Instance{Name: "shop", OpsURL: "http://shop.example"}, Token: testToken}
+	if err := remote.Start(t.Context()); err == nil {
+		t.Fatal("token send over plaintext HTTP to a remote host succeeded")
+		return
+	} else if !strings.Contains(err.Error(), "refuses to send a token") {
+		t.Fatalf("plaintext remote token error = %v, want the token refusal", err)
+		return
+	}
+	if err := remote.Stop(t.Context()); err == nil {
+		t.Fatal("token delete over plaintext HTTP to a remote host succeeded")
+		return
+	} else if !strings.Contains(err.Error(), "refuses to send a token") {
+		t.Fatalf("plaintext remote token delete error = %v, want the token refusal", err)
+		return
+	}
+}
+func cancelWhenRowUp(ts *httptest.Server, ctx context.Context, wants []string, cancel context.CancelFunc) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/admin", nil)
+		if err != nil {
+			return fmt.Errorf("admin test: page request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			return fmt.Errorf("admin test: page get: %w", err)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if cerr := resp.Body.Close(); cerr != nil {
+			return fmt.Errorf("admin test: close page: %w", cerr)
+		}
+		if err != nil {
+			return fmt.Errorf("admin test: read page: %w", err)
+		}
+		if pageHolds(string(body), wants) {
+			cancel()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("admin test: row never held %v within budget", wants)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type sweepCancel struct {
+	tap    *sseTap
+	ts     *httptest.Server
+	stream *http.Response
+	cancel context.CancelFunc
+}
+
+func (d *sweepCancel) run(ctx context.Context) error {
+	if cerr := cancelWhenRowUp(d.ts, ctx, []string{"fast", "up"}, d.cancel); cerr != nil {
+		return cerr
+	}
+	event, ok := d.tap.next(ctx, 3*time.Second)
+	if !ok {
+		return fmt.Errorf("stream sent no heartbeat within 3s")
+	}
+	if event != ": live\n\n" {
+		return fmt.Errorf("first stream message %q, want the heartbeat comment", event)
+	}
+	event, ok = d.tap.next(ctx, 3*time.Second)
+	if !ok {
+		return fmt.Errorf("fast instance sent no event within 3s")
+	}
+	if !strings.Contains(event, "instance-fast") || !strings.Contains(event, "<td>up</td>") {
+		return fmt.Errorf("first event %q must name fast as up", event)
+	}
+	if second, ok := d.tap.next(ctx, 300*time.Millisecond); ok {
+		return fmt.Errorf("second stream message %q after cancel, want exactly one event", second)
+	}
+	if cerr := d.stream.Body.Close(); cerr != nil {
+		return fmt.Errorf("admin test: close events: %w", cerr)
+	}
+	return nil
+}
+
+func TestAdminCancelledSweepKeepsCompletedDropsRest(t *testing.T) {
+	fast := fixedHealth(http.StatusOK, "ok")
+	defer fast.Close()
+	release := make(chan struct{})
+	defer close(release)
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		select {
+		case <-release:
+		case <-req.Context().Done():
+		}
+	}))
+	defer blocked.Close()
+	srv := &admin.Server{Interval: time.Hour, MaxInstances: 10, AllowedHosts: []string{hostOf(t, fast.URL), hostOf(t, blocked.URL)}}
+	ts := httptest.NewServer(newAdminRouter(srv, tokenGuard()))
+	defer ts.Close()
+	if code := postInstance(t, ts, "fast", fast.URL); code != http.StatusCreated {
+		t.Fatalf("fast POST status = %d, want 201", code)
+		return
+	}
+	if code := postInstance(t, ts, "slow", blocked.URL); code != http.StatusCreated {
+		t.Fatalf("slow POST status = %d, want 201", code)
+		return
+	}
+	gctx, gcancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer gcancel()
+	sctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stream := openEvents(t, ts, gctx)
+	if stream == nil {
+		t.Fatal("events stream did not open")
+		return
+	}
+	tap := newSseTap()
+	if gerr := func() error {
+		go group (gctx) {
+			go { tap.read(gctx, stream.Body)? }
+			go { (&sweepCancel{tap: tap, ts: ts, stream: stream, cancel: cancel}).run(gctx)? }
+			go { srv.PollOnceForTest(sctx)? }
+		}
+		return nil
+	}(); gerr != nil {
+		t.Fatalf("go group: %v", gerr)
+		return
+	}
+	if code, body := getPage(t, ts, "/admin"); !pageHolds(body, []string{"fast", "up", "slow", "unknown"}) {
+		t.Fatalf("page after cancelled sweep status = %d, body %q must keep fast up and slow unknown", code, body)
 		return
 	}
 }

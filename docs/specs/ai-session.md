@@ -297,9 +297,9 @@ func Faults() []*fault.Error
 - `TestActiveKeepsThePartsOfTheReturnedMessage` proves a read edit leaves the stored parts alone.
 - `TestEngineSessionContractSQLite` proves the contract on SQLite with a repeated `Prepare`.
 - `TestEngineSessionContractMemory` proves the contract on the in-memory store.
-- `TestEngineSessionContractPostgres` proves the contract on PostgreSQL, skipping without `SPIRA_TEST_POSTGRES_DSN`.
-- `TestEngineSessionContractMySQL` proves the contract on MySQL, skipping without `SPIRA_TEST_MYSQL_DSN`.
-- `TestEngineSessionContractMSSQL` proves the contract on SQL Server, skipping without `SPIRA_TEST_MSSQL_DSN`.
+- `TestEngineSessionContractPostgres` proves the contract on PostgreSQL, failing without `SPIRA_TEST_POSTGRES_DSN`.
+- `TestEngineSessionContractMySQL` proves the contract on MySQL, failing without `SPIRA_TEST_MYSQL_DSN`.
+- `TestEngineSessionContractMSSQL` proves the contract on SQL Server, failing without `SPIRA_TEST_MSSQL_DSN`.
 - `contractAppendOrdersBySequence` proves insertion order under equal timestamps on every store.
 - `contractLastNExtendsToTurnStart` proves the turn-start extension and the count guard on every store.
 - `contractConversationsStayIsolated` proves conversation isolation on every store.
@@ -326,8 +326,8 @@ func Faults() []*fault.Error
 - `contractTrailingSpaceIDsStayIsolated` proves trailing-space isolation on every store.
 - `contractDeleteThenRecreateRefusesTheOldVersion` proves a deleted version stays dead on every store.
 - `contractOverlongIDIsRefused` proves the id byte limit on every store.
-- `TestEngineSessionClaimAdmitsOneWinner` proves one claim wins on every engine.
-- `TestEngineDeleteClearsAConcurrentAppend` proves a concurrent append leaves no rows after `Delete` on every engine.
+- `TestEngineSessionClaimAdmitsOneWinner` proves one claim wins on PostgreSQL, MySQL and SQL Server, failing without its DSN. `TestSessionClaimAdmitsOneWinnerSQLite` proves it on SQLite.
+- `TestEngineDeleteClearsAConcurrentAppend` proves a concurrent append leaves no rows after `Delete` on PostgreSQL, MySQL and SQL Server, failing without its DSN. `TestSessionDeleteClearsAConcurrentAppendSQLite` proves it on SQLite.
 - `TestEngineSQLiteConcurrentEnsureOpensOneSession` proves two overlapping opens on SQLite share one session.
 - `TestRememberNestedSameSessionRecordsOnce` proves nested layers record once.
 - `TestSessionFaultsMatchSpecTable` proves the declared faults match the code table. Planted fault: a code missing from the table.

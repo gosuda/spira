@@ -23,6 +23,7 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 ## Gates
 
 - `just gate` MUST exit 0 before every commit. The native `.git/hooks/pre-commit` runs it. [Tony Hoare]
+- `just slop` MUST exit 0 before every commit: sloplint at the standard profile over the TypeScript, JavaScript and shell files, failing on major findings; `.lgo` files are not parsed until gosuda/sloplint#37 lands. [Tony Hoare]
 - `just eject` MUST exit 0 at the end of every unit of work. An eject failure is a finding. [Tony Hoare]
 - A change that adds behavior lands only after its new tests have been seen to fail on the tree without the change. [Tony Hoare]
 
@@ -37,7 +38,7 @@ The `justfile` sets this itself. Override the root with `LOGOS_ROOT`. [John Carm
 - Struct tags name wire fields only (`json`, `path`, `query`, `header`, `form`, `cookie`, `body`, `env`, `col`). A tag never selects behavior. [Claude Shannon]
 - Cross-cutting behavior is an ordered list of `web.Stage` values written in code. Every stage boundary is settled: the reply or the error that a handler or a stage returns is written at once, `next` returns `nil, nil`, and a stage reads the outcome from `ctx.Status()`. [Edsger W. Dijkstra]
 - Errors are `(T, error)` with `?`, wrapped as `fmt.Errorf("<package>: <what>: %w", err)`. Absence is `T?`. Panic only for programmer errors at registration time. [Tony Hoare]
-- Third-party modules: `golang.org/x/crypto` in `auth`; database drivers only in tests, `example/` and generated applications. Resolve versions with `logos get`; never type one from memory. [Richard Feynman]
+- Third-party modules: `golang.org/x/crypto` in `auth`; `github.com/quic-go/quic-go` in `http3` (MIT, no cgo); database drivers only in tests, `example/` and generated applications. Resolve versions with `logos get`; never type one from memory. [Richard Feynman]
 - Tests run the real parts: in-memory SQLite and `net/http/httptest`. [John Carmack]
 
 ## Design procedure

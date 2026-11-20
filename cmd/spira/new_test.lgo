@@ -1,0 +1,232 @@
+package main_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	spira "github.com/gosuda/spira/cmd/spira"
+)
+
+type newEngineCase struct {
+	engine       string
+	flag         string
+	sqlcEngine   string
+	driverImport string
+	driverName   string
+	driverMod    string
+	dialect      string
+	userQuery    string
+	createMarker string
+	dsnEnv       string
+	enginesFile  bool
+}
+
+func newEngineCases() []newEngineCase {
+	return []newEngineCase{
+		{"sqlite", "", "sqlite", "modernc.org/sqlite", "sqlite", "modernc.org/sqlite v1.62.0", "INTEGER PRIMARY KEY", "RETURNING id", "got ?? store.UserID(0)", "", false},
+		{"postgresql", "postgresql", "postgresql", "github.com/jackc/pgx/v5/stdlib", "pgx", "github.com/jackc/pgx/v5 v5.13.0", "BIGSERIAL PRIMARY KEY", "RETURNING id", "got ?? store.UserID(0)", "SPIRA_TEST_POSTGRES_DSN", true},
+		{"mysql", "mysql", "mysql", "github.com/go-sql-driver/mysql", "mysql", "github.com/go-sql-driver/mysql v1.10.2", "AUTO_INCREMENT", ":execlastid", "store.UserID(id)", "SPIRA_TEST_MYSQL_DSN", true},
+		{"mssql", "mssql", "mssql", "github.com/microsoft/go-mssqldb", "sqlserver", "github.com/microsoft/go-mssqldb v1.12.0", "IDENTITY(1,1)", "OUTPUT INSERTED.id", "got ?? store.UserID(0)", "SPIRA_TEST_MSSQL_DSN", true},
+	}
+}
+
+func TestNewGeneratesExpectedFiles(t *testing.T) {
+	for _, c := range newEngineCases() {
+		t.Run(c.engine, func(t *testing.T) {
+			checkEngineApp(t, c)
+		})
+	}
+}
+
+func checkEngineApp(t *testing.T, c newEngineCase) {
+	t.Helper()
+	dir := genApp(t, "example.com/demo", c.flag)
+	for _, f := range expectedFiles(c.engine) {
+		assertFile(t, dir, f)
+	}
+	if !c.enginesFile {
+		assertAbsent(t, dir, "db/check_engines_test.lgo")
+	}
+	assertContains(t, dir, "main.lgo", "_ \""+c.driverImport+"\"")
+	assertContains(t, dir, "main.lgo", "db.Open(\""+c.driverName+"\", dsn)")
+	assertContains(t, dir, "main.lgo", "for _, stage := range web.Defaults()")
+	assertContains(t, dir, "main.lgo", "r.Handle(\"GET\", \"/assets/\"")
+	assertContains(t, dir, "go.mod", "module example.com/demo")
+	assertGoModPinsMatchRepo(t, dir)
+	assertContains(t, dir, "go.mod", "replace github.com/gosuda/spira => ")
+	assertContains(t, dir, "justfile", "logos build -o bin/sqlc-gen-spira github.com/gosuda/spira/cmd/sqlc-gen-spira")
+	assertContains(t, dir, "sqlc.yaml", "engine: "+c.sqlcEngine)
+	assertContains(t, dir, "db/migrations/0001_create_users.up.sql", c.dialect)
+	assertContains(t, dir, "db/queries/users.sql", c.userQuery)
+	assertContains(t, dir, "features/account/createuser.lgo", c.createMarker)
+	assertContains(t, dir, "features/account/store.lgo", "store.SessionID(id)")
+	assertContains(t, dir, "features/account/account.lgo", "auth.ErrInvalidCredentials.Err()")
+	assertContains(t, dir, "features/account/account.lgo", "auth.VerifyAgainstDummy(in.Password)")
+	assertContains(t, dir, "features/account/faults.lgo", "account.failed")
+	assertContains(t, dir, "features/account/store.lgo", "ErrAccountFailed.Wrap")
+	assertContains(t, dir, "features/home/views.lgo", "features/home/islands/greet.svelte")
+	assertContains(t, dir, "frontend/src/entry.ts", "../../features/**/islands/*.{svelte,react.tsx,solid.tsx}")
+	if c.enginesFile {
+		assertContains(t, dir, "db/check_engines_test.lgo", c.dsnEnv)
+		assertContains(t, dir, "db/check_test.lgo", "TestMigrationsLoad")
+		return
+	}
+	assertContains(t, dir, "db/check_test.lgo", "CheckReversible")
+}
+
+func TestNewRejectsUnknownEngine(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	err := spira.RunNew([]string{"-engine", "oracle", dir, "example.com/demo"})
+	if err == nil {
+		t.Fatalf("RunNew(oracle) = nil, want usage error")
+		return
+	}
+	if !strings.Contains(err.Error(), "usage: spira new") {
+		t.Fatalf("RunNew(oracle) = %q, want usage", err.Error())
+		return
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatalf("oracle left %s behind", dir)
+		return
+	}
+}
+
+func TestNewRefusesNonEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+		return
+	}
+	if err := spira.RunNew([]string{dir, "example.com/demo"}); err == nil {
+		t.Fatalf("RunNew(non-empty) = nil, want refusal")
+		return
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); !os.IsNotExist(statErr) {
+		t.Fatalf("go.mod written into non-empty dir")
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "keep.txt"))
+	if err != nil || string(data) != "keep" {
+		t.Fatalf("keep.txt disturbed: %q, %v", data, err)
+		return
+	}
+}
+
+func TestNewRejectsBadModulePath(t *testing.T) {
+	for _, bad := range []string{"", "has space/x", "/abs/path", "trailing/", "a//b", "UPPER/case", "a/./b"} {
+		dir := filepath.Join(t.TempDir(), "app")
+		if err := spira.RunNew([]string{dir, bad}); err == nil {
+			t.Fatalf("RunNew(%q) = nil, want error", bad)
+			return
+		}
+		if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+			t.Fatalf("RunNew(%q) left %s behind", bad, dir)
+			return
+		}
+	}
+}
+
+func TestNewUsageShapes(t *testing.T) {
+	shapes := [][]string{{}, {"onlydir"}, {"-engine"}, {"-engine", "sqlite"}, {"-engine", "sqlite", "a", "b", "c"}, {"-bogus", "a", "b"}, {"-spira-dir"}, {"-engine", "sqlite", "-spira-dir"}, {"-spira-dir", "a", "b", "c", "d"}}
+	for _, args := range shapes {
+		err := spira.RunNew(args)
+		if err == nil || !strings.Contains(err.Error(), "usage: spira new") {
+			t.Fatalf("RunNew(%q) = %v, want usage", args, err)
+			return
+		}
+	}
+}
+
+func genApp(t *testing.T, module string, flag string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "app")
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("repo root: %v", err)
+		return ""
+	}
+	args := []string{"-spira-dir", root, dir, module}
+	if flag != "" {
+		args = []string{"-engine", flag, "-spira-dir", root, dir, module}
+	}
+	if err := spira.RunNew(args); err != nil {
+		t.Fatalf("RunNew: %v", err)
+		return ""
+	}
+	return dir
+}
+
+func expectedFiles(engine string) []string {
+	files := []string{
+		"go.mod",
+		"go.sum",
+		"logos.toml",
+		"justfile",
+		"sqlc.yaml",
+		"tools/go.mod",
+		"tools/go.sum",
+		"main.lgo",
+		"db/migrations.lgo",
+		"db/check_test.lgo",
+		"db/migrations/0001_create_users.up.sql",
+		"db/migrations/0001_create_users.down.sql",
+		"db/migrations/0002_create_sessions.up.sql",
+		"db/migrations/0002_create_sessions.down.sql",
+		"db/queries/users.sql",
+		"db/queries/sessions.sql",
+		"features/home/home.lgo",
+		"features/home/views.lgo",
+		"features/home/islands/greet.svelte",
+		"features/account/account.lgo",
+		"features/account/faults.lgo",
+		"features/account/views.lgo",
+		"features/account/store.lgo",
+		"features/account/createuser.lgo",
+		"frontend/package.json",
+		"frontend/vite.config.ts",
+		"frontend/tsconfig.json",
+		"frontend/biome.json",
+		"frontend/src/entry.ts",
+		"frontend/src/island.ts",
+		"frontend/src/slots.ts",
+		"frontend/src/adapters/react.ts",
+		"frontend/src/adapters/solid.ts",
+		"frontend/src/adapters/svelte.ts",
+		"frontend/src/adapters/wasm.ts",
+	}
+	if engine != "sqlite" {
+		files = append(files, "db/check_engines_test.lgo")
+	}
+	return files
+}
+
+func assertFile(t *testing.T, dir string, rel string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); err != nil {
+		t.Fatalf("stat %s: %v", rel, err)
+		return
+	}
+}
+
+func assertAbsent(t *testing.T, dir string, rel string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); !os.IsNotExist(err) {
+		t.Fatalf("%s present, want absent", rel)
+		return
+	}
+}
+
+func assertContains(t *testing.T, dir string, rel string, want string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+		return
+	}
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("%s lacks %q", rel, want)
+		return
+	}
+}

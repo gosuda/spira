@@ -1,0 +1,394 @@
+package http3
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gosuda/spira/web"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"logos/rt"
+	"logos/sync"
+)
+
+type Server struct {
+	Addr              string = ":8080"
+	Router            *web.Router
+	ReadHeaderTimeout time.Duration = 5 * time.Second
+	ShutdownGrace     time.Duration = 20 * time.Second
+	TLS               *tls.Config?
+	H2C               bool
+	H3                bool
+
+	state sync.Locked[serverState]
+}
+
+type serverState struct {
+	run *serverRun?
+}
+
+type serverRun struct {
+	inner      *web.Server
+	h3         *http3.Server?
+	udpConn    net.PacketConn?
+	join       *joinState
+	tcpAddr    string
+	udpAddr    string
+	udpPort    int
+}
+
+type h3Bound struct {
+	srv  *http3.Server
+	conn net.PacketConn
+	port int
+}
+
+type joinState struct {
+	done chan struct{}
+	err  sync.Locked[error]
+}
+
+func (s *Server) AltSvc() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if port, open := s.advertised(); open && ctx.Request.TLS != nil {
+				ctx.ResponseHeader().Set("Alt-Svc", altSvcValue(port))
+			}
+			return next(ctx)
+		}
+	}
+}
+
+func altSvcValue(port int) string {
+	return $"h3=\":{port}\"; ma=2592000"
+}
+
+func (s *Server) advertised() (int, bool) {
+	var port int
+	open := false
+	s.state.WithLock(func(st *serverState) {
+		held := st.run
+		if held != nil && held.udpPort != 0 {
+			port = held.udpPort
+			open = true
+		}
+	})
+	return port, open
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	busy := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run != nil {
+			busy = true
+		}
+	})
+	if busy {
+		return errors.New("http3: server already started")
+	}
+	if s.Router == nil {
+		return errors.New("http3: server needs a router")
+	}
+	if s.H3 {
+		return s.startH3(ctx)
+	}
+	inner := &web.Server{Addr: s.Addr, Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
+	l, lerr := net.Listen("tcp", s.Addr)
+	if lerr != nil {
+		return fmt.Errorf("http3: listen %s: %w", s.Addr, lerr)
+	}
+	if serr := inner.Serve(ctx, l); serr != nil {
+		return errors.Join(serr, l.Close())
+	}
+	return s.store(s.serve(ctx, inner, l.Addr().String(), nil), ctx)
+}
+
+func (s *Server) startH3(ctx context.Context) error {
+	cfg := s.TLS
+	if cfg == nil {
+		return ErrH3NeedsTLS.Err()
+	}
+	l, conn, berr := bindPair(s.Addr)
+	if berr != nil {
+		return berr
+	}
+	if serr := s.Serve(ctx, l, conn); serr != nil {
+		return errors.Join(serr, l.Close(), conn.Close())
+	}
+	return nil
+}
+
+func (s *Server) Serve(ctx context.Context, l net.Listener, conn net.PacketConn) error {
+	if l == nil {
+		return errors.New("http3: serve needs a listener")
+	}
+	if conn == nil {
+		return errors.New("http3: serve needs a packet connection")
+	}
+	busy := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run != nil {
+			busy = true
+		}
+	})
+	if busy {
+		return errors.New("http3: server already started")
+	}
+	if s.Router == nil {
+		return errors.New("http3: server needs a router")
+	}
+	cfg := s.TLS
+	if cfg == nil {
+		return ErrH3NeedsTLS.Err()
+	}
+	uaddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ErrListenUDP.Wrap(errors.New("listen udp: address is not UDP"))
+	}
+	inner := &web.Server{Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
+	if serr := inner.Serve(ctx, l); serr != nil {
+		return serr
+	}
+	return s.store(s.serve(ctx, inner, l.Addr().String(), newH3(s.Router, cfg, conn, uaddr.Port)), ctx)
+}
+
+func bindPair(addr string) (net.Listener, net.PacketConn, error) {
+	_, portStr, serr := net.SplitHostPort(addr)
+	if serr != nil {
+		return nil, nil, ErrListenUDP.Wrap(serr)
+	}
+	port, perr := strconv.Atoi(portStr)
+	if perr != nil || port != 0 {
+		return bindExact(addr)
+	}
+	var last error
+	for attempt := 0; attempt < 8; attempt++ {
+		l, lerr := net.Listen("tcp", addr)
+		if lerr != nil {
+			return nil, nil, fmt.Errorf("http3: listen %s: %w", addr, lerr)
+		}
+		conn, _, uerr := openUDP(l.Addr().String())
+		if uerr == nil {
+			return l, conn, nil
+		}
+		last = errors.Join(uerr, l.Close())
+	}
+	return nil, nil, ErrListenUDP.Wrap(fmt.Errorf("listen udp %s after 8 tries: %w", addr, last))
+}
+
+func bindExact(addr string) (net.Listener, net.PacketConn, error) {
+	conn, _, berr := openUDP(addr)
+	if berr != nil {
+		return nil, nil, berr
+	}
+	tcpAddr := conn.LocalAddr().String()
+	l, lerr := net.Listen("tcp", tcpAddr)
+	if lerr != nil {
+		return nil, nil, errors.Join(fmt.Errorf("http3: listen %s: %w", tcpAddr, lerr), conn.Close())
+	}
+	return l, conn, nil
+}
+
+func (s *Server) store(run *serverRun, ctx context.Context) error {
+	stored := false
+	s.state.WithLock(func(st *serverState) {
+		if st.run == nil {
+			st.run = run
+			stored = true
+		}
+	})
+	if !stored {
+		return errors.Join(errors.New("http3: server already started"), run.stop(ctx, s.ShutdownGrace))
+	}
+	return nil
+}
+
+func openUDP(addr string) (net.PacketConn, int, error) {
+	raddr, rerr := net.ResolveUDPAddr("udp", addr)
+	if rerr != nil {
+		return nil, 0, ErrListenUDP.Wrap(rerr)
+	}
+	conn, lerr := net.ListenUDP("udp", raddr)
+	if lerr != nil {
+		return nil, 0, ErrListenUDP.Wrap(fmt.Errorf("listen udp %s: %w", addr, lerr))
+	}
+	if conn == nil {
+		return nil, 0, ErrListenUDP.Wrap(errors.New("listen udp: missing connection"))
+	}
+	uaddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil, 0, errors.Join(ErrListenUDP.Wrap(errors.New("listen udp: address is not UDP")), conn.Close())
+	}
+	return conn, uaddr.Port, nil
+}
+
+func newH3(router *web.Router, cfg *tls.Config, conn net.PacketConn, port int) *h3Bound {
+	tlsCopy := cfg.Clone()
+	if tlsCopy.MinVersion < tls.VersionTLS13 {
+		tlsCopy.MinVersion = tls.VersionTLS13
+	}
+	srv := &http3.Server{TLSConfig: tlsCopy, Handler: refuseExtendedConnect(router), QUICConfig: &quic.Config{Allow0RTT: false}}
+	return &h3Bound{srv: srv, conn: conn, port: port}
+}
+
+func refuseExtendedConnect(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodConnect && req.ProtoMajor == 3 && req.Proto != "HTTP/3.0" {
+			http.Error(w, "extended CONNECT is not implemented", http.StatusNotImplemented)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+func (s *Server) serve(startCtx context.Context, inner *web.Server, tcpAddr string, bound *h3Bound?) *serverRun {
+	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
+	udpAddr := ""
+	udpPort := 0
+	var h3srv *http3.Server?
+	var udpConn net.PacketConn?
+	if b := bound; b != nil {
+		h3srv = b.srv
+		udpConn = b.conn
+		udpAddr = b.conn.LocalAddr().String()
+		udpPort = b.port
+		g.Go(func(_ context.Context) error {
+			if serr := b.srv.Serve(b.conn); !errors.Is(serr, http.ErrServerClosed) {
+				return ErrH3Serve.Wrap(serr)
+			}
+			return nil
+		})
+	}
+	js := &joinState{done: make(chan struct{})}
+	waiter, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
+	waiter.Go(func(_ context.Context) error {
+		js.err.WithLock(func(e *error) {
+			*e = g.Wait()
+		})
+		close(js.done)
+		return nil
+	})
+	return &serverRun{inner: inner, h3: h3srv, udpConn: udpConn, join: js, tcpAddr: tcpAddr, udpAddr: udpAddr, udpPort: udpPort}
+}
+
+func (s *Server) Stop(ctx context.Context) error {
+	var held *serverRun?
+	s.state.WithLock(func(st *serverState) {
+		held = st.run
+		st.run = nil
+	})
+	current := held
+	if current != nil {
+		return current.stop(ctx, s.ShutdownGrace)
+	}
+	return nil
+}
+
+func (r *serverRun) stop(ctx context.Context, grace time.Duration) error {
+	sctx, cancel := context.WithTimeout(ctx, grace)
+	defer cancel()
+	if h := r.h3; h != nil {
+		return r.stopH3(ctx, sctx, h)
+	}
+	shutdownErr := r.inner.Stop(sctx)
+	select {
+	case <-r.join.done:
+	case <-ctx.Done():
+		return errors.Join(shutdownErr, ctx.Err())
+	}
+	var joinErr error
+	r.join.err.WithLock(func(e *error) {
+		joinErr = *e
+	})
+	return errors.Join(joinErr, shutdownErr)
+}
+
+func (r *serverRun) stopH3(ctx context.Context, sctx context.Context, h *http3.Server) error {
+	sg, _ := rt.NewGroup(context.WithoutCancel(sctx), 0)
+	var herr sync.Locked[error]
+	var terr sync.Locked[error]
+	sg.Go(func(_ context.Context) error {
+		return r.quitH3(sctx, h, &herr)
+	})
+	sg.Go(func(_ context.Context) error {
+		return r.quitTCP(sctx, &terr)
+	})
+	var waitErr sync.Locked[error]
+	shutDone := make(chan struct{})
+	waiter, _ := rt.NewGroup(context.WithoutCancel(sctx), 0)
+	waiter.Go(func(_ context.Context) error {
+		waitErr.WithLock(func(e *error) {
+			*e = sg.Wait()
+		})
+		close(shutDone)
+		return nil
+	})
+	select {
+	case <-shutDone:
+	case <-ctx.Done():
+		cerr := r.closeConn()
+		return errors.Join(ctx.Err(), cerr)
+	}
+	shutdownErr := collectStop(&waitErr, &herr, &terr)
+	var joinErr error
+	select {
+	case <-r.join.done:
+		r.join.err.WithLock(func(e *error) {
+			joinErr = *e
+		})
+	case <-ctx.Done():
+		joinErr = ctx.Err()
+	}
+	if cerr := r.closeConn(); cerr != nil {
+		joinErr = errors.Join(joinErr, cerr)
+	}
+	return errors.Join(joinErr, shutdownErr)
+}
+
+func (r *serverRun) quitH3(sctx context.Context, h *http3.Server, herr *sync.Locked[error]) error {
+	if serr := h.Shutdown(sctx); serr != nil {
+		herr.WithLock(func(e *error) {
+			*e = errors.Join(ErrH3Shutdown.Wrap(serr), h.Close())
+		})
+	}
+	return nil
+}
+
+func (r *serverRun) quitTCP(sctx context.Context, terr *sync.Locked[error]) error {
+	if serr := r.inner.Stop(sctx); serr != nil {
+		terr.WithLock(func(e *error) {
+			*e = serr
+		})
+	}
+	return nil
+}
+
+func collectStop(waitErr *sync.Locked[error], herr *sync.Locked[error], terr *sync.Locked[error]) error {
+	var out error
+	waitErr.WithLock(func(e *error) {
+		out = errors.Join(out, *e)
+	})
+	herr.WithLock(func(e *error) {
+		out = errors.Join(out, *e)
+	})
+	terr.WithLock(func(e *error) {
+		out = errors.Join(out, *e)
+	})
+	return out
+}
+
+func (r *serverRun) closeConn() error {
+	if c := r.udpConn; c != nil {
+		r.udpConn = nil
+		if cerr := c.Close(); cerr != nil {
+			return ErrListenUDP.Wrap(fmt.Errorf("http3: close udp listener: %w", cerr))
+		}
+	}
+	return nil
+}

@@ -1,0 +1,15 @@
+package web
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrBindInvalid = fault.New("web.bind_invalid", fault.Invalid, "The request is invalid.")
+
+var ErrBindUnprocessable = fault.New("web.bind_unprocessable", fault.Unprocessable, "The request cannot be processed.")
+
+var ErrBodyTooLarge = fault.New("web.body_too_large", fault.TooLarge, "The request body is too large.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrBindInvalid, ErrBindUnprocessable, ErrBodyTooLarge}
+}

@@ -98,3 +98,8 @@ ai/rag/bpe.lgo implements the encoder over that vocabulary; its split
 pattern and greedy lowest-rank merge follow the cl100k_base tokenizer as
 vendored in tiktoken-rs src/vendor_tiktoken.rs and
 src/tiktoken_ext/openai_public.rs.
+
+This product includes github.com/quic-go/quic-go
+(https://github.com/quic-go/quic-go), version v0.65.0.
+Copyright (c) 2016 the quic-go authors and Google, Inc.
+Licensed under the MIT License.

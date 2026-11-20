@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/auth"
 	"github.com/gosuda/spira/meter"
 	"github.com/gosuda/spira/ops"
 	"github.com/gosuda/spira/web"
@@ -23,7 +24,7 @@ func tokenGuard() web.Stage {
 	return func(next web.Handler) web.Handler {
 		return func(ctx *web.Context) (web.Reply, error) {
 			if ctx.Request.Header.Get("Authorization") != "Bearer "+opsToken {
-				return nil, web.Fail(web.Problem{Status: http.StatusUnauthorized, Title: "ops token required"})
+				return nil, auth.ErrInvalidCredentials.Err()
 			}
 			return next(ctx)
 		}

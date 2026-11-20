@@ -2,12 +2,12 @@
 
 The `spira` command generates an application and runs the application and the frontend workspace together. It restarts the application when an `.lgo` file changes.
 
-Status: the `spira dev` subcommand is in the tree and `spira new` is specified and is not in the tree yet.
+Status: `spira new` and `spira dev` are both in the tree.
 
 ## Interface
 
 ```text
-usage: spira new [-engine sqlite|postgresql|mysql|mssql] <dir> <module-path>
+usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>
 usage: spira dev <main-package>
 ```
 
@@ -15,17 +15,19 @@ usage: spira dev <main-package>
 
 ### Arguments
 
-- The command MUST accept `new`, an optional `-engine` flag, and two arguments: a directory and a module path.
+- The command MUST accept `new`, an optional `-engine` flag and an optional `-spira-dir` flag.
+- `new` MUST take two arguments: a directory and a module path.
 - The command MUST accept `dev` and one main-package argument.
-- On any other arguments, the command MUST write `usage: spira new [-engine sqlite|postgresql|mysql|mssql] <dir> <module-path>` or `usage: spira dev <main-package>` to stderr.
+- On any other arguments, the command MUST write a usage line to stderr.
+- That line MUST be `usage: spira new [-engine sqlite|postgresql|mysql|mssql] [-spira-dir <path>] <dir> <module-path>` or `usage: spira dev <main-package>`.
 - The command MUST then exit 2.
 
 ### spira new
 
-The subcommand `spira new` is specified and is not in the tree yet.
+The subcommand `spira new` writes a minimal application into `<dir>` from files embedded with `embed`.
 
 - `spira new` MUST write files embedded with `embed` into `<dir>`.
-- `spira new` MUST write `go.mod`, `logos.toml`, `justfile`, `sqlc.yaml` and `tools/go.mod`.
+- `spira new` MUST write `go.mod`, `go.sum`, `logos.toml`, `justfile`, `sqlc.yaml`, `tools/go.mod` and `tools/go.sum`.
 - The `justfile` MUST have the recipes `gate`, `sql`, `sql-check` and `web`.
 - `spira new` MUST write `db/migrations/0001_create_users.up.sql` and `db/migrations/0001_create_users.down.sql`.
 - `spira new` MUST write `db/migrations/0002_create_sessions.up.sql` and `db/migrations/0002_create_sessions.down.sql`.
@@ -33,6 +35,7 @@ The subcommand `spira new` is specified and is not in the tree yet.
 - `spira new` MUST write `main.lgo` with ordinary statements, an application struct and `app.Run`.
 - `spira new` MUST write a `features/home/` folder with a page, a form and one Svelte island.
 - `spira new` MUST write a `features/account/` folder with login, logout, a protected page and a session store built on `auth` primitives.
+- `spira new` MUST write `features/account/faults.lgo` with one internal fault.
 - `spira new` MUST write a test that runs `migrate.CheckReversible` and `store.PrepareAll`.
 - `spira new` MUST write a copy of `frontend/` whose island glob is `../../features/**/islands/*.{svelte,react.tsx,solid.tsx}`.
 - The engine MUST select the SQL dialect of the migrations and queries.
@@ -48,8 +51,17 @@ The subcommand `spira new` is specified and is not in the tree yet.
 - For `sqlite`, the test MUST use an in-memory database.
 - For `postgresql`, the test MUST read `SPIRA_TEST_POSTGRES_DSN`.
 - For `mysql`, the test MUST read `SPIRA_TEST_MYSQL_DSN`.
+- For `mssql`, the test MUST read `SPIRA_TEST_MSSQL_DSN`.
+- The login handler MUST call `auth.VerifyAgainstDummy` when the user is missing.
+- A missing user and a wrong password MUST answer `auth.invalid_credentials`.
+- The account handlers MUST NOT call `web.Fail` with a literal problem.
+- A bad session user id MUST wrap the account fault.
 - `spira new` MUST refuse a non-empty `<dir>`.
 - `spira new` MUST accept only `sqlite`, `postgresql`, `mysql` and `mssql` for `-engine`.
+- With `-spira-dir <path>`, the generated `go.mod` MUST hold a `replace github.com/gosuda/spira => <path>` line.
+- `spira new` MUST then require `spira` at `v0.0.0`.
+- Without `-spira-dir`, `spira new` MUST require `spira` at the pseudo-version of the binary build revision.
+- When no revision is available, the command MUST refuse with a message that names `-spira-dir`.
 - After `just sql` in the generated directory, `logos build ./...` MUST pass.
 - After `just sql` in the generated directory, `logos test ./...` MUST pass.
 
@@ -63,11 +75,17 @@ The subcommand `spira new` is specified and is not in the tree yet.
 - SIGTERM MUST stop the server process group and the frontend process group.
 - After that stop, the command MUST reap those processes.
 - The frontend start MUST return nil only when the start error wraps `context.Canceled`.
+- The loop MUST report each server start on `Started` with role `server`.
+- The loop MUST report each frontend start on `Started` with role `frontend`.
+- A report MUST carry the command and the process environment.
+- The loop MUST NOT block when `Started` is nil.
+- A blocked report MUST end when the context ends.
 
 ### Restart
 
 - The command MUST poll every 500 ms.
 - The command MUST restart the server when the modification time of an `.lgo` file changes.
+- The command MUST restart the server when the size of an `.lgo` file changes.
 - The command MUST restart the server when an `.lgo` file appears.
 - The command MUST restart the server when an `.lgo` file disappears.
 - The command MUST NOT restart the server for a file whose name does not end in `.lgo`.
@@ -101,14 +119,20 @@ The subcommand `spira new` is specified and is not in the tree yet.
 
 ## Proof
 
-- `TestNewGeneratesSqliteApplication` generates into a temporary directory and runs `just sql`, `logos build ./...` and `logos test ./...` for `sqlite`.
-- The `spira new` test MUST run the same generation for `postgresql` and `mysql` behind the `engines` build tag.
-- The `spira new` test MUST run the same generation for `mssql` behind the `engines` build tag.
+- `TestNewGeneratesExpectedFiles` proves the file set and the engine pieces for `sqlite`, `postgresql`, `mysql` and `mssql`.
+- `TestNewGeneratesExpectedFiles` proves the account faults and the `auth` login shape.
+- `TestNewRejectsUnknownEngine` proves an unknown engine is a usage error that leaves no directory.
+- `TestNewRefusesNonEmptyDir` proves generation refuses a non-empty directory without writing.
+- `TestNewRejectsBadModulePath` proves bad module paths are refused without writing.
+- `TestNewUsageShapes` proves every other argument shape prints the `spira new` usage.
+- `TestNewPseudoVersion` proves the pseudo-version shape, its error paths, and the `v0.0.0` version for a `-spira-dir` build.
+- Generation plus `just sql`, `logos build ./...` and `logos test ./...` MUST pass for every engine.
+- The three server engines MUST run with their DSN exported.
 - `TestWatchRestartsServerOnlyOnLgoChange` proves a restart on an `.lgo` change, and no restart for a `.txt` file or for `node_modules`.
 - `TestWatchCancelEndsLoopAndKillsStandinGroups` proves that cancel stops the server group and the frontend group.
 - `TestWatchServerSelfExitWaitsForChange` proves that a server exit waits for an `.lgo` change.
 - `TestWatchServerSelfExitLogsOneWarningWithRealStatus` proves one warning with the real exit error.
-- `TestWatchRestartReapsPreviousServerBeforeNextStart` proves the previous server is gone before the next start.
+- `TestWatchRestartReapsPreviousServerBeforeNextStart` proves the previous server is gone before the next start, and that a size-only change restarts.
 - `TestWatchCancelReapsAllChildren` proves that cancel reaps the child processes.
 - `TestWatchRejectsRootThatIsNotADirectory` proves the directory error and that no process starts.
 - `TestWatchGivesTheViteOriginToTheServer` proves `SPIRA_VITE_ORIGIN` is `http://localhost:5173` even when the parent holds another value.

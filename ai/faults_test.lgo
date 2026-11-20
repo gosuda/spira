@@ -1,0 +1,142 @@
+package ai_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestFaultsMatchSpecTable(t *testing.T) {
+	faulttest.CheckTable(t, "../docs/specs/ai.md", ai.Faults())
+}
+
+func TestFaultConfirmationRequired(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "book_flight"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{})
+	if !errors.Is(err, ai.ErrConfirmationRequired) {
+		t.Fatalf("error = %v, want the ai.confirmation_required fault", err)
+		return
+	}
+	paused := &ai.ConfirmError{}
+	if !errors.As(err, &paused) {
+		t.Fatalf("error = %v, want the waiting call ids behind errors.As", err)
+		return
+	}
+	requireStrings(t, "waiting", paused.Waiting, "c1")
+}
+
+func TestFaultToolLimitExceeded(t *testing.T) {
+	log := &toolLog{}
+	model := &scripted{replies: []ai.Reply{asking(call("a", "weather"), call("b", "weather"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: log.tools()}, ai.Limits{PerTool: 1})
+	if !errors.Is(err, ai.ErrToolLimitExceeded) {
+		t.Fatalf("error = %v, want the ai.tool_limit_exceeded fault", err)
+		return
+	}
+	breach := &ai.LimitError{}
+	if !errors.As(err, &breach) || breach.Limit != 1 {
+		t.Fatalf("error = %v, want the gathered results behind errors.As", err)
+	}
+}
+
+func TestFaultInvalidDecision(t *testing.T) {
+	model := &scripted{replies: []ai.Reply{saying("done")}}
+	conversation := append(question(), asking(call("c1", "weather")).Message)
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: conversation, Decisions: []ai.Decision{{Call: "nope"}}}, ai.Limits{})
+	if !errors.Is(err, ai.ErrInvalidDecision) {
+		t.Fatalf("error = %v, want the ai.invalid_decision fault", err)
+	}
+}
+
+func TestFaultUnknownTool(t *testing.T) {
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "nope"))}}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: (&toolLog{}).tools()}, ai.Limits{})
+	if !errors.Is(err, ai.ErrUnknownTool) {
+		t.Fatalf("error = %v, want the ai.unknown_tool fault", err)
+	}
+}
+
+func TestFaultModelFailed(t *testing.T) {
+	model := &scripted{fail: errModelDown}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question()}, ai.Limits{})
+	if !errors.Is(err, ai.ErrModelFailed) {
+		t.Fatalf("error = %v, want the ai.model_failed fault", err)
+		return
+	}
+	if !errors.Is(err, errModelDown) {
+		t.Fatalf("error = %v, want the model cause behind errors.Is", err)
+	}
+}
+
+func TestFaultInvalidToolArguments(t *testing.T) {
+	search, _ := ai.SearchTools([]ai.Tool{described("one", "first")})
+	_, err := search.Call(t.Context(), `{"query":`)
+	if !errors.Is(err, ai.ErrInvalidToolArguments) {
+		t.Fatalf("error = %v, want the ai.invalid_tool_arguments fault", err)
+	}
+}
+
+func TestFaultEmptyAnswer(t *testing.T) {
+	_, err := ai.Structured[structuredItem]("   ")
+	if !errors.Is(err, ai.ErrEmptyAnswer) {
+		t.Fatalf("error = %v, want the ai.empty_answer fault", err)
+	}
+}
+
+func TestFaultAnswerTooLarge(t *testing.T) {
+	_, err := ai.Structured[structuredItem](strings.Repeat(" ", (1<<20)+1))
+	if !errors.Is(err, ai.ErrAnswerTooLarge) {
+		t.Fatalf("error = %v, want the ai.answer_too_large fault", err)
+	}
+}
+
+func TestFaultUnterminatedFence(t *testing.T) {
+	_, err := ai.Structured[structuredItem]("```json\n{\"name\":\"ada\",\"count\":3}\n")
+	if !errors.Is(err, ai.ErrUnterminatedFence) {
+		t.Fatalf("error = %v, want the ai.unterminated_fence fault", err)
+	}
+}
+
+func TestFaultInvalidAnswer(t *testing.T) {
+	_, err := ai.Structured[structuredItem](`{"name":"ada","count":3} trailing`)
+	if !errors.Is(err, ai.ErrInvalidAnswer) {
+		t.Fatalf("error = %v, want the ai.invalid_answer fault", err)
+	}
+}
+
+func TestFaultsHideSecretsAndHostileText(t *testing.T) {
+	secret := "sk-live-51H7x9q2secret"
+	hostile := "<script>alert(1)</script>'; DROP TABLE x; --"
+	model := &scripted{fail: errors.New("provider said no: " + secret)}
+	_, merr := ai.Run(t.Context(), model, ai.Request{Messages: question()}, ai.Limits{})
+	if merr == nil {
+		t.Fatal("a failing model must return an error")
+		return
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, merr), secret)
+	evil := &scripted{replies: []ai.Reply{asking(ai.ToolCall{ID: "c1", Name: hostile, Arguments: "{}"})}}
+	_, uerr := ai.Run(t.Context(), evil, ai.Request{Messages: question(), Tools: (&toolLog{}).tools()}, ai.Limits{})
+	if uerr == nil {
+		t.Fatal("an unknown tool must return an error")
+		return
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, uerr), hostile)
+	args := `{"query": "` + hostile
+	search, _ := ai.SearchTools([]ai.Tool{described("one", hostile)})
+	askingSearch := &scripted{replies: []ai.Reply{asking(ai.ToolCall{ID: "c1", Name: "search_tools", Arguments: args}), saying("done")}}
+	_, serr := ai.Run(t.Context(), askingSearch, ai.Request{Messages: question(), Tools: []ai.Tool{search}}, ai.Limits{})
+	if serr != nil {
+		t.Fatalf("search arguments must become result text, got %v", serr)
+		return
+	}
+	got := resultsOf(askingSearch.seen[1].Messages[2])
+	if len(got) != 1 {
+		t.Fatalf("results = %q, want one tool result", got)
+		return
+	}
+	faulttest.RefuseLeak(t, []byte(got[0]), hostile)
+}

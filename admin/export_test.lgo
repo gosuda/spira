@@ -1,0 +1,13 @@
+package admin
+
+import (
+	"context"
+)
+
+func TokenHostAllowedForTest(raw string) bool {
+	return tokenHostAllowed(raw)
+}
+
+func (s *Server) PollOnceForTest(ctx context.Context) error {
+	return s.pollOnce(ctx)
+}

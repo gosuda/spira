@@ -1,10 +1,8 @@
 package auth_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,11 +48,6 @@ func brokenAuthenticator(ctx *web.Context) (auth.Principal?, error) {
 }
 
 func TestRequireWithoutAuthenticateAnswers500(t *testing.T) {
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{})))
-	defer slog.SetDefault(previous)
-
 	r := web.NewRouter()
 	r.Use(auth.Require(auth.Authenticated()))
 	r.Handle("GET", "/x", okHandler)
@@ -63,8 +56,15 @@ func TestRequireWithoutAuthenticateAnswers500(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status %d want 500 body %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(logs.String(), "auth.Require used without auth.Authenticate") {
-		t.Fatalf("log %q lacks the required message", logs.String())
+	body := rec.Body.String()
+	if !strings.Contains(body, `"internal"`) {
+		t.Fatalf("body %q lacks the fixed internal code", body)
+	}
+	if strings.Contains(body, "auth.misconfigured") {
+		t.Fatalf("body %q exposes the declared code of an internal fault", body)
+	}
+	if strings.Contains(body, "Require used without") {
+		t.Fatalf("body %q exposes the operator cause", body)
 	}
 }
 
@@ -73,9 +73,10 @@ func TestRequireAnswers401WithoutPrincipal403WithOne(t *testing.T) {
 		name    string
 		methods []auth.Authenticator
 		want    int
+		code    string
 	}{
-		{"anonymous", []auth.Authenticator{noPrincipal}, http.StatusUnauthorized},
-		{"known", []auth.Authenticator{principalB}, http.StatusForbidden},
+		{"anonymous", []auth.Authenticator{noPrincipal}, http.StatusUnauthorized, "auth.invalid_credentials"},
+		{"known", []auth.Authenticator{principalB}, http.StatusForbidden, "auth.forbidden"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -87,6 +88,7 @@ func TestRequireAnswers401WithoutPrincipal403WithOne(t *testing.T) {
 			if rec.Code != tc.want {
 				t.Fatalf("status %d want %d body %s", rec.Code, tc.want, rec.Body.String())
 			}
+			assertProblemCode(t, rec.Body.String(), tc.code)
 		})
 	}
 }
@@ -156,6 +158,7 @@ func TestAuthenticateErrorIs401Problem(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
 		t.Fatalf("content type %q want application/problem+json", ct)
 	}
+	assertProblemCode(t, rec.Body.String(), "auth.invalid_credentials")
 }
 
 func TestBearerVerifiesTokenAndFallsThrough(t *testing.T) {

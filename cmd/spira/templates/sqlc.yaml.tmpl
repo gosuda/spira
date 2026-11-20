@@ -1,0 +1,24 @@
+version: "2"
+plugins:
+  - name: spira
+    process: { cmd: sqlc-gen-spira, format: json }
+rules:
+  - name: no-unbounded-write
+    message: "UPDATE and DELETE need a WHERE clause"
+    rule: 'query.sql.matches("(?is)^\\s*(update|delete)\\b") && !query.sql.matches("(?is)\\bwhere\\b")'
+sql:
+  - engine: {{SQLC_ENGINE}}
+    schema: db/migrations
+    queries: db/queries
+    rules: [no-unbounded-write]
+    codegen:
+      - plugin: spira
+        out: db/store
+        options:
+          package: store
+          tables:
+            users: { type: User, key: id, key_type: UserID }
+            sessions: { type: Session, key: id_hash, key_type: SessionID }
+          refs:
+            sessions.user_id: users
+          overrides: {}

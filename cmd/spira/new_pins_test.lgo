@@ -1,0 +1,111 @@
+package main_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestNewToolPinsMatchRepo(t *testing.T) {
+	toolsMod := readRepoFile(t, "../../tools/go.mod")
+	toolsSum := readRepoFile(t, "../../tools/go.sum")
+	goSum := readRepoFile(t, "../../go.sum")
+	tmplMod := readTemplateFile(t, "templates/tools-go.mod.tmpl")
+	tmplGoSum := readTemplateFile(t, "templates/go.sum.tmpl")
+	tmplToolsSum := readTemplateFile(t, "templates/tools-go.sum.tmpl")
+	wantMod := strings.Replace(toolsMod, "module github.com/gosuda/spira/tools", "module {{MODULE}}/tools", 1)
+	if tmplMod != wantMod {
+		t.Fatalf("templates/tools-go.mod.tmpl drifts from tools/go.mod")
+		return
+	}
+	if tmplGoSum != goSum {
+		t.Fatalf("templates/go.sum.tmpl drifts from go.sum")
+		return
+	}
+	if tmplToolsSum != toolsSum {
+		t.Fatalf("templates/tools-go.sum.tmpl drifts from tools/go.sum")
+		return
+	}
+}
+
+func TestNewDriverPinsMatchRepo(t *testing.T) {
+	for _, c := range newEngineCases() {
+		mod := c.driverMod[:strings.Index(c.driverMod, " ")]
+		want := mod + " " + repoModuleVersion(t, mod)
+		if c.driverMod != want {
+			t.Fatalf("engine %s pins %q, repo go.mod holds %q", c.engine, c.driverMod, want)
+			return
+		}
+	}
+}
+
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.FromSlash(rel))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+		return ""
+	}
+	return string(data)
+}
+
+func readTemplateFile(t *testing.T, rel string) string {
+	t.Helper()
+	return readRepoFile(t, rel)
+}
+
+func repoModuleVersion(t *testing.T, module string) string {
+	t.Helper()
+	for _, line := range strings.Split(readRepoFile(t, "../../go.mod"), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == module {
+			return fields[1]
+		}
+	}
+	t.Fatalf("%s not in go.mod", module)
+	return ""
+}
+
+func driverModule(pinned string) string {
+	if i := strings.Index(pinned, " "); i >= 0 {
+		return pinned[:i]
+	}
+	return pinned
+}
+
+func assertGoModPinsMatchRepo(t *testing.T, dir string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+		return
+	}
+	inside := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "require (" {
+			inside = true
+			continue
+		}
+		if trimmed == ")" {
+			inside = false
+			continue
+		}
+		if !inside {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[0] == "github.com/gosuda/spira" {
+			continue
+		}
+		want := repoModuleVersion(t, fields[0])
+		if fields[1] != want {
+			t.Fatalf("go.mod pins %s %s, repo go.mod holds %s", fields[0], fields[1], want)
+			return
+		}
+	}
+}

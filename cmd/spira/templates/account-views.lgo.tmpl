@@ -1,0 +1,35 @@
+package account
+
+import (
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+func loginPage() view.Node {
+	return view.Main(
+		view.H1(view.T("Log in")),
+		view.Form(
+			view.Attr("method", "post"),
+			view.Attr("action", "/account/login"),
+			view.Label(view.Attr("for", "username"), view.T("Name")),
+			view.Input(view.Attr("type", "text"), view.Attr("id", "username"), view.Attr("name", "username")),
+			view.Label(view.Attr("for", "password"), view.T("Password")),
+			view.Input(view.Attr("type", "password"), view.Attr("id", "password"), view.Attr("name", "password")),
+			view.Button(view.Attr("type", "submit"), view.T("Log in")),
+		),
+	)
+}
+
+func accountPage(ctx *web.Context) view.Node {
+	p := web.Get(ctx, auth.PrincipalKey) ?? auth.Principal{}
+	return view.Main(
+		view.H1(view.T("Account")),
+		view.P(view.T("Signed in as "+p.ID+".")),
+		view.Form(
+			view.Attr("method", "post"),
+			view.Attr("action", "/account/logout"),
+			view.Button(view.Attr("type", "submit"), view.T("Log out")),
+		),
+	)
+}

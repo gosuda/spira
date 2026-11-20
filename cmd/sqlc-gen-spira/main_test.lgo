@@ -949,12 +949,37 @@ func TestSliceQuery(t *testing.T) {
 		"type FindDocsRow struct",
 		"func FindDocs(ctx context.Context, q db.Querier, Kind string, Ids []int64) ([]FindDocsRow, error)",
 		`db.In(FindDocsQuery, "ids", len(Ids))`,
-		"args = append(args, Ids...)",
+		"for _, v := range Ids {",
+		"args = append(args, v)",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("query file holds no %q:\n%s", want, src)
 			return
 		}
+	}
+}
+
+func TestQueryFileOmitsTimeImportForEntityRows(t *testing.T) {
+	req := patchRequest(t, "sqlite", func(req *Request) {
+		req.PluginOptions = pluginOptions(t, map[string]any{
+			"tables": map[string]any{
+				"items": map[string]any{"type": "Item", "key": "id", "key_type": "ItemID"},
+			},
+		})
+	})
+	src := queryFile(t, req, "items.sql.lgo")
+	if !strings.Contains(src, "(Item?, error)") {
+		t.Fatalf("entity query file holds no Item return:\n%s", src)
+		return
+	}
+	if strings.Contains(src, "\"time\"") {
+		t.Fatalf("entity query file imports time:\n%s", src)
+		return
+	}
+	models := generateFile(t, req)
+	if !strings.Contains(models, "\"time\"") {
+		t.Fatalf("entity models file holds no time import:\n%s", models)
+		return
 	}
 }
 

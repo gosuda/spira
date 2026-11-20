@@ -1,0 +1,35 @@
+logos_root := env_var_or_default("LOGOS_ROOT", "/home/alpha/repos-devtool/LoGOs/.outline/worktree/spira-toolchain-tip")
+upstream_go := env_var_or_default("UPSTREAM_GO", "/home/linuxbrew/.linuxbrew/bin/go")
+
+export GOROOT := logos_root
+export GOTOOLCHAIN := "local"
+export PATH := justfile_directory() / "bin:" + logos_root / "bin:" + env_var("PATH")
+
+gate: build lint test web
+
+build:
+    logos build ./...
+
+lint:
+    logos lint ./...
+
+test:
+    logos test -count=1 ./...
+
+sql:
+    logos mod download github.com/gosuda/spira
+    logos build -o bin/sqlc-gen-spira github.com/gosuda/spira/cmd/sqlc-gen-spira
+    cd tools && go mod tidy && go tool sqlc generate -f ../sqlc.yaml
+
+sql-check:
+    just sql
+    (cd tools && go tool sqlc vet -f ../sqlc.yaml)
+    @if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then test -z "$(git status --porcelain -- '*.sql.lgo')"; else echo "sql-check: not a git tree, skipping generated-file check"; fi
+    @rg -n --glob '*.lgo' --glob '!*.sql.lgo' --glob '!db/*' 'db\.(Query|One|Exec)\b' && exit 1 || true
+
+web:
+    pnpm --dir frontend install
+    pnpm --dir frontend run build
+
+engines:
+    logos test -race -tags engines -count=1 ./db/...

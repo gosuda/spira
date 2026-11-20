@@ -365,8 +365,8 @@ func TestLogoutFailsClosedWhenDeleteFails(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
 	req.AddCookie(c1)
 	out := callAuth(t, r, req)
-	if out.Code != http.StatusInternalServerError {
-		t.Fatalf("logout with a failing delete: status %d want 500 body %s", out.Code, out.Body.String())
+	if out.Code != http.StatusServiceUnavailable {
+		t.Fatalf("logout with a failing delete: status %d want 503 body %s", out.Code, out.Body.String())
 	}
 	if len(out.Result().Cookies()) != 0 {
 		t.Fatalf("logout with a failing delete issued a cookie")
@@ -394,8 +394,8 @@ func TestLoginFailsClosedWhenDeleteFails(t *testing.T) {
 	again := httptest.NewRequest(http.MethodPost, "/login", nil)
 	again.AddCookie(c1)
 	out := callAuth(t, r, again)
-	if out.Code != http.StatusInternalServerError {
-		t.Fatalf("re-login with a failing delete: status %d want 500 body %s", out.Code, out.Body.String())
+	if out.Code != http.StatusServiceUnavailable {
+		t.Fatalf("re-login with a failing delete: status %d want 503 body %s", out.Code, out.Body.String())
 	}
 	if len(out.Result().Cookies()) != 0 {
 		t.Fatalf("re-login with a failing delete issued a cookie")

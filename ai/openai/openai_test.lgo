@@ -789,23 +789,36 @@ func TestClientErrorAddsNoResultToTheBreaker(t *testing.T) {
 	}
 }
 
+type countingTransport struct {
+	calls *atomic.Int64
+	next  http.RoundTripper
+}
+
+func (s *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	s.calls.Add(1)
+	return s.next.RoundTrip(r)
+}
+
 func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 	body := strings.Repeat("x", (1<<20)+8)
-	rec := &recorder{}
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
+		if _, err := io.ReadAll(r.Body); err != nil {
 			t.Errorf("server read: %v", err)
 		}
-		rec.add(r, string(raw))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		if _, err := io.WriteString(w, body); err != nil {
-			t.Errorf("server write: %v", err)
+			t.Logf("server write ended when the client stopped at its limit: %v", err)
 		}
 	}))
 	t.Cleanup(srv.Close)
 	c := testClient(srv)
+	transport := c.HTTP.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	c.HTTP.Transport = &countingTransport{calls: &calls, next: transport}
 	c.Policy = resilience.Policy{Timeout: 30 * time.Second, Retry: resilience.Retry{Attempts: 2}}
 	_, err := c.Embed(context.Background(), make([]string, 8))
 	if err == nil {
@@ -817,8 +830,8 @@ func TestFailingStatusBodyIsCutAtOneMiB(t *testing.T) {
 	if status, _, length, ok := openai.FaultDetail(err); !ok || status != 500 || length != 1<<20 {
 		t.Fatalf("detail = %d %d, want status 500 with the body cut at one mebibyte", status, length)
 	}
-	if rec.count() != 2 {
-		t.Fatalf("server saw %d calls, want 2: the 500 is retried, not a caller fault", rec.count())
+	if calls.Load() != 2 {
+		t.Fatalf("client sent %d requests, want 2: the 500 is retried, not a caller fault", calls.Load())
 	}
 }
 
