@@ -99,10 +99,14 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.startH3(ctx)
 	}
 	inner := &web.Server{Addr: s.Addr, Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
-	if serr := inner.Start(ctx); serr != nil {
-		return serr
+	l, lerr := net.Listen("tcp", s.Addr)
+	if lerr != nil {
+		return fmt.Errorf("http3: listen %s: %w", s.Addr, lerr)
 	}
-	return s.store(s.serve(ctx, inner, s.Addr, nil), ctx)
+	if serr := inner.Serve(ctx, l); serr != nil {
+		return errors.Join(serr, l.Close())
+	}
+	return s.store(s.serve(ctx, inner, l.Addr().String(), nil), ctx)
 }
 
 func (s *Server) startH3(ctx context.Context) error {

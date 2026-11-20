@@ -172,7 +172,17 @@ func assertH3ALPN(t *testing.T, udpAddr string, pool *x509.CertPool) {
 func TestH3NeedsTLSFailsStart(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/hello", h3Hello)
-	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, H3: true}
+	probe, perr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if perr != nil {
+		t.Fatalf("reserve udp port: %v", perr)
+		return
+	}
+	udpAddr := probe.LocalAddr().(*net.UDPAddr)
+	if cerr := probe.Close(); cerr != nil {
+		t.Fatalf("release udp port: %v", cerr)
+		return
+	}
+	s := &http3.Server{Addr: udpAddr.String(), Router: r, H3: true}
 	err := s.Start(context.Background())
 	if err == nil {
 		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -189,6 +199,15 @@ func TestH3NeedsTLSFailsStart(t *testing.T) {
 	}
 	if addr := s.BoundUDPAddrForTest(); addr != "" {
 		t.Fatalf("UDP bound after failed start: %s", addr)
+		return
+	}
+	rebind, rerr := net.ListenUDP("udp", udpAddr)
+	if rerr != nil {
+		t.Fatalf("UDP listener survived the failed start: %v", rerr)
+		return
+	}
+	if cerr := rebind.Close(); cerr != nil {
+		t.Fatalf("close probe: %v", cerr)
 		return
 	}
 }
@@ -419,9 +438,12 @@ func TestH3AltSvcAbsentWhenH3False(t *testing.T) {
 		return
 	}
 	defer stopH3Server(t, s)
-	srv := httptest.NewServer(r)
-	defer srv.Close()
-	if got := httpGetHeader(t, srv.URL+"/hello", "Alt-Svc"); got != "" {
+	tcpAddr := s.BoundTCPAddrForTest()
+	if tcpAddr == "" {
+		t.Fatal("missing bound TCP address")
+		return
+	}
+	if got := httpGetHeader(t, "http://"+tcpAddr+"/hello", "Alt-Svc"); got != "" {
 		t.Fatalf("Alt-Svc %q want empty without H3", got)
 		return
 	}
