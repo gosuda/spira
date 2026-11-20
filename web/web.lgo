@@ -102,10 +102,13 @@ func (r *Router) Group(prefix string, build func(g *Router)) {
 
 func (r *Router) remember(h Handler) *routeCell {
 	cell := &routeCell{handler: h}
-	r.stages.WithLock(func(list *[]Stage) {
-		now := append([]Stage(nil), (*list)...)
+	r.install.WithLock(func(*struct{}) {
+		var now []Stage
+		r.stages.WithLock(func(list *[]Stage) {
+			now = append(now, (*list)...)
+			r.registered.WithLock(func(registered *[]*routeCell) { *registered = append(*registered, cell) })
+		})
 		cell.current.WithLock(func(cur *http.Handler) { *cur = served(r.rootRouter(), now, h) })
-		r.registered.WithLock(func(registered *[]*routeCell) { *registered = append(*registered, cell) })
 	})
 	return cell
 }

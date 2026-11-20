@@ -257,6 +257,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Group` MUST give the inner router the parent stages from the time of the call.
 - A `Use` after `Group` MUST NOT apply to a route inside that group.
 - A `Use` on a router MUST apply to the routes that router registered before the call.
+- A stage constructor MUST NOT call `Use`, `Group`, or `Handle` on a router: construction runs under the router's install lock, and a route made there would wrap the same stage again.
 - `Routes` MUST list each route in registration order.
 - `Routes` MUST return a new slice on each call.
 - `Routes` MUST copy each `Doc` response list.
