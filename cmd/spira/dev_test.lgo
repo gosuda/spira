@@ -369,6 +369,19 @@ func TestWatchRestartReapsPreviousServerBeforeNextStart(t *testing.T) {
 		if err := await(sctx, "restart after .lgo change", backstop(t), func() bool { return lineCount(startsLog) == 2 }); err != nil {
 			return err
 		}
+		info, statErr := os.Stat(seed)
+		if statErr != nil {
+			return statErr
+		}
+		if err := os.WriteFile(seed, []byte("package main\n// bigger\n"), 0o644); err != nil {
+			return err
+		}
+		if err := os.Chtimes(seed, info.ModTime(), info.ModTime()); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart after a size-only change", backstop(t), func() bool { return lineCount(startsLog) == 3 }); err != nil {
+			return err
+		}
 		cancel()
 		return nil
 	}

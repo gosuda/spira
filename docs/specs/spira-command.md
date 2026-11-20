@@ -81,6 +81,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 
 - The command MUST poll every 500 ms.
 - The command MUST restart the server when the modification time of an `.lgo` file changes.
+- The command MUST restart the server when the size of an `.lgo` file changes.
 - The command MUST restart the server when an `.lgo` file appears.
 - The command MUST restart the server when an `.lgo` file disappears.
 - The command MUST NOT restart the server for a file whose name does not end in `.lgo`.
@@ -127,7 +128,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - `TestWatchCancelEndsLoopAndKillsStandinGroups` proves that cancel stops the server group and the frontend group.
 - `TestWatchServerSelfExitWaitsForChange` proves that a server exit waits for an `.lgo` change.
 - `TestWatchServerSelfExitLogsOneWarningWithRealStatus` proves one warning with the real exit error.
-- `TestWatchRestartReapsPreviousServerBeforeNextStart` proves the previous server is gone before the next start.
+- `TestWatchRestartReapsPreviousServerBeforeNextStart` proves the previous server is gone before the next start, and that a size-only change restarts.
 - `TestWatchCancelReapsAllChildren` proves that cancel reaps the child processes.
 - `TestWatchRejectsRootThatIsNotADirectory` proves the directory error and that no process starts.
 - `TestWatchGivesTheViteOriginToTheServer` proves `SPIRA_VITE_ORIGIN` is `http://localhost:5173` even when the parent holds another value.
