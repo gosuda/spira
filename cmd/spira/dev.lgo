@@ -58,7 +58,7 @@ func watch(ctx context.Context, cfg Loop) error {
 			if cmd == nil {
 				return fmt.Errorf("cmd/spira: start %s: no process", cfg.ServerCmd[0])
 			}
-			notifyStart(ctx, cfg, Start{Role: "server", Command: cfg.ServerCmd, Env: cmd.Env})
+			go notifyStart(ctx, cfg, Start{Role: "server", Command: cfg.ServerCmd, Env: cmd.Env})
 			exited := make(chan error, 1)
 			go reap(ctx, cmd, exited)
 			if !superviseExit(ctx, cmd, exited, restarts) {
@@ -131,21 +131,29 @@ func frontend(ctx context.Context, cfg Loop) error {
 	if cmd == nil {
 		return fmt.Errorf("cmd/spira: start %s: no process", cfg.FrontendCmd[0])
 	}
-	notifyStart(ctx, cfg, Start{Role: "frontend", Command: cfg.FrontendCmd, Env: cmd.Env})
+	go group (ctx) {
+		go notifyStart(ctx, cfg, Start{Role: "frontend", Command: cfg.FrontendCmd, Env: cmd.Env})
+		go frontendWait(ctx, cmd)
+	}
+	return nil
+}
+
+func frontendWait(ctx context.Context, cmd *exec.Cmd) error {
 	if runErr := cmd.Wait(); runErr != nil && ctx.Err() == nil {
 		slog.Warn("cmd/spira: frontend exited", "error", runErr)
 	}
 	return nil
 }
 
-func notifyStart(ctx context.Context, cfg Loop, s Start) {
+func notifyStart(ctx context.Context, cfg Loop, s Start) error {
 	if cfg.Started == nil {
-		return
+		return nil
 	}
 	select {
 	case cfg.Started <- s:
 	case <-ctx.Done():
 	}
+	return nil
 }
 
 func scanLoop(ctx context.Context, cfg Loop, restarts chan<- struct{}, prev map[string]fileMark) error {
