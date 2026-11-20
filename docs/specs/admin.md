@@ -99,11 +99,13 @@ func Faults() []*fault.Error
 - The poll client MUST NOT follow redirects.
 - The poll MUST use one breaker per instance.
 - A nil `Now` MUST mean `time.Now`.
-- The probe MUST send the operator token when set and the target uses TLS or a loopback host; otherwise it MUST probe without the token.
+- When the target uses TLS or a loopback host, the probe MUST send the operator token when set.
+- Otherwise the probe MUST run without the token.
 - The probe MUST NOT send the token over plaintext HTTP to a non-loopback host. Loopback means the literal host `localhost` (any case) or an IP literal in a loopback range (`127.0.0.0/8`, `::1`).
 - The poll MUST probe each instance concurrently with a bound of 8.
 - Each result MUST apply and publish as its probe completes.
-- A cancelled sweep MUST apply and publish nothing further: results that completed before the cancellation stay applied and published, and the rest are dropped.
+- A cancelled sweep MUST apply and publish nothing further.
+- Results completed before the cancellation MUST stay applied and published; the rest MUST be dropped.
 - An unhealthy answer MUST mark that instance down.
 - A status change MUST publish exactly one event.
 - `Start` MUST begin polling and `Stop` MUST end it.
@@ -112,7 +114,8 @@ func Faults() []*fault.Error
 
 - `Client.Start` MUST register `Self` with `POST /admin/instances`.
 - `Client.Stop` MUST remove `Self` with `DELETE /admin/instances/{name}`.
-- `Client` MUST send its token as a bearer header when set and the server URL uses TLS or a loopback host; otherwise `Start` and `Stop` MUST fail without sending.
+- When the server URL uses TLS or a loopback host, `Client` MUST send its token as a bearer header.
+- On a cleartext URL to a non-loopback host, `Start` and `Stop` MUST fail without sending.
 - `Client.Stop` MUST tolerate a 404 answer.
 - A second `Stop` MUST still succeed.
 
@@ -167,6 +170,7 @@ func Faults() []*fault.Error
 - `TestAdminEmptyAllowlistRefuses` proves that an empty allowlist refuses every registration.
 - `TestAdminListedHostAcceptedAndPolled` proves that a listed host is accepted and polled.
 - `TestAdminRedirectOutsideAllowlistMakesNoSecondRequest` proves that a redirect outside the allowlist is not followed.
+- `TestAdminClientRefusesRedirectWithToken` proves the registry client refuses a redirect before it forwards the token.
 - `TestAdminRefusesCredentialedAndForeignSchemeURLs` proves that credentialed and foreign-scheme URLs are refused without echo.
 - `TestTokenHostAllowedScope` proves that tokens go over TLS and to loopback hosts only.
 - `TestAdminClientRefusesTokenOverPlaintextRemote` proves that `Start` and `Stop` fail without sending over plaintext HTTP to a remote host.

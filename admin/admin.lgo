@@ -478,7 +478,8 @@ func (c *Client) send(ctx context.Context, method string, path string, body []by
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errRedirectRefused }}
+	resp, err := client.Do(req)
 	if err != nil {
 		return ErrRegistryUnreachable.Wrap(fmt.Errorf("admin: %s %s: %w", method, path, err))
 	}

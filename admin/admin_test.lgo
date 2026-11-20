@@ -957,6 +957,27 @@ func TestAdminRedirectOutsideAllowlistMakesNoSecondRequest(t *testing.T) {
 	}
 }
 
+func TestAdminClientRefusesRedirectWithToken(t *testing.T) {
+	var secondHits atomic.Int64
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		secondHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, second.URL+"/admin/instances", http.StatusFound)
+	}))
+	defer first.Close()
+	c := &admin.Client{Server: first.URL, Self: admin.Instance{Name: "shop", OpsURL: "http://127.0.0.1/ops"}, Token: "secret-token"}
+	if err := c.Start(context.Background()); err == nil {
+		t.Fatal("Start followed the redirect, want the redirect refused")
+		return
+	}
+	if secondHits.Load() != 0 {
+		t.Fatalf("redirect target saw %d requests, want none", secondHits.Load())
+	}
+}
+
 func TestAdminRefusesCredentialedAndForeignSchemeURLs(t *testing.T) {
 	srv := &admin.Server{MaxInstances: 10, AllowedHosts: []string{"listed"}}
 	r := newAdminRouter(srv, tokenGuard())
