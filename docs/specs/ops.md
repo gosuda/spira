@@ -89,7 +89,7 @@ func Faults() []*fault.Error
 
 ## Proof
 
-- `TestReadyNamesFailingCheck` proves that a failed check makes `/ops/ready` answer 503 and names that check.
+- `TestReadyNamesFailingCheck` proves that a failed check makes `/ops/ready` answer 503, names that check, and carries the constant fault message.
 - `TestReadyAndHealthPassAllChecks` proves that both routes answer 200 when every check passes.
 - `TestLiveAnswers200WhileServing` proves that live answers 200, and that health with no checks answers 200.
 - `TestEveryOpsEndpointRefusedWithoutGuardCredentials` proves that `Mount` runs the guard on all six routes.
@@ -100,7 +100,6 @@ func Faults() []*fault.Error
 - `TestTimedOutCheckFails` proves that the check context ends at `CheckTimeout`.
 - `TestExpiredCheckReturningNilFails` proves that a nil result after the timeout answers 503 and names the check.
 - `TestMountRefusesNonPositiveCheckTimeout` proves the panic for a zero `CheckTimeout`.
-- `TestCheckFailedThroughReady` proves that a failed check answers 503, names the check, and carries the constant fault message without the cause text.
 - `TestCheckOutputHidesSecretsAndHostileInput` proves that secrets and hostile input in a check error reach neither the report body nor the public view.
 - `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 
