@@ -118,3 +118,35 @@ test("pause state and sink survive a search swap of the results list", () => {
 		'<span id="stock-9" hx-swap-oob="outerHTML">Kettle: $20.00, 1 in stock</span>';
 	expect(dispatchMessage("stock-sink", "stock", filteredOut)).toBe(false);
 });
+
+function adminToggle(): HTMLButtonElement {
+	const toggle = document.querySelector(
+		'section[data-live-region="admin"] button[data-live-toggle]',
+	);
+	if (!(toggle instanceof HTMLButtonElement)) {
+		throw new Error("Expected the admin pause button");
+	}
+	return toggle;
+}
+
+test("resume replays the instance updates paused in the region", () => {
+	const toggle = adminToggle();
+	toggle.click();
+	expect(toggle.getAttribute("aria-pressed")).toBe("true");
+	const down =
+		'<tr id="instance-shop" hx-swap-oob="outerHTML"><td>shop</td><td>down</td></tr>';
+	expect(dispatchMessage("admin-sink", "instance", down)).toBe(false);
+	expect(fixtureElement("shop-status").textContent).toBe("up");
+	const redelivered: Array<unknown> = [];
+	fixtureElement("admin-sink").addEventListener(
+		"htmx:sseBeforeMessage",
+		(event) => {
+			redelivered.push((event as CustomEvent).detail);
+		},
+	);
+	toggle.click();
+	expect(toggle.getAttribute("aria-pressed")).toBe("false");
+	expect(redelivered).toHaveLength(1);
+	expect((redelivered[0] as MessageEvent).data).toBe(down);
+	expect(dispatchMessage("admin-sink", "instance", down)).toBe(true);
+});

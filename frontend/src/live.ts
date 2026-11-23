@@ -36,6 +36,42 @@ function isFilteredStockUpdate(event: Event, region: Element): boolean {
 
 export function installLiveUpdates(): void {
 	const pausedRegions = new WeakSet<Element>();
+	const retainedUpdates = new WeakMap<
+		Element,
+		Array<{ target: Element; message: MessageEvent }>
+	>();
+	const maxRetainedUpdates = 128;
+
+	function retainPausedUpdate(
+		region: Element,
+		target: Element,
+		message: MessageEvent,
+	): void {
+		const kept = retainedUpdates.get(region) ?? [];
+		kept.push({ target, message });
+		if (kept.length > maxRetainedUpdates) {
+			kept.shift();
+		}
+		retainedUpdates.set(region, kept);
+	}
+
+	function replayRetainedUpdates(region: Element): void {
+		const kept = retainedUpdates.get(region);
+		retainedUpdates.delete(region);
+		if (!kept) {
+			return;
+		}
+		for (const { target, message } of kept) {
+			target.dispatchEvent(
+				new CustomEvent("htmx:sseBeforeMessage", {
+					bubbles: true,
+					cancelable: true,
+					composed: true,
+					detail: message,
+				}),
+			);
+		}
+	}
 
 	function revealToggle(toggle: HTMLButtonElement): void {
 		const region = toggle.closest(regionSelector);
@@ -78,6 +114,8 @@ export function installLiveUpdates(): void {
 		const wasPaused = pausedRegions.delete(region);
 		if (!wasPaused) {
 			pausedRegions.add(region);
+		} else {
+			replayRetainedUpdates(region);
 		}
 		toggle.setAttribute("aria-pressed", String(!wasPaused));
 	});
@@ -87,10 +125,14 @@ export function installLiveUpdates(): void {
 			return;
 		}
 		const region = event.target.closest(regionSelector);
-		if (
-			region &&
-			(pausedRegions.has(region) || isFilteredStockUpdate(event, region))
-		) {
+		if (region && pausedRegions.has(region)) {
+			retainPausedUpdate(
+				region,
+				event.target,
+				(event as CustomEvent<MessageEvent>).detail,
+			);
+			event.preventDefault();
+		} else if (region && isFilteredStockUpdate(event, region)) {
 			event.preventDefault();
 		}
 	});
