@@ -105,7 +105,7 @@ export function installSlotMover(root?: ParentNode): void
 - That file also proves a missing entry, a bad `when` value, malformed props and a non-object props value. Each case logs one error and keeps the fallback.
 - `moves template content into the matching spira-slot` proves the slot mover.
 - `treats the slot id as a value, not a selector` proves the byte-for-byte id match.
-- `leaves a template with no matching slot in place` proves that an unknown slot id does not remove the template.
+- That test and the invalid `slot-id` lines of `test/corpus.test.ts` also prove that an unknown slot id does not remove the template.
 - `test/island-glob.test.ts` proves glob paths derive repository-relative island keys.
 - `test/wasm.test.ts` proves the host object, the assigned id, the cleared fallback and a failed fetch.
 - `test/wasm-retry.test.ts` proves a second island requests `wasm_exec.js` again after the first load fails.

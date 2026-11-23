@@ -174,20 +174,6 @@ describe("slot mover hardening", () => {
 		});
 		expect(document.querySelector("template[data-spira-slot]")).toBe(bad);
 	});
-
-	test("leaves a template with no matching slot in place", async () => {
-		document.body.innerHTML = `<spira-slot id="s1"><p>text A</p></spira-slot>`;
-		installSlotMover(document.body);
-		const orphan = document.createElement("template");
-		orphan.dataset.spiraSlot = "nope";
-		orphan.innerHTML = "<em>orphan</em>";
-		document.body.append(orphan);
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		expect(document.querySelector("template[data-spira-slot]")).toBe(orphan);
-		expect(document.querySelector("spira-slot#s1 p")?.textContent).toBe(
-			"text A",
-		);
-	});
 });
 
 describe("slot mover", () => {
