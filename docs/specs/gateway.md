@@ -152,10 +152,9 @@ func Faults() []*fault.Error
 - `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
 - `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
 - `TestUnknownLengthEmptyBodyFailsOver` proves that an empty body of unknown length fails over.
-- `TestUnknownLengthNonemptyBodyIsPreserved` proves that a nonempty body of unknown length reaches the upstream whole.
+- `TestUnknownLengthNonemptyBodyIsPreserved` proves that a nonempty body of unknown length reaches the upstream whole, with the byte that the empty-proof read took handed back.
 - `TestPeekEmptyFailsClosedOnStalledBody` proves that a stalled body of unknown length answers 502 without an upstream.
 - `TestStalledBodyPeekAnswersWhileTheBodyStaysOpen` proves that a chunked request with no body byte gets its 502 within three seconds while the connection stays open.
-- `TestPeekEmptyPushesBackReadyByte` proves that the empty-proof read hands the byte back.
 - `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
 - `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.
 - `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.

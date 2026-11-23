@@ -35,37 +35,6 @@ func TestPeekEmptyFailsClosedOnStalledBody(t *testing.T) {
 	}
 }
 
-func TestPeekEmptyPushesBackReadyByte(t *testing.T) {
-	preq := httptest.NewRequest(http.MethodPost, "http://example.com/shop/order", &streamChunks{rest: []byte("x"), step: 1})
-	preq.ContentLength = -1
-	if preq.Body == nil {
-		t.Fatal("fixture needs a body")
-		return
-	}
-	empty, body, expired := gateway.PeekEmptyForTest(preq, 2*time.Second)
-	if expired != nil {
-		t.Fatalf("ready body must not expire the wait: %v", expired)
-		return
-	}
-	if empty {
-		t.Fatalf("nonempty body must not prove empty")
-		return
-	}
-	kept, rerr := io.ReadAll(body)
-	if rerr != nil {
-		t.Fatal(rerr)
-		return
-	}
-	if cerr := body.Close(); cerr != nil {
-		t.Fatal(cerr)
-		return
-	}
-	if string(kept) != "x" {
-		t.Fatalf("pushed-back body holds %q want %q", kept, "x")
-		return
-	}
-}
-
 func TestStalledBodyPeekAnswersWhileTheBodyStaysOpen(t *testing.T) {
 	routes := []gateway.Route{{PathPrefix: "/shop", To: []string{deadUpstream(t)}}}
 	router := web.NewRouter()
