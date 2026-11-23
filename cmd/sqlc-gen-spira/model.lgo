@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 type Model struct {
@@ -642,6 +643,9 @@ func (r *resolver) addEntity(ct catalogTable) error {
 }
 
 func (r *resolver) entityField(ct catalogTable, col *Column) (Field, error) {
+	if err := tagSafeName(col.Name); err != nil {
+		return Field{}, fmt.Errorf("sqlc-gen-spira: %s: %w", r.columnContext(ct.schema, col), err)
+	}
 	goType, err := r.goColumnType(ct.schema, ct.table.Rel.Name, col)
 	if err != nil {
 		return Field{}, err
@@ -653,6 +657,13 @@ func (r *resolver) entityField(ct catalogTable, col *Column) (Field, error) {
 		Table:   ct.table.Rel.Name,
 		NotNull: col.NotNull,
 	}, nil
+}
+
+func tagSafeName(name string) error {
+	if strings.ContainsFunc(name, func(c rune) bool { return c == '`' || unicode.IsControl(c) }) {
+		return fmt.Errorf("column name %q cannot be written into a struct tag", name)
+	}
+	return nil
 }
 
 func (r *resolver) columnBase(schema string, table string, col *Column) (string, error) {
@@ -738,6 +749,9 @@ func (r *resolver) queryColumns(q *Query, qd *QueryDef) error {
 func (r *resolver) queryField(q *Query, col *Column, index int) (Field, error) {
 	if col.Name == "" {
 		return Field{}, fmt.Errorf("sqlc-gen-spira: %s: column %d needs an alias", q.Name, index)
+	}
+	if err := tagSafeName(col.Name); err != nil {
+		return Field{}, fmt.Errorf("sqlc-gen-spira: query %s column %d: %w", q.Name, index, err)
 	}
 	if col.EmbedTable.Name != "" {
 		return r.embedField(q, col)

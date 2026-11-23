@@ -1,0 +1,1 @@
+DROP TABLE spira_sqlc_runtime_mssql_items;

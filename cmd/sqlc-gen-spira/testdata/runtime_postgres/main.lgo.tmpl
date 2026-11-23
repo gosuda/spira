@@ -1,0 +1,172 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	"example.com/spira-sqlc-postgres-runtime/store"
+	"github.com/gosuda/spira/db"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	err := exercisePostgresRuntime(ctx, os.Getenv("SPIRA_TEST_POSTGRES_DSN"))
+	cancel()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func exercisePostgresRuntime(ctx context.Context, dsn string) error {
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return errors.New("SPIRA_TEST_POSTGRES_DSN is not a valid pgx connection string")
+	}
+	admin := stdlib.OpenDB(*config)
+	defer admin.Close()?
+	schema := "spira_sqlc_" + strings.ToLower(rand.Text())
+	quoted := pgx.Identifier{schema}.Sanitize()
+	admin.ExecContext(ctx, "CREATE SCHEMA "+quoted)?
+	defer dropPostgresRuntimeSchema(admin, quoted)?
+
+	config = config.Copy()
+	config.RuntimeParams["search_path"] = schema
+	oracle := stdlib.OpenDB(*config)
+	defer oracle.Close()?
+	registered := stdlib.RegisterConnConfig(config)
+	defer stdlib.UnregisterConnConfig(registered)
+	pool := db.Open("pgx", registered)?
+	if pool == nil {
+		return errors.New("db.Open returned no PostgreSQL pool")
+	}
+	defer stopPostgresRuntimePool(pool)?
+	pool.Start(ctx)?
+
+	fixture := postgresRuntimeFixture{pool: pool, oracle: oracle}
+	preparePostgresRuntime(ctx, fixture)?
+	comparePostgresWritesAndOne(ctx, fixture)?
+	return comparePostgresMany(ctx, fixture)
+}
+
+func dropPostgresRuntimeSchema(admin *sql.DB, quoted string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	admin.ExecContext(ctx, "DROP SCHEMA "+quoted+" CASCADE")?
+	return nil
+}
+
+func stopPostgresRuntimePool(pool *db.Pool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return pool.Stop(ctx)
+}
+
+type postgresRuntimeFixture struct {
+	pool   *db.Pool
+	oracle *sql.DB
+}
+
+func preparePostgresRuntime(ctx context.Context, f postgresRuntimeFixture) error {
+	err := store.PrepareAll(ctx, f.pool)
+	if err == nil {
+		return errors.New("PrepareAll succeeded before the items table was created")
+	}
+	pgError, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok || pgError.Code != "42P01" || !strings.Contains(err.Error(), "PrepareAll: ") {
+		return fmt.Errorf("PrepareAll before migration: want a wrapped undefined-table error: %w", err)
+	}
+	migration := os.ReadFile("migrations/0001_create_items.up.sql")?
+	f.oracle.ExecContext(ctx, string(migration))?
+	return store.PrepareAll(ctx, f.pool)
+}
+
+type postgresRuntimeItem struct {
+	shelf    string
+	title    string
+	revision int32
+}
+
+func comparePostgresWritesAndOne(ctx context.Context, f postgresRuntimeFixture) error {
+	const generatedID int64 = 11
+	const controlID int64 = 31
+	store.AddItem(ctx, f.pool, store.AddItemArgs{ID: generatedID, Shelf: "north", Title: "before", Revision: 4})?
+	f.oracle.ExecContext(ctx, "INSERT INTO items (title, revision, shelf, id) VALUES ($1, $2, $3, $4)", "before", 4, "north", controlID)?
+	inserted := readPostgresRuntimeItem(ctx, f.oracle, generatedID)?
+	control := readPostgresRuntimeItem(ctx, f.oracle, controlID)?
+	if inserted != control {
+		return fmt.Errorf("AddItem persisted %+v, database/sql insert persisted %+v", inserted, control)
+	}
+
+	for _, title := range []string{"renamed", "stale edit"} {
+		count := store.RenameItem(ctx, f.pool, store.RenameItemArgs{ID: generatedID, Title: title, ExpectedRevision: 4})?
+		result := f.oracle.ExecContext(ctx, "UPDATE items SET revision = revision + 1, title = $2 WHERE revision = $1 AND id = $3", 4, title, controlID)?
+		wantCount := result.RowsAffected()?
+		if count != wantCount {
+			return fmt.Errorf("RenameItem(%q) affected %d rows, database/sql affected %d", title, count, wantCount)
+		}
+	}
+
+	want := readPostgresRuntimeItem(ctx, f.oracle, controlID)?
+	persisted := readPostgresRuntimeItem(ctx, f.oracle, generatedID)?
+	if persisted != want {
+		return fmt.Errorf("generated writes persisted %+v, equivalent database/sql writes persisted %+v", persisted, want)
+	}
+	got := store.GetItem(ctx, f.pool, generatedID)?
+	if got == nil {
+		return errors.New("GetItem returned no row for the persisted item")
+	}
+	if got.ID != generatedID || got.Shelf != persisted.shelf || got.Title != persisted.title || got.Revision != persisted.revision {
+		return fmt.Errorf("GetItem returned %+v, database/sql read id %d and %+v", got, generatedID, persisted)
+	}
+	missing := store.GetItem(ctx, f.pool, 999)?
+	if missing != nil {
+		return fmt.Errorf("GetItem returned %+v for missing id 999", missing)
+	}
+	return nil
+}
+
+func readPostgresRuntimeItem(ctx context.Context, oracle *sql.DB, id int64) (postgresRuntimeItem, error) {
+	var row postgresRuntimeItem
+	oracle.QueryRowContext(ctx, "SELECT shelf, title, revision FROM items WHERE id = $1", id).Scan(&row.shelf, &row.title, &row.revision)?
+	return row, nil
+}
+
+func comparePostgresMany(ctx context.Context, f postgresRuntimeFixture) error {
+	f.oracle.ExecContext(ctx, `INSERT INTO items (id, shelf, title, revision) VALUES
+		(42, 'north', 'matching row', 5), (23, 'north', 'matching row', 5),
+		(7, 'north', 'old revision', 4), (9, 'south', 'other shelf', 5),
+		(8, 'north', 'unlisted id', 5)`)?
+	rows := f.oracle.QueryContext(ctx, "SELECT id FROM items WHERE shelf = $1 AND revision = $2 ORDER BY id", "north", 5)?
+	defer rows.Close()?
+	var eligible []int64
+	for rows.Next() {
+		var id int64
+		rows.Scan(&id)?
+		eligible = append(eligible, id)
+	}
+	rows.Err()?
+	for _, ids := range [][]int64{{42, 7, 23, 9, 11, 42}, {}} {
+		got := store.ListItems(ctx, f.pool, store.ListItemsArgs{Shelf: "north", Ids: ids, Revision: 5})?
+		var want []int64
+		for _, id := range eligible {
+			if slices.Contains(ids, id) {
+				want = append(want, id)
+			}
+		}
+		if !slices.Equal(got, want) {
+			return fmt.Errorf("ListItems(%v) = %v, database/sql oracle = %v", ids, got, want)
+		}
+	}
+	return nil
+}

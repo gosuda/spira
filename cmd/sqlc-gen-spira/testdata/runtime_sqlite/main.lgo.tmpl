@@ -1,0 +1,189 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/db"
+	_ "modernc.org/sqlite"
+
+	"example.com/spira-sqlc-runtime/store"
+)
+
+//go:embed migrations/0001_create_items.up.sql
+var schema string
+
+const renamedItem = "renamed fourth item"
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := compareQueries(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func compareQueries(ctx context.Context) error {
+	pool := db.Open("sqlite", "file:sqlc-runtime?mode=memory&cache=shared")?
+	if pool == nil {
+		return errors.New("db.Open returned no pool")
+	}
+	defer pool.Stop(ctx)?
+	oracle := sql.Open("sqlite", ":memory:")?
+	defer oracle.Close()?
+	oracle.SetMaxOpenConns(1)
+
+	prepare := store.PrepareAll(ctx, pool)
+	if prepare == nil {
+		return errors.New("PrepareAll accepted queries before the items table existed")
+	}
+	if !errors.Is(prepare, db.ErrStatementFailed) || !strings.Contains(prepare.Error(), "PrepareAll: GetItem:") {
+		return fmt.Errorf("PrepareAll did not name GetItem on an empty schema: %w", prepare)
+	}
+	pool.ExecContext(ctx, schema)?
+	oracle.ExecContext(ctx, schema)?
+	store.PrepareAll(ctx, pool)?
+
+	id := compareInsertAndRename(ctx, pool, oracle)?
+	compareGetItem(ctx, pool, oracle, id)?
+	compareSliceItems(ctx, pool, oracle)?
+	store.DeleteItem(ctx, pool, id)?
+	oracle.ExecContext(ctx, "DELETE FROM items WHERE id = ?", id)?
+	compareGetItem(ctx, pool, oracle, id)?
+	compareListItems(ctx, pool, oracle)?
+	return compareRepeatedBindItems(ctx, pool, oracle)
+}
+
+func compareInsertAndRename(ctx context.Context, pool *db.Pool, oracle *sql.DB) (int64, error) {
+	var id int64
+	for _, name := range []string{"first item", "second item's label", "third item", "fourth item"} {
+		id = store.InsertItem(ctx, pool, name)?
+		result := oracle.ExecContext(ctx, "INSERT INTO items (name) VALUES (?)", name)?
+		want := result.LastInsertId()?
+		if id != want {
+			return 0, fmt.Errorf("InsertItem(%q) id = %d, database/sql id = %d", name, id, want)
+		}
+	}
+	got := store.RenameItem(ctx, pool, renamedItem, id)?
+	result := oracle.ExecContext(ctx, "UPDATE items SET name = ? WHERE id = ?", renamedItem, id)?
+	want := result.RowsAffected()?
+	if got != want {
+		return 0, fmt.Errorf("RenameItem affected %d rows, database/sql affected %d", got, want)
+	}
+	return id, nil
+}
+
+func compareGetItem(ctx context.Context, pool *db.Pool, oracle *sql.DB, id int64) error {
+	got := store.GetItem(ctx, pool, id)?
+	var want store.Item
+	err := oracle.QueryRowContext(ctx, "SELECT id, name FROM items WHERE id = ?", id).Scan(&want.ID, &want.Name)
+	if errors.Is(err, sql.ErrNoRows) {
+		if got != nil {
+			return fmt.Errorf("GetItem(%d) = %+v, database/sql found no row", id, got)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("database/sql GetItem(%d): %w", id, err)
+	}
+	if got == nil {
+		return fmt.Errorf("GetItem(%d) found no row, database/sql row = %+v", id, want)
+	}
+	if got != want {
+		return fmt.Errorf("GetItem(%d) = %+v, database/sql row = %+v", id, got, want)
+	}
+	return nil
+}
+
+func compareListItems(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	got := store.ListItems(ctx, pool)?
+	want := readOracleItems(ctx, oracle, "SELECT id, name FROM items ORDER BY id DESC")?
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("ListItems = %+v, database/sql rows = %+v", got, want)
+	}
+	return nil
+}
+
+func compareSliceItems(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	const minID int64 = 1
+	cases := []struct {
+		ids       []int64
+		oracleSQL string
+		args      []any
+	}{
+		{
+			ids:       []int64{4, 1, 2},
+			oracleSQL: "SELECT id, name FROM items WHERE id > ? AND name <> ? AND id IN (?, ?, ?) ORDER BY id DESC",
+			args:      []any{minID, renamedItem, int64(4), int64(1), int64(2)},
+		},
+		{
+			ids:       []int64{},
+			oracleSQL: "SELECT id, name FROM items WHERE id > ? AND name <> ? AND id IN (NULL) ORDER BY id DESC",
+			args:      []any{minID, renamedItem},
+		},
+	}
+	for _, c := range cases {
+		args := store.FilterItemsArgs{OmitName: renamedItem, Ids: c.ids, MinID: minID}
+		got := store.FilterItems(ctx, pool, args)?
+		want := readOracleItems(ctx, oracle, c.oracleSQL, c.args...)?
+		if !slices.Equal(got, want) {
+			return fmt.Errorf("FilterItems(%v) = %+v, database/sql rows = %+v", c.ids, got, want)
+		}
+	}
+	return nil
+}
+
+func compareRepeatedBindItems(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	const anchorID int64 = 2
+	const omitName = "third item"
+	const literalName = "?12"
+	const seed = "INSERT INTO items (id, name) VALUES (5, ?), (6, 'slice item')"
+	pool.ExecContext(ctx, seed, literalName)?
+	oracle.ExecContext(ctx, seed, literalName)?
+
+	cases := []struct {
+		ids       []int64
+		oracleSQL string
+		args      []any
+	}{
+		{
+			ids:       []int64{5, 6, 3, 1},
+			oracleSQL: "SELECT id, name FROM items WHERE name NOT IN (?, ?) AND id >= ? AND (id = ? OR id IN (?, ?, ?, ?)) ORDER BY id DESC",
+			args:      []any{omitName, literalName, anchorID, anchorID, int64(5), int64(6), int64(3), int64(1)},
+		},
+		{
+			oracleSQL: "SELECT id, name FROM items WHERE name NOT IN (?, ?) AND id >= ? AND (id = ? OR id IN (NULL)) ORDER BY id DESC",
+			args:      []any{omitName, literalName, anchorID, anchorID},
+		},
+	}
+	for _, c := range cases {
+		args := store.FilterItemsWithRepeatedBindArgs{AnchorID: anchorID, Ids: c.ids, OmitName: omitName}
+		got := store.FilterItemsWithRepeatedBind(ctx, pool, args)?
+		want := readOracleItems(ctx, oracle, c.oracleSQL, c.args...)?
+		if !slices.Equal(got, want) {
+			return fmt.Errorf("FilterItemsWithRepeatedBind(%v) = %+v, database/sql rows = %+v", c.ids, got, want)
+		}
+	}
+	return nil
+}
+
+func readOracleItems(ctx context.Context, oracle *sql.DB, query string, args ...any) ([]store.Item, error) {
+	rows := oracle.QueryContext(ctx, query, args...)?
+	defer rows.Close()?
+	var want []store.Item
+	for rows.Next() {
+		var row store.Item
+		rows.Scan(&row.ID, &row.Name)?
+		want = append(want, row)
+	}
+	rows.Err()?
+	return want, nil
+}

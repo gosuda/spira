@@ -778,13 +778,6 @@ func checkEngineFiles(t *testing.T, tc engineCase, req *Request, files []File) {
 		t.Fatalf("query file holds no UpdateItem with UpdateItemArgs:\n%s", queries)
 		return
 	}
-	models := generateFile(t, req)
-	for _, want := range []string{"PrepareAll: GetItem", "PrepareAll: UpdateItem", "p.Prepare(ctx, GetItemQuery)"} {
-		if !strings.Contains(models, want) {
-			t.Fatalf("models file holds no %q:\n%s", want, models)
-			return
-		}
-	}
 }
 
 func versionedFixture(t *testing.T) *Request {
@@ -881,6 +874,43 @@ func TestUnmappedTypeNamesTableAndColumn(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %v, want substring %q", err, want)
 			return
+		}
+	}
+}
+
+func TestTableColumnNameThatBreaksTheStructTagIsRefused(t *testing.T) {
+	for _, name := range []string{"a`b", "a\nb", "a\x00b"} {
+		req := patchRequest(t, "sqlite", func(r *Request) {
+			r.Catalog.Schemas[0].Tables[0].Columns[0].Name = name
+		})
+		_, _, err := Generate(req)
+		if err == nil {
+			t.Fatalf("Generate accepted table column name %q; want a struct tag error", name)
+			return
+		}
+		for _, want := range []string{"struct tag", "items"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error for %q = %v, want substring %q", name, err, want)
+				return
+			}
+		}
+	}
+}
+
+func TestQueryColumnNameThatBreaksTheStructTagIsRefused(t *testing.T) {
+	for _, name := range []string{"ti`tle", "ti\ntle"} {
+		req := sliceFixture(t)
+		req.Queries[0].Columns[1].Name = name
+		_, _, err := Generate(req)
+		if err == nil {
+			t.Fatalf("Generate accepted query column name %q; want a struct tag error", name)
+			return
+		}
+		for _, want := range []string{"struct tag", "FindDocs"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error for %q = %v, want substring %q", name, err, want)
+				return
+			}
 		}
 	}
 }

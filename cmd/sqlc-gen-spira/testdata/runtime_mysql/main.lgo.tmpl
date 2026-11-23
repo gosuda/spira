@@ -1,0 +1,208 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"time"
+
+	"example.com/spira-sqlc-mysql-runtime/store"
+	"github.com/go-sql-driver/mysql"
+	"github.com/gosuda/spira/db"
+)
+
+//go:embed migrations/0001_create_items.up.sql
+var schemaUp string
+
+//go:embed migrations/0001_create_items.down.sql
+var schemaDown string
+
+const readOracleItemSQL = "SELECT id, note, name, created_at, version FROM spira_mysql_runtime_items WHERE id = ?"
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dsn := os.Getenv("SPIRA_TEST_MYSQL_DSN")
+	pool := db.Open("mysql", dsn)?
+	if pool == nil {
+		return errors.New("mysql runtime: db.Open returned no pool")
+	}
+	defer pool.Stop(ctx)?
+	oracle := sql.Open("mysql", dsn)?
+	defer oracle.Close()?
+
+	comparePrepareWithoutTable(ctx, pool, oracle)?
+	oracle.ExecContext(ctx, schemaUp)?
+	defer dropFixtureTable(oracle)?
+	stmt := oracle.PrepareContext(ctx, readOracleItemSQL)?
+	stmt.Close()?
+	store.PrepareAll(ctx, pool)?
+
+	ids := compareWrites(ctx, pool, oracle)?
+	compareMissingRead(ctx, pool, oracle)?
+	return compareSlices(ctx, pool, oracle, ids)
+}
+
+func comparePrepareWithoutTable(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	stmt, err := oracle.PrepareContext(ctx, readOracleItemSQL)
+	if err == nil {
+		closeErr := stmt.Close()
+		return errors.Join(errors.New("mysql runtime: spira_mysql_runtime_items already exists; use a scratch database"), closeErr)
+	}
+	want, ok := errors.AsType[*mysql.MySQLError](err)
+	if !ok || want.Number != 1146 {
+		return fmt.Errorf("database/sql prepare did not report a missing table: %w", err)
+	}
+	preparedErr := store.PrepareAll(ctx, pool)
+	if preparedErr == nil {
+		return errors.New("PrepareAll succeeded before the fixture table existed")
+	}
+	got, ok := errors.AsType[*mysql.MySQLError](preparedErr)
+	if !ok || got.Number != want.Number {
+		return fmt.Errorf("PrepareAll against the missing table: %w; database/sql reported MySQL error %d", preparedErr, want.Number)
+	}
+	return nil
+}
+
+func dropFixtureTable(oracle *sql.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := oracle.ExecContext(ctx, schemaDown)
+	return err
+}
+
+type itemIDs struct {
+	Generated int64
+	Oracle    int64
+}
+
+type itemSnapshot struct {
+	ID        int64
+	Note      sql.NullString
+	Name      string
+	CreatedAt time.Time
+	Version   int32
+}
+
+func fixtureTime() time.Time {
+	return time.Date(2024, time.February, 3, 4, 5, 6, 0, time.UTC)
+}
+
+func compareWrites(ctx context.Context, pool *db.Pool, oracle *sql.DB) (itemIDs, error) {
+	id := store.CreateItem(ctx, pool, "created by store", fixtureTime())?
+	var actualID int64
+	oracle.QueryRowContext(ctx, "SELECT id FROM spira_mysql_runtime_items WHERE name = ?", "created by store").Scan(&actualID)?
+	if id != actualID {
+		return itemIDs{}, fmt.Errorf("CreateItem returned ID %d; database/sql found %d", id, actualID)
+	}
+	before := readOracleItem(ctx, oracle, id)?
+	compareItem(ctx, pool, before)?
+
+	other := insertOracleItem(ctx, oracle, "created by oracle", 1)?
+	store.ClearItemNote(ctx, pool, id)?
+	oracle.ExecContext(ctx, "UPDATE spira_mysql_runtime_items SET note = ? WHERE id = ?", "", other)?
+	for _, name := range []string{"eligible", "stale"} {
+		got := store.ReviseItem(ctx, pool, store.ReviseItemArgs{Name: name, ID: id, Version: 1})?
+		result := oracle.ExecContext(ctx, "UPDATE spira_mysql_runtime_items SET name = ?, version = version + 1 WHERE id = ? AND version = ?", name, other, 1)?
+		want := result.RowsAffected()?
+		if got != want {
+			return itemIDs{}, fmt.Errorf("ReviseItem(%q) affected %d rows; database/sql affected %d", name, got, want)
+		}
+	}
+	want := readOracleItem(ctx, oracle, other)?
+	want.ID = id
+	persisted := readOracleItem(ctx, oracle, id)?
+	if persisted.Note != want.Note || persisted.Name != want.Name || !persisted.CreatedAt.Equal(want.CreatedAt) || persisted.Version != want.Version {
+		return itemIDs{}, fmt.Errorf("generated writes persisted %+v; database/sql writes persisted %+v", persisted, want)
+	}
+	compareItem(ctx, pool, want)?
+	return itemIDs{Generated: id, Oracle: other}, nil
+}
+
+func insertOracleItem(ctx context.Context, oracle *sql.DB, name string, version int32) (int64, error) {
+	result := oracle.ExecContext(ctx, "INSERT INTO spira_mysql_runtime_items (name, created_at, version) VALUES (?, ?, ?)", name, fixtureTime(), version)?
+	return result.LastInsertId()
+}
+
+func readOracleItem(ctx context.Context, oracle *sql.DB, id int64) (itemSnapshot, error) {
+	var row itemSnapshot
+	oracle.QueryRowContext(ctx, readOracleItemSQL, id).Scan(&row.ID, &row.Note, &row.Name, &row.CreatedAt, &row.Version)?
+	return row, nil
+}
+
+func compareItem(ctx context.Context, pool *db.Pool, want itemSnapshot) error {
+	got := store.ReadItem(ctx, pool, want.ID)?
+	if got == nil {
+		return fmt.Errorf("ReadItem(%d) returned no row; database/sql found %+v", want.ID, want)
+	}
+	note := got.Note
+	if got.ID != want.ID || (note != nil) != want.Note.Valid || (note ?? "") != want.Note.String ||
+		got.Name != want.Name || !got.CreatedAt.Equal(want.CreatedAt) || got.Version != want.Version {
+		return fmt.Errorf("ReadItem(%d) = %+v; database/sql = %+v", want.ID, got, want)
+	}
+	return nil
+}
+
+func compareMissingRead(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	const missingID int64 = -1
+	_, err := readOracleItem(ctx, oracle, missingID)
+	if err == nil {
+		return fmt.Errorf("database/sql unexpectedly found ID %d", missingID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("database/sql read of ID %d: %w", missingID, err)
+	}
+	got := store.ReadItem(ctx, pool, missingID)?
+	if got != nil {
+		return fmt.Errorf("ReadItem(%d) returned %+v; database/sql found no row", missingID, got)
+	}
+	return nil
+}
+
+func compareSlices(ctx context.Context, pool *db.Pool, oracle *sql.DB, ids itemIDs) error {
+	const blockedName = "blocked"
+	const minVersion int32 = 2
+	blocked := insertOracleItem(ctx, oracle, blockedName, minVersion)?
+	old := insertOracleItem(ctx, oracle, "old version", minVersion-1)?
+	eligible := readEligibleIDs(ctx, oracle, blockedName, minVersion)?
+	for _, selected := range [][]int64{nil, {old, ids.Oracle, blocked}, {ids.Oracle, ids.Generated}} {
+		got := store.ListMatchingItems(ctx, pool, store.ListMatchingItemsArgs{
+			BlockedName: blockedName,
+			SelectedIds: selected,
+			MinVersion:  minVersion,
+		})?
+		var want []int64
+		for _, id := range eligible {
+			if slices.Contains(selected, id) {
+				want = append(want, id)
+			}
+		}
+		if !slices.Equal(got, want) {
+			return fmt.Errorf("ListMatchingItems(%v) = %v; database/sql rows in the selected set = %v", selected, got, want)
+		}
+	}
+	return nil
+}
+
+func readEligibleIDs(ctx context.Context, oracle *sql.DB, blockedName string, minVersion int32) ([]int64, error) {
+	rows := oracle.QueryContext(ctx, "SELECT id FROM spira_mysql_runtime_items WHERE name <> ? AND version >= ? ORDER BY id", blockedName, minVersion)?
+	defer rows.Close()?
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		rows.Scan(&id)?
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}

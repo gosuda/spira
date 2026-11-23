@@ -73,6 +73,7 @@ The plugin writes one JSON object to standard output. The object has one field `
 - An array column MUST be an error that names the table and the column.
 - An unmapped type MUST be an error that names the table and the column.
 - The plugin MUST NOT guess a type.
+- A column name with a backtick or a control character MUST be an error, because the generated `col` tag is a raw string.
 - On MySQL, an unsigned integer column MUST be an error unless `overrides` names a type.
 
 All engines:
@@ -183,6 +184,7 @@ SQL Server:
 - A slice marker without a slice parameter names the marker and the query.
 - An unknown embed table MUST be the error naming the query and the table.
 - An unmapped type and an array column each produce an error.
+- A column name with a backtick or a control character produces an error that names the table or the query.
 - An unsigned MySQL integer produces an error.
 - Each error names the table and the column.
 - Any engine other than `sqlite`, `postgresql`, `mysql` and `mssql` produces an error.

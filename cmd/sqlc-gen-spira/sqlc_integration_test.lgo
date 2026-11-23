@@ -1,0 +1,81 @@
+package main_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestSQLcSQLiteIntegration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if err := exerciseSQLcSQLite(ctx, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func exerciseSQLcSQLite(ctx context.Context, dir string) error {
+	root := filepath.Abs(filepath.Join("..", ".."))?
+	os.CopyFS(dir, os.DirFS(filepath.Join("testdata", "runtime_sqlite")))?
+	os.Rename(filepath.Join(dir, "main.lgo.tmpl"), filepath.Join(dir, "main.lgo"))?
+	configureSQLcSQLite(ctx, root, dir)?
+
+	build := exec.CommandContext(ctx, "logos", "build", "-o", filepath.Join(dir, "sqlc-gen-spira"), "./cmd/sqlc-gen-spira")
+	build.Dir = root
+	runSQLcSQLiteCommand(build)?
+	generateSQLcSQLite(ctx, dir)?
+
+	run := exec.CommandContext(ctx, "logos", "run", ".")
+	run.Dir = dir
+	runSQLcSQLiteCommand(run)?
+
+	invalid := []byte("-- name: MissingColumn :one\nSELECT missing_column FROM items;\n")
+	os.WriteFile(filepath.Join(dir, "queries", "invalid.sql"), invalid, 0o644)?
+	err := generateSQLcSQLite(ctx, dir)
+	if err == nil {
+		return errors.New("sqlc generate accepted a query selecting missing_column")
+	}
+	if _, exited := errors.AsType[*exec.ExitError](err); !exited || ctx.Err() != nil {
+		return fmt.Errorf("sqlc did not reject the invalid query: %w", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "invalid.sql:") || !strings.Contains(msg, `column "missing_column" does not exist`) {
+		return fmt.Errorf("sqlc did not name the missing column in invalid.sql: %w", err)
+	}
+	return nil
+}
+
+func configureSQLcSQLite(ctx context.Context, root string, dir string) error {
+	for _, name := range []string{"go.mod", "go.sum", "logos.toml"} {
+		data := os.ReadFile(filepath.Join(root, name))?
+		os.WriteFile(filepath.Join(dir, name), data, 0o644)?
+	}
+	os.CopyFS(filepath.Join(dir, "tools"), os.DirFS(filepath.Join(root, "tools")))?
+	edit := exec.CommandContext(ctx, "go", "mod", "edit",
+		"-module=example.com/spira-sqlc-runtime", "-require=github.com/gosuda/spira@v0.0.0",
+		"-replace=github.com/gosuda/spira="+root)
+	edit.Dir = dir
+	return runSQLcSQLiteCommand(edit)
+}
+
+func generateSQLcSQLite(ctx context.Context, dir string) error {
+	cmd := exec.CommandContext(ctx, "go", "tool", "sqlc", "generate", "-f", "../sqlc.yaml")
+	cmd.Dir = filepath.Join(dir, "tools")
+	cmd.Env = append(cmd.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return runSQLcSQLiteCommand(cmd)
+}
+
+func runSQLcSQLiteCommand(cmd *exec.Cmd) error {
+	cmd.Env = append(cmd.Environ(), "GOWORK=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", "GOPROXY=off", "GOSUMDB=off", "GOTELEMETRY=off")
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v in %s: %w\n%s", cmd.Args, cmd.Dir, err, out)
+	}
+	return nil
+}

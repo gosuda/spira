@@ -1,0 +1,74 @@
+//go:build engines
+
+package main_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestEngineSQLcGenSpiraMSSQL(t *testing.T) {
+	if os.Getenv("SPIRA_TEST_MSSQL_DSN") == "" {
+		t.Fatal("SPIRA_TEST_MSSQL_DSN is empty; run `just engines` or set it to a SQL Server test database")
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if err := exerciseMSSQLRuntime(ctx, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func exerciseMSSQLRuntime(ctx context.Context, dir string) error {
+	root := filepath.Abs(filepath.Join("..", ".."))?
+	os.CopyFS(dir, os.DirFS(filepath.Join("testdata", "runtime_mssql")))?
+	os.Rename(filepath.Join(dir, "main.lgo.tmpl"), filepath.Join(dir, "main.lgo"))?
+	configureMSSQLRuntime(ctx, root, dir)?
+
+	plugin := filepath.Join(dir, "sqlc-gen-spira")
+	build := exec.CommandContext(ctx, "logos", "build", "-o", plugin, "./cmd/sqlc-gen-spira")
+	build.Dir = root
+	runMSSQLRuntimeCommand(build)?
+
+	generate := exec.CommandContext(ctx, "go", "tool", "sqlc", "generate", "-f", filepath.Join(dir, "sqlc.yaml"))
+	generate.Dir = filepath.Join(dir, "tools")
+	generate.Env = append(generate.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runMSSQLRuntimeCommand(generate)?
+
+	binary := filepath.Join(dir, "mssql-runtime")
+	caller := exec.CommandContext(ctx, "logos", "build", "-o", binary, ".")
+	caller.Dir = dir
+	runMSSQLRuntimeCommand(caller)?
+
+	run := exec.CommandContext(ctx, binary)
+	run.Dir = dir
+	return runMSSQLRuntimeCommand(run)
+}
+
+func configureMSSQLRuntime(ctx context.Context, root string, dir string) error {
+	for _, name := range []string{"go.mod", "go.sum", "logos.toml"} {
+		data := os.ReadFile(filepath.Join(root, name))?
+		os.WriteFile(filepath.Join(dir, name), data, 0o644)?
+	}
+	os.CopyFS(filepath.Join(dir, "tools"), os.DirFS(filepath.Join(root, "tools")))?
+	edit := exec.CommandContext(ctx, "go", "mod", "edit",
+		"-module=example.com/spira-mssql-runtime", "-require=github.com/gosuda/spira@v0.0.0",
+		"-replace=github.com/gosuda/spira="+root)
+	edit.Dir = dir
+	return runMSSQLRuntimeCommand(edit)
+}
+
+func runMSSQLRuntimeCommand(cmd *exec.Cmd) error {
+	cmd.Env = append(cmd.Environ(), "GOWORK=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", "GOPROXY=off", "GONOPROXY=none", "GOTELEMETRY=off")
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v in %s: %w\n%s", cmd.Args, cmd.Dir, err, out)
+	}
+	return nil
+}
