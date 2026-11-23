@@ -1307,3 +1307,112 @@ func TestServerClosesSlowHeadersWithinReadHeaderTimeout(t *testing.T) {
 		return
 	}
 }
+
+func TestServerClosesSlowBodyWithinReadTimeout(t *testing.T) {
+	r := web.NewRouter()
+	handlerDone := make(chan struct{})
+	r.Handle("POST", "/echo", func(ctx *web.Context) (web.Reply, error) {
+		data, rerr := web.ReadBody(ctx.Request, 1024)
+		if rerr != nil {
+			return web.Problem{Title: "body read failed", Status: http.StatusBadRequest}, nil
+		}
+		close(handlerDone)
+		return web.Data{Value: string(data)}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, ReadTimeout: 300 * time.Millisecond}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+	conn, derr := net.DialTimeout("tcp", addr, 5*time.Second)
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, werr := fmt.Fprintf(conn, "POST /echo HTTP/1.1\r\nHost: %s\r\nContent-Length: 8\r\n\r\nab", addr); werr != nil {
+		t.Fatalf("write request head: %v", werr)
+		return
+	}
+	if derr := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); derr != nil {
+		t.Fatalf("set read deadline: %v", derr)
+		return
+	}
+	start := time.Now()
+	_, rerr := io.ReadAll(conn)
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("stalled body stayed open %v past the 300ms read timeout", elapsed)
+		return
+	}
+	if rerr != nil && strings.Contains(rerr.Error(), "i/o timeout") {
+		t.Fatalf("stalled body kept the connection open until the test deadline: %v", rerr)
+		return
+	}
+	select {
+	case <-handlerDone:
+		t.Fatal("the handler completed although the body never finished")
+	default:
+	}
+}
+
+func TestServerClosesIdleConnectionAfterIdleTimeout(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "hi"}, nil
+	})
+	s := &web.Server{Addr: "127.0.0.1:0", Router: r, IdleTimeout: 300 * time.Millisecond}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopServer(t, s)
+	addr := s.BoundAddrForTest()
+	conn, derr := net.DialTimeout("tcp", addr, 5*time.Second)
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, werr := fmt.Fprintf(conn, "GET /hello HTTP/1.1\r\nHost: %s\r\n\r\n"); werr != nil {
+		t.Fatalf("write request: %v", werr)
+		return
+	}
+	if derr := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); derr != nil {
+		t.Fatalf("set read deadline: %v", derr)
+		return
+	}
+	bufr := bufio.NewReader(conn)
+	res, rerr := http.ReadResponse(bufr, &http.Request{Method: "GET"})
+	if rerr != nil {
+		t.Fatalf("read response: %v", rerr)
+		return
+	}
+	body, berr := io.ReadAll(res.Body)
+	if cerr := res.Body.Close(); cerr != nil {
+		t.Errorf("close response body: %v", cerr)
+	}
+	if berr != nil || !strings.Contains(string(body), "hi") {
+		t.Fatalf("first answer body = %q, %v", body, berr)
+		return
+	}
+	start := time.Now()
+	if _, rerr = bufr.ReadByte(); rerr == nil {
+		t.Fatal("idle connection received a byte instead of a close")
+		return
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("idle connection stayed open %v past the 300ms idle timeout", elapsed)
+		return
+	}
+}

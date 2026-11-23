@@ -229,12 +229,15 @@ func (e *ProblemError) Error() string
 func Fail(p Problem) error
 
 type Server struct {
-	Addr              string = ":8080"
-	Router            *Router
-	ReadHeaderTimeout time.Duration = 5 * time.Second
-	ShutdownGrace     time.Duration = 20 * time.Second
-	TLS               *tls.Config?
-	H2C               bool
+	Addr                 string = ":8080"
+	Router               *Router
+	ReadHeaderTimeout    time.Duration = 5 * time.Second
+	ReadTimeout          time.Duration = 30 * time.Second
+	IdleTimeout          time.Duration = 120 * time.Second
+	ShutdownGrace        time.Duration = 20 * time.Second
+	TLS                  *tls.Config?
+	H2C                  bool
+	HTTP2ExtendedConnect bool
 	// unexported fields
 }
 
@@ -326,6 +329,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - Field types MUST be string, bool, the int kinds, float64, `time.Duration`, named strings and their option forms.
 - `Route` MUST set each top-level `Wire` to the binding-tag key.
 - Each `Source` MUST name its source or stay empty.
+- `Route` MUST list a field that has a binding tag even when its `json` tag is `-`.
 - A `body` field MUST keep its JSON wire name.
 - `Route` MUST store that schema in the `RouteInfo`.
 - `Route` MUST run `Bind` before it calls the handler.
@@ -354,6 +358,9 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - An htmx request that is not boosted MUST answer 200 with `HX-Redirect`.
 - Any other `Redirect` MUST set `Location` to `To`.
 - Any other `Redirect` MUST use `Status`.
+- A `Redirect` whose `To` has a scheme other than `http` or `https` MUST answer a 500 problem.
+- That refusal MUST NOT set `Location` or `HX-Redirect`.
+- The application MUST check a redirect target that comes from user input. The router does not check the host.
 - A problem whose `Status` is 0 MUST use status 500.
 - The problem comparison MUST use only `text/html`, `application/json` and `application/problem+json`.
 - A missing or invalid `q` MUST count as 1.
@@ -407,6 +414,13 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Serve` MUST fail before serving and MUST NOT close the listener when the server is started, the router is nil, or `TLS` holds no certificate, `GetCertificate` or `GetConfigForClient`.
 - A cancelled start context MUST NOT stop the server.
 - The server MUST pass `OPTIONS *` to the router.
+- The server MUST pass `ReadTimeout` to `net/http.Server`.
+- The server MUST pass `IdleTimeout` to `net/http.Server`.
+- A positive `ReadTimeout` MUST bound request body reads.
+- A zero or negative `ReadTimeout` MUST disable the request read timeout.
+- A zero `IdleTimeout` MUST use `ReadTimeout`.
+- A negative `IdleTimeout` MUST disable the idle timeout.
+- The server MUST NOT set `WriteTimeout` so streaming responses stay open.
 - `Stop` MUST wait for an in-flight request until `ShutdownGrace` ends.
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
 - `Stop` MUST close open connections when shutdown times out.
@@ -427,7 +441,11 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Stop` MUST end HTTP/2 streams within `ShutdownGrace` like HTTP/1.1 connections.
 - `TrackConn` MUST return the tracked connection when the context comes from the server.
 - `TrackConn` MUST return the same connection when the context holds no server state.
-- Extended CONNECT over HTTP/2 MUST stay unbuilt in this toolchain.
+- `HTTP2ExtendedConnect` defaults to false. Set it only if the router handles HTTP/2 extended CONNECT requests.
+- When `HTTP2ExtendedConnect` is true, the server MUST enable extended CONNECT on its TLS HTTP/2 and configured `H2C` connections.
+- `HTTP2ExtendedConnect` MUST NOT enable HTTP/2 by itself.
+- For an RFC 8441 WebSocket endpoint, register a `CONNECT` route that calls `websocket.Serve` before the handler returns.
+- HTTP/2 extended CONNECT streams MUST stay under `net/http` shutdown. They do not enter the hijacked connection set.
 
 ### Code table
 
@@ -475,6 +493,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestLateUseAppliesToEarlierRoutes` proves that a stage added after route registration still runs.
 - `TestUseWhileServingDoesNotRace` proves that `Use` under live traffic does not race.
 - `TestRedirectUnderHtmxAndPlain` proves `HX-Redirect` and `Location`.
+- `TestRedirectRefusesScriptSchemes` and `TestRedirectKeepsOrdinaryTargets` prove the redirect scheme rule.
 - `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped or joined fault.
 - `TestInternalFaultIsLoggedOnce` proves that a 500 fault is logged once while a 409 fault stays quiet.
 - `TestWrappedLegacyProblemKeepsTheProblem` proves that a wrapped `Fail` keeps its problem.
@@ -509,6 +528,8 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestAsteriskTargetIsRejectedWithoutARedirect` proves the 400 for the request target `*` and the root stage header.
 - `TestServerStopWaitsForInFlightRequest` proves that `Stop` waits for a live request.
 - `TestServerClosesSlowHeadersWithinReadHeaderTimeout` proves that the TCP listener closes stalled headers within the timeout.
+- `TestServerClosesSlowBodyWithinReadTimeout` proves that the server closes a connection whose body stalls beyond `ReadTimeout`.
+- `TestServerClosesIdleConnectionAfterIdleTimeout` proves that the server closes an idle keep-alive connection after `IdleTimeout`.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
 - `TestStartWithoutTLSCertificateFailsAndFreesThePort` proves that a missing certificate fails `Start` before binding and leaves the port free.
 - `TestStartWithDynamicCertificateConfigServes` proves that a dynamic certificate config still starts.
@@ -529,6 +550,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestServerStopReturnsWithinGraceForH2WhenHandlerNeverReturns` proves the grace deadline for an h2 stream.
 - `TestServerStopClosesH2StreamWhenShutdownTimesOut` proves a timed-out shutdown ends an h2 stream context.
 - `TestTrackConnWithoutServerReturnsUntracked` proves `TrackConn` without server state returns the same connection.
+- `TestHTTP2WebSocketEchoAndClose` proves extended CONNECT through a `Server` with `H2C` and `HTTP2ExtendedConnect` enabled.
 - `TestRouteBindsTypedFields` proves path, query, header, cookie and form binding.
 - `TestBindCollectsEveryFieldError` proves that one 400 lists every bad field.
 - `TestBindRequiredFieldMissing` proves the `required` rule.
@@ -548,6 +570,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestFormBodyOverMaxBodyIsRejected` proves the 413 answer for an oversized form body.
 - `TestMalformedOptionQueryValueIsAFieldError` proves that a malformed query value fails with rule `format` instead of absence.
 - `TestRouteInfoCarriesSchemaAndDoc` proves the stored `Wire`, the stored `Source` and the attached `Doc`.
+- `TestRouteSchemaKeepsBoundFieldsThatJSONHides` proves that a header field with `json:"-"` stays in the route schema with its source.
 - `TestRoutesReturnsACopy` proves that mutating one call leaves the next call unchanged.
 - `TestDescribeUnknownRoutePanics` proves the unknown-route panic.
 - `TestDescribeInsideAGroupAttachesTheDoc` proves that `Describe` in a group finds the prefixed route.

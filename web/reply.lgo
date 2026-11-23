@@ -169,7 +169,27 @@ func (r *Router) writeData(ctx *Context, d Data) error {
 	return nil
 }
 
+func redirectTargetAllowed(to string) bool {
+	stripped := strings.Map(func(r rune) rune {
+		if r <= ' ' || r == 0x7f {
+			return -1
+		}
+		return r
+	}, to)
+	i := strings.IndexAny(stripped, ":/?#")
+	if i < 0 || stripped[i] != ':' {
+		return true
+	}
+	scheme := strings.ToLower(stripped[:i])
+	return scheme == "http" || scheme == "https"
+}
+
 func (r *Router) writeRedirect(ctx *Context, d Redirect) error {
+	if !redirectTargetAllowed(d.To) {
+		slog.Error("web: redirect target refused", "path", ctx.Request.URL.Path)
+		refused := Problem{Title: "Internal Server Error", Status: http.StatusInternalServerError, Detail: "web: redirect target refused"}
+		return r.writeProblem(ctx, refused)
+	}
 	w := ctx.writer
 	htmx := ctx.Htmx()
 	if htmx.Request && !htmx.Boosted {

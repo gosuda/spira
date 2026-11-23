@@ -49,6 +49,7 @@ func RouteSchema[In any]() schema.Schema {
 	if !ok {
 		return found
 	}
+	var val In
 	const for _, f := range comptime.Fields[In]() {
 		tags := FieldTags{
 			Name:   f.Name,
@@ -60,6 +61,7 @@ func RouteSchema[In any]() schema.Schema {
 			Cookie: f.Tag.Get("cookie"),
 		}
 		key, source := BindingTag(tags)
+		present := false
 		for i := range obj.Fields {
 			match := obj.Fields[i].Name == f.Name
 			if match && key != "" {
@@ -67,6 +69,13 @@ func RouteSchema[In any]() schema.Schema {
 			}
 			if match {
 				obj.Fields[i].Source = source
+				present = true
+			}
+		}
+		if !present && key != "" {
+			found, ok := schema.FieldOf[f.Type](any(&val.[f]))
+			if ok {
+				obj.Fields = append(obj.Fields, schema.Field{Name: f.Name, Wire: key, Source: source, Schema: &schema.Node{Value: found}})
 			}
 		}
 	}
