@@ -108,6 +108,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `Mount` MUST validate `Origin`: an absent `Origin` is allowed.
 - A present `Origin` MUST parse as `http` or `https`.
 - A present `Origin` MUST match the request `Host`; anything else answers 403 with a no-id JSON-RPC error.
+- When the request arrived on a loopback address, a present `Origin` MUST name `localhost` or a loopback IP; anything else answers the same 403. A DNS rebinding page makes `Origin` and `Host` both name its own domain while that domain resolves to the loopback address, so the match with `Host` alone does not stop it. The rule follows the localhost protection of the MCP Go SDK (`modelcontextprotocol/go-sdk`, `mcp/streamable.go`) and the local server guidance of the specification's security best practices, and applies only to a request with an `Origin`, because only a browser can be rebound and a browser sends `Origin` on every `POST`.
 - `Mount` MUST answer 400 for a present `MCP-Protocol-Version` other than `2025-11-25`.
 - `Mount` MUST answer 400 for a body that is not one JSON-RPC envelope, with error `-32700`.
 - `Mount` MUST take a guard as `ops` and `admin` do.
@@ -199,6 +200,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
 - They also pin that the guard runs and a refused request never reaches a tool.
+- `TestMountRefusesRebindingOnLoopback` proves that a request on the loopback listener whose `Origin` and `Host` both name another domain answers 403 and never reaches the tool, and that `localhost` and `127.0.0.1` still pass.
 - `TestMountCallToolError`, `TestMountUnknownTool`, `TestMountMalformed`, `TestMountUnknownMethod` and `TestMountNotification` pin the error results and the protocol error codes.
 - They also pin the 400 for an unparseable body and the 202 for a notification.
 - `TestMountClientServer` runs the client of this package against `Mount` over `net/http/httptest`.
