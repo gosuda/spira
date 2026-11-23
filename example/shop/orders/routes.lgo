@@ -1,0 +1,169 @@
+package orders
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/orm"
+	"github.com/gosuda/spira/web"
+)
+
+type Feature struct {
+	DB *db.Pool
+}
+
+const callTimeout = 10 * time.Second
+
+var errEmptyCart = errors.New("orders: cart is empty")
+
+func (f *Feature) Register(r *web.Router) {
+	r.Group("/orders", func(g *web.Router) {
+		g.Use(auth.Require(auth.Authenticated()))
+		g.Handle("POST", "", f.create)
+		g.Handle("POST", "/{id}/cancel", f.cancel)
+	})
+}
+
+func (f *Feature) create(wctx *web.Context) (web.Reply, error) {
+	call, cancel := context.WithTimeout(wctx.Ctx(), callTimeout)
+	defer cancel()
+	p := web.Get(wctx, auth.PrincipalKey)
+	if p == nil {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	key := p.ID
+	uid, err := strconv.ParseInt(key, 10, 64)
+	if err != nil {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	done, err := orm.InSession(call, f.DB, func(s *orm.Session) (created, error) {
+		return insertOrder(call, s, store.UserID(uid), key)
+	})
+	if err != nil {
+		if errors.Is(err, errEmptyCart) {
+			return nil, ErrEmptyCart.WithFields(fault.Field{Name: "cart", Rule: "empty", Message: "cart is empty."}).Err()
+		}
+		return nil, fmt.Errorf("orders: create order: %w", err)
+	}
+	return web.Fragment{Status: http.StatusCreated, Body: OrderCreated(done.ID, done.Total)}, nil
+}
+
+type created struct {
+	ID    int64
+	Total int64
+}
+
+func insertOrder(call context.Context, s *orm.Session, user store.UserID, key string) (created, error) {
+	var zero created
+	lines, err := store.ListCartItems(call, s.Tx(), "user", key)
+	if err != nil {
+		return zero, fmt.Errorf("orders: list cart: %w", err)
+	}
+	if len(lines) == 0 {
+		return zero, errEmptyCart
+	}
+	var total int64
+	for _, l := range lines {
+		total += l.Quantity * l.Product.Price
+	}
+	order := &store.Order{UserID: user, Status: "open", Total: total, CreatedAt: time.Now().UTC()}
+	orm.Add(s, store.OrderTable, order)
+	if err := s.Flush(call); err != nil {
+		return zero, fmt.Errorf("orders: insert order: %w", err)
+	}
+	for _, l := range lines {
+		line := &store.OrderLine{OrderID: order.ID, ProductID: l.Product.ID, Quantity: l.Quantity, UnitPrice: l.Product.Price}
+		orm.Add(s, store.OrderLineTable, line)
+	}
+	if _, err := store.ClearCart(call, s.Tx(), "user", key); err != nil {
+		return zero, fmt.Errorf("orders: clear cart: %w", err)
+	}
+	return created{ID: int64(order.ID), Total: total}, nil
+}
+
+func (f *Feature) cancel(wctx *web.Context) (web.Reply, error) {
+	call, cancel := context.WithTimeout(wctx.Ctx(), callTimeout)
+	defer cancel()
+	p := web.Get(wctx, auth.PrincipalKey)
+	if p == nil {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	uid, err := strconv.ParseInt(p.ID, 10, 64)
+	if err != nil {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	n, err := strconv.ParseInt(wctx.Request.PathValue("id"), 10, 64)
+	if err != nil {
+		return nil, ErrUnknownOrder.Err()
+	}
+	if err := cancelOrder(call, f.DB, store.OrderID(n), store.UserID(uid)); err != nil {
+		if _, stale := errors.AsType[*orm.StaleError](err); stale {
+			return nil, ErrStaleOrder.Err()
+		}
+		return nil, fmt.Errorf("orders: cancel order: %w", err)
+	}
+	return web.Fragment{Body: OrderStatus(n, "cancelled")}, nil
+}
+
+func cancelOrder(ctx context.Context, pool *db.Pool, id store.OrderID, user store.UserID) error {
+	snapshot := orm.InSQLiteImmediateSession(ctx, pool, func(s *orm.Session) (store.Order, error) {
+		return loadOpenOrder(ctx, s, id, user)
+	})?
+	probeWait(ctx)?
+	_, err := orm.InSQLiteImmediateSession(ctx, pool, func(s *orm.Session) (struct{}, error) {
+		return struct{}{}, cancelOwnedOrder(ctx, s, snapshot)
+	})
+	return err
+}
+
+func loadOpenOrder(ctx context.Context, s *orm.Session, id store.OrderID, user store.UserID) (store.Order, error) {
+	found := orm.Get(ctx, s, store.OrderTable, id)?
+	if found == nil {
+		return store.Order{}, ErrUnknownOrder.Err()
+	}
+	if found.UserID != user {
+		return store.Order{}, ErrUnknownOrder.Err()
+	}
+	if found.Status == "cancelled" {
+		return store.Order{}, ErrAlreadyCancelled.Err()
+	}
+	return *found, nil
+}
+
+func cancelOwnedOrder(ctx context.Context, s *orm.Session, snapshot store.Order) error {
+	current := store.GetOrder(ctx, s.Tx(), snapshot.ID)?
+	if current == nil {
+		return ErrUnknownOrder.Err()
+	}
+	if current.UserID != snapshot.UserID {
+		return ErrUnknownOrder.Err()
+	}
+	held := orm.Attach(s, store.OrderTable, []store.Order{snapshot})
+	if len(held) != 1 {
+		return errors.New("orders: attach order snapshot returned no order")
+	}
+	held[0].Status = "cancelled"
+	return nil
+}
+
+type probeKey struct{}
+
+func probeWait(call context.Context) error {
+	v := call.Value(probeKey{})
+	if v == nil {
+		return nil
+	}
+	probe, ok := v.(func(context.Context) error)
+	if !ok {
+		return nil
+	}
+	return probe(call)
+}

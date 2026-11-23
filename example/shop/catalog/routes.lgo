@@ -1,0 +1,115 @@
+package catalog
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"net/url"
+	"slices"
+	"strconv"
+
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+type Feature struct {
+	DB     *db.Pool
+	Assets *asset.Manifest
+}
+
+func (f *Feature) Register(r *web.Router) {
+	r.Handle("GET", "/catalog", f.list)
+	r.Handle("GET", "/catalog/search", f.search)
+	r.Handle("GET", "/catalog/{id}", f.detail)
+	r.Handle("GET", "/api/products", f.apiList)
+}
+
+func (f *Feature) list(ctx *web.Context) (web.Reply, error) {
+	query := ctx.Request.URL.Query().Get("q")
+	order := ctx.Request.URL.Query().Get("sort")
+	items, err := productsFor(ctx.Ctx(), f.DB, query)
+	if err != nil {
+		return nil, err
+	}
+	sortProducts(items, order)
+	return web.Page{Title: "Catalog", Body: List(items, query, order, recommendedLater(f.DB, 0))}, nil
+}
+
+func (f *Feature) search(ctx *web.Context) (web.Reply, error) {
+	query := ctx.Request.URL.Query().Get("q")
+	order := ctx.Request.URL.Query().Get("sort")
+	items, err := productsFor(ctx.Ctx(), f.DB, query)
+	if err != nil {
+		return nil, err
+	}
+	sortProducts(items, order)
+	if layout.WantsFragment(ctx) {
+		return web.Fragment{Body: Results(items)}, nil
+	}
+	return web.Redirect{To: "/catalog?q=" + url.QueryEscape(query) + "&sort=" + url.QueryEscape(order)}, nil
+}
+
+func (f *Feature) detail(ctx *web.Context) (web.Reply, error) {
+	id, err := strconv.ParseInt(ctx.Request.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		return nil, ErrUnknownProduct.Err()
+	}
+	row, err := store.GetProduct(ctx.Ctx(), f.DB, store.ProductID(id))
+	if err != nil {
+		return nil, fmt.Errorf("catalog: get product: %w", err)
+	}
+	if row == nil {
+		return nil, ErrUnknownProduct.Err()
+	}
+	product := row ?? store.Product{}
+	return web.Page{Title: product.Name, Body: Detail(product, recommendedLater(f.DB, id))}, nil
+}
+
+func (f *Feature) apiList(ctx *web.Context) (web.Reply, error) {
+	items, err := store.ListProducts(ctx.Ctx(), f.DB)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list products: %w", err)
+	}
+	return web.Data{Value: items}, nil
+}
+
+func productsFor(ctx context.Context, q db.Querier, query string) ([]store.Product, error) {
+	if query == "" {
+		items, err := store.ListProducts(ctx, q)
+		if err != nil {
+			return nil, fmt.Errorf("catalog: list products: %w", err)
+		}
+		return items, nil
+	}
+	items, err := store.SearchProducts(ctx, q, "%"+query+"%")
+	if err != nil {
+		return nil, fmt.Errorf("catalog: search products: %w", err)
+	}
+	return items, nil
+}
+
+func sortProducts(items []store.Product, order string) {
+	switch order {
+	case "price_asc":
+		slices.SortFunc(items, func(a store.Product, b store.Product) int { return cmp.Compare(a.Price, b.Price) })
+	case "price_desc":
+		slices.SortFunc(items, func(a store.Product, b store.Product) int { return cmp.Compare(b.Price, a.Price) })
+	}
+}
+
+func recommendedLater(pool *db.Pool, exclude int64) *view.Later {
+	return &view.Later{
+		Fallback: layout.Fallback(view.P(view.T("Loading recommendations."))),
+		Resolve: func(ctx context.Context) (view.Node, error) {
+			items, err := store.ListRecommendedProducts(ctx, pool, store.ProductID(exclude))
+			if err != nil {
+				return view.Group{}, fmt.Errorf("catalog: recommendations: %w", err)
+			}
+			return Recommended(items), nil
+		},
+	}
+}

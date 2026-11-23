@@ -1,0 +1,18 @@
+package orders
+
+import (
+	"github.com/gosuda/spira/view"
+)
+
+func OrderCreated(id int64, total int64) view.Node {
+	return view.Div(
+		view.H1(view.T("Order created")),
+		view.P(view.T($"Order {id} totals {total}.")),
+	)
+}
+
+func OrderStatus(id int64, status string) view.Node {
+	return view.Div(
+		view.P(view.T($"Order {id} is {status}.")),
+	)
+}

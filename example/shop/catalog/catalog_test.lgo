@@ -1,0 +1,618 @@
+package catalog_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/example/shop/catalog"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+	"golang.org/x/net/html"
+
+	_ "modernc.org/sqlite"
+)
+
+func openPool(t *testing.T) *db.Pool? {
+	t.Helper()
+	key := strings.NewReplacer("/", "_").Replace(t.Name())
+	pool, err := db.Open("sqlite", fmt.Sprintf("file:spira_catalog_%s?mode=memory&cache=shared", key))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatalf("open: no pool")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+		return nil
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+		return nil
+	}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+		return nil
+	}
+	seedProducts(t, pool)
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func seedProducts(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	rows := []string{
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'Widget', 1299, 10, '2026-01-02 10:00:00')",
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (2, '<script>alert(1)</script>', 500, 5, '2026-01-03 10:00:00')",
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (3, 'Gadget', 2500, 0, '2026-01-01 10:00:00')",
+	}
+	for _, q := range rows {
+		if _, err := pool.ExecContext(t.Context(), q); err != nil {
+			t.Fatalf("seed: %v", err)
+			return
+		}
+	}
+}
+
+func testRouter(pool *db.Pool) *web.Router {
+	r := web.NewRouter()
+	r.Layout = layoutPage()
+	feature := &catalog.Feature{DB: pool, Assets: asset.Dev("http://localhost:5173")}
+	feature.Register(r)
+	return r
+}
+
+func layoutPage() func(ctx *web.Context, p web.Page) view.Node {
+	return func(ctx *web.Context, p web.Page) view.Node {
+		return view.Html(view.Head(view.Title(view.T(p.Title))), view.Body(p.Body))
+	}
+}
+
+func get(t *testing.T, r *web.Router, target string, headers http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	for k, vs := range headers {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func htmxHeaders() http.Header {
+	return http.Header{"HX-Request": []string{"true"}}
+}
+
+func TestCatalogPageStartsWithDoctype(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "<!doctype html>") {
+		t.Fatalf("body starts %q, want the doctype", body[:min(64, len(body))])
+	}
+	if vary := rec.Header().Get("Vary"); !strings.Contains(vary, "HX-Request") {
+		t.Fatalf("Vary = %q, want the htmx cache keys", vary)
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Fatalf("body lacks the escaped product name")
+	}
+	if strings.Contains(body, "<script>alert(1)</script>") {
+		t.Fatalf("body holds the raw injected script")
+	}
+	if !strings.Contains(body, `entry="example/shop/catalog/islands/gallery.react.tsx"`) {
+		t.Fatalf("body lacks the gallery island")
+	}
+	if !strings.Contains(body, `entry="example/shop/catalog/islands/filter.solid.tsx"`) {
+		t.Fatalf("body lacks the filter island")
+	}
+	if !strings.Contains(body, `hx-get="/catalog/search"`) {
+		t.Fatalf("body lacks the htmx search box")
+	}
+}
+
+func TestCatalogFragmentForHtmx(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog", htmxHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<html") {
+		t.Fatalf("fragment carries the document shell")
+	}
+	if !strings.Contains(body, "Widget") {
+		t.Fatalf("fragment lacks the product list")
+	}
+	if vary := rec.Header().Get("Vary"); !strings.Contains(vary, "HX-Request") {
+		t.Fatalf("Vary = %q, want the htmx cache key", vary)
+	}
+}
+
+func TestCatalogBoostedReturnsFullPage(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	headers := htmxHeaders()
+	headers.Set("HX-Boosted", "true")
+	rec := get(t, testRouter(pool), "/catalog", headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "<html") {
+		t.Fatalf("boosted response lacks the document shell")
+	}
+}
+
+func TestProductDetail(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	router := testRouter(pool)
+	rec := get(t, router, "/catalog/1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "Widget") {
+		t.Fatalf("detail lacks the product name")
+	}
+	missing := get(t, router, "/catalog/999", nil)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d, want 404", missing.Code)
+	}
+	if ct := missing.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("missing content type = %q, want application/problem+json", ct)
+	}
+	var problem map[string]string
+	if err := json.Unmarshal(missing.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode missing product fault: %v", err)
+		return
+	}
+	want := map[string]string{
+		"code":    "catalog.unknown_product",
+		"message": "The product was not found.",
+	}
+	if !maps.Equal(problem, want) {
+		t.Fatalf("missing product fault = %v, want only %v", problem, want)
+	}
+}
+
+func TestSearchFragmentFilters(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog/search?q=Wid", htmxHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Widget") {
+		t.Fatalf("search lacks the matching product")
+	}
+	if strings.Contains(body, "Gadget") {
+		t.Fatalf("search holds a product outside the query")
+	}
+}
+
+func TestPlainSearchRedirectsToList(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog/search?q=Widget", nil)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rec.Code)
+		return
+	}
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "q=Widget") {
+		t.Fatalf("Location = %q, want the query carried over", loc)
+	}
+}
+
+func TestAPIProducts(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/api/products", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type = %q, want application/json", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "Widget") {
+		t.Fatalf("api body lacks the product name")
+	}
+}
+
+func TestRecommendationsResolveWithoutReload(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog/1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	if !rec.Flushed {
+		t.Fatal("detail response was not flushed")
+	}
+	body := rec.Body.String()
+	_, slot, found := strings.Cut(body, `<spira-slot id="`)
+	if !found {
+		t.Fatal("detail lacks the recommendations fallback slot")
+		return
+	}
+	slotID, afterID, found := strings.Cut(slot, `">`)
+	if !found || slotID == "" {
+		t.Fatal("recommendations fallback slot lacks an ID")
+		return
+	}
+	fallback, afterFallback, found := strings.Cut(afterID, "</spira-slot>")
+	if !found || !strings.Contains(fallback, "Loading recommendations.") {
+		t.Fatal("recommendations slot lacks its loading fallback")
+		return
+	}
+	_, resolved, found := strings.Cut(afterFallback, `<template data-spira-slot="`+slotID+`">`)
+	if !found {
+		t.Fatal("detail lacks the matching resolved template after the fallback")
+		return
+	}
+	recommendations, _, found := strings.Cut(resolved, "</template>")
+	if !found || !strings.Contains(recommendations, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Fatal("resolved recommendations lack the escaped name of the other in-stock product")
+	}
+	if strings.Contains(recommendations, "Widget") || strings.Contains(recommendations, "Gadget") {
+		t.Fatal("resolved recommendations include the current or out-of-stock product")
+	}
+	if strings.Contains(body, "<script>alert(1)</script>") {
+		t.Fatal("detail rendered the raw script payload")
+	}
+}
+
+func TestSortOrdersByPrice(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog?sort=price_desc", htmxHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	gadget := strings.Index(body, "Gadget")
+	widget := strings.Index(body, "Widget")
+	if gadget < 0 || widget < 0 || gadget > widget {
+		t.Fatalf("price_desc order wrong: Gadget at %d, Widget at %d", gadget, widget)
+	}
+}
+
+func parsePage(t *testing.T, body string) *html.Node? {
+	t.Helper()
+	doc, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse page as HTML: %v", err)
+		return nil
+	}
+	return doc
+}
+
+func pageAttr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func pageHasAttr(n *html.Node, key string) bool {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func pageAll(root *html.Node, match func(n *html.Node) bool) []*html.Node {
+	var found []*html.Node
+	for n := range root.Descendants() {
+		if match(n) {
+			found = append(found, n)
+		}
+	}
+	return found
+}
+
+func pageFirst(root *html.Node, match func(n *html.Node) bool) *html.Node? {
+	for n := range root.Descendants() {
+		if match(n) {
+			return n
+		}
+	}
+	return nil
+}
+
+func pageWithin(outer *html.Node, inner *html.Node) bool {
+	if outer == inner {
+		return true
+	}
+	for n := range outer.Descendants() {
+		if n == inner {
+			return true
+		}
+	}
+	return false
+}
+
+func stockRegion(t *testing.T, doc *html.Node) *html.Node? {
+	t.Helper()
+	regions := pageAll(doc, func(n *html.Node) bool { return pageAttr(n, "data-live-region") == "stock" })
+	if len(regions) != 1 {
+		t.Fatalf("stock regions = %d, want one stable region", len(regions))
+		return nil
+	}
+	return regions[0]
+}
+
+func requireRegionOwnsSinkAndToggle(t *testing.T, doc *html.Node, region *html.Node) *html.Node? {
+	t.Helper()
+	sink := pageFirst(doc, func(n *html.Node) bool { return pageAttr(n, "sse-swap") == "stock" })
+	if sink == nil {
+		t.Fatal("page lacks the stock SSE sink")
+		return nil
+	}
+	if !pageWithin(region, sink) {
+		t.Fatal("the stock SSE sink is outside the region")
+	}
+	toggle := pageFirst(doc, func(n *html.Node) bool {
+		return n.Data == "button" && pageHasAttr(n, "data-live-toggle")
+	})
+	if toggle == nil {
+		t.Fatal("page lacks the pause toggle")
+		return nil
+	}
+	if !pageWithin(region, toggle) {
+		t.Fatal("the pause toggle is outside the region")
+	}
+	return sink
+}
+
+func listDocument(t *testing.T, pool *db.Pool) *html.Node? {
+	t.Helper()
+	rec := get(t, testRouter(pool), "/catalog", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return nil
+	}
+	return parsePage(t, rec.Body.String())
+}
+
+func searchForm(doc *html.Node) *html.Node? {
+	return pageFirst(doc, func(n *html.Node) bool {
+		if n.Data != "form" {
+			return false
+		}
+		return pageFirst(n, func(c *html.Node) bool { return c.Data == "input" && pageAttr(c, "name") == "q" }) != nil
+	})
+}
+
+func resultsList(t *testing.T, doc *html.Node) *html.Node? {
+	t.Helper()
+	results := pageAll(doc, func(n *html.Node) bool { return pageAttr(n, "id") == "results" })
+	if len(results) != 1 {
+		t.Fatalf("results lists = %d, want one", len(results))
+		return nil
+	}
+	return results[0]
+}
+
+func TestListStockRegionOwnsTargets(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	doc := listDocument(t, pool)
+	if doc == nil {
+		return
+	}
+	region := stockRegion(t, doc)
+	if region == nil {
+		return
+	}
+	if pageFirst(region, func(n *html.Node) bool { return n != region && pageAttr(n, "data-live-region") == "stock" }) != nil {
+		t.Fatal("the stock region nests another live region")
+	}
+	results := resultsList(t, doc)
+	if results == nil {
+		return
+	}
+	if !pageWithin(region, results) {
+		t.Fatal("the results list is outside the stock region")
+	}
+	targets := pageAll(doc, func(n *html.Node) bool { return strings.HasPrefix(pageAttr(n, "id"), "stock-") })
+	if len(targets) == 0 {
+		t.Fatal("page lacks stock update targets")
+		return
+	}
+	for _, target := range targets {
+		if !pageWithin(region, target) {
+			t.Fatalf("stock target %q is outside the region", pageAttr(target, "id"))
+		}
+	}
+}
+
+func TestListStockRegionOwnsSinkAndToggle(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	doc := listDocument(t, pool)
+	if doc == nil {
+		return
+	}
+	region := stockRegion(t, doc)
+	if region == nil {
+		return
+	}
+	sink := requireRegionOwnsSinkAndToggle(t, doc, region)
+	if sink == nil {
+		return
+	}
+	results := resultsList(t, doc)
+	if results == nil {
+		return
+	}
+	if pageWithin(results, sink) {
+		t.Fatal("the SSE sink sits inside the results list and cannot survive a search swap")
+	}
+}
+
+func TestListSearchFormReplacesList(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	doc := listDocument(t, pool)
+	if doc == nil {
+		return
+	}
+	form := searchForm(doc)
+	if form == nil {
+		t.Fatal("page lacks the search form")
+		return
+	}
+	if got := pageAttr(form, "hx-target"); got != "#results" {
+		t.Fatalf("search hx-target = %q, want #results", got)
+	}
+	if got := pageAttr(form, "hx-swap"); got != "outerHTML" {
+		t.Fatalf("search hx-swap = %q, want outerHTML so the returned list replaces the old one", got)
+	}
+}
+
+func TestListPageCarriesNoOutOfBandMarkup(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	doc := listDocument(t, pool)
+	if doc == nil {
+		return
+	}
+	if stray := pageFirst(doc, func(n *html.Node) bool { return pageAttr(n, "hx-swap-oob") != "" }); stray != nil {
+		t.Fatalf("page markup carries hx-swap-oob on %q; only SSE row payloads may swap oob", pageAttr(stray, "id"))
+	}
+}
+
+func TestDetailStockRegionOwnsItsTarget(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog/1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	doc := parsePage(t, rec.Body.String())
+	if doc == nil {
+		return
+	}
+	region := stockRegion(t, doc)
+	if region == nil {
+		return
+	}
+	target := pageFirst(doc, func(n *html.Node) bool { return pageAttr(n, "id") == "stock-1" })
+	if target == nil {
+		t.Fatal("detail lacks the product stock target")
+		return
+	}
+	if stray := pageFirst(doc, func(n *html.Node) bool { return pageAttr(n, "hx-swap-oob") != "" }); stray != nil {
+		t.Fatalf("detail page carries hx-swap-oob on %q; htmx would strip it and the row with it", pageAttr(stray, "id"))
+	}
+	if !pageWithin(region, target) {
+		t.Fatal("the product stock target is outside the region")
+	}
+	requireRegionOwnsSinkAndToggle(t, doc, region)
+}
+
+func TestSearchFragmentReplacesTheWholeList(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog/search?q=Gad", htmxHeaders())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	trimmed := strings.TrimSpace(body)
+	if !strings.HasPrefix(trimmed, `<ul id="results">`) {
+		t.Fatalf("fragment starts %q, want the whole results list as its root", trimmed[:min(64, len(trimmed))])
+	}
+	if n := strings.Count(body, `id="results"`); n != 1 {
+		t.Fatalf("fragment holds %d results ids, want exactly one, not a nested duplicate", n)
+	}
+	if strings.Contains(body, "hx-swap-oob") {
+		t.Fatal("search response carries hx-swap-oob; htmx strips nested oob targets and would erase every stock row from its own result")
+	}
+	if !strings.Contains(body, `id="stock-3"`) {
+		t.Fatal("fragment lacks the matching product stock target")
+	}
+	if n := strings.Count(body, `id="stock-`); n != 1 {
+		t.Fatalf("fragment holds %d stock target ids, want exactly the matched one", n)
+	}
+	if strings.Contains(body, `id="stock-1"`) {
+		t.Fatal("fragment carries a stock target the query filtered out")
+	}
+	if strings.Contains(body, "sse-swap") {
+		t.Fatal("fragment duplicates the SSE sink")
+	}
+	if strings.Contains(body, "data-live-toggle") {
+		t.Fatal("fragment duplicates the pause toggle")
+	}
+}

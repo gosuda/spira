@@ -1,0 +1,27 @@
+package stock
+
+import (
+	"github.com/gosuda/spira/bus"
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/web"
+)
+
+type Tick struct {
+	ID    int64
+	Name  string
+	Stock int64
+	Price int64
+}
+
+type Feature struct {
+	Topic *bus.Topic[live.Event]
+}
+
+func (f *Feature) Register(r *web.Router) {
+	if f.Topic == nil {
+		panic("stock: Feature.Topic is required")
+	}
+	r.Handle("GET", "/stock/events", func(ctx *web.Context) (web.Reply, error) {
+		return live.Events(ctx, f.Topic.Subscribe(ctx.Ctx())), nil
+	})
+}

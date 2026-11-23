@@ -1,0 +1,108 @@
+package assist
+
+import (
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"strings"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/web"
+)
+
+type Feature struct {
+	Model   ai.Model
+	Catalog *rag.Memory
+}
+
+func (f *Feature) Register(r *web.Router) {
+	if f.Model == nil {
+		panic("assist: Feature.Model is required")
+	}
+	if f.Catalog == nil {
+		panic("assist: Feature.Catalog is required")
+	}
+	r.Handle("POST", "/assist/ask", func(ctx *web.Context) (web.Reply, error) {
+		return f.ask(ctx)
+	})
+}
+
+func (f *Feature) ask(ctx *web.Context) (web.Reply, error) {
+	q := strings.TrimSpace(ctx.Request.FormValue("q"))
+	if q == "" {
+		return nil, ErrMissingQuery.Err()
+	}
+	search := func(c context.Context, s rag.Search) ([]rag.Document, error) {
+		return f.Catalog.Search(c, s)
+	}
+	model := ai.Wrap(f.Model, rag.Augment(search, rag.Search{TopK: 4}))
+	req := ai.Request{
+		Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: q}}}},
+		Tools:    []ai.Tool{searchTool(f.Catalog)},
+	}
+	reply, err := ai.Run(ctx.Ctx(), model, req, ai.Limits{})
+	if err != nil {
+		return nil, fmt.Errorf("assist: run: %w", err)
+	}
+	events := make(chan live.Event, 4)
+	ev, err := live.NewEvent("answer", Answer(answerText(reply)))
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case events <- ev:
+	case <-ctx.Ctx().Done():
+		return nil, ctx.Ctx().Err()
+	}
+	close(events)
+	return live.Events(ctx, events), nil
+}
+
+func answerText(reply ai.Reply) string {
+	var b strings.Builder
+	for _, part := range reply.Message.Parts {
+		if text, isText := part.(ai.Text); isText {
+			b.WriteString(text.Text)
+		}
+	}
+	return b.String()
+}
+
+type queryArgs struct {
+	Query string `json:"query"`
+}
+
+func searchTool(catalog *rag.Memory) ai.Tool {
+	return ai.Tool{
+		Name:        "search_products",
+		Description: "Search the product catalog by keywords and return the matching products.",
+		Schema:      `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`,
+		Call: func(ctx context.Context, arguments string) (string, error) {
+			return searchCatalog(ctx, catalog, arguments)
+		},
+	}
+}
+
+func searchCatalog(ctx context.Context, catalog *rag.Memory, arguments string) (string, error) {
+	var args queryArgs
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+		return "", fmt.Errorf("assist: search_products arguments: %w", err)
+	}
+	if strings.TrimSpace(args.Query) == "" {
+		return "", fmt.Errorf("assist: search_products needs a query")
+	}
+	docs, err := catalog.Search(ctx, rag.Search{Query: args.Query, TopK: 4})
+	if err != nil {
+		return "", fmt.Errorf("assist: search_products: %w", err)
+	}
+	if len(docs) == 0 {
+		return "no products match the query", nil
+	}
+	var b strings.Builder
+	for _, d := range docs {
+		b.WriteString("- " + d.ID + ": " + d.Text + "\n")
+	}
+	return strings.TrimSuffix(b.String(), "\n"), nil
+}

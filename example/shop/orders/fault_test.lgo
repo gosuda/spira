@@ -1,0 +1,39 @@
+package orders_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/example/shop/orders"
+	"github.com/gosuda/spira/fault"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestOrdersFaultsStayClientSafe(t *testing.T) {
+	const secret = "SECRET-ORDERS-84022"
+	plain := []struct {
+		err     *fault.Error
+		code    string
+		message string
+	}{
+		{orders.ErrUnknownOrder, "orders.unknown_order", "The order was not found."},
+		{orders.ErrStaleOrder, "orders.stale_order", "The order changed since it was read."},
+	}
+	for _, tc := range plain {
+		raw := faulttest.PublicJSON(t, tc.err.Wrap(errors.New(secret)))
+		faulttest.RefuseLeak(t, raw, secret)
+		if !strings.Contains(string(raw), `"`+tc.code+`"`) {
+			t.Fatalf("public view %s lacks the fault code", raw)
+		}
+		if !strings.Contains(string(raw), tc.message) {
+			t.Fatalf("public view %s lacks the constant message", raw)
+		}
+	}
+	withFields := orders.ErrEmptyCart.WithFields(fault.Field{Name: "cart", Rule: "empty", Message: "cart is empty."}).Err()
+	view := fault.Public(withFields)
+	if len(view.Fields) != 1 || view.Fields[0].Name != "cart" {
+		t.Fatalf("empty cart fault keeps %+v, want the cart field", view.Fields)
+	}
+	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, withFields), secret)
+}

@@ -1,0 +1,11 @@
+package cart
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrUnknownItem = fault.New("cart.unknown_item", fault.NotFound, "The cart item was not found.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrUnknownItem}
+}

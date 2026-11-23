@@ -1,0 +1,119 @@
+package catalog
+
+import (
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/example/shop/stock"
+	"github.com/gosuda/spira/view"
+)
+
+func List(items const []store.Product, query string, order string, recommended view.Node) view.Group {
+	return view.Group{Nodes: []view.Node{
+		view.H1(view.T("Catalog")),
+		view.P(view.Attr("id", "cart-note")),
+		SearchForm(query),
+		FilterIsland(query, order),
+		stock.Region(Results(items)),
+		GalleryIsland(items),
+		view.H2(view.T("Recommended")),
+		recommended,
+	}}
+}
+
+func Detail(item store.Product, recommended view.Node) view.Group {
+	return view.Group{Nodes: []view.Node{
+		view.H1(view.T(item.Name)),
+		stock.Region(stock.Display(productTick(item))),
+		view.P(view.Attr("id", "cart-note")),
+		layout.AddForm($"{item.ID}", item.Name, "1", nil),
+		GalleryIsland([]store.Product{item}),
+		view.H2(view.T("Recommended")),
+		recommended,
+	}}
+}
+
+func SearchForm(query string) view.Node {
+	return view.Form(
+		view.Attr("method", "get"),
+		view.Attr("action", "/catalog"),
+		view.Hx("get", "/catalog/search"),
+		view.Hx("target", "#results"),
+		view.Hx("swap", "outerHTML"),
+		view.Hx("trigger", "input changed delay:300ms, submit"),
+		view.Label(view.T("Search")),
+		view.Input(view.Attr("type", "search"), view.Attr("name", "q"), view.Attr("value", query)),
+		view.Button(view.Attr("type", "submit"), view.T("Search")),
+	)
+}
+
+func FilterLinks(order string) view.Node {
+	current := "price order: unsorted"
+	if order == "price_asc" {
+		current = "price order: low first"
+	}
+	if order == "price_desc" {
+		current = "price order: high first"
+	}
+	return view.P(
+		view.T(current),
+		view.A(view.Attr("href", "/catalog?sort=price_asc"), view.T("Price up")),
+		view.A(view.Attr("href", "/catalog?sort=price_desc"), view.T("Price down")),
+	)
+}
+
+func FilterIsland(query string, order string) view.Node {
+	return &view.Island{
+		Entry:    "example/shop/catalog/islands/filter.solid.tsx",
+		Props:    map[string]any{"query": query, "order": order},
+		Fallback: FilterLinks(order),
+	}
+}
+
+func Results(items const []store.Product) view.Node {
+	return view.Ul(
+		view.Attr("id", "results"),
+		view.Each(items, func(item const store.Product) view.Node {
+			return Row(item)
+		}),
+	)
+}
+
+func Row(item const store.Product) view.Node {
+	return view.Li(
+		view.Attr("data-price", $"{item.Price}"),
+		view.A(view.Attr("href", $"/catalog/{item.ID}"), view.T(item.Name)),
+		stock.Display(productTick(item)),
+		layout.AddForm($"{item.ID}", item.Name, "1", nil),
+	)
+}
+
+func productTick(item const store.Product) stock.Tick {
+	return stock.Tick{ID: int64(item.ID), Name: item.Name, Stock: item.Stock, Price: item.Price}
+}
+
+func Recommended(items const []store.Product) view.Group {
+	if len(items) == 0 {
+		return view.Group{Nodes: []view.Node{view.P(view.T("No recommendations yet."))}}
+	}
+	return view.Group{Nodes: []view.Node{
+		view.Ul(view.Each(items, func(item const store.Product) view.Node {
+			return view.Li(view.A(view.Attr("href", $"/catalog/{item.ID}"), view.T(item.Name)))
+		})),
+	}}
+}
+
+func GalleryIsland(items const []store.Product) view.Node {
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
+	}
+	first := "No products yet."
+	if len(names) > 0 {
+		first = names[0]
+	}
+	return &view.Island{
+		Entry:    "example/shop/catalog/islands/gallery.react.tsx",
+		Props:    map[string]any{"items": names},
+		Fallback: layout.Fallback(view.Div(view.Attr("data-gallery", "fallback"), view.P(view.T(first)))),
+	}
+}

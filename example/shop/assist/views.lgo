@@ -1,0 +1,12 @@
+package assist
+
+import (
+	"github.com/gosuda/spira/view"
+)
+
+func Answer(text string) view.Node {
+	return view.Div(
+		view.Attr("class", "assist-answer"),
+		view.P(view.T(text)),
+	)
+}

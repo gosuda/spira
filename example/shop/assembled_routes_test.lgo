@@ -1,0 +1,273 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
+	"io"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/config"
+	"github.com/gosuda/spira/view"
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
+)
+
+const assembledProduct = "Scheduled mug"
+
+func TestAssembledShopRoutes(t *testing.T) {
+	pool := scheduledStockPool(t)
+	if pool == nil {
+		return
+	}
+	assets := asset.Dev("http://localhost:5173")
+	router, _ := buildRouter(shopParts{pool: pool, assets: assets, tags: view.Group{}, dev: true})
+	shop := scheduledStockServer(t, router)
+	shop.Client().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	t.Run("UnauthenticatedMetrics", func(t *testing.T) {
+		status, _ := getAssembledShop(t, shop, "/ops/metrics", nil)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("GET /ops/metrics: status %d, want 401", status)
+		}
+	})
+	t.Run("OpenAPIProductsGET", func(t *testing.T) {
+		status, body := getAssembledShop(t, shop, "/openapi.json", nil)
+		if status != http.StatusOK {
+			t.Fatalf("GET /openapi.json: status %d, want 200", status)
+		}
+		var doc struct {
+			OpenAPI string                               `json:"openapi"`
+			Paths   map[string]map[string]jsontext.Value `json:"paths"`
+		}
+		if err := json.Unmarshal(body, &doc); err != nil {
+			t.Fatalf("decode OpenAPI document: %v", err)
+		}
+		if doc.OpenAPI != "3.1.0" {
+			t.Fatalf("OpenAPI version %q, want 3.1.0", doc.OpenAPI)
+		}
+		if item, ok := doc.Paths["/api/products"]; ok {
+			if operation, ok := item["get"]; ok && operation.Kind() == jsontext.KindBeginObject {
+				return
+			}
+		}
+		t.Fatal("OpenAPI paths lacks a GET operation at /api/products")
+	})
+	t.Run("PlainCatalogFormSearch", func(t *testing.T) {
+		testAssembledCatalogFormSearch(t, shop)
+	})
+	t.Run("HtmxCatalogFragment", func(t *testing.T) {
+		testAssembledCatalogFragment(t, shop)
+	})
+}
+
+func getAssembledShop(t *testing.T, shop *httptest.Server, path string, headers http.Header) (int, []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, shop.URL+path, nil)
+	if err != nil {
+		t.Fatalf("construct GET %s: %v", path, err)
+		return 0, nil
+	}
+	maps.Copy(req.Header, headers)
+	resp, err := shop.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+		return 0, nil
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close GET %s body: %v", path, err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read GET %s body: %v", path, err)
+	}
+	return resp.StatusCode, body
+}
+
+func testAssembledCatalogFormSearch(t *testing.T, shop *httptest.Server) {
+	const catalogPath = "/catalog"
+	page := getAssembledCatalogDocument(t, shop, catalogPath)
+	if page == nil {
+		return
+	}
+	if !assembledResultsContainProduct(page) {
+		t.Fatal("the ordinary catalog page does not list the seeded product")
+	}
+	action, found := assembledCatalogSearchAction(page)
+	if !found {
+		t.Fatal("the catalog has no ordinary GET form for the search query")
+	}
+	target, err := url.Parse(action)
+	if err != nil {
+		t.Fatalf("parse catalog form action %q: %v", action, err)
+		return
+	}
+	if target.IsAbs() || target.Host != "" {
+		t.Fatalf("catalog search form action %q is not local to the shop", action)
+	}
+	target = (&url.URL{Path: catalogPath}).ResolveReference(target)
+	for _, search := range []struct {
+		query       string
+		wantProduct bool
+	}{
+		{query: assembledProduct, wantProduct: true},
+		{query: "no matching product", wantProduct: false},
+	} {
+		target.RawQuery = url.Values{"q": []string{search.query}}.Encode()
+		result := getAssembledCatalogDocument(t, shop, target.RequestURI())
+		if result == nil {
+			return
+		}
+		if got := assembledResultsContainProduct(result); got != search.wantProduct {
+			t.Errorf("native search for %q lists %q: got %t, want %t", search.query, assembledProduct, got, search.wantProduct)
+		}
+	}
+}
+
+func getAssembledCatalogDocument(t *testing.T, shop *httptest.Server, path string) *html.Node? {
+	t.Helper()
+	status, body := getAssembledShop(t, shop, path, nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET %s: status %d, want 200", path, status)
+	}
+	if !startsAsAssembledHTMLDocument(body) {
+		t.Fatalf("GET %s does not begin with an HTML doctype and document root", path)
+	}
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse GET %s as HTML: %v", path, err)
+		return nil
+	}
+	return doc
+}
+
+func startsAsAssembledHTMLDocument(body []byte) bool {
+	wire := html.NewTokenizer(bytes.NewReader(body))
+	if wire.Next() != html.DoctypeToken || !bytes.EqualFold(wire.Text(), []byte("html")) {
+		return false
+	}
+	for kind := wire.Next(); ; kind = wire.Next() {
+		switch kind {
+		case html.CommentToken:
+			continue
+		case html.TextToken:
+			if len(bytes.TrimSpace(wire.Text())) == 0 {
+				continue
+			}
+		case html.StartTagToken:
+			name, _ := wire.TagName()
+			return bytes.Equal(name, []byte("html"))
+		}
+		return false
+	}
+}
+
+func assembledCatalogSearchAction(doc *html.Node) (string, bool) {
+	for form := range doc.Descendants() {
+		if form.DataAtom != atom.Form {
+			continue
+		}
+		method := assembledHTMLAttr(form, "method")
+		if method != "" && !strings.EqualFold(method, http.MethodGet) {
+			continue
+		}
+		for control := range form.Descendants() {
+			if control.DataAtom == atom.Input && assembledHTMLAttr(control, "name") == "q" {
+				return assembledHTMLAttr(form, "action"), true
+			}
+		}
+	}
+	return "", false
+}
+
+func assembledResultsContainProduct(doc *html.Node) bool {
+	for results := range doc.Descendants() {
+		if assembledHTMLAttr(results, "id") != "results" {
+			continue
+		}
+		for node := range results.Descendants() {
+			if node.Type == html.TextNode && strings.TrimSpace(node.Data) == assembledProduct {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func assembledHTMLAttr(node *html.Node, key string) string {
+	for _, attr := range node.Attr {
+		if attr.Key == key {
+			return attr.Val
+		}
+	}
+	return ""
+}
+
+func testAssembledCatalogFragment(t *testing.T, shop *httptest.Server) {
+	status, body := getAssembledShop(t, shop, "/catalog", http.Header{"Hx-Request": []string{"true"}})
+	if status != http.StatusOK {
+		t.Fatalf("GET /catalog with HX-Request: status %d, want 200", status)
+	}
+	wire := html.NewTokenizer(bytes.NewReader(body))
+	foundProduct := false
+	for kind := wire.Next(); kind != html.ErrorToken; kind = wire.Next() {
+		switch kind {
+		case html.DoctypeToken:
+			t.Fatal("htmx catalog fragment contains a document doctype")
+		case html.StartTagToken, html.EndTagToken, html.SelfClosingTagToken:
+			if name, _ := wire.TagName(); bytes.Equal(name, []byte("html")) {
+				t.Fatal("htmx catalog fragment contains an html document root")
+			}
+		case html.TextToken:
+			foundProduct = foundProduct || bytes.Equal(bytes.TrimSpace(wire.Text()), []byte(assembledProduct))
+		}
+	}
+	if err := wire.Err(); !errors.Is(err, io.EOF) {
+		t.Fatalf("read htmx catalog fragment: %v", err)
+	}
+	if !foundProduct {
+		t.Fatalf("htmx catalog fragment lacks the seeded product %q", assembledProduct)
+	}
+}
+
+func TestShopSettingsDefaultsAndOverrides(t *testing.T) {
+	cases := []struct {
+		name      string
+		values    map[string]string
+		addr      string
+		dsn       string
+		publicURL string
+	}{
+		{"defaults", nil, ":8080", "file:spira_shop?mode=memory&cache=shared", "http://localhost:8080"},
+		{"overrides", map[string]string{"SPIRA_ADDR": "127.0.0.1:9090", "SPIRA_DSN": "file:other.db", "SPIRA_PUBLIC_URL": "https://shop.example"}, "127.0.0.1:9090", "file:other.db", "https://shop.example"},
+		{"explicit empty", map[string]string{"SPIRA_DSN": ""}, ":8080", "", "http://localhost:8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := loadShopSettings(config.Map(tc.values))
+			if err != nil {
+				t.Fatalf("load settings: %v", err)
+				return
+			}
+			if got.Addr != tc.addr || got.DSN != tc.dsn || got.PublicURL != tc.publicURL {
+				t.Errorf("settings = %#v, want address %q, DSN %q, public URL %q", got, tc.addr, tc.dsn, tc.publicURL)
+			}
+		})
+	}
+}

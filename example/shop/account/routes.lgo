@@ -1,0 +1,144 @@
+package account
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/web"
+)
+
+type Feature struct {
+	DB       *db.Pool
+	Sessions *auth.Sessions
+}
+
+const callTimeout = 10 * time.Second
+
+func (f *Feature) Register(r *web.Router) {
+	r.Group("/account", func(g *web.Router) {
+		g.Use(auth.Authenticate(f.Sessions.Authenticator()))
+		g.Handle("GET", "/login", f.showLogin)
+		g.Handle("POST", "/login", f.login)
+		g.Handle("POST", "/logout", f.logout)
+		g.Group("", func(protected *web.Router) {
+			protected.Use(auth.Require(auth.Authenticated()))
+			protected.Handle("GET", "", f.showAccount)
+		})
+	})
+}
+
+func (f *Feature) showLogin(wctx *web.Context) (web.Reply, error) {
+	return web.Page{Title: "Sign in", Body: LoginPage()}, nil
+}
+
+func (f *Feature) showAccount(wctx *web.Context) (web.Reply, error) {
+	p := web.Get(wctx, auth.PrincipalKey)
+	if p == nil {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	return web.Page{Title: "Account", Body: AccountPage(p.ID, strings.Join(p.Roles, ", "))}, nil
+}
+
+func (f *Feature) login(wctx *web.Context) (web.Reply, error) {
+	call, cancel := context.WithTimeout(wctx.Ctx(), callTimeout)
+	defer cancel()
+	if err := wctx.Request.ParseForm(); err != nil {
+		return nil, auth.ErrBadRequest.Err()
+	}
+	name := wctx.Request.PostFormValue("user")
+	secret := wctx.Request.PostFormValue("password")
+	user, err := store.GetUserByName(call, f.DB, name)
+	if err != nil {
+		return nil, fmt.Errorf("account: lookup user: %w", err)
+	}
+	if user == nil {
+		auth.VerifyAgainstDummy(secret)
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	ok, err := auth.VerifyPassword(user.PasswordHash, secret)
+	if err != nil {
+		return nil, fmt.Errorf("account: verify password: %w", err)
+	}
+	if !ok {
+		return nil, auth.ErrInvalidCredentials.Err()
+	}
+	cookie, err := f.Sessions.Login(wctx, auth.Principal{ID: $"{int64(user.ID)}"})
+	if err != nil {
+		return nil, fmt.Errorf("account: login: %w", err)
+	}
+	if cookie == nil {
+		return nil, fmt.Errorf("account: login issued no cookie")
+	}
+	wctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+	return web.Redirect{To: "/account"}, nil
+}
+
+func (f *Feature) logout(wctx *web.Context) (web.Reply, error) {
+	cookie, err := f.Sessions.Logout(wctx)
+	if err != nil {
+		return nil, fmt.Errorf("account: logout: %w", err)
+	}
+	if cookie == nil {
+		return nil, fmt.Errorf("account: logout issued no cookie")
+	}
+	wctx.ResponseHeader().Add("Set-Cookie", cookie.String())
+	return web.Redirect{To: "/account/login"}, nil
+}
+
+func NewSessionStore(p *db.Pool) auth.SessionStore {
+	return &sessionStore{pool: p}
+}
+
+type sessionStore struct {
+	pool *db.Pool
+}
+
+func (s *sessionStore) Load(ctx context.Context, id string) (auth.Principal?, error) {
+	call, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	row, err := store.GetSession(call, s.pool, store.SessionID(id), time.Now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("account: load session: %w", err)
+	}
+	if row == nil {
+		return nil, nil
+	}
+	return auth.Principal{ID: $"{int64(row.UserID)}", Roles: splitRoles(row.Roles)}, nil
+}
+
+func (s *sessionStore) Save(ctx context.Context, id string, p auth.Principal, ttl time.Duration) error {
+	call, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	uid, err := strconv.ParseInt(p.ID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("account: session principal %q: %w", p.ID, err)
+	}
+	exp := time.Now().UTC().Add(ttl)
+	args := store.SaveSessionArgs{IDHash: store.SessionID(id), UserID: store.UserID(uid), Roles: strings.Join(p.Roles, ","), ExpiresAt: exp}
+	if err := store.SaveSession(call, s.pool, args); err != nil {
+		return fmt.Errorf("account: save session: %w", err)
+	}
+	return nil
+}
+
+func (s *sessionStore) Delete(ctx context.Context, id string) error {
+	call, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	if err := store.DeleteSession(call, s.pool, store.SessionID(id)); err != nil {
+		return fmt.Errorf("account: delete session: %w", err)
+	}
+	return nil
+}
+
+func splitRoles(roles string) []string {
+	if roles == "" {
+		return nil
+	}
+	return strings.Split(roles, ",")
+}

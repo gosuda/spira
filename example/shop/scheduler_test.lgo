@@ -1,0 +1,142 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/db"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/view"
+)
+
+func TestScheduledStockReachesEventsStream(t *testing.T) {
+	pool := scheduledStockPool(t)
+	if pool == nil {
+		return
+	}
+	assets := asset.Dev("http://localhost:5173")
+	router, scheduler := buildRouter(shopParts{pool: pool, assets: assets, tags: view.Group{}, dev: true})
+	server := scheduledStockServer(t, router)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
+	defer cancel()
+	if err := scheduler.Start(ctx); err != nil {
+		t.Fatalf("start stock scheduler: %v", err)
+	}
+	afterStockTest(t, "stock scheduler", scheduler.Stop)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/stock/events", nil)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("open stock stream: %v", err)
+		return
+	}
+	defer func() {
+		cancel()
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close stock stream body: %v", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("stock stream: status %d, content type %q; want 200 and text/event-stream", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+
+	wire := bufio.NewScanner(resp.Body)
+	wantScheduledStock(t, wire, "Scheduled mug: 7", "$12.00")
+	if _, err := pool.ExecContext(ctx, "UPDATE products SET stock = 19, price = 2400 WHERE id = 1"); err != nil {
+		t.Fatalf("update stock: %v", err)
+	}
+	wantScheduledStock(t, wire, "Scheduled mug: 19", "$24.00")
+}
+
+func wantScheduledStock(t *testing.T, wire *bufio.Scanner, wants ...string) {
+	t.Helper()
+	var stockEvent bool
+	found := make([]bool, len(wants))
+	for wire.Scan() {
+		line := wire.Text()
+		switch {
+		case line == "":
+			if stockEvent && !slices.Contains(found, false) {
+				return
+			}
+			stockEvent = false
+			found = make([]bool, len(wants))
+		case line == "event: stock":
+			stockEvent = true
+		case strings.HasPrefix(line, "data: "):
+			for i, want := range wants {
+				found[i] = found[i] || strings.Contains(line, want)
+			}
+		}
+	}
+	t.Fatalf("stock stream ended before event: stock with data containing %q (read error: %v)", wants, wire.Err())
+}
+
+func scheduledStockPool(t *testing.T) *db.Pool? {
+	t.Helper()
+	pool, err := db.Open("sqlite", "file:spira_scheduled_stock?mode=memory&cache=shared&_pragma=busy_timeout(3000)")
+	if err != nil {
+		t.Fatalf("open stock database: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatal("open stock database: no pool")
+		return nil
+	}
+	afterStockTest(t, "stock database", pool.Stop)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := seedScheduledStock(ctx, pool); err != nil {
+		t.Fatalf("seed stock database: %v", err)
+		return nil
+	}
+	return pool
+}
+
+func seedScheduledStock(ctx context.Context, pool *db.Pool) error {
+	steps := migrate.Load(shopdb.FS())?
+	migrate.Apply(ctx, pool, steps)?
+	pool.ExecContext(ctx, "INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'Scheduled mug', 1200, 7, '2026-01-02 10:00:00')")?
+	return nil
+}
+
+func scheduledStockServer(t *testing.T, router http.Handler) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(router)
+	afterStockTest(t, "stock HTTP server", func(ctx context.Context) error {
+		if err := server.Config.Shutdown(ctx); err != nil {
+			server.Client().CloseIdleConnections()
+			if closeErr := server.Config.Close(); closeErr != nil {
+				t.Errorf("force-close stock HTTP server: %v", closeErr)
+			}
+			return err
+		}
+		server.Close()
+		return nil
+	})
+	return server
+}
+
+func afterStockTest(t *testing.T, name string, stop func(context.Context) error) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stop(ctx); err != nil {
+			t.Errorf("stop %s: %v", name, err)
+		}
+	})
+}

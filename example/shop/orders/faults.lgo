@@ -1,0 +1,17 @@
+package orders
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrUnknownOrder = fault.New("orders.unknown_order", fault.NotFound, "The order was not found.")
+
+var ErrEmptyCart = fault.New("orders.empty_cart", fault.Unprocessable, "The cart is empty.")
+
+var ErrStaleOrder = fault.New("orders.stale_order", fault.Conflict, "The order changed since it was read.")
+
+var ErrAlreadyCancelled = fault.New("orders.already_cancelled", fault.Conflict, "The order is already cancelled.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrUnknownOrder, ErrEmptyCart, ErrStaleOrder, ErrAlreadyCancelled}
+}

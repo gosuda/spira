@@ -1,0 +1,7 @@
+package assist
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrMissingQuery = fault.New("assist.missing_query", fault.Invalid, "A query is required.")
