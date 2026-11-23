@@ -125,16 +125,51 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	var hold time.Time
 	outerCtx, cancelOuter := context.WithCancelCause(ctx)
 	defer cancelOuter(nil)
-	head, err := resilience.Do[streamHead](ctx, c.Policy, func(actx context.Context) (streamHead, error) {
-		if err := holdUntil(ctx, hold); err != nil {
+	policy := c.streamPolicy()
+	head, err := resilience.Do[streamHead](ctx, policy, c.headCall(headAttempt{ctx: ctx, payload: payload, budget: budget, hold: &hold, outer: outerCtx}))
+	if err != nil {
+		yield ai.Chunk{}, err
+		return
+	}
+	watch := c.armIdle(policy.Timeout, cancelOuter)
+	defer watch.stop()
+	defer head.stop(nil)
+	defer closeBody(head.body)
+	for chunk, cerr := range c.streamChunks(ctx, head, watch) {
+		watch.stop()
+		cut := stallCut(head.ctx, cerr)
+		yield chunk, cut
+		watch.touch()
+	}
+}
+
+func (c *Client) streamPolicy() resilience.Policy {
+	policy := c.Policy
+	if policy.Timeout <= 0 {
+		policy.Timeout = 10 * time.Second
+	}
+	return policy
+}
+
+type headAttempt struct {
+	ctx     context.Context
+	payload []byte
+	budget  time.Duration
+	hold    *time.Time
+	outer   context.Context
+}
+
+func (c *Client) headCall(a headAttempt) func(actx context.Context) (streamHead, error) {
+	return func(actx context.Context) (streamHead, error) {
+		if err := holdUntil(a.ctx, *a.hold); err != nil {
 			return streamHead{}, ErrProviderError.Wrap(err)
 		}
-		streamCtx, stop := context.WithCancelCause(outerCtx)
+		streamCtx, stop := context.WithCancelCause(a.outer)
 		detach := context.AfterFunc(actx, func() { stop(context.Cause(actx)) })
-		status, header, body, derr := c.do(streamCtx, payload)
+		status, header, body, derr := c.do(streamCtx, a.payload)
 		if derr != nil {
 			stop(nil)
-			return streamHead{}, stallAttempt(outerCtx, derr)
+			return streamHead{}, stallAttempt(a.outer, derr)
 		}
 		if status >= 200 && status <= 299 && detach() {
 			return streamHead{ctx: streamCtx, body: body, stop: stop}, nil
@@ -146,30 +181,19 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		if rerr != nil {
 			failure = classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", statusDetailOf(status, data), rerr))
 		}
-		if wait := retryWait(header, budget); wait > 0 {
+		if wait := retryWait(header, a.budget); wait > 0 {
 			failure = &deferred{cause: failure, wait: wait}
 		}
 		if wait := deferredWait(failure); wait > 0 {
 			when := time.Now().Add(wait)
-			if when.After(hold) {
-				hold = when
+			if when.After(*a.hold) {
+				*a.hold = when
 			}
 		}
 		if callerFault(failure) {
 			return streamHead{}, resilience.Ignored(failure)
 		}
 		return streamHead{}, failure
-	})
-	if err != nil {
-		yield ai.Chunk{}, err
-		return
-	}
-	watch := c.armIdle(c.Policy.Timeout, cancelOuter)
-	defer watch.stop()
-	defer head.stop(nil)
-	defer closeBody(head.body)
-	for chunk, cerr := range c.streamChunks(ctx, head, watch) {
-		yield chunk, stallCut(head.ctx, cerr)
 	}
 }
 

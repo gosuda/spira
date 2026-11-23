@@ -64,6 +64,8 @@ func Faults() []*fault.Error
 - Ten seconds MUST be that bound when the timeout is not positive.
 - Each read byte and line MUST reset that bound.
 - An idle expiry MUST end the stream as `anthropic.provider_stream_cut`.
+- A nonpositive `Policy.Timeout` MUST bound attempts at ten seconds.
+- `Stream` MUST pause the idle bound while yielding a chunk.
 - `Stream` MUST hold the next attempt for a valid `Retry-After`, within `Retry.Max`.
 - A response body over 1 MiB MUST end the call as `anthropic.provider_too_large`.
 - The body of a failing status MUST be cut at 1 MiB.
