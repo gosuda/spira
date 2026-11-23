@@ -1,0 +1,39 @@
+package ai_test
+
+import (
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+func TestSearchToolsKeepsReservedSearchToolName(t *testing.T) {
+	managed := []ai.Tool{
+		described(ai.SearchToolName, "A managed tool with the reserved search name"),
+		described("weather", "Returns current weather conditions"),
+	}
+	search, narrow := ai.SearchTools(managed)
+	always := described("clock", "Tells the time")
+	model := &scripted{replies: []ai.Reply{saying("ok"), saying("ok")}}
+	wrapped := ai.Wrap(model, narrow)
+
+	if _, err := wrapped.Chat(t.Context(), ai.Request{
+		Messages: question(),
+		Tools:    []ai.Tool{search, managed[1], always},
+	}); err != nil {
+		t.Fatalf("Chat with the search tool: %v", err)
+		return
+	}
+	if got := model.seen[0].Tools[0].Description; got != search.Description {
+		t.Fatalf("search tool description = %q, want returned search tool description %q", got, search.Description)
+	}
+	requireStrings(t, "tools with the search tool present", toolNames(model.seen[0]), ai.SearchToolName, "clock")
+
+	if _, err := wrapped.Chat(t.Context(), ai.Request{
+		Messages: question(),
+		Tools:    []ai.Tool{managed[1], always},
+	}); err != nil {
+		t.Fatalf("Chat without the search tool: %v", err)
+		return
+	}
+	requireStrings(t, "tools without the search tool", toolNames(model.seen[1]), "clock")
+}

@@ -176,7 +176,7 @@ func (n narrowing) narrow(req Request) Request {
 	found := foundTools(req.Messages)
 	var visible []Tool
 	for _, tool := range req.Tools {
-		if !(n.managed[tool.Name] ?? false) || (found[tool.Name] ?? false) {
+		if tool.Name == SearchToolName || !(n.managed[tool.Name] ?? false) || (found[tool.Name] ?? false) {
 			visible = append(visible, tool)
 		}
 	}
