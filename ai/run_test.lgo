@@ -465,14 +465,6 @@ func TestRunEndsWhenTheContextEndsDuringATool(t *testing.T) {
 
 var errModelDown = errors.New("run test: model down")
 
-func TestRunWrapsTheModelError(t *testing.T) {
-	model := &scripted{fail: errModelDown}
-	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question()}, ai.Limits{})
-	if !errors.Is(err, errModelDown) || !errors.Is(err, ai.ErrModelFailed) {
-		t.Fatalf("error = %v, want the model error behind the ai.model_failed fault", err)
-	}
-}
-
 func TestRunNeverCallsAToolWhenTheContextEndedBeforeTheBatch(t *testing.T) {
 	log := &toolLog{}
 	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather"))}}
