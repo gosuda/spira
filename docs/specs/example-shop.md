@@ -5,11 +5,11 @@ The shop is the sample application. Package `shopdb` holds its schema. The appli
 ## Interface
 
 ```text
-example/shop/main.lgo
     DB *db.Pool
     Jobs *job.Scheduler
-    Admin *admin.Client
     Web *web.Server
+    Registry *admin.Server
+    Admin *admin.Client
     app.Run
 
 example/shop/catalog/
@@ -54,15 +54,17 @@ func FS() fs.FS
 - `main` MUST be ordinary statements that end in `app.Run`.
 - The application struct MUST hold `DB *db.Pool`.
 - The application struct MUST hold `Jobs *job.Scheduler`.
-- The application struct MUST hold `Admin *admin.Client`.
 - The application struct MUST hold `Web *web.Server`.
-- Each feature MUST be a struct whose methods are the handlers.
+- The application struct MUST hold `Registry *admin.Server`.
+- The application struct MUST hold `Admin *admin.Client`.
 - Feature fields that are parts MUST be non-nil pointers, as the [module conventions](../../AGENTS.md) state.
 - The sample MUST apply the steps from `shopdb.FS` at start.
 - That database MUST be SQLite.
 - A read MUST call a generated function in `db/store`.
 - With JavaScript off, each htmx control MUST work as a link or a form post.
 - Each island MUST have a server-rendered fallback.
+- The shop MUST register through its loopback listener.
+- A non-loopback public URL MUST NOT stop startup.
 
 ### Catalog
 
@@ -125,6 +127,13 @@ func FS() fs.FS
 - A failed database check MUST show that instance as down.
 - That row MUST change without a page reload.
 - `example/edge` MUST forward `/shop/catalog` to the shop.
+
+### Admin
+
+- `POST /admin/instances` with a shopper session MUST return 403.
+- `POST /admin/instances` without credentials MUST return 401.
+- `POST /admin/instances` with the service token MUST return 201.
+- `GET /admin` with a shopper session MUST return 200.
 
 ### Schema
 
