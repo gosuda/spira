@@ -1,0 +1,240 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+const h3TestPeerAddr = "192.0.2.1:1234"
+const h3TestOrigin = "https://frontend.example"
+
+func newH3ConnectTestRequest(ctx context.Context, body io.Reader) *http.Request {
+	r := httptest.NewRequestWithContext(ctx, http.MethodConnect, "/ws", body)
+	r.Proto, r.ProtoMajor, r.ProtoMinor = "HTTP/3.0", 3, 0
+	r.RemoteAddr = h3TestPeerAddr
+	r.ContentLength = -1
+	r.Header.Set(":protocol", "websocket")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Sec-WebSocket-Protocol", "first, echo")
+	return r
+}
+
+// The pipe carries frame bytes only; the recorder captures HTTP headers on flush.
+type h3HandlerStream struct {
+	net.Conn
+	*httptest.ResponseRecorder
+	frames *bufio.Writer
+	accepted chan *http.Response
+	reading chan struct{}
+}
+
+func (s *h3HandlerStream) EnableFullDuplex() error { return nil }
+
+func (s *h3HandlerStream) Read(p []byte) (int, error) {
+	select {
+	case s.reading <- struct{}{}:
+	default:
+	}
+	return s.Conn.Read(p)
+}
+
+func (s *h3HandlerStream) Write(p []byte) (int, error) {
+	return s.frames.Write(p)
+}
+
+func (s *h3HandlerStream) FlushError() error {
+	if !s.Flushed {
+		s.ResponseRecorder.Flush()
+		select {
+		case s.accepted <- s.Result():
+		default:
+			return errors.New("extended CONNECT headers already published")
+		}
+	}
+	return s.frames.Flush()
+}
+
+// Closing the request body unblocks reads without finishing the response.
+func (s *h3HandlerStream) Close() error {
+	return s.SetReadDeadline(time.Unix(0, 0))
+}
+
+type h3HandlerPeer struct {
+	net.Conn
+	reading <-chan struct{}
+	cancel context.CancelFunc
+}
+
+func runH3HandlerExchange(ctx context.Context, session func(context.Context, *websocket.Conn) error, client func(context.Context, *h3HandlerPeer) error) error {
+	ctx, stop := context.WithTimeout(ctx, 5*time.Second)
+	defer stop()
+	op, cancel := context.WithCancel(ctx)
+	defer cancel()
+	socket, peer := net.Pipe()
+	stream := &h3HandlerStream{
+		Conn: socket, ResponseRecorder: httptest.NewRecorder(), frames: bufio.NewWriter(socket),
+		accepted: make(chan *http.Response, 1), reading: make(chan struct{}, 1),
+	}
+	r := newH3ConnectTestRequest(op, stream)
+	r.Header.Set("Origin", h3TestOrigin)
+	stream.Header().Set("Sec-WebSocket-Accept", "http1-only")
+	stream.Header().Set("Content-Length", "0")
+	cfg := websocket.Config{Subprotocols: []string{"echo", "first"}, AllowedOrigins: []string{h3TestOrigin}}
+	serve := func() error {
+		defer socket.Close()?
+		defer close(stream.accepted)
+		return websocket.Serve(stream, r, cfg, func(c *websocket.Conn) error {
+			return session(r.Context(), c)
+		})
+	}
+	exchange := func() error {
+		defer peer.Close()?
+		deadline, _ := ctx.Deadline()
+		peer.SetDeadline(deadline)?
+		awaitH3ConnectHeaders(ctx, stream.accepted)?
+		return client(ctx, &h3HandlerPeer{Conn: peer, reading: stream.reading, cancel: cancel})
+	}
+	go group (ctx) {
+		go { serve()? }
+		go { exchange()? }
+	}
+	return nil
+}
+
+func awaitH3ConnectHeaders(ctx context.Context, accepted <-chan *http.Response) error {
+	select {
+	case resp, ok := <-accepted:
+		if !ok {
+			return errors.New("handler returned without flushing extended CONNECT headers")
+		}
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("Sec-WebSocket-Protocol") != "echo" {
+			return fmt.Errorf("extended CONNECT status %d, headers %v; want 200 and echo subprotocol", resp.StatusCode, resp.Header)
+		}
+		if resp.Header.Get("Sec-WebSocket-Accept") != "" || resp.Header.Get("Content-Length") != "" {
+			return fmt.Errorf("extended CONNECT response included a forbidden field: %v", resp.Header)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+func TestHTTP3WebSocketHandlerEchoAndClose(t *testing.T) {
+	if err := runH3HandlerExchange(t.Context(), echoH3ConnectSession, exchangeH3ConnectFrames); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func echoH3ConnectSession(ctx context.Context, c *websocket.Conn) error {
+	if addr := c.NetConn().RemoteAddr(); addr.Network() != "udp" || addr.String() != h3TestPeerAddr {
+		return fmt.Errorf("WebSocket peer = %s %s, want udp %s", addr.Network(), addr, h3TestPeerAddr)
+	}
+	if c.Subprotocol() != "echo" {
+		return fmt.Errorf("session subprotocol = %q, want echo", c.Subprotocol())
+	}
+	kind, data := c.Next(ctx)?
+	if kind != websocket.Text {
+		return fmt.Errorf("first message kind = %d, want text", kind)
+	}
+	c.WriteText(ctx, data)?
+	kind, data = c.Next(ctx)?
+	if kind != websocket.Close || !bytes.Equal(data, []byte{3, 0xe8}) {
+		return fmt.Errorf("last message = %d %x, want close 1000", kind, data)
+	}
+	return nil
+}
+
+func exchangeH3ConnectFrames(_ context.Context, peer *h3HandlerPeer) error {
+	writeClientBytes(peer, 0x81, []byte("hello"))?
+	frames := bufio.NewReader(peer)
+	first, body := readServerBytes(frames)?
+	if first != 0x1 || string(body) != "hello" {
+		return fmt.Errorf("text echo = %x %q, want text hello", first, body)
+	}
+	writeClientBytes(peer, 0x88, []byte{3, 0xe8})?
+	first, body = readServerBytes(frames)?
+	if first != 0x8 || !bytes.Equal(body, []byte{3, 0xe8}) {
+		return fmt.Errorf("close echo = %x %x, want close 1000", first, body)
+	}
+	switch b, err := frames.ReadByte(); {
+	case err == nil:
+		return fmt.Errorf("read after close frame = byte 0x%02x, want end of stream", b)
+	case !errors.Is(err, io.EOF):
+		return fmt.Errorf("read after close frame = %w, want end of stream", err)
+	}
+	return nil
+}
+
+func TestHTTP3WebSocketHandlerCancellation(t *testing.T) {
+	session := func(ctx context.Context, c *websocket.Conn) error {
+		switch _, _, err := c.Next(ctx); {
+		case err == nil:
+			return errors.New("read with canceled context = nil, want context canceled")
+		case !errors.Is(err, context.Canceled):
+			return fmt.Errorf("read with canceled context = %w, want context canceled", err)
+		}
+		return nil
+	}
+	client := func(ctx context.Context, peer *h3HandlerPeer) error {
+		select {
+		case <-peer.reading:
+			peer.cancel()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		switch b, err := bufio.NewReader(peer).ReadByte(); {
+		case err == nil:
+			return fmt.Errorf("read after cancellation = byte 0x%02x, want end of stream", b)
+		case !errors.Is(err, io.EOF):
+			return fmt.Errorf("read after cancellation = %w, want end of stream", err)
+		}
+		return nil
+	}
+	if err := runH3HandlerExchange(t.Context(), session, client); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTP3WebSocketHandlerRejectsInvalidHandshake(t *testing.T) {
+	cases := [...]struct {
+		name string
+		header string
+		value string
+		status int
+		fault error
+	}{
+		{"protocol", ":protocol", "other", http.StatusBadRequest, websocket.ErrHandshakeFailed},
+		{"version", "Sec-WebSocket-Version", "12", http.StatusUpgradeRequired, websocket.ErrHandshakeFailed},
+		{"key", "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==", http.StatusBadRequest, websocket.ErrHandshakeFailed},
+		{"subprotocol", "Sec-WebSocket-Protocol", "echo, echo", http.StatusBadRequest, websocket.ErrHandshakeFailed},
+		{"origin", "Origin", h3TestOrigin, http.StatusForbidden, websocket.ErrForbiddenOrigin},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			r := newH3ConnectTestRequest(t.Context(), io.NopCloser(bytes.NewReader(nil)))
+			r.Header.Set(test.header, test.value)
+			w := httptest.NewRecorder()
+			err := websocket.Serve(w, r, websocket.Config{}, func(_ *websocket.Conn) error {
+				t.Error("handler started a session for a rejected handshake")
+				return nil
+			})
+			if w.Code != test.status || !errors.Is(err, test.fault) {
+				t.Fatalf("rejected handshake = status %d, error %v; want %d, %v", w.Code, err, test.status, test.fault)
+			}
+			if test.status == http.StatusUpgradeRequired && w.Header().Get("Sec-WebSocket-Version") != "13" {
+				t.Fatalf("version rejection did not advertise version 13: %v", w.Header())
+			}
+		})
+	}
+}

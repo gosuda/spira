@@ -1,0 +1,247 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/web"
+	"github.com/gosuda/spira/websocket"
+)
+
+func tlsH2WebSocketCertificate() (tls.Certificate, *x509.CertPool, error) {
+	key := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)?
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)?
+	leaf := x509.ParseCertificate(der)?
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, roots, nil
+}
+
+func startTLSH2WebSocket(t *testing.T, router *web.Router, handler http.Handler) (*web.Server, *http.Transport, string) {
+	t.Helper()
+	cert, roots, err := tlsH2WebSocketCertificate()
+	if err != nil {
+		t.Fatalf("make loopback TLS certificate: %v", err)
+		panic("certificate setup failed")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+		panic("listen failed")
+	}
+	router.Handle(http.MethodConnect, "/ws", func(_ *web.Context) (web.Reply, error) {
+		return web.Delegate{To: handler}, nil
+	})
+	server := &web.Server{
+		Router: router, TLS: &tls.Config{Certificates: []tls.Certificate{cert}},
+		HTTP2ExtendedConnect: true,
+	}
+	if err := server.Serve(t.Context(), listener); err != nil {
+		t.Fatalf("serve TLS: %v (close listener: %v)", err, listener.Close())
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := server.Stop(ctx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
+	protocols := &http.Protocols{}
+	protocols.SetHTTP2(true)
+	tr := &http.Transport{Protocols: protocols, TLSClientConfig: &tls.Config{RootCAs: roots}}
+	t.Cleanup(tr.CloseIdleConnections)
+	return server, tr, "https://" + listener.Addr().String()
+}
+
+func openTLSH2WebSocket(t *testing.T, tr *http.Transport, base string) (*http.Request, *http.Response, func([]byte) (int, error)) {
+	t.Helper()
+	input, send := io.Pipe()
+	req := newH2WebSocketRequest(t, base, input)
+	stopPipe := context.AfterFunc(req.Context(), func() {
+		if err := input.CloseWithError(req.Context().Err()); err != nil {
+			t.Errorf("close CONNECT input after cancellation: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		stopPipe()
+		if err := send.Close(); err != nil {
+			t.Errorf("close CONNECT writer: %v", err)
+		}
+		if err := input.Close(); err != nil {
+			t.Errorf("close CONNECT reader: %v", err)
+		}
+	})
+	resp := openH2WebSocket(t, tr, req)
+	state := resp.TLS
+	if state == nil {
+		t.Fatal("CONNECT response lacks TLS state")
+		panic("CONNECT did not use TLS")
+	}
+	if state.NegotiatedProtocol != "h2" || len(state.VerifiedChains) == 0 {
+		t.Fatalf("CONNECT ALPN = %q, verified certificate chains = %d; want h2 with a verified chain", state.NegotiatedProtocol, len(state.VerifiedChains))
+	}
+	return req, resp, send.Write
+}
+
+const tlsH2SiblingBody = "sibling survived"
+
+func tlsH2Sibling(t *testing.T, release <-chan struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Test-Peer", r.RemoteAddr)
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			t.Errorf("flush sibling headers: %v", err)
+			return
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		if _, err := io.WriteString(w, tlsH2SiblingBody); err != nil {
+			t.Errorf("write sibling body: %v", err)
+		}
+	})
+}
+
+func openTLSH2Sibling(t *testing.T, tr *http.Transport, base string) *http.Response {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/peer", nil)
+	if err != nil {
+		t.Fatalf("build sibling request: %v", err)
+		panic("sibling request setup failed")
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("start sibling request: %v", err)
+		panic("sibling request failed")
+	}
+	t.Cleanup(func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close sibling response: %v", err)
+		}
+	})
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
+		t.Fatalf("sibling response = %s %s, want HTTP/2 200", resp.Proto, resp.Status)
+	}
+	return resp
+}
+
+func TestTLSHTTP2WebSocketEchoAndSiblingSurvives(t *testing.T) {
+	release := make(chan struct{})
+	router := web.NewRouter()
+	handler := tlsH2Sibling(t, release)
+	router.Handle(http.MethodGet, "/peer", func(_ *web.Context) (web.Reply, error) {
+		return web.Delegate{To: handler}, nil
+	})
+	_, tr, base := startTLSH2WebSocket(t, router, http.HandlerFunc(h2Echo))
+	_, stream, send := openTLSH2WebSocket(t, tr, base)
+	if _, err := send([]byte{0x81, 0x85, 1, 2, 3, 4, 'i', 'g', 'o', 'h', 'n'}); err != nil {
+		t.Fatalf("send masked text: %v", err)
+	}
+	frames := bufio.NewReader(stream.Body)
+	opcode, body, err := readServerBytes(frames)
+	if err != nil {
+		t.Fatalf("read text echo: %v", err)
+		return
+	}
+	if opcode != 0x1 || string(body) != "hello" {
+		t.Fatalf("text echo = opcode %#x, payload %q", opcode, body)
+	}
+
+	sibling := openTLSH2Sibling(t, tr, base)
+	peer := stream.Header.Get("X-Test-Peer")
+	if got := sibling.Header.Get("X-Test-Peer"); peer == "" || got != peer {
+		t.Fatalf("sibling TCP peer = %q, want CONNECT peer %q", got, peer)
+	}
+	if _, err := send([]byte{0x88, 0x82, 1, 2, 3, 4, 2, 0xea}); err != nil {
+		t.Fatalf("send masked normal close: %v", err)
+	}
+	opcode, body, err = readServerBytes(frames)
+	if err != nil {
+		t.Fatalf("read close echo: %v", err)
+		return
+	}
+	if opcode != 0x8 || !bytes.Equal(body, []byte{3, 0xe8}) {
+		t.Fatalf("close echo = opcode %#x, payload %x", opcode, body)
+	}
+	if _, err := frames.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after WebSocket close = %v, want end of CONNECT stream", err)
+	}
+	close(release)
+	got, err := io.ReadAll(sibling.Body)
+	if err != nil || string(got) != tlsH2SiblingBody {
+		t.Fatalf("sibling response after CONNECT closed = %q, error %v, want %q", got, err, tlsH2SiblingBody)
+	}
+}
+
+type tlsH2SessionResult struct {
+	readErr  error
+	serveErr error
+}
+
+func TestTLSHTTP2WebSocketStopClosesBlockedRead(t *testing.T) {
+	reading := make(chan struct{})
+	finished := make(chan tlsH2SessionResult, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var result tlsH2SessionResult
+		result.serveErr = websocket.Serve(w, r, websocket.Config{}, func(c *websocket.Conn) error {
+			close(reading)
+			_, _, result.readErr = c.Next(context.Background())
+			return result.readErr
+		})
+		select {
+		case finished <- result:
+		default:
+			t.Error("WebSocket session result channel is already full")
+		}
+	})
+	srv, tr, base := startTLSH2WebSocket(t, web.NewRouter(), handler)
+	req, stream, _ := openTLSH2WebSocket(t, tr, base)
+	select {
+	case <-reading:
+	case <-req.Context().Done():
+		t.Fatalf("accepted WebSocket did not reach its read: %v", req.Context().Err())
+	}
+
+	stop, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	err := srv.Stop(stop)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(stop.Err(), context.DeadlineExceeded) {
+		t.Fatalf("Stop with an open WebSocket = %v (caller context: %v), want caller deadline exceeded", err, stop.Err())
+	}
+	select {
+	case result := <-finished:
+		if result.readErr == nil || !errors.Is(result.serveErr, result.readErr) {
+			t.Fatalf("shutdown did not end the blocked read with an error: Next = %v, Serve = %v", result.readErr, result.serveErr)
+		}
+	case <-req.Context().Done():
+		t.Fatalf("WebSocket session did not return after Stop: %v", req.Context().Err())
+	}
+	if _, err := bufio.NewReader(stream.Body).ReadByte(); err == nil || req.Context().Err() != nil {
+		t.Fatalf("client read after Stop = %v (request context: %v), want peer termination before client timeout", err, req.Context().Err())
+	}
+}

@@ -17,6 +17,7 @@ var errHandshakeUpgrade = errors.New("websocket: handshake requires Upgrade head
 var errHandshakeVersion = errors.New("websocket: handshake requires Sec-WebSocket-Version 13")
 var errHandshakeKey = errors.New("websocket: handshake requires Sec-WebSocket-Key with base64 of 16 bytes")
 var errHandshakeSubprotocol = errors.New("websocket: Sec-WebSocket-Protocol must be an RFC 7230 token")
+var errExtendedConnect = errors.New("websocket: invalid extended CONNECT handshake")
 
 func acceptKey(key string) string {
 	sum := sha1.Sum([]byte(strings.TrimSpace(key) + handshakeGUID))
@@ -49,6 +50,37 @@ func checkUpgrade(r *http.Request) error {
 	}
 	if !handshakeValidKey(key) {
 		return errHandshakeKey
+	}
+	return nil
+}
+
+func checkExtendedConnect(r *http.Request) error {
+	protocol := r.Header.Values(":protocol")
+	if r.Method != http.MethodConnect || len(protocol) != 1 || protocol[0] != "websocket" || r.Host == "" || r.Body == nil || r.Body == http.NoBody {
+		return errExtendedConnect
+	}
+	for _, name := range [...]string{"Connection", "Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Accept"} {
+		if len(r.Header.Values(name)) != 0 {
+			return errExtendedConnect
+		}
+	}
+	version := r.Header.Values("Sec-WebSocket-Version")
+	if len(version) != 1 || strings.TrimSpace(version[0]) != "13" {
+		return errHandshakeVersion
+	}
+	return checkOfferedSubprotocols(r.Header.Values("Sec-WebSocket-Protocol"))
+}
+
+func checkOfferedSubprotocols(offered []string) error {
+	seen := map[string]struct{}{}
+	for _, line := range offered {
+		for part := range strings.SplitSeq(line, ",") {
+			name := strings.TrimSpace(part)
+			if _, exists := seen[name]; exists || !handshakeValidToken(name) {
+				return errHandshakeSubprotocol
+			}
+			seen[name] = struct{}{}
+		}
 	}
 	return nil
 }

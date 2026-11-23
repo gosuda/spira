@@ -1,10 +1,10 @@
 # websocket
 
-Package `websocket` speaks RFC 6455 over HTTP/1.1 on `net/http` types. It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
+Package `websocket` speaks RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 on `net/http` types.
+It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
 
-The package owns the server side of one WebSocket connection: the handshake answer, the frame loop and the close handshake. It starts no goroutine and holds no global state.
-
-The package follows RFC 6455. The unexported blocks are the frame codec, the opening-handshake checks, the origin check, the close-code rules and the message-assembly engine. `Conn` is the only public transport; HTTP/2 extended CONNECT stays with `web`.
+The package owns the handshake answer, the frame loop and the close handshake. It holds no global session state.
+`Conn` is the public transport for a hijacked HTTP/1.1 socket or one HTTP/2 stream.
 
 ## Interface
 
@@ -147,6 +147,7 @@ var ErrTooLarge = fault.New("websocket.too_large", fault.TooLarge, "The websocke
 func Faults() []*fault.Error
 
 func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error)
+func Serve(w http.ResponseWriter, r *http.Request, cfg Config, session func(*Conn) error) error
 func ServeHijacked(conn net.Conn, rw *bufio.ReadWriter, subprotocol string, limit int64) *Conn
 func (c *Conn) NetConn() net.Conn
 func (c *Conn) Subprotocol() string
@@ -159,7 +160,7 @@ func (c *Conn) CloseWithCode(ctx context.Context, code uint16, reason string) er
 func (c *Conn) Close() error
 ```
 
-`header` moves no payload bytes and opens no connection. `readHeader` reads 2 to 14 header bytes and never reads payload bytes. `acceptKey`, `checkUpgrade`, `upgradeStatus`, `handshakeFailureHeaders`, `upgradeHeaders`, `pickSubprotocol`, `checkOrigin` and `sameOrigin` are pure header checks. `parseClose`, `validCloseCode` and `appendClose` move no frame bytes. `engine` reads frames from a `*bufio.Reader` and assembles messages; it opens no connection and starts no goroutine. `Conn` owns one hijacked connection, answers pings, echoes one close and ends.
+The frame codec and message engine are shared by HTTP/1.1 and HTTP/2. `Conn` answers pings, echoes one close and ends.
 Each detection site wraps its unexported cause in the declared fault for that class. The frame, engine and close codecs surface `ErrProtocolError` or `ErrTooLarge` through the `Exposed` probes in `export_test.lgo` and `close_export_test.lgo`. The handshake checks keep their unexported causes for the status map and surface them through `handshake_export_test.lgo`.
 
 ## Requirements
@@ -212,6 +213,17 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `handshakeFailureHeaders` MUST set `Sec-WebSocket-Version: 13` for the version error only.
 - The 426 caller MUST send `Sec-WebSocket-Version: 13` with the response.
 
+### HTTP/2 opening handshake (RFC 8441 section 5)
+
+- `Serve` MUST accept HTTP/2 `CONNECT` only when `:protocol` is `websocket`.
+- The HTTP/2 server MUST validate the required pseudo-headers before `Serve` receives the request.
+- `Serve` MUST reject `Connection`, `Upgrade`, `Sec-WebSocket-Key` and `Sec-WebSocket-Accept` on the request.
+- `Serve` MUST require exactly one `Sec-WebSocket-Version` field with value `13`.
+- `Serve` MUST reject an invalid or repeated subprotocol token in the client's offer.
+- `Serve` MUST apply the same origin check and subprotocol selection as `Upgrade`.
+- On success, `Serve` MUST send HTTP 200 and flush the headers before calling `session`.
+- The HTTP/2 response MUST NOT include `Connection`, `Upgrade`, `Sec-WebSocket-Accept` or `Content-Length`.
+
 ### Origin check (RFC 6455 section 4.1, RFC 6454 section 7)
 
 - `checkOrigin` MUST allow a request with no `Origin` header.
@@ -219,12 +231,19 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `checkOrigin` MUST allow an `http` or `https` origin whose host equals the request host.
 - `checkOrigin` MUST reject any other origin with `errHandshakeOrigin`.
 - `Upgrade` MUST answer that rejection with HTTP 403 and no close code.
+- `Serve` MUST also answer a rejected HTTP/2 origin with HTTP 403 and no close code.
 
 ### Connection (RFC 6455 sections 5.4, 5.5, 5.6, 6, 7)
 
 - `Upgrade` MUST write each handshake failure status itself and return the fault.
 - `Upgrade` MUST answer 101 with `Upgrade`, `Connection`, `Accept` and the subprotocol.
 - `Upgrade` MUST hijack the connection and return a `Conn` over it.
+- On HTTP/1.1, `Serve` MUST use `Upgrade`, run `session` and close the socket.
+- On HTTP/2, `Serve` MUST read from the request body and write frames to the response stream.
+- The handler MUST call `Serve` before it returns. The callback MUST finish using the `Conn` before it returns.
+- On HTTP/2, `NetConn` MUST refer to the stream only. Its deadlines MUST apply to that stream.
+- On HTTP/2, `Conn.Close` MUST unblock stream I/O and prevent later use of the response writer. Return from the handler to finish the response stream.
+- HTTP/2 operations MUST observe cancellation and deadlines. Termination of a WebSocket MUST NOT close the shared HTTP/2 connection.
 - `ServeHijacked` MUST panic on a nil connection or buffer.
 - A limit of 0 MUST select 1048576 bytes.
 - A negative limit MUST panic.
@@ -391,6 +410,10 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestUpgradeAnswers101WithRFCVector` proves that the RFC 6455 section 1.3 sample key answers 101 with its accept value.
 - `TestUpgradeOriginPolicy` proves that foreign origins get 403 while same, absent and listed origins get 101.
 - `TestUpgradeSelectsSubprotocolInServerOrder` proves that the first supported offered subprotocol wins.
+- `TestHTTP2WebSocketEchoAndClose` exercises a masked text echo, subprotocol selection and a close handshake over HTTP/2. It then uses the same connection for another request.
+- `TestHTTP2WebSocketRejectsInvalidHandshake` checks the protocol, legacy key, version, subprotocol offer and origin rejections.
+- `TestHTTP2WebSocketReadDeadlineAndCancellation` checks read deadlines and cancellation on a live HTTP/2 stream.
+- `TestHTTP2WebSocketWriteDeadline` checks a write blocked by HTTP/2 flow control. The HTTP/2 connection stays open.
 - `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
 
 ## Not in scope
@@ -398,4 +421,3 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - Extensions such as permessage-deflate. No requirement names them.
 - A client handshake builder. The code checks requests only.
 - A background keep-alive loop. The application sends `Ping` itself.
-- HTTP/2 extended CONNECT. That handshake stays with `web`, which hands `Conn` a stream through `ServeHijacked`.
