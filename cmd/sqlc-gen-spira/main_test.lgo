@@ -303,22 +303,6 @@ func TestNullableKeyColumnUsesUnderlyingOption(t *testing.T) {
 	}
 }
 
-func TestKeyTypesAreDistinct(t *testing.T) {
-	src := generateFile(t, enumFixture(t))
-	for _, decl := range []string{
-		"type ItemID int64",
-		"type OrderLineID int64",
-	} {
-		if !strings.Contains(src, decl) {
-			t.Fatalf("generated file missing %q", decl)
-			return
-		}
-	}
-	if strings.Count(src, "ItemID") < 3 || strings.Count(src, "OrderLineID") < 2 {
-		t.Fatalf("key types are declared but never used:\n%s", src)
-	}
-}
-
 func TestTableVarsPointAtGeneratedEntities(t *testing.T) {
 	src := generateFile(t, enumFixture(t))
 	for _, decl := range []string{

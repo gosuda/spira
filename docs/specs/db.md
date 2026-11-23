@@ -218,8 +218,8 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the bounded `Stop` and the close that finishes after it. A registered SQL function holds the statement open until the test releases it.
 - `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the shutdown probe adds no statement to the cache.
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
-- `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
-- `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.
+- `TestInTxRollsBackOnError` proves that an error undoes the insert and returns that error.
+- `TestInTxRollsBackOnPanic` proves that a panic undoes the insert and continues.
 - `TestInTxCommitFailureReturnsCommitErrorAlone` proves that a commit failure returns `db.constraint_violation` with the `db: commit` cause.
 - `TestStatementCacheNeverExceedsCapacity` proves the limit of 256 statements.
 - `TestInExpandsTheMarker` proves marker replacement, `NULL`, and a second marker left unchanged.
@@ -248,10 +248,10 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `TestQueryRejectsUnsupportedFieldBeforeRows` proves the unsupported-type error before a row is read.
 - `TestQueryServesSixteenConcurrentReaders` proves concurrent reads on one pool.
 - `TestEnginePostgres`, `TestEngineMySQL` and `TestEngineMSSQL` prove a round trip, a commit, a rollback and `Prepare` on each engine. `just engines` starts the three engines. Each test fails naming its DSN variable when it is empty; the file carries `//go:build engines`, so the plain run skips it.
-- `TestFaultUnknownDriver` proves `db.Open` rejects an unknown driver with `db.unknown_driver`.
-- `TestFaultMissingParseTime` proves `db.Open` rejects a `mysql` DSN without `parseTime=true`.
-- `TestFaultShapeMismatch` proves a column mismatch returns `db.shape_mismatch`.
-- `TestFaultNullInNonOptional` proves a NULL returns `db.null_in_non_optional`.
+- `TestOpenRejectsUnknownDriver` proves `db.Open` rejects an unknown driver with `db.unknown_driver`.
+- `TestOpenRejectsMysqlWithoutParseTime` proves `db.Open` rejects a `mysql` DSN without `parseTime=true`.
+- `TestQueryRejectsWrongColumnOrder` and `TestQueryRejectsMismatchedColumnsWithoutRows` prove a column mismatch returns `db.shape_mismatch`.
+- `TestQueryRejectsNullInNonOptional` proves a NULL returns `db.null_in_non_optional`.
 - `TestFaultConstraintViolation` proves a duplicate insert returns `db.constraint_violation`.
 - `TestFaultStatementFailed` proves a missing table returns `db.statement_failed` and not `db.unavailable`.
 - `TestFaultPrefixParserTable` proves the `MySQL` prefix parser accepts and rejects its table.

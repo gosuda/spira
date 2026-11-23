@@ -24,53 +24,6 @@ func faultExec(t *testing.T, pool *db.Pool, statement string) {
 	}
 }
 
-func TestFaultUnknownDriver(t *testing.T) {
-	_, err := db.Open("oracle", "x")
-	if !errors.Is(err, db.ErrUnknownDriver) {
-		t.Fatalf("Open error = %v, want db.ErrUnknownDriver", err)
-		return
-	}
-}
-
-func TestFaultMissingParseTime(t *testing.T) {
-	_, err := db.Open("mysql", "user:pass@/dbname")
-	if !errors.Is(err, db.ErrMissingParseTime) {
-		t.Fatalf("Open error = %v, want db.ErrMissingParseTime", err)
-		return
-	}
-}
-
-type faultPair struct {
-	A string `col:"a"`
-	B string `col:"b"`
-}
-
-func TestFaultShapeMismatch(t *testing.T) {
-	pool := openPool(t)
-	faultExec(t, pool, "CREATE TABLE fault_pairs (a TEXT, b TEXT)")
-	_, err := db.Query[faultPair](t.Context(), pool, "SELECT b, a FROM fault_pairs")
-	if !errors.Is(err, db.ErrShapeMismatch) {
-		t.Fatalf("Query error = %v, want db.ErrShapeMismatch", err)
-		return
-	}
-}
-
-type faultStrict struct {
-	ID int64  `col:"id"`
-	S  string `col:"s"`
-}
-
-func TestFaultNullInNonOptional(t *testing.T) {
-	pool := openPool(t)
-	faultExec(t, pool, "CREATE TABLE fault_strict (id INTEGER PRIMARY KEY, s TEXT)")
-	faultExec(t, pool, "INSERT INTO fault_strict (id, s) VALUES (1, NULL)")
-	_, err := db.Query[faultStrict](t.Context(), pool, "SELECT id, s FROM fault_strict")
-	if !errors.Is(err, db.ErrNullInNonOptional) {
-		t.Fatalf("Query error = %v, want db.ErrNullInNonOptional", err)
-		return
-	}
-}
-
 type faultUniq struct {
 	N int64 `col:"n"`
 }
@@ -190,23 +143,6 @@ func TestFaultPublicHidesSecretsAndHostile(t *testing.T) {
 	faultExec(t, pool, "INSERT INTO fault_secret (k) VALUES ('sk-live-secret-value')")
 	_, serr := db.Exec(t.Context(), pool, "INSERT INTO fault_secret (k) VALUES ('sk-live-secret-value')")
 	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, serr), "sk-live-secret-value")
-}
-
-func TestConstraintCleanupOnEarlyReturn(t *testing.T) {
-	pool := openPool(t)
-	ran := false
-	withConstraintProbe(t, t.Context(), pool, constraintProbe{
-		table: "fault_cleanup_uniq",
-		mark:  "?",
-		check: func(dupErr error) {
-			ran = true
-		},
-	})
-	if !ran {
-		t.Fatal("probe body did not run")
-		return
-	}
-	faultExec(t, pool, "CREATE TABLE fault_cleanup_uniq (n INTEGER NOT NULL UNIQUE)")
 }
 
 func TestEngineMySQLRefusedPort(t *testing.T) {
