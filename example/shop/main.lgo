@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -104,14 +105,33 @@ func assemble(ctx context.Context, settings Settings, service *admin.Server?) (*
 	if err != nil {
 		return nil, err
 	}
+	inner, err := loopbackServerURL(settings.Addr)
+	if err != nil {
+		return nil, err
+	}
+	innerHost, err := opsHost(inner)
+	if err != nil {
+		return nil, err
+	}
 	svc := service ?? &admin.Server{}
 	if len(svc.AllowedHosts) == 0 {
-		svc.AllowedHosts = []string{host}
+		svc.AllowedHosts = []string{host, innerHost}
 	}
 	svc.ProbeToken = token
 	router, scheduler := buildRouter(shopParts{settings: settings, pool: pool, assets: assets, tags: tags, dev: dev, admin: svc, serviceToken: token})
-	application := &Application{DB: pool, Jobs: scheduler, Web: &web.Server{Addr: settings.Addr, Router: router}, Registry: svc, Admin: shopAdmin(settings, token)}
+	application := &Application{DB: pool, Jobs: scheduler, Web: &web.Server{Addr: settings.Addr, Router: router}, Registry: svc, Admin: shopAdmin(inner, token)}
 	return application, nil
+}
+
+func loopbackServerURL(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("shop: address %q needs host:port", addr)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port), nil
 }
 
 func newServiceToken() (string, error) {
@@ -221,8 +241,9 @@ func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 	service.Mount(router, guard)
 	return router, scheduler
 }
-func shopAdmin(settings Settings, token string) *admin.Client {
-	return &admin.Client{Server: settings.PublicURL, Self: admin.Instance{Name: "shop", OpsURL: settings.PublicURL}, Token: token}
+
+func shopAdmin(serverURL string, token string) *admin.Client {
+	return &admin.Client{Server: serverURL, Self: admin.Instance{Name: "shop", OpsURL: serverURL}, Token: token}
 }
 
 func mountAssets(r *web.Router, assets *asset.Manifest) {

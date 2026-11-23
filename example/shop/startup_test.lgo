@@ -1,4 +1,4 @@
-package main
+package main_test
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/gosuda/spira/admin"
 	"github.com/gosuda/spira/app"
+	shopmain "github.com/gosuda/spira/example/shop"
 )
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -35,9 +36,9 @@ func freePort(t *testing.T) int {
 	return addr.Port
 }
 
-func startupSettings(port int) Settings {
+func startupSettings(port int) shopmain.Settings {
 	base := fmt.Sprintf("127.0.0.1:%d", port)
-	return Settings{
+	return shopmain.Settings{
 		Addr:       base,
 		DSN:        fmt.Sprintf("file:spira_startup_%d?mode=memory&cache=shared", port),
 		ViteOrigin: "http://127.0.0.1:1",
@@ -88,7 +89,7 @@ func TestShopStartsRegistersAndReportsUp(t *testing.T) {
 	settings := startupSettings(port)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
-	application, err := assemble(ctx, settings, &admin.Server{Interval: 50 * time.Millisecond})
+	application, err := shopmain.AssembleForTest(ctx, settings, &admin.Server{Interval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("assemble the shop: %v", err)
 		return
@@ -122,4 +123,64 @@ func TestShopStartsRegistersAndReportsUp(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the shop did not stop after cancel")
 	}
+}
+
+func launchShop(t *testing.T, settings shopmain.Settings) (*shopmain.Application?, string, func()) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	application, err := shopmain.AssembleForTest(ctx, settings, &admin.Server{Interval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("assemble the shop: %v", err)
+		return nil, "", func() {}
+	}
+	if application == nil {
+		t.Fatal("assemble the shop: no application")
+		return nil, "", func() {}
+	}
+	token := application.Admin.Token ?? ""
+	if token == "" {
+		t.Fatal("the assembled shop carries no admin service token")
+		return nil, "", func() {}
+	}
+	runCtx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var runErr error
+	pool, _ := rt.NewGroup(context.WithoutCancel(runCtx), 0)
+	pool.Go(func(_ context.Context) error {
+		runErr = app.Run(runCtx, application)
+		close(done)
+		return nil
+	})
+	wait := func() {
+		stop()
+		select {
+		case <-done:
+			if runErr != nil {
+				t.Errorf("shop run: %v", runErr)
+			}
+		case <-time.After(20 * time.Second):
+			t.Error("the shop did not stop after cancel")
+		}
+	}
+	return application, token, wait
+}
+
+func TestShopStartsWithNonLoopbackPublicURL(t *testing.T) {
+	port := freePort(t)
+	if port == 0 {
+		return
+	}
+	settings := startupSettings(port)
+	settings.PublicURL = fmt.Sprintf("http://192.168.1.20:%d", port)
+	application, token, stop := launchShop(t, settings)
+	defer stop()
+	if application == nil {
+		t.Fatal("assemble the shop: no application")
+		return
+	}
+	if got := application.Admin.Server; got == settings.PublicURL {
+		t.Errorf("registration target = %q, want the loopback listener, not the advertised URL", got)
+	}
+	pollAdminUp(t, "http://"+settings.Addr, token)
 }

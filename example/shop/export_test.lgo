@@ -1,0 +1,11 @@
+package main
+
+import (
+	"context"
+
+	"github.com/gosuda/spira/admin"
+)
+
+func AssembleForTest(ctx context.Context, settings Settings, service *admin.Server?) (*Application?, error) {
+	return assemble(ctx, settings, service)
+}
