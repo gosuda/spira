@@ -989,6 +989,31 @@ func TestSliceQuery(t *testing.T) {
 	}
 }
 
+func TestSliceQueryBindAfterSliceMarker(t *testing.T) {
+	req := sliceFixture(t)
+	kindCol := Column{Name: "kind", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
+	idsCol := Column{Name: "ids", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}, IsSQLCSlice: true}
+	idCol := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}}
+	titleCol := Column{Name: "title", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
+	req.Queries = append(req.Queries, Query{
+		Name: "FindByKindSliceTitle", Cmd: ":many", Filename: "docs.sql",
+		Text:    "SELECT id, title FROM items WHERE kind = ? AND id IN (/*SLICE:ids*/?) AND title = ?",
+		Columns: []Column{idCol, titleCol},
+		Params:  []Parameter{{Number: 1, Column: kindCol}, {Number: 2, Name: "ids", Column: idsCol}, {Number: 3, Column: titleCol}},
+	})
+	src := queryFile(t, req, "docs.sql.lgo")
+	for _, want := range []string{
+		"type FindByKindSliceTitleArgs struct",
+		"func FindByKindSliceTitle(ctx context.Context, q db.Querier, args FindByKindSliceTitleArgs) ([]FindByKindSliceTitleRow, error)",
+		"queryArgs = append(queryArgs, args.Title)",
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("query file holds no %q:\n%s", want, src)
+			return
+		}
+	}
+}
+
 func TestQueryFileOmitsTimeImportForEntityRows(t *testing.T) {
 	req := patchRequest(t, "sqlite", func(req *Request) {
 		req.PluginOptions = pluginOptions(t, map[string]any{
