@@ -8,6 +8,7 @@ import (
 )
 
 const ProtocolVersion = "2025-11-25"
+const jsonRPCVersion = "2.0"
 
 type Envelope struct {
 	JSONRPC string         `json:"jsonrpc"`
@@ -30,7 +31,7 @@ func (e *RPCError) Error() string {
 
 func encodeEnvelope(msg Envelope) ([]byte, error) {
 	if msg.JSONRPC == "" {
-		msg.JSONRPC = "2.0"
+		msg.JSONRPC = jsonRPCVersion
 	}
 	line, err := json.Marshal(msg)
 	if err != nil {
@@ -44,8 +45,8 @@ func decodeEnvelope(line []byte) (Envelope, error) {
 	if err := json.Unmarshal(line, &msg); err != nil {
 		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: decode message: %w", err))
 	}
-	if msg.JSONRPC == "" {
-		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: message holds no jsonrpc member"))
+	if msg.JSONRPC != jsonRPCVersion {
+		return Envelope{}, ErrProtocolError.Wrap(fmt.Errorf("mcp: message must use JSON-RPC %s", jsonRPCVersion))
 	}
 	return msg, nil
 }
@@ -56,7 +57,7 @@ func newRequest(id int64, method string, params any) (Envelope, error) {
 		return Envelope{}, err
 	}
 	return Envelope{
-		JSONRPC: "2.0",
+		JSONRPC: jsonRPCVersion,
 		ID:      jsontext.Value(strconv.FormatInt(id, 10)),
 		Method:  method,
 		Params:  raw,
@@ -68,7 +69,7 @@ func newNotification(method string, params any) (Envelope, error) {
 	if err != nil {
 		return Envelope{}, err
 	}
-	return Envelope{JSONRPC: "2.0", Method: method, Params: raw}, nil
+	return Envelope{JSONRPC: jsonRPCVersion, Method: method, Params: raw}, nil
 }
 
 func marshalParams(method string, params any) (jsontext.Value, error) {
