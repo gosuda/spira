@@ -4,7 +4,9 @@ package appdb_test
 
 import (
 	"context"
+	"crypto/rand"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,25 +29,69 @@ func engineDSN(t *testing.T) string {
 	return dsn
 }
 
-func TestEngineCheckReversibleAndPrepareAll(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pool, err := db.Open("{{DRIVER_NAME}}", engineDSN(t))
+func openStarted(t *testing.T, ctx context.Context, dsn string) *db.Pool? {
+	t.Helper()
+	pool, err := db.Open("{{DRIVER_NAME}}", dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
-		return
+		return nil
 	}
 	if pool == nil {
 		t.Fatalf("open left no pool")
-		return
+		return nil
 	}
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer stopCancel()
 		if serr := pool.Stop(stopCtx); serr != nil {
 			t.Errorf("stop: %v", serr)
 		}
-	}()
+	})
+	if serr := pool.Start(ctx); serr != nil {
+		t.Fatalf("start: %v", serr)
+		return nil
+	}
+	return pool
+}
+
+func openScratch(t *testing.T, dsn string) *db.Pool? {
+	t.Helper()
+	name := "spira_rev_my_" + strings.ToLower(rand.Text())
+	target := strings.Replace(dsn, "spira_test", name, 1)
+	if target == dsn {
+		t.Fatalf("{{DSN_ENV}} must name the database spira_test")
+		return nil
+	}
+	create := "CREATE DATABASE " + name
+	drop := "DROP DATABASE IF EXISTS " + name
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	admin := openStarted(t, ctx, dsn)
+	if admin == nil {
+		return nil
+	}
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer dropCancel()
+		if _, err := admin.ExecContext(dropCtx, drop); err != nil {
+			t.Errorf("drop scratch %s: %v", name, err)
+		}
+	})
+	if _, err := admin.ExecContext(ctx, create); err != nil {
+		t.Fatalf("create scratch %s: %v", name, err)
+		return nil
+	}
+	return openStarted(t, ctx, target)
+}
+
+func TestEngineCheckReversibleAndPrepareAll(t *testing.T) {
+	dsn := engineDSN(t)
+	pool := openScratch(t, dsn)
+	if pool == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	steps, err := migrate.Load(appdb.FS())
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -59,15 +105,11 @@ func TestEngineCheckReversibleAndPrepareAll(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 		return
 	}
-	defer func() {
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer rbCancel()
-		if rerr := migrate.Rollback(rbCtx, pool, steps, len(steps)); rerr != nil {
-			t.Errorf("rollback cleanup: %v", rerr)
-		}
-	}()
 	if err := store.PrepareAll(ctx, pool); err != nil {
 		t.Fatalf("prepare: %v", err)
 		return
+	}
+	if err := migrate.Rollback(ctx, pool, steps, len(steps)); err != nil {
+		t.Fatalf("rollback: %v", err)
 	}
 }

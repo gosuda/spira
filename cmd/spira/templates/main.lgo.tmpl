@@ -35,6 +35,9 @@ func main() {
 
 func run(ctx context.Context) error {
 	pool := openPool()?
+	if pool == nil {
+		return fmt.Errorf("demo: no database pool")
+	}
 	steps := migrate.Load(appdb.FS())?
 	if err := migrate.Apply(ctx, pool, steps); err != nil {
 		return err
@@ -68,16 +71,12 @@ func run(ctx context.Context) error {
 	return app.Run(ctx, &application{DB: pool, Web: srv})
 }
 
-func openPool() (*db.Pool, error) {
+func openPool() (*db.Pool?, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "{{DSN}}"
 	}
-	pool := db.Open("{{DRIVER_NAME}}", dsn)?
-	if pool == nil {
-		return nil, fmt.Errorf("demo: no database pool")
-	}
-	return pool, nil
+	return db.Open("{{DRIVER_NAME}}", dsn)
 }
 
 func loadManifest() (*asset.Manifest?, error) {

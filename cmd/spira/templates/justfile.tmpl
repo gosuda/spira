@@ -5,7 +5,7 @@ export GOROOT := logos_root
 export GOTOOLCHAIN := "local"
 export PATH := justfile_directory() / "bin:" + logos_root / "bin:" + env_var("PATH")
 
-gate: build lint test web
+gate: sql-check build lint test web
 
 build:
     logos build ./...
@@ -19,13 +19,55 @@ test:
 sql:
     logos mod download github.com/gosuda/spira
     logos build -o bin/sqlc-gen-spira github.com/gosuda/spira/cmd/sqlc-gen-spira
-    cd tools && go mod tidy && go tool sqlc generate -f ../sqlc.yaml
+    GOWORK=off go -C tools tool sqlc generate -f "$PWD/sqlc.yaml"
 
 sql-check:
-    just sql
-    (cd tools && go tool sqlc vet -f ../sqlc.yaml)
-    @if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then test -z "$(git status --porcelain -- '*.sql.lgo')"; else echo "sql-check: not a git tree, skipping generated-file check"; fi
-    @rg -n --glob '*.lgo' --glob '!*.sql.lgo' --glob '!db/*' 'db\.(Query|One|Exec)\b' && exit 1 || true
+    #!/usr/bin/env bash
+    set -euo pipefail
+    status=0
+    rg --no-config --no-ignore --hidden -n -U --glob '*.lgo' \
+        --glob '!**/.git/**' --glob '!/frontend/node_modules/**' --glob '!/db/store/**' \
+        '\bdb\s*\.\s*(Query|One|Exec)\b' . || status=$?
+    case "$status" in
+        0) printf 'sql-check: use generated queries instead of raw db calls\n' >&2; exit 1 ;;
+        1) ;;
+        *) printf 'sql-check: rg failed (exit %s)\n' "$status" >&2; exit "$status" ;;
+    esac
+
+    if [[ -L db ]]; then
+        printf 'sql-check: symlink is not a SQL input: db\n' >&2
+        exit 1
+    fi
+    scratch="$(mktemp -d /tmp/spira-new-sql-check.XXXXXXXX)"
+    trap 'rm -rf -- "${scratch:?}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    printf '%s\0' sqlc.yaml go.mod go.sum tools/go.mod tools/go.sum > "$scratch/sql-inputs"
+    find -P db/migrations db/queries \( -type d -o -type l -o -name '*.sql' \) \
+        -print0 >> "$scratch/sql-inputs"
+    while IFS= read -r -d '' input; do
+        if [[ -L "$input" ]]; then
+            printf 'sql-check: symlink is not a SQL input: %s\n' "$input" >&2
+            exit 1
+        fi
+        if [[ -d "$input" ]]; then
+            mkdir -p -- "$scratch/$input"
+            continue
+        fi
+        if [[ ! -f "$input" ]]; then
+            printf 'sql-check: expected a regular input file: %s\n' "$input" >&2
+            exit 1
+        fi
+        cp --parents -- "$input" "$scratch"
+    done < "$scratch/sql-inputs"
+
+    export GOWORK=off
+    go -C "$scratch/tools" tool sqlc vet -f "$scratch/sqlc.yaml"
+    logos build -mod=readonly -modfile="$scratch/go.mod" -o "$scratch/sqlc-gen-spira" github.com/gosuda/spira/cmd/sqlc-gen-spira
+    test -x "$scratch/sqlc-gen-spira"
+    PATH="$scratch:$PATH" go -C "$scratch/tools" tool sqlc generate -f "$scratch/sqlc.yaml"
+    diff -qr --no-dereference -- db/store "$scratch/db/store"
 
 web:
     pnpm --dir frontend install
