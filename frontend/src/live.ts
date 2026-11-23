@@ -1,3 +1,5 @@
+import htmx, { type HtmxSwapSpecification } from "htmx.org";
+
 const regionSelector = "[data-live-region]";
 const toggleSelector = "[data-live-region] button[data-live-toggle]";
 
@@ -55,6 +57,19 @@ export function installLiveUpdates(): void {
 		retainedUpdates.set(region, kept);
 	}
 
+	function swapSpecFor(target: Element): HtmxSwapSpecification {
+		const raw =
+			target.getAttribute("hx-swap") ??
+			target.getAttribute("data-hx-swap") ??
+			"";
+		const swapStyle = raw.split(/\s+/, 1)[0] || htmx.config.defaultSwapStyle;
+		return {
+			swapStyle,
+			swapDelay: htmx.config.defaultSwapDelay,
+			settleDelay: htmx.config.defaultSettleDelay,
+		};
+	}
+
 	function replayRetainedUpdates(region: Element): void {
 		const kept = retainedUpdates.get(region);
 		retainedUpdates.delete(region);
@@ -62,14 +77,13 @@ export function installLiveUpdates(): void {
 			return;
 		}
 		for (const { target, message } of kept) {
-			target.dispatchEvent(
-				new CustomEvent("htmx:sseBeforeMessage", {
-					bubbles: true,
-					cancelable: true,
-					composed: true,
-					detail: message,
-				}),
-			);
+			if (!target.isConnected) {
+				continue;
+			}
+			if (!htmx.trigger(target, "htmx:sseBeforeMessage", message)) {
+				continue;
+			}
+			htmx.swap(target, message.data, swapSpecFor(target));
 		}
 	}
 

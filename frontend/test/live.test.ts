@@ -1,11 +1,20 @@
-import { installLiveUpdates } from "../src/live";
+import { stubDomGlobals } from "./dom-stubs";
+
+stubDomGlobals();
+
+let installLiveUpdates: () => void;
+
+// htmx builds one XPathEvaluator at module top level, so the module
+// under test loads after the stubs above through a dynamic import.
+beforeAll(async () => {
+	({ installLiveUpdates } = await import("../src/live"));
+	installLiveUpdates();
+});
 
 const stockUpdate =
 	'<span id="stock-7" hx-swap-oob="outerHTML">Mug: $15.00, 4 in stock</span>';
 const stockControl =
 	'<button id="stock-toggle" type="button" data-live-toggle aria-pressed="false" hidden>Pause live stock updates</button>';
-
-beforeAll(installLiveUpdates);
 
 beforeEach(() => {
 	document.body.innerHTML = `
@@ -129,24 +138,14 @@ function adminToggle(): HTMLButtonElement {
 	return toggle;
 }
 
-test("resume replays the instance updates paused in the region", () => {
+test("resume applies the instance updates paused in the region", () => {
 	const toggle = adminToggle();
 	toggle.click();
 	expect(toggle.getAttribute("aria-pressed")).toBe("true");
-	const down =
-		'<tr id="instance-shop" hx-swap-oob="outerHTML"><td>shop</td><td>down</td></tr>';
+	const down = '<span id="shop-status" hx-swap-oob="outerHTML">down</span>';
 	expect(dispatchMessage("admin-sink", "instance", down)).toBe(false);
 	expect(fixtureElement("shop-status").textContent).toBe("up");
-	const redelivered: Array<unknown> = [];
-	fixtureElement("admin-sink").addEventListener(
-		"htmx:sseBeforeMessage",
-		(event) => {
-			redelivered.push((event as CustomEvent).detail);
-		},
-	);
 	toggle.click();
 	expect(toggle.getAttribute("aria-pressed")).toBe("false");
-	expect(redelivered).toHaveLength(1);
-	expect((redelivered[0] as MessageEvent).data).toBe(down);
-	expect(dispatchMessage("admin-sink", "instance", down)).toBe(true);
+	expect(fixtureElement("shop-status").textContent).toBe("down");
 });
