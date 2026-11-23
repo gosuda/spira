@@ -98,6 +98,20 @@ func MapColumn[E any, K comparable, F any](r *MappedTable[E, K], name string, pr
 			*p = append((*last)[:0], (*p)...)
 		})
 	}
+	if _, optional := any(&probe).(*rt.Option[[]byte]); optional {
+		r.clones = append(r.clones, func(next, previous *E) {
+			p, _ := any(project(next)).(*rt.Option[[]byte])
+			last, _ := any(project(previous)).(*rt.Option[[]byte])
+			if p == nil || last == nil {
+				return
+			}
+			if !p.Present || !last.Present || p.Value == nil || last.Value == nil {
+				p.Value = bytes.Clone(p.Value)
+				return
+			}
+			p.Value = append(last.Value[:0], p.Value...)
+		})
+	}
 	if strings.EqualFold(name, r.table.Key) {
 		mapKey(r, project)
 	}
@@ -338,6 +352,8 @@ func fieldValue[F any](address *F) any {
 	case *rt.Option[float64]:
 		return presentValue(p)
 	case *rt.Option[time.Time]:
+		return presentValue(p)
+	case *rt.Option[[]byte]:
 		return presentValue(p)
 	}
 	return *address
