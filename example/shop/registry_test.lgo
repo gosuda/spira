@@ -1,0 +1,131 @@
+package main_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/example/shop/db/store"
+)
+
+func loginShopper(t *testing.T, base string, name string, password string) string {
+	t.Helper()
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, base+"/account/login", strings.NewReader("user="+name+"&password="+password))
+	if err != nil {
+		t.Fatalf("new login request: %v", err)
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("shopper login: %v", err)
+		return ""
+	}
+	if _, derr := io.Copy(io.Discard, resp.Body); derr != nil {
+		t.Fatalf("drain login body: %v", derr)
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Fatalf("close login body: %v", cerr)
+	}
+	if resp.StatusCode != http.StatusSeeOther && resp.StatusCode != http.StatusFound {
+		t.Fatalf("shopper login status = %d, want a redirect", resp.StatusCode)
+		return ""
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "__Host-spira" && cookie.Value != "" {
+			return cookie.Value
+		}
+	}
+	t.Fatal("shopper login set no session cookie")
+	return ""
+}
+
+type registryCall struct {
+	method string
+	url    string
+	body   []byte
+	cookie string
+	token  string
+}
+
+func registryStatus(t *testing.T, call registryCall) int {
+	t.Helper()
+	client := &http.Client{Timeout: 5 * time.Second}
+	var reader io.Reader
+	if call.body != nil {
+		reader = bytes.NewReader(call.body)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), call.method, call.url, reader)
+	if err != nil {
+		t.Fatalf("new registry request: %v", err)
+		return 0
+	}
+	if call.body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if call.cookie != "" {
+		req.AddCookie(&http.Cookie{Name: "__Host-spira", Value: call.cookie})
+	}
+	if call.token != "" {
+		req.Header.Set("Authorization", "Bearer "+call.token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("registry request: %v", err)
+		return 0
+	}
+	if _, derr := io.Copy(io.Discard, resp.Body); derr != nil {
+		t.Fatalf("drain registry body: %v", derr)
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Fatalf("close registry body: %v", cerr)
+	}
+	return resp.StatusCode
+}
+
+func TestShopRegistryWritesNeedServiceToken(t *testing.T) {
+	port := freePort(t)
+	if port == 0 {
+		return
+	}
+	settings := startupSettings(port)
+	application, token, stop := launchShop(t, settings)
+	defer stop()
+	if application == nil {
+		t.Fatal("assemble the shop: no application")
+		return
+	}
+	base := "http://" + settings.Addr
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	hash, err := auth.HashPassword("shopper-password-1")
+	if err != nil {
+		t.Fatalf("hash shopper password: %v", err)
+		return
+	}
+	if _, cerr := store.CreateUser(ctx, application.DB, "shopper", hash); cerr != nil {
+		t.Fatalf("create shopper: %v", cerr)
+		return
+	}
+	cookie := loginShopper(t, base, "shopper", "shopper-password-1")
+	instance := []byte(fmt.Sprintf(`{"name":"mallory","opsUrl":%q}`, base+"/ops/health"))
+	if got := registryStatus(t, registryCall{method: http.MethodPost, url: base + "/admin/instances", body: instance, cookie: cookie}); got != http.StatusForbidden {
+		t.Errorf("shopper registry write status = %d, want 403", got)
+	}
+	if got := registryStatus(t, registryCall{method: http.MethodPost, url: base + "/admin/instances", body: instance}); got != http.StatusUnauthorized {
+		t.Errorf("anonymous registry write status = %d, want 401", got)
+	}
+	if got := registryStatus(t, registryCall{method: http.MethodPost, url: base + "/admin/instances", body: instance, token: token}); got != http.StatusCreated {
+		t.Errorf("service registry write status = %d, want 201", got)
+	}
+	if got := registryStatus(t, registryCall{method: http.MethodGet, url: base + "/admin", cookie: cookie}); got != http.StatusOK {
+		t.Errorf("shopper registry read status = %d, want 200", got)
+	}
+}

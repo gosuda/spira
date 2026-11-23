@@ -238,8 +238,35 @@ func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 	})
 	openapi.Mount(router, openapi.Info{Title: "Shop", Version: "1.0.0"})
 	service := p.admin ?? &admin.Server{}
-	service.Mount(router, guard)
+	service.Mount(router, registryWritesOnly(guard, auth.Require(isService)))
 	return router, scheduler
+}
+
+func isService(p auth.Principal?) bool {
+	if p == nil {
+		return false
+	}
+	return p.ID == "service"
+}
+
+func registryWritesOnly(reader web.Stage, writer web.Stage) web.Stage {
+	return func(next web.Handler) web.Handler {
+		read := reader(next)
+		write := writer(next)
+		return func(ctx *web.Context) (web.Reply, error) {
+			if writesRegistry(ctx) {
+				return write(ctx)
+			}
+			return read(ctx)
+		}
+	}
+}
+
+func writesRegistry(ctx *web.Context) bool {
+	if method := ctx.Request.Method; method != http.MethodPost && method != http.MethodDelete {
+		return false
+	}
+	return strings.HasPrefix(ctx.Request.URL.Path, "/admin/instances")
 }
 
 func shopAdmin(serverURL string, token string) *admin.Client {
