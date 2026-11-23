@@ -40,7 +40,7 @@ func Nav() view.Node {
 		view.A(view.Attr("href", "/catalog"), view.T("Catalog")),
 		view.A(view.Attr("href", "/cart"), view.T("Cart")),
 		view.A(view.Attr("href", "/account"), view.T("Account")),
-		view.A(view.Attr("href", "/stock"), view.T("Stock")),
+		view.A(view.Attr("href", "/catalog"), view.T("Stock")),
 	)
 }
 

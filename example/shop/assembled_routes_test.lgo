@@ -70,6 +70,9 @@ func TestAssembledShopRoutes(t *testing.T) {
 	t.Run("HtmxCatalogFragment", func(t *testing.T) {
 		testAssembledCatalogFragment(t, shop)
 	})
+	t.Run("NavLinksResolve", func(t *testing.T) {
+		testAssembledNavLinksResolve(t, shop)
+	})
 }
 
 func getAssembledShop(t *testing.T, shop *httptest.Server, path string, headers http.Header) (int, []byte) {
@@ -244,6 +247,41 @@ func testAssembledCatalogFragment(t *testing.T, shop *httptest.Server) {
 	if !foundProduct {
 		t.Fatalf("htmx catalog fragment lacks the seeded product %q", assembledProduct)
 	}
+}
+
+func testAssembledNavLinksResolve(t *testing.T, shop *httptest.Server) {
+	page := getAssembledCatalogDocument(t, shop, "/catalog")
+	if page == nil {
+		return
+	}
+	links := assembledNavHrefs(page)
+	if len(links) == 0 {
+		t.Fatal("the shop nav holds no local links")
+		return
+	}
+	for _, href := range links {
+		if status, _ := getAssembledShop(t, shop, href, nil); status == http.StatusNotFound {
+			t.Errorf("GET %s from the shop nav: status 404", href)
+		}
+	}
+}
+
+func assembledNavHrefs(doc *html.Node) []string {
+	var out []string
+	for nav := range doc.Descendants() {
+		if nav.DataAtom != atom.Nav {
+			continue
+		}
+		for anchor := range nav.Descendants() {
+			if anchor.DataAtom != atom.A {
+				continue
+			}
+			if href := assembledHTMLAttr(anchor, "href"); strings.HasPrefix(href, "/") {
+				out = append(out, href)
+			}
+		}
+	}
+	return out
 }
 
 func TestShopSettingsDefaultsAndOverrides(t *testing.T) {
