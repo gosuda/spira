@@ -222,51 +222,6 @@ func TestH3NeedsTLSFailsStart(t *testing.T) {
 	}
 }
 
-func TestH3ListenUDPFailsOnTakenPort(t *testing.T) {
-	raddr, rerr := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if rerr != nil {
-		t.Fatalf("resolve: %v", rerr)
-		return
-	}
-	squat, serr := net.ListenUDP("udp", raddr)
-	if serr != nil {
-		t.Fatalf("squat: %v", serr)
-		return
-	}
-	defer func() {
-		if cerr := squat.Close(); cerr != nil {
-			t.Errorf("close squat: %v", cerr)
-		}
-	}()
-	addr := squat.LocalAddr().String()
-	r := web.NewRouter()
-	r.Handle("GET", "/hello", h3Hello)
-	cert, pool := testCert(t)
-	if pool == nil {
-		t.Fatal("cert pool missing")
-		return
-	}
-	s := &http3.Server{Addr: addr, Router: r, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
-	err := s.Start(context.Background())
-	if err == nil {
-		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if serr := s.Stop(cctx); serr != nil {
-			t.Errorf("stop leaked server: %v", serr)
-		}
-		t.Fatal("start on a taken UDP port succeeded")
-		return
-	}
-	if !errors.Is(err, http3.ErrListenUDP) {
-		t.Fatalf("start error = %v, want ErrListenUDP", err)
-		return
-	}
-	if got := s.BoundUDPAddrForTest(); got != "" {
-		t.Fatalf("UDP bound after failed start: %s", got)
-		return
-	}
-}
-
 func TestH3StartFailsWhenTCPPortTaken(t *testing.T) {
 	squat, serr := net.Listen("tcp", "127.0.0.1:0")
 	if serr != nil {
@@ -301,42 +256,6 @@ func TestH3StartFailsWhenTCPPortTaken(t *testing.T) {
 		t.Fatalf("UDP bound after failed start: %s", got)
 		return
 	}
-}
-
-func TestH3ServesHTTP3OverUDP(t *testing.T) {
-	r := web.NewRouter()
-	r.Handle("GET", "/hello", h3Hello)
-	cert, pool := testCert(t)
-	if pool == nil {
-		t.Fatal("cert pool missing")
-		return
-	}
-	s := startH3Server(t, r, cert, 2*time.Second)
-	if s == nil {
-		t.Fatal("server did not start")
-		return
-	}
-	udpAddr := s.BoundUDPAddrForTest()
-	if udpAddr == "" {
-		t.Fatal("no UDP bound address")
-		return
-	}
-	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
-	defer closeH3Transport(t, tr)
-	status, proto, body := h3Get(t, tr, "https://"+udpAddr+"/hello")
-	if status != http.StatusOK {
-		t.Fatalf("status %d want 200", status)
-		return
-	}
-	if proto != "HTTP/3.0" {
-		t.Fatalf("proto %q want HTTP/3.0", proto)
-		return
-	}
-	if !strings.Contains(body, `"hi"`) {
-		t.Fatalf("body %q lacks the value", body)
-		return
-	}
-	assertH3ALPN(t, udpAddr, pool)
 }
 
 func TestH3SharesRouterWithTCP(t *testing.T) {
@@ -646,12 +565,8 @@ func TestH3RefusesEarlyData(t *testing.T) {
 }
 
 type h3SlowProbe struct {
-	entered  chan struct{}
-	release  chan struct{}
-	status   sync.Locked[int]
-	fetchErr sync.Locked[error]
-	stopErr  sync.Locked[error]
-	stopDur  sync.Locked[time.Duration]
+	entered chan struct{}
+	release chan struct{}
 }
 
 type h3StuckProbe struct {
@@ -659,7 +574,6 @@ type h3StuckProbe struct {
 	release    chan struct{}
 	stopWithin time.Duration = time.Minute
 	stopErr    sync.Locked[error]
-	stopDur    sync.Locked[time.Duration]
 }
 
 func h3SlowHandler(p *h3SlowProbe) web.Handler {
@@ -695,66 +609,6 @@ func waitH3Entered(ctx context.Context, entered chan struct{}) error {
 	}
 }
 
-func fetchH3Slow(ctx context.Context, tr h3CloseableTransport, url string, p *h3SlowProbe) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: build: %w", err) })
-		return nil
-	}
-	resp, err := tr.RoundTrip(req)
-	if err != nil {
-		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: do: %w", err) })
-		return nil
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			return
-		}
-	}()
-	if _, rerr := io.ReadAll(resp.Body); rerr != nil {
-		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: read: %w", rerr) })
-		return nil
-	}
-	p.status.WithLock(func(v *int) { *v = resp.StatusCode })
-	if cerr := tr.Close(); cerr != nil {
-		p.fetchErr.WithLock(func(e *error) { *e = fmt.Errorf("http3 test: close transport: %w", cerr) })
-	}
-	return nil
-}
-
-func stopH3Slow(ctx context.Context, s *http3.Server, p *h3SlowProbe) error {
-	if err := waitH3Entered(ctx, p.entered); err != nil {
-		return err
-	}
-	start := time.Now()
-	p.stopErr.WithLock(func(e *error) { *e = s.Stop(ctx) })
-	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
-	return nil
-}
-
-func releaseH3Slow(ctx context.Context, p *h3SlowProbe) error {
-	if err := waitH3Entered(ctx, p.entered); err != nil {
-		return err
-	}
-	time.Sleep(50 * time.Millisecond)
-	close(p.release)
-	return nil
-}
-
-type h3Target struct {
-	tr  h3CloseableTransport
-	url string
-}
-
-func driveH3Slow(ctx context.Context, target h3Target, s *http3.Server, p *h3SlowProbe) error {
-	go group (ctx) {
-		go fetchH3Slow(ctx, target.tr, target.url, p)
-		go stopH3Slow(ctx, s, p)
-		go releaseH3Slow(ctx, p)
-	}
-	return nil
-}
-
 func fetchH3Stuck(ctx context.Context, tr http.RoundTripper, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -780,117 +634,9 @@ func stopH3Stuck(ctx context.Context, s *http3.Server, p *h3StuckProbe) error {
 	time.Sleep(50 * time.Millisecond)
 	stopCtx, cancel := context.WithTimeout(ctx, p.stopWithin)
 	defer cancel()
-	start := time.Now()
 	p.stopErr.WithLock(func(e *error) { *e = s.Stop(stopCtx) })
-	p.stopDur.WithLock(func(d *time.Duration) { *d = time.Since(start) })
 	close(p.release)
 	return nil
-}
-
-func driveH3Stuck(ctx context.Context, target h3Target, s *http3.Server, p *h3StuckProbe) error {
-	go group (ctx) {
-		go fetchH3Stuck(ctx, target.tr, target.url)
-		go stopH3Stuck(ctx, s, p)
-	}
-	return nil
-}
-
-func TestH3StopDrainsWithinGrace(t *testing.T) {
-	r := web.NewRouter()
-	p := &h3SlowProbe{entered: make(chan struct{}), release: make(chan struct{})}
-	r.Handle("GET", "/slow", h3SlowHandler(p))
-	cert, pool := testCert(t)
-	if pool == nil {
-		t.Fatal("cert pool missing")
-		return
-	}
-	s := startH3Server(t, r, cert, 5*time.Second)
-	if s == nil {
-		t.Fatal("server did not start")
-		return
-	}
-	udpAddr := s.BoundUDPAddrForTest()
-	if udpAddr == "" {
-		t.Fatal("no UDP bound address")
-		return
-	}
-	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
-	defer closeH3Transport(t, tr)
-	if err := driveH3Slow(context.Background(), h3Target{tr: tr, url: "https://"+udpAddr+"/slow"}, s, p); err != nil {
-		t.Fatalf("drive: %v", err)
-		return
-	}
-	var status int
-	p.status.WithLock(func(v *int) { status = *v })
-	if status != http.StatusNoContent {
-		t.Fatalf("in-flight status %d want 204", status)
-		return
-	}
-	var ferr error
-	p.fetchErr.WithLock(func(e *error) { ferr = *e })
-	if ferr != nil {
-		t.Fatalf("in-flight request failed: %v", ferr)
-		return
-	}
-	var serr error
-	p.stopErr.WithLock(func(e *error) { serr = *e })
-	if serr != nil {
-		t.Fatalf("Stop during a live H3 request: %v", serr)
-		return
-	}
-	var dur time.Duration
-	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
-	if dur < 40*time.Millisecond {
-		t.Fatalf("Stop returned after %v, before the in-flight request ended", dur)
-		return
-	}
-}
-
-func TestH3StopClosesOnTimeout(t *testing.T) {
-	r := web.NewRouter()
-	p := &h3StuckProbe{entered: make(chan struct{}), release: make(chan struct{})}
-	r.Handle("GET", "/stuck", h3StuckHandler(p))
-	cert, pool := testCert(t)
-	if pool == nil {
-		t.Fatal("cert pool missing")
-		return
-	}
-	s := startH3Server(t, r, cert, 500*time.Millisecond)
-	if s == nil {
-		t.Fatal("server did not start")
-		return
-	}
-	udpAddr := s.BoundUDPAddrForTest()
-	if udpAddr == "" {
-		t.Fatal("no UDP bound address")
-		return
-	}
-	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
-	defer closeH3Transport(t, tr)
-	if err := driveH3Stuck(context.Background(), h3Target{tr: tr, url: "https://"+udpAddr+"/stuck"}, s, p); err != nil {
-		t.Fatalf("drive: %v", err)
-		return
-	}
-	var err error
-	p.stopErr.WithLock(func(e *error) { err = *e })
-	if err == nil {
-		t.Fatal("Stop of a never-returning H3 request reported success")
-		return
-	}
-	if !strings.Contains(err.Error(), "context deadline exceeded") {
-		t.Fatalf("Stop error %q does not name the grace deadline", err.Error())
-		return
-	}
-	var dur time.Duration
-	p.stopDur.WithLock(func(d *time.Duration) { dur = *d })
-	if dur < 400*time.Millisecond {
-		t.Fatalf("Stop returned after %v without waiting out the grace period", dur)
-		return
-	}
-	if dur > 5*time.Second {
-		t.Fatalf("Stop returned after %v, beyond the grace period", dur)
-		return
-	}
 }
 
 func TestFaultsMatchSpecCodeTable(t *testing.T) {

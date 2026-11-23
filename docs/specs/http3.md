@@ -106,18 +106,19 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 ## Proof
 
 - `TestH3NeedsTLSFailsStart` proves that H3 without TLS fails to start and opens no listener.
-- `TestH3ServesHTTP3OverUDP` proves that a request over UDP gets the router answer with ALPN `h3`.
-- `TestH3SharesRouterWithTCP` proves that the same route answers over both listeners.
+- `TestH3SharesRouterWithTCP` proves that a request over UDP gets the router answer over HTTP/3. It also proves that the same route answers over both listeners on one port.
+- `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates ALPN `h3` and refuses a client that offers only another protocol.
 - `TestH3AltSvcOnHTTPSOnly` proves the header value on HTTPS and its absence on cleartext and when `H3` is false.
 - `TestH3AltSvcIgnoresRegistrationOrder` proves that discovery works whether the stage is added before or after route registration.
 - `TestH3RequiresTLS13` proves that a pre-1.3 handshake on the UDP listener fails.
-- `TestH3StopDrainsWithinGrace` proves that `Stop` waits for a live HTTP/3 request.
+- `TestH3StopSendsGOAWAYBeforeDrain` proves that `Stop` sends GOAWAY while an HTTP/3 request is live, and that the request then completes.
+- `TestH3StopMeetsShutdownGrace` proves that `Stop` waits for a live HTTP/3 request until `ShutdownGrace` ends.
 - `TestH3StopClosesUDPListener` proves that the UDP port rebinds right after `Stop`.
 - `TestH3StopShutsTCPWhileH3Drains` proves that TCP stops accepting while an HTTP/3 request drains.
 - `TestH3RefusesExtendedConnect` proves that an extended CONNECT request answers 501 without reaching the router while plain H3 traffic still passes.
 - `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
 - `TestH3RefusesEarlyData` sends QUIC 0-RTT data and checks that the server resumes the TLS session without accepting that data.
-- `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.
+- `TestH3StopClosesClientConnectionOnTimeout` proves that a timed-out shutdown returns `http3.h3_shutdown` with the deadline cause and closes the HTTP/3 connection.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
