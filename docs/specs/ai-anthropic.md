@@ -60,6 +60,10 @@ func Faults() []*fault.Error
 - `Chat` MUST retry a 429 answer as `anthropic.provider_rate_limited`, after a valid `Retry-After`.
 - `Stream` MUST retry a failing initial answer as `Chat` does.
 - `Stream` MUST NOT make a second request after one event.
+- `Stream` MUST arm an idle bound of `Policy.Timeout` after the initial answer succeeds.
+- Ten seconds MUST be that bound when the timeout is not positive.
+- Each read byte and line MUST reset that bound.
+- An idle expiry MUST end the stream as `anthropic.provider_stream_cut`.
 - `Stream` MUST hold the next attempt for a valid `Retry-After`, within `Retry.Max`.
 - A response body over 1 MiB MUST end the call as `anthropic.provider_too_large`.
 - The body of a failing status MUST be cut at 1 MiB.

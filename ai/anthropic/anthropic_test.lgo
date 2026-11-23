@@ -2080,7 +2080,6 @@ func TestStreamOutlivesTheHeadAttempt(t *testing.T) {
 }
 
 func TestStreamOfAStalledProviderEndsAtTheIdleBound(t *testing.T) {
-	ready := make(chan *anthropic.IdleProbe, 1)
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2090,17 +2089,13 @@ func TestStreamOfAStalledProviderEndsAtTheIdleBound(t *testing.T) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		probe := <-ready
-		probe.Fire()
 		<-release
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(release) })
 	c := testClient(srv)
 	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
-	probe, restore := anthropic.ArmIdleProbe(c)
-	t.Cleanup(restore)
-	ready <- probe
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_, err := ai.Collect(c.Stream(ctx, ai.Request{
@@ -2116,5 +2111,41 @@ func TestStreamOfAStalledProviderEndsAtTheIdleBound(t *testing.T) {
 	}
 	if !anthropic.IsStall(err) {
 		t.Fatalf("stall error = %v, want the named stall error", err)
+	}
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("stalled stream ended after %v, want at least the 200ms idle bound", elapsed)
+	}
+}
+
+func TestStreamRetriesWhenTheFirstAttemptHangs(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			time.Sleep(2 * time.Second)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, helloDelta); err != nil {
+			return
+		}
+		if _, err := io.WriteString(w, "event: message_stop\n"+`data: {"type": "message_stop"}`+"\n\n"); err != nil {
+			return
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 500 * time.Millisecond, Retry: resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	reply, err := ai.Collect(c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+	if err != nil {
+		t.Fatalf("stream with a hanging first attempt failed: %v", err)
+		return
+	}
+	if _, text := partTexts(reply.Message.Parts); text != "Hello" {
+		t.Errorf("stream text = %q, want %q", text, "Hello")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("server saw %d requests, want exactly 2", got)
 	}
 }
