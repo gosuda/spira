@@ -181,17 +181,17 @@ func assertH3ALPN(t *testing.T, udpAddr string, pool *x509.CertPool) {
 func TestH3NeedsTLSFailsStart(t *testing.T) {
 	r := web.NewRouter()
 	r.Handle("GET", "/hello", h3Hello)
-	probe, perr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if perr != nil {
-		t.Fatalf("reserve udp port: %v", perr)
+	held, herr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if herr != nil {
+		t.Fatalf("hold udp port: %v", herr)
 		return
 	}
-	udpAddr := probe.LocalAddr().(*net.UDPAddr)
-	if cerr := probe.Close(); cerr != nil {
-		t.Fatalf("release udp port: %v", cerr)
-		return
-	}
-	s := &http3.Server{Addr: udpAddr.String(), Router: r, H3: true}
+	defer func() {
+		if cerr := held.Close(); cerr != nil {
+			t.Errorf("close held udp port: %v", cerr)
+		}
+	}()
+	s := &http3.Server{Addr: held.LocalAddr().String(), Router: r, H3: true}
 	err := s.Start(context.Background())
 	if err == nil {
 		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -202,21 +202,12 @@ func TestH3NeedsTLSFailsStart(t *testing.T) {
 		t.Fatal("start without TLS succeeded")
 		return
 	}
-	if !errors.Is(err, http3.ErrH3NeedsTLS) {
-		t.Fatalf("start error = %v, want ErrH3NeedsTLS", err)
+	if errors.Is(err, http3.ErrListenUDP) || !errors.Is(err, http3.ErrH3NeedsTLS) {
+		t.Fatalf("start error = %v, want ErrH3NeedsTLS before any bind of the held port", err)
 		return
 	}
 	if addr := s.BoundUDPAddrForTest(); addr != "" {
 		t.Fatalf("UDP bound after failed start: %s", addr)
-		return
-	}
-	rebind, rerr := net.ListenUDP("udp", udpAddr)
-	if rerr != nil {
-		t.Fatalf("UDP listener survived the failed start: %v", rerr)
-		return
-	}
-	if cerr := rebind.Close(); cerr != nil {
-		t.Fatalf("close probe: %v", cerr)
 		return
 	}
 }
