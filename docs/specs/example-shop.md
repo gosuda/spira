@@ -76,6 +76,7 @@ func FS() fs.FS
 - The catalog feature MUST offer a detail page.
 - The catalog feature MUST offer a search control that swaps a fragment.
 - `GET /api/products` MUST be a data reply from [web](web.md).
+- Catalog reads MUST bound the database call at ten seconds.
 - The catalog MUST render recommendations with `view.Later` from [view](view.md).
 - That slot MUST show its fallback before its content.
 - That content MUST appear without a page reload.

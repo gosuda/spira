@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"time"
 	"cmp"
 	"context"
 	"fmt"
@@ -21,6 +22,8 @@ type Feature struct {
 	Assets *asset.Manifest
 }
 
+const callTimeout = 10 * time.Second
+
 func (f *Feature) Register(r *web.Router) {
 	r.Handle("GET", "/catalog", f.list)
 	r.Handle("GET", "/catalog/search", f.search)
@@ -31,7 +34,9 @@ func (f *Feature) Register(r *web.Router) {
 func (f *Feature) list(ctx *web.Context) (web.Reply, error) {
 	query := ctx.Request.URL.Query().Get("q")
 	order := ctx.Request.URL.Query().Get("sort")
-	items, err := productsFor(ctx.Ctx(), f.DB, query)
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
+	items, err := productsFor(call, f.DB, query)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +47,9 @@ func (f *Feature) list(ctx *web.Context) (web.Reply, error) {
 func (f *Feature) search(ctx *web.Context) (web.Reply, error) {
 	query := ctx.Request.URL.Query().Get("q")
 	order := ctx.Request.URL.Query().Get("sort")
-	items, err := productsFor(ctx.Ctx(), f.DB, query)
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
+	items, err := productsFor(call, f.DB, query)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +65,9 @@ func (f *Feature) detail(ctx *web.Context) (web.Reply, error) {
 	if err != nil || id <= 0 {
 		return nil, ErrUnknownProduct.Err()
 	}
-	row, err := store.GetProduct(ctx.Ctx(), f.DB, store.ProductID(id))
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
+	row, err := store.GetProduct(call, f.DB, store.ProductID(id))
 	if err != nil {
 		return nil, fmt.Errorf("catalog: get product: %w", err)
 	}
@@ -70,7 +79,9 @@ func (f *Feature) detail(ctx *web.Context) (web.Reply, error) {
 }
 
 func (f *Feature) apiList(ctx *web.Context) (web.Reply, error) {
-	items, err := store.ListProducts(ctx.Ctx(), f.DB)
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
+	items, err := store.ListProducts(call, f.DB)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: list products: %w", err)
 	}
@@ -105,7 +116,9 @@ func recommendedLater(pool *db.Pool, exclude int64) *view.Later {
 	return &view.Later{
 		Fallback: layout.Fallback(view.P(view.T("Loading recommendations."))),
 		Resolve: func(ctx context.Context) (view.Node, error) {
-			items, err := store.ListRecommendedProducts(ctx, pool, store.ProductID(exclude))
+			call, cancel := context.WithTimeout(ctx, callTimeout)
+			defer cancel()
+			items, err := store.ListRecommendedProducts(call, pool, store.ProductID(exclude))
 			if err != nil {
 				return view.Group{}, fmt.Errorf("catalog: recommendations: %w", err)
 			}
