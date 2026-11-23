@@ -2178,6 +2178,32 @@ func TestStreamZeroTimeoutUsesFallbackBound(t *testing.T) {
 	}
 }
 
+func TestStreamStalledHeadUsesFallbackBound(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 0}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, err := ai.Collect(c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+	elapsed := time.Since(start)
+	if err == nil || !errors.Is(err, resilience.ErrTimeout) {
+		t.Fatalf("stalled head error = %v, want the resilience timeout", err)
+		return
+	}
+	if elapsed < 10*time.Second {
+		t.Errorf("stalled head ended after %v, want at least the ten-second fallback bound", elapsed)
+	}
+	if elapsed > 30*time.Second {
+		t.Errorf("stalled head took %v, want the ten-second bound to fire near it", elapsed)
+	}
+}
+
 func TestStreamAttemptTimeoutComesFromPolicy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(2 * time.Second)
