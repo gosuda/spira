@@ -87,42 +87,9 @@ func TestShopStartsRegistersAndReportsUp(t *testing.T) {
 		return
 	}
 	settings := startupSettings(port)
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-	application, err := shopmain.AssembleForTest(ctx, settings, &admin.Server{Interval: 50 * time.Millisecond})
-	if err != nil {
-		t.Fatalf("assemble the shop: %v", err)
-		return
-	}
-	if application == nil {
-		t.Fatal("assemble the shop: no application")
-		return
-	}
-	token := application.Admin.Token ?? ""
-	if token == "" {
-		t.Fatal("the assembled shop carries no admin service token")
-		return
-	}
-	runCtx, stop := context.WithCancel(context.Background())
+	_, token, stop := launchShop(t, settings)
 	defer stop()
-	done := make(chan struct{})
-	var runErr error
-	pool, _ := rt.NewGroup(context.WithoutCancel(runCtx), 0)
-	pool.Go(func(_ context.Context) error {
-		runErr = app.Run(runCtx, application)
-		close(done)
-		return nil
-	})
 	pollAdminUp(t, settings.PublicURL, token)
-	stop()
-	select {
-	case <-done:
-		if runErr != nil {
-			t.Fatalf("shop run: %v", runErr)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("the shop did not stop after cancel")
-	}
 }
 
 func launchShop(t *testing.T, settings shopmain.Settings) (*shopmain.Application?, string, func()) {
@@ -144,23 +111,14 @@ func launchShop(t *testing.T, settings shopmain.Settings) (*shopmain.Application
 		return nil, "", func() {}
 	}
 	runCtx, stop := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var runErr error
 	pool, _ := rt.NewGroup(context.WithoutCancel(runCtx), 0)
 	pool.Go(func(_ context.Context) error {
-		runErr = app.Run(runCtx, application)
-		close(done)
-		return nil
+		return app.Run(runCtx, application)
 	})
 	wait := func() {
 		stop()
-		select {
-		case <-done:
-			if runErr != nil {
-				t.Errorf("shop run: %v", runErr)
-			}
-		case <-time.After(20 * time.Second):
-			t.Error("the shop did not stop after cancel")
+		if werr := pool.Wait(); werr != nil {
+			t.Errorf("shop run: %v", werr)
 		}
 	}
 	return application, token, wait
