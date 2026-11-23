@@ -329,28 +329,6 @@ func TestHTTPRequestKeepsTheStatusOfACutBody(t *testing.T) {
 	}
 }
 
-func TestHTTPNotifyKeepsTheStatusOfACutBody(t *testing.T) {
-	transport := &cutTransport{total: 100, cut: io.ErrUnexpectedEOF}
-	inner := mcp.NewHTTP("http://mcp.invalid", &http.Client{Transport: transport})
-	defer func() {
-		if err := inner.Close(); err != nil {
-			t.Errorf("close transport: %v", err)
-		}
-	}()
-	err := inner.Notify(context.Background(), mcp.Envelope{JSONRPC: "2.0", Method: "notifications/initialized"})
-	if err == nil || !strings.Contains(err.Error(), "400") {
-		t.Fatalf("err = %v, want the 400 rejection", err)
-		return
-	}
-	if !strings.Contains(err.Error(), "body read ended early") {
-		t.Fatalf("err = %v, want the status with the read cause", err)
-		return
-	}
-	if transport.calls != 1 {
-		t.Fatalf("transport saw %d calls, want 1", transport.calls)
-	}
-}
-
 type jsonCutReader struct {
 	data []byte
 	cut  error

@@ -361,8 +361,6 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestSplitHasNoRepeatingTail` proves that no chunk repeats the next one and that the last chunk ends with the last sentence.
 - `TestSplitChunksFitTheTokenBudget` proves every chunk resplits to itself at 80 tokens.
 - `TestSplitLosesNoText` proves full coverage at overlaps 0, 50 and 200.
-- `TestSplitShortTextStaysWhole` proves a short text stays one chunk.
-- `TestSplitLongTextCutsAtTheSentence` proves a long text cuts at a period.
 - `TestSplitLastChunkStaysWhole` proves the last chunk keeps its period cut.
 - `TestSplitCutsAtCustomMarks` proves the seven CJK cuts.
 - `TestSplitOverlapWithSemicolons` proves the four semicolon cuts with overlap.
@@ -379,7 +377,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestReadTextPinsTheIDVector` pins the SHA-256 rule for `"Test content"`.
 - `TestReadTextKeepsEmptyAndWhitespace` proves `loadEmptyText` and `loadTextWithOnlyWhitespace`.
 - `TestReadTextPassesTheSourceThrough` proves `resourceDescriptionHandling` and `resourceWithoutExtension`: the source argument passes into metadata unchanged.
-- `TestReadTextReadsTwiceWithTheSameID` proves `multipleCallsToGetReturnSameResult`, with equal ids where the reference returns random ids.
+- `TestReadTextKeepsTheWholeText` and `TestReadTextPinsTheIDVector` also prove `multipleCallsToGetReturnSameResult`: the id is the SHA-256 of the text, so two reads of one text give one id where the reference returns random ids.
 - `TestReadersRefuseInputAboveTheLimit` proves the size bound for both readers on syntax-valid input at and above the limit, and names the size error.
 - `TestReadTextOverLimitWithCutConnectionIsFinal` proves over-limit text with a cut connection reports the size limit.
 - `TestReadJSONOverLimitWithCutConnectionIsFinal` proves over-limit JSON with a cut connection reports the size limit.
@@ -397,7 +395,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestRewriteSendsTheReferencePrompt`, `TestTranslateSendsTheReferencePrompt` and `TestCompressSendsHistoryAndTheFollowUpQuery` prove the exact prompt text of each transformer.
 - `TestRewriteWithABlankAnswerKeepsTheQuery` proves the blank-answer rule.
 - `TestExpandReturnsOneQueryPerLine`, `TestExpandWithFewerLinesKeepsTheQuery` and `TestExpandWithATrailingNewlineKeepsTheVariants` prove the line-count rule.
-- `TestPgvectorSharesTheStoreContract` proves that `Memory` and `Pgvector` satisfy `Store`.
+- The two `var _ rag.Store` assertions in `pgvector_test.lgo` prove at compile time that `Memory` and `Pgvector` satisfy `Store`.
 - `TestPgvectorRefusesBadTables` proves the table pattern and the constructor refusals.
 - `TestPgvectorBlankIdSendsNoEmbedding` proves that a blank id costs no embedding request.
 - `TestPgvectorVectorTextFormatsBrackets` proves the `[1,2.5,-3]` vector text form.

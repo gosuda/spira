@@ -199,13 +199,12 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
 - They also pin that the guard runs and a refused request never reaches a tool.
-- `TestMountCallToolError`, `TestMountUnknownTool`, `TestMountMalformed`, `TestMountUnknownMethod` and `TestMountNotification` pin the error results and the protocol error codes.
-- They also pin the 400 for an unparseable body and the 202 for a notification.
+- `TestMountCallToolError`, `TestMountUnknownTool`, `TestMountUnknownMethod` and `TestMountNotification` pin the error results and the protocol error codes.
+- `TestMountNotification` also pins the 202 for a notification, and `TestMCPFaultParseError` pins the 400 for an unparseable body.
 - `TestMountClientServer` runs the client of this package against `Mount` over `net/http/httptest`.
 - `TestMountClientServer` covers initialize, list and call.
-- `TestHTTPRequestKeepsTheStatusOfACutBody` proves the kept status and the read cause.
-- `TestHTTPNotifyKeepsTheStatusOfACutBody` proves the kept status and the read cause.
-- `TestHTTPKeepsStatusOnCutJSONRPCError` proves the kept status, the read cause and the RPC error.
+- `TestHTTPRequestKeepsTheStatusOfACutBody` proves the kept status and the read cause of a cut body that holds no RPC error.
+- `TestHTTPKeepsStatusOnCutJSONRPCError` proves the kept status, the read cause and the RPC error on `Request` and on `Notify`.
 - `TestStdioOverlongLineWithReadErrorPoisonsTransport` proves the over-limit report and the unusable transport.
 
 ## Not in scope

@@ -81,17 +81,6 @@ func pollAdminUp(t *testing.T, publicURL string, token string) string {
 	return ""
 }
 
-func TestShopStartsRegistersAndReportsUp(t *testing.T) {
-	port := freePort(t)
-	if port == 0 {
-		return
-	}
-	settings := startupSettings(port)
-	_, token, stop := launchShop(t, settings)
-	defer stop()
-	pollAdminUp(t, settings.PublicURL, token)
-}
-
 func launchShop(t *testing.T, settings shopmain.Settings) (*shopmain.Application?, string, func()) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)

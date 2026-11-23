@@ -381,25 +381,6 @@ func TestMountNotification(t *testing.T) {
 	}
 }
 
-func TestMountMalformed(t *testing.T) {
-	var calls int
-	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
-	status, raw := postRaw(t, ts, `{`, nil)
-	if status != http.StatusBadRequest {
-		t.Fatalf("status %d, want 400 (body %s)", status, raw)
-		return
-	}
-	env := decodeEnvelope(t, raw)
-	e := env.Error
-	if e == nil {
-		t.Errorf("no error in %s, want -32700", raw)
-		return
-	}
-	if e.Code != -32700 {
-		t.Errorf("code %d, want -32700", e.Code)
-	}
-}
-
 func TestMountUnknownMethod(t *testing.T) {
 	var calls int
 	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
