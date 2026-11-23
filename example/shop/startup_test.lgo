@@ -117,6 +117,10 @@ func launchShop(t *testing.T, settings shopmain.Settings) (*shopmain.Application
 	})
 	wait := func() {
 		stop()
+		timer := time.AfterFunc(20*time.Second, func() {
+			t.Errorf("shop did not stop after cancel")
+		})
+		defer timer.Stop()
 		if werr := pool.Wait(); werr != nil {
 			t.Errorf("shop run: %v", werr)
 		}
