@@ -56,6 +56,11 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - A missing user and a wrong password MUST answer `auth.invalid_credentials`.
 - The account handlers MUST NOT call `web.Fail` with a literal problem.
 - A bad session user id MUST wrap the account fault.
+- `main.lgo` MUST seed the user `demo` only when `SPIRA_SEED_DEMO_PASSWORD` is set and not empty.
+- The seed MUST give the user `demo` the value of `SPIRA_SEED_DEMO_PASSWORD` as its password.
+- When the user `demo` exists, the seed MUST replace its password with that value.
+- The templates MUST NOT hold a password for the user `demo`.
+- For `sqlite`, `spira new` MUST write `main_test.lgo` and `export_test.lgo`, which test the seed.
 - `spira new` MUST refuse a non-empty `<dir>`.
 - `spira new` MUST accept only `sqlite`, `postgresql`, `mysql` and `mssql` for `-engine`.
 - With `-spira-dir <path>`, the generated `go.mod` MUST hold a `replace github.com/gosuda/spira => <path>` line.
@@ -71,6 +76,10 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - The command MUST start the frontend as `pnpm --dir frontend run dev`.
 - The command MUST set `SPIRA_VITE_ORIGIN` to `http://localhost:5173` on the server process.
 - That value MUST replace an inherited `SPIRA_VITE_ORIGIN`.
+- The command MUST set `SPIRA_SEED_DEMO_PASSWORD` on the server process.
+- When the parent environment holds a value for `SPIRA_SEED_DEMO_PASSWORD` that is not empty, the command MUST pass that value.
+- Otherwise the command MUST make one random value for the run and write it once to stderr.
+- Every server start of one run MUST get the same value.
 - SIGINT MUST stop the server process group and the frontend process group.
 - SIGTERM MUST stop the server process group and the frontend process group.
 - After that stop, the command MUST reap those processes.
@@ -121,6 +130,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 
 - `TestNewGeneratesExpectedFiles` proves the file set and the engine pieces for `sqlite`, `postgresql`, `mysql` and `mssql`.
 - `TestNewGeneratesExpectedFiles` proves the account faults and the `auth` login shape.
+- `TestNewGeneratesExpectedFiles` proves that a `sqlite` application holds the seed test.
 - `TestNewRejectsUnknownEngine` proves an unknown engine is a usage error that leaves no directory.
 - `TestNewRefusesNonEmptyDir` proves generation refuses a non-empty directory without writing.
 - `TestNewRejectsBadModulePath` proves bad module paths are refused without writing.
@@ -136,6 +146,8 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - `TestWatchCancelReapsAllChildren` proves that cancel reaps the child processes.
 - `TestWatchRejectsRootThatIsNotADirectory` proves the directory error and that no process starts.
 - `TestWatchGivesTheViteOriginToTheServer` proves `SPIRA_VITE_ORIGIN` is `http://localhost:5173` even when the parent holds another value.
+- `TestWatchGivesOneDemoPasswordToEveryServerStart` proves a value that is not empty on each server start, an inherited value that is kept, and the same value after a restart.
+- The generated `TestSeedDemoUserFollowsTheEnvironment`, which `TestNewGeneratedSQLiteAppRuns` runs, proves no seed without `SPIRA_SEED_DEMO_PASSWORD`, a seed with it, and a new password on a second seed.
 - `TestFrontendCancelDuringStartupReturnsNil` proves that a cancel during startup returns nil and leaves no child.
 - `TestFrontendLaunchFailureWithLiveContextReturnsError` proves that a launch failure with a live context returns the start error.
 - `TestFrontendLaunchFailureRacingCancelReturnsError` proves that a launch failure racing a cancel returns the start error.

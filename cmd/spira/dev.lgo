@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -15,6 +16,8 @@ import (
 )
 
 const viteOrigin = "SPIRA_VITE_ORIGIN=http://localhost:5173"
+
+const demoPasswordKey = "SPIRA_SEED_DEMO_PASSWORD"
 
 type Start struct {
 	Role    string
@@ -43,11 +46,12 @@ func watch(ctx context.Context, cfg Loop) error {
 		return err
 	}
 	restarts := make(chan struct{}, 1)
+	demoPassword := demoPasswordKey + "=" + demoPasswordValue()
 	go group (ctx) {
 		go frontend(ctx, cfg)
 		go scanLoop(ctx, cfg, restarts, base)
 		for ctx.Err() == nil {
-			serverEnv := []string{viteOrigin}
+			serverEnv := []string{viteOrigin, demoPassword}
 			cmd, startErr := startProc(ctx, cfg.ServerCmd, serverEnv)
 			if startErr != nil {
 				if !reportExit(ctx, startErr, restarts) {
@@ -68,6 +72,15 @@ func watch(ctx context.Context, cfg Loop) error {
 		return nil
 	}
 	return nil
+}
+
+func demoPasswordValue() string {
+	if inherited := os.Getenv(demoPasswordKey); inherited != "" {
+		return inherited
+	}
+	generated := rand.Text()
+	fmt.Fprintf(os.Stderr, "cmd/spira: demo account demo, password %s (set %s to choose it)\n", generated, demoPasswordKey)
+	return generated
 }
 
 func requireRoot(root string) error {

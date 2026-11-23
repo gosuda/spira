@@ -7,3 +7,8 @@ WHERE name = ?;
 INSERT INTO users (name, password_hash)
 VALUES (?, ?)
 RETURNING id;
+
+-- name: SetUserPassword :exec
+UPDATE users
+SET password_hash = ?
+WHERE name = ?;

@@ -45,7 +45,7 @@ func run(ctx context.Context) error {
 	if err := store.PrepareAll(ctx, pool); err != nil {
 		return err
 	}
-	if err := ensureDemoUser(ctx, pool); err != nil {
+	if err := seedDemoUser(ctx, pool); err != nil {
 		return err
 	}
 	manifest := loadManifest()?
@@ -87,12 +87,16 @@ func loadManifest() (*asset.Manifest?, error) {
 	return asset.Load(os.DirFS("frontend/dist"), ".vite/manifest.json")
 }
 
-func ensureDemoUser(ctx context.Context, pool *db.Pool) error {
-	found := store.GetUserByName(ctx, pool, "demo")?
-	if found != nil {
+func seedDemoUser(ctx context.Context, pool *db.Pool) error {
+	password := os.Getenv("SPIRA_SEED_DEMO_PASSWORD")
+	if password == "" {
 		return nil
 	}
-	hash := auth.HashPassword("demo")?
+	hash := auth.HashPassword(password)?
+	found := store.GetUserByName(ctx, pool, "demo")?
+	if found != nil {
+		return store.SetUserPassword(ctx, pool, hash, "demo")
+	}
 	_, err := account.CreateUser(ctx, pool, "demo", hash)
 	return err
 }

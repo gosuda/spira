@@ -198,6 +198,8 @@ func expectedFiles(engine string) []string {
 	}
 	if engine != "sqlite" {
 		files = append(files, "db/check_engines_test.lgo")
+	} else {
+		files = append(files, "main_test.lgo", "export_test.lgo")
 	}
 	return files
 }

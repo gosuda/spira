@@ -6,3 +6,8 @@ WHERE name = ?;
 -- name: CreateUser :execlastid
 INSERT INTO users (name, password_hash)
 VALUES (?, ?);
+
+-- name: SetUserPassword :exec
+UPDATE users
+SET password_hash = ?
+WHERE name = ?;

@@ -181,7 +181,7 @@ The other replies follow the same rule. `web.Fragment` writes HTML with `HX-Reta
 
 ### Commands
 
-- `spira dev <main-package>` starts `logos run` for the application and `pnpm --dir frontend run dev`, gives the server `SPIRA_VITE_ORIGIN=http://localhost:5173`, and restarts the server when an `.lgo` file changes.
+- `spira dev <main-package>` starts `logos run` for the application and `pnpm --dir frontend run dev`, gives the server `SPIRA_VITE_ORIGIN=http://localhost:5173` and `SPIRA_SEED_DEMO_PASSWORD`, and restarts the server when an `.lgo` file changes. It passes an inherited `SPIRA_SEED_DEMO_PASSWORD`; otherwise it makes a random one and prints it once. An application from `spira new` creates the user `demo` with that password only when the variable is set.
 - `sqlc-gen-spira` runs under sqlc as a `process` plugin; it also accepts `generate` for manual use and reads a request from standard input.
 
 ## What main ships
