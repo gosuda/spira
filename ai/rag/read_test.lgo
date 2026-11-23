@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -158,8 +159,8 @@ func TestReadersRefuseInputAboveTheLimit(t *testing.T) {
 		t.Fatalf("above-limit JSON is %d bytes, want %d", len(over), (1<<20)+1)
 		return
 	}
-	if _, err := rag.ReadJSON(strings.NewReader(over)); !isSizeError(err) {
-		t.Errorf("ReadJSON above the limit returns %v, want the size error", err)
+	if _, err := rag.ReadJSON(strings.NewReader(over)); !isSizeError(err) || !errors.Is(err, rag.ErrTooLarge) {
+		t.Errorf("ReadJSON above the limit returns %v, want the too_large fault", err)
 	}
 	full := pre + strings.Repeat("a", (1<<20)-overhead) + post
 	if len(full) != 1<<20 {
@@ -218,8 +219,8 @@ func TestReadJSONOverLimitWithCutConnectionIsFinal(t *testing.T) {
 func TestReadJSONRefusesDeepNesting(t *testing.T) {
 	deep := strings.Repeat("[", 10001) + strings.Repeat("]", 10001)
 	_, err := rag.ReadJSON(strings.NewReader(deep))
-	if err == nil || !strings.Contains(err.Error(), "max depth") {
-		t.Errorf("ReadJSON at depth 10001 returns %v, want the depth error", err)
+	if err == nil || !strings.Contains(err.Error(), "max depth") || !errors.Is(err, rag.ErrInvalidRequest) {
+		t.Errorf("ReadJSON at depth 10001 returns %v, want the invalid_request depth fault", err)
 	}
 	shallow, err := rag.ReadJSON(strings.NewReader(`{"a": [[["x"]]]}`))
 	if err != nil {
