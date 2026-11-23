@@ -2167,9 +2167,7 @@ func TestStreamZeroTimeoutUsesFallbackBound(t *testing.T) {
 	for _, timeout := range []time.Duration{0, -time.Second} {
 		c := testClient(srv)
 		c.Policy = resilience.Policy{Timeout: timeout}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		reply, err := ai.Collect(c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
-		cancel()
+		reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
 		if err != nil {
 			t.Fatalf("stream with timeout %v failed: %v", timeout, err)
 			return
@@ -2177,6 +2175,25 @@ func TestStreamZeroTimeoutUsesFallbackBound(t *testing.T) {
 		if _, text := partTexts(reply.Message.Parts); text != "Hello" {
 			t.Errorf("stream with timeout %v text = %q, want %q", timeout, text, "Hello")
 		}
+	}
+}
+
+func TestStreamAttemptTimeoutComesFromPolicy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 300 * time.Millisecond}
+	start := time.Now()
+	_, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+	elapsed := time.Since(start)
+	if err == nil || !errors.Is(err, resilience.ErrTimeout) {
+		t.Fatalf("slow head error = %v, want the resilience timeout", err)
+		return
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Errorf("slow head took %v, want under 1.5s so the policy bound fires first", elapsed)
 	}
 }
 
