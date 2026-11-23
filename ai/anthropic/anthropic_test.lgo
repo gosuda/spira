@@ -2078,3 +2078,43 @@ func TestStreamOutlivesTheHeadAttempt(t *testing.T) {
 		t.Errorf("stream text has %d bytes, want the %d bytes of every delta", len(text), 5*deltas)
 	}
 }
+
+func TestStreamOfAStalledProviderEndsAtTheIdleBound(t *testing.T) {
+	ready := make(chan *anthropic.IdleProbe, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stall\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		probe := <-ready
+		probe.Fire()
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
+	probe, restore := anthropic.ArmIdleProbe(c)
+	t.Cleanup(restore)
+	ready <- probe
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := ai.Collect(c.Stream(ctx, ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err == nil || !errors.Is(err, anthropic.ErrProviderStreamCut) {
+		t.Fatalf("collect error = %v, want the stream cut fault", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("stall error = %v, want the named stall error, not a cancel", err)
+	}
+	if !anthropic.IsStall(err) {
+		t.Fatalf("stall error = %v, want the named stall error", err)
+	}
+}

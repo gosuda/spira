@@ -1,0 +1,125 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"logos/rt"
+
+	"github.com/gosuda/spira/admin"
+	"github.com/gosuda/spira/app"
+)
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for a free port: %v", err)
+		return 0
+	}
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close probe listener: %v", err)
+		}
+	}()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("probe listener address %v is not TCP", ln.Addr())
+		return 0
+	}
+	return addr.Port
+}
+
+func startupSettings(port int) Settings {
+	base := fmt.Sprintf("127.0.0.1:%d", port)
+	return Settings{
+		Addr:       base,
+		DSN:        fmt.Sprintf("file:spira_startup_%d?mode=memory&cache=shared", port),
+		ViteOrigin: "http://127.0.0.1:1",
+		PublicURL:  "http://" + base,
+	}
+}
+
+func pollAdminUp(t *testing.T, publicURL string, token string) string {
+	t.Helper()
+	give := time.Now().Add(25 * time.Second)
+	client := &http.Client{Timeout: 2 * time.Second}
+	var last string
+	for time.Now().Before(give) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, publicURL+"/admin", nil)
+		if err != nil {
+			t.Fatalf("new admin request: %v", err)
+			return ""
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err == nil {
+			raw, rerr := io.ReadAll(resp.Body)
+			cerr := resp.Body.Close()
+			if rerr != nil {
+				t.Fatalf("read admin page: %v", rerr)
+				return ""
+			}
+			if cerr != nil {
+				t.Fatalf("close admin page body: %v", cerr)
+				return ""
+			}
+			last = string(raw)
+			if resp.StatusCode == http.StatusOK && strings.Contains(last, "instance-shop") && strings.Contains(last, ">up<") {
+				return last
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("the shop never reported itself up; last admin page: %q", last)
+	return ""
+}
+
+func TestShopStartsRegistersAndReportsUp(t *testing.T) {
+	port := freePort(t)
+	if port == 0 {
+		return
+	}
+	settings := startupSettings(port)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	application, err := assemble(ctx, settings, &admin.Server{Interval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("assemble the shop: %v", err)
+		return
+	}
+	if application == nil {
+		t.Fatal("assemble the shop: no application")
+		return
+	}
+	token := application.Admin.Token ?? ""
+	if token == "" {
+		t.Fatal("the assembled shop carries no admin service token")
+		return
+	}
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	done := make(chan struct{})
+	var runErr error
+	pool, _ := rt.NewGroup(context.WithoutCancel(runCtx), 0)
+	pool.Go(func(_ context.Context) error {
+		runErr = app.Run(runCtx, application)
+		close(done)
+		return nil
+	})
+	pollAdminUp(t, settings.PublicURL, token)
+	stop()
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("shop run: %v", runErr)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the shop did not stop after cancel")
+	}
+}

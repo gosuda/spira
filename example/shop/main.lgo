@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
-
 	"github.com/gosuda/spira/admin"
 	"github.com/gosuda/spira/ai/openai"
 	"github.com/gosuda/spira/ai/rag"
@@ -49,10 +52,11 @@ type Settings struct {
 }
 
 type Application struct {
-	DB    *db.Pool
-	Jobs  *job.Scheduler
-	Admin *admin.Client
-	Web   *web.Server
+	DB       *db.Pool
+	Jobs     *job.Scheduler
+	Web      *web.Server
+	Registry *admin.Server
+	Admin    *admin.Client
 }
 
 func main() {
@@ -67,23 +71,79 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("shop: load settings: %w", err)
 	}
-	pool, err := openShopPool(ctx, settings.DSN)
+	application, err := assemble(ctx, settings, nil)
 	if err != nil {
 		return err
 	}
+	if application == nil {
+		return fmt.Errorf("shop: assemble: no application")
+	}
+	return app.Run(ctx, application)
+}
+
+func assemble(ctx context.Context, settings Settings, service *admin.Server?) (*Application?, error) {
+	pool, err := openShopPool(ctx, settings.DSN)
+	if err != nil {
+		return nil, err
+	}
 	if pool == nil {
-		return fmt.Errorf("shop: open pool: no pool")
+		return nil, fmt.Errorf("shop: open pool: no pool")
 	}
 	assets, tags, dev, err := loadShopTags(settings.ViteOrigin)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if assets == nil {
-		return fmt.Errorf("shop: load assets: no manifest")
+		return nil, fmt.Errorf("shop: load assets: no manifest")
 	}
-	router, scheduler := buildRouter(shopParts{settings: settings, pool: pool, assets: assets, tags: tags, dev: dev})
-	application := &Application{DB: pool, Jobs: scheduler, Admin: shopAdmin(settings), Web: &web.Server{Addr: settings.Addr, Router: router}}
-	return app.Run(ctx, application)
+	token, err := newServiceToken()
+	if err != nil {
+		return nil, err
+	}
+	host, err := opsHost(settings.PublicURL)
+	if err != nil {
+		return nil, err
+	}
+	svc := service ?? &admin.Server{}
+	if len(svc.AllowedHosts) == 0 {
+		svc.AllowedHosts = []string{host}
+	}
+	svc.ProbeToken = token
+	router, scheduler := buildRouter(shopParts{settings: settings, pool: pool, assets: assets, tags: tags, dev: dev, admin: svc, serviceToken: token})
+	application := &Application{DB: pool, Jobs: scheduler, Web: &web.Server{Addr: settings.Addr, Router: router}, Registry: svc, Admin: shopAdmin(settings, token)}
+	return application, nil
+}
+
+func newServiceToken() (string, error) {
+	var entropy [32]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", fmt.Errorf("shop: service token entropy: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(entropy[:]), nil
+}
+
+func verifyServiceToken(token string) auth.Authenticator {
+	return auth.Bearer(func(ctx context.Context, presented string) (auth.Principal?, error) {
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(token)) != 1 {
+			return nil, nil
+		}
+		return auth.Principal{ID: "service"}, nil
+	})
+}
+
+func opsHost(publicURL string) (string, error) {
+	u, err := url.Parse(publicURL)
+	if err != nil || u == nil || u.Host == "" {
+		return "", fmt.Errorf("shop: public URL %q needs a host", publicURL)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("shop: public URL %q needs an http or https scheme", publicURL)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("shop: public URL %q must not hold user info", publicURL)
+	}
+	return u.Host, nil
 }
 
 func loadShopSettings(source config.Source) (Settings, error) {
@@ -94,13 +154,14 @@ func loadShopSettings(source config.Source) (Settings, error) {
 }
 
 type shopParts struct {
-	settings Settings
-	pool     *db.Pool
-	assets   *asset.Manifest
-	tags     view.Node
-	dev      bool
+	settings     Settings
+	pool         *db.Pool
+	assets       *asset.Manifest
+	tags         view.Node
+	dev          bool
+	admin        *admin.Server?
+	serviceToken string
 }
-
 func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 	reg := meter.NewRegistry()
 	router := web.NewRouter()
@@ -116,7 +177,7 @@ func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 	}
 	router.Use(meter.HTTP(reg))
 	sessions := &auth.Sessions{Store: auth.NewMemoryStore()}
-	router.Use(auth.Authenticate(sessions.Authenticator()))
+	router.Use(auth.Authenticate(sessions.Authenticator(), verifyServiceToken(p.serviceToken)))
 	catalogFeature := &catalog.Feature{DB: p.pool, Assets: p.assets}
 	catalogFeature.Register(router)
 	cartFeature := &cart.Feature{DB: p.pool}
@@ -156,13 +217,12 @@ func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 		Checks:   map[string]func(ctx context.Context) error{"db": p.pool.Start},
 	})
 	openapi.Mount(router, openapi.Info{Title: "Shop", Version: "1.0.0"})
-	adminService := &admin.Server{}
-	adminService.Mount(router, guard)
+	service := p.admin ?? &admin.Server{}
+	service.Mount(router, guard)
 	return router, scheduler
 }
-
-func shopAdmin(settings Settings) *admin.Client {
-	return &admin.Client{Server: settings.PublicURL, Self: admin.Instance{Name: "shop", OpsURL: settings.PublicURL}}
+func shopAdmin(settings Settings, token string) *admin.Client {
+	return &admin.Client{Server: settings.PublicURL, Self: admin.Instance{Name: "shop", OpsURL: settings.PublicURL}, Token: token}
 }
 
 func mountAssets(r *web.Router, assets *asset.Manifest) {
