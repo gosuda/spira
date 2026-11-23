@@ -205,13 +205,6 @@ func refuse(t *testing.T, raw []byte, limit int64) error {
 	return err
 }
 
-func TestRefuseReservedBits(t *testing.T) {
-	err := refuse(t, []byte{0xc1, 0x00}, frameLimit)
-	if !errors.Is(err, websocket.ErrProtocolError) {
-		t.Fatalf("error = %v, want ErrProtocolError", err)
-	}
-}
-
 func TestRefuseUnknownOpcode(t *testing.T) {
 	for _, opcode := range []uint8{0x3, 0x4, 0x5, 0x6, 0x7, 0xb, 0xc, 0xd, 0xe, 0xf} {
 		err := refuse(t, []byte{0x80 | opcode, 0x00}, frameLimit)

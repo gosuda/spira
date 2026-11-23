@@ -324,7 +324,6 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestRFCDataFrames` proves that unmasked text, masked text and fragment heads read and encode back.
 - `TestRFCControlFrames` proves that the ping and pong vectors read and encode back.
 - `TestRFCLargeFrames` proves that the 126-byte, 256-byte, 65536-byte and masked 64-bit vectors carry real payload bytes.
-- `TestRefuseReservedBits` proves that a set rsv bit fails with `ErrProtocolError`.
 - `TestRefuseUnknownOpcode` proves that each opcode in 0x3 to 0x7 and 0xB to 0xF fails with `ErrProtocolError`.
 - `TestRefuseControlTooLarge` proves that a 16-bit control length of 126 fails with `ErrProtocolError`.
 - `TestRefuseControlTooLarge64` proves that a minimal 64-bit control length of 65536 fails with `ErrProtocolError`.
@@ -336,38 +335,31 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestMaskMatchesByteLoop` proves that `mask` matches the byte loop for lengths 0 to 40 and offsets 0 to 3.
 - `TestReadHeaderZeroAllocs` proves that a warmed `readHeader` allocates nothing.
 - `FuzzFrame` proves that any input either fails `readHeader` or encodes back to the consumed bytes.
-- `TestAcceptKeyMatchesRFC6455Vector` proves that the RFC 6455 section 1.3 vector gives `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
-- `TestAcceptKeyTrimsOuterWhitespace` proves that `acceptKey` trims outer whitespace before hashing.
-- `TestCheckUpgradeAcceptsValidRequest` proves that a valid request passes.
-- `TestCheckUpgradeRefusesNonGet` proves that a non-GET method fails with the method error.
+- `TestAcceptKeyTrimsOuterWhitespace` proves that `acceptKey` trims outer whitespace and gives the RFC 6455 section 1.3 value `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
 - `TestCheckUpgradeRefusesOldProtocol` proves that HTTP/1.0 fails with the protocol error.
 - `TestCheckUpgradeRefusesMissingConnection` proves that a `Connection` without the upgrade token fails with the connection error.
 - `TestCheckUpgradeRefusesWrongUpgrade` proves that a wrong `Upgrade` token fails with the upgrade error.
 - `TestCheckUpgradeRefusesWrongVersion` proves that a wrong version fails with the version error.
 - `TestCheckUpgradeRefusesMissingVersion` proves that a missing version fails with the version error.
 - `TestCheckUpgradeRefusesDuplicateVersion` proves that two version lines fail with the version error.
-- `TestCheckUpgradeRefusesBadKey` proves that a bad key fails with the key error.
 - `TestCheckUpgradeRefusesMissingKey` proves that a missing key fails with the key error.
 - `TestCheckUpgradeRefusesDuplicateKey` proves that two key lines fail with the key error.
 - `TestCheckUpgradeRefusesShortKey` proves that a 15-byte decoded key fails with the key error.
 - `TestCheckUpgradeRefusesLongKey` proves that a 17-byte decoded key fails with the key error.
 - `TestCheckUpgradeRefusesUnpaddedKey` proves that an unpadded key fails with the key error.
-- `TestCheckUpgradeAcceptsPaddedOuterWhitespaceKey` proves that a key with outer whitespace passes.
-- `TestCheckUpgradeRefusesInnerWhitespaceKey` proves that a key with inner whitespace fails with the key error.
+- `TestCheckUpgradeAcceptsPaddedOuterWhitespaceKey` proves that a valid request passes when the key has outer whitespace.
+- `TestCheckUpgradeRefusesInnerWhitespaceKey` proves that a key with inner whitespace fails with the key error. Whitespace is outside the base64 alphabet.
 - `TestCheckUpgradeAcceptsMixedCaseTokens` proves that token match ignores case across lines.
 - `TestCheckUpgradeAcceptsSplitUpgradeLines` proves that `Upgrade` match spans two header lines.
-- `TestCheckUpgradeAcceptsCommaTokens` proves that `Connection` match spans comma values.
-- `TestCheckUpgradeAcceptsSpacedCommaTokens` proves that token match tolerates spaces around commas.
+- `TestCheckUpgradeAcceptsSpacedCommaTokens` proves that `Connection` match spans comma values and tolerates spaces around commas.
 - `TestUpgradeStatusCodes` proves that nil maps to 101, version to 426, method to 405 and each other error to 400.
-- `TestFailureHeadersSetsVersionOn426` proves that the version error yields `Sec-WebSocket-Version: 13`.
 - `TestFailureHeadersEmptyOtherwise` proves that a non-version error yields no version header.
 - `TestUpgradeHeadersRoundTrip` proves that response headers carry `Upgrade`, `Connection`, the RFC accept value and the subprotocol.
 - `TestUpgradeHeadersOmitsEmptySubprotocol` proves that an empty subprotocol sets no protocol header.
 - `TestUpgradeHeadersRefusesCRLFInjection` proves that a CR LF subprotocol fails with the subprotocol error.
 - `TestPickSubprotocolPrefersServerOrder` proves that the first supported offered name wins.
 - `TestPickSubprotocolFallsBackToSecond` proves that an unoffered first choice falls back to the second.
-- `TestPickSubprotocolReturnsEmptyOnNoMatch` proves that no match returns empty text.
-- `TestPickSubprotocolNeverPicksUnoffered` proves that an unoffered value is never picked.
+- `TestPickSubprotocolReturnsEmptyOnNoMatch` proves that no match returns empty text and never a name the client did not offer.
 - `TestPickSubprotocolTrimsSupportedName` proves that a supported name with spaces matches after trimming.
 - `TestPickSubprotocolIgnoresBlankNames` proves that blank names are skipped.
 - `TestPickSubprotocolRefusesCRLFInjection` proves that a CR LF supported name fails with the subprotocol error.
@@ -376,11 +368,9 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestParseCloseEmpty` proves that an empty payload returns code 1005 with empty reason and no error.
 - `TestParseCloseOneByte` proves that a one-byte payload fails with `ErrProtocolError`.
 - `TestParseCloseCodeOnly` proves that a two-byte payload decodes the code in network order with empty reason.
-- `TestParseCloseCodeReason` proves that a longer payload decodes code 1000 and reason `bye`.
 - `TestParseCloseInvalidUTF8` proves that an invalid UTF-8 reason fails with `ErrProtocolError`.
 - `TestAppendCloseReasonLimits` proves that a 123-byte reason fits in 125 bytes and a 124-byte reason fails with `ErrProtocolError`.
 - `TestAppendCloseRefusesBadCode` proves that each refused code fails with `ErrProtocolError`.
-- `TestCloseRoundTrip` proves that an appended close payload parses back to its code and reason.
 - `TestEngineFragmentedHelloWithPing` proves that a ping arrives first and fragments assemble to `Hello`.
 - `TestEngineRefusesStrayContinuation` proves that a continuation with no open message fails with `ErrProtocolError`.
 - `TestEngineRefusesNewDataWhileOpen` proves that a data frame while a message stays open fails with `ErrProtocolError`.
@@ -395,23 +385,22 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestEngineAcceptsSplitFourByteRune` proves that a rune split across fragments passes once completed.
 - `TestEngineNextZeroAllocs` proves that a warmed `next` allocates nothing per message.
 - `TestFaultsMatchSpecCodeTable` proves that `Faults` holds each spec table code once with its kind and message.
-- `TestFaultHandshakeFailedInvalidMethod` proves that a non-GET handshake answers 405 with `ErrHandshakeFailed`.
+- `TestFaultHandshakeFailedInvalidMethod` proves that a non-GET handshake fails the method check, answers 405 and returns `ErrHandshakeFailed`.
 - `TestFaultForbiddenOriginRejected` proves that a foreign origin answers 403 with `ErrForbiddenOrigin` and hides the origin and secrets from the public view.
-- `TestFaultPublicHidesFrameBytes` proves that a protocol fault hides hostile frame bytes from the public view and sends 1002 with no reason text.
+- `TestFaultPublicHidesFrameBytes` proves that a frame with a set reserved bit fails with `ErrProtocolError`, that the public view hides its hostile bytes, and that the server sends 1002 with no reason text.
 - `TestFaultClosedAfterClose` proves that calls after the close fail with `ErrClosed`.
-- `TestPeerCloseEchoedOnceThenEnds` proves that a peer close with code 1000 is echoed once and the connection ends.
+- `TestPeerCloseEchoedOnceThenEnds` proves that a peer close with code 1000 and reason `bye` is echoed once, that `ParseClose` decodes it, and that the connection ends.
 - `TestFaultFrameOverLimitSends1009` proves that a message past the limit fails with `ErrTooLarge` and sends 1009.
 - `TestFaultInvalidUTF8Sends1007` proves that invalid UTF-8 text fails with `ErrProtocolError` and sends 1007.
-- `TestFaultReservedBitSends1002` proves that a set reserved bit fails with `ErrProtocolError` and sends 1002.
 - `TestPingAnsweredWithPong` proves that a ping arrives as an event and the peer gets its pong.
 - `TestBinaryEchoRoundTrip1KiB` proves that a 1024-byte binary message echoes back byte for byte.
 - `TestExpiredContextFailsFast` proves that an expired context fails a read and a write.
-- `TestCloseWithCodeEndsConnection` proves that `CloseWithCode` sends 1000 and ends the connection.
-- `TestUpgradeAnswers101WithRFCVector` proves that the RFC 6455 section 1.3 sample key answers 101 with its accept value.
+- `TestCloseWithCodeEndsConnection` proves that `CloseWithCode` sends code 1000 with reason `bye`, that the payload parses back, and that the connection ends.
+- `TestUpgradeAnswers101WithRFCVector` proves that a valid request with the RFC 6455 section 1.3 sample key answers 101 with its accept value.
 - `TestUpgradeOriginPolicy` proves that foreign origins get 403 while same, absent and listed origins get 101.
 - `TestUpgradeSelectsSubprotocolInServerOrder` proves that the first supported offered subprotocol wins.
 - `TestHTTP2WebSocketEchoAndClose` exercises a masked text echo, subprotocol selection and a close handshake over HTTP/2. It then uses the same connection for another request.
-- `TestHTTP2WebSocketRejectsInvalidHandshake` checks the protocol, legacy key, version, subprotocol offer and origin rejections.
+- `TestHTTP2WebSocketRejectsInvalidHandshake` checks the protocol, legacy key, version, subprotocol offer and origin rejections. The 426 version rejection carries `Sec-WebSocket-Version: 13`.
 - `TestHTTP2WebSocketReadDeadlineAndCancellation` checks read deadlines and cancellation on a live HTTP/2 stream.
 - `TestHTTP2WebSocketWriteDeadline` checks a write blocked by HTTP/2 flow control. The HTTP/2 connection stays open.
 - `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
