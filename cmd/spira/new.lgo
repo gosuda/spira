@@ -339,6 +339,7 @@ func sharedFiles() []filePair {
 		{"templates/db-migrations.lgo.tmpl", "db/migrations.lgo"},
 		{"templates/home-home.lgo.tmpl", "features/home/home.lgo"},
 		{"templates/home-views.lgo.tmpl", "features/home/views.lgo"},
+		{"templates/home-test.lgo.tmpl", "features/home/home_test.lgo"},
 		{"templates/greet.svelte.tmpl", "features/home/islands/greet.svelte"},
 		{"templates/account-account.lgo.tmpl", "features/account/account.lgo"},
 		{"templates/account-faults.lgo.tmpl", "features/account/faults.lgo"},
