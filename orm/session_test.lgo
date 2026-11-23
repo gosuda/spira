@@ -1,0 +1,258 @@
+package orm_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/orm"
+
+	_ "modernc.org/sqlite"
+)
+
+type itemID int64
+
+type item struct {
+	ID      itemID `col:"id"`
+	Name    string `col:"name"`
+	Version int64  `col:"version"`
+}
+
+var items = orm.Table[item, itemID]{Name: "orm_items", Key: "id", Version: "version"}
+
+func openPool(t *testing.T, driver string, dsn string) *db.Pool {
+	t.Helper()
+	pool, err := db.Open(driver, dsn)
+	if err != nil {
+		panic(err)
+	}
+	if pool == nil {
+		panic("db.Open returned no pool")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("close pool: %v", err)
+		}
+	})
+	return pool
+}
+
+func sqlitePool(t *testing.T) *db.Pool {
+	t.Helper()
+	return openPool(t, "sqlite", "file:"+t.Name()+"?mode=memory&cache=shared&_pragma=read_uncommitted(1)")
+}
+
+func exec(ctx context.Context, q db.Querier, sql string) error {
+	_, err := db.Exec(ctx, q, sql)
+	return err
+}
+
+func TestOptimisticWrite(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := exec(ctx, pool, "CREATE TABLE orm_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := optimisticWrite(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func optimisticWrite(ctx context.Context, pool *db.Pool) error {
+	added := &item{Name: "before"}
+	_, seedErr := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		orm.Add[item, itemID](s, items, added)
+		fixed := &item{ID: 100, Name: "explicit key"}
+		orm.Add[item, itemID](s, items, fixed)
+		s.Flush(ctx)?
+		if fixed.ID != 100 || fixed.Version != 1 {
+			return 0, fmt.Errorf("explicit insert changed key or did not set version: %+v", fixed)
+		}
+		orm.Remove[item, itemID](s, items, fixed)
+		return 0, nil
+	})
+	if seedErr != nil {
+		return seedErr
+	}
+	if added.ID == 0 || added.Version != 1 {
+		return fmt.Errorf("insert did not refresh key/version: %+v", added)
+	}
+	_, staleErr := orm.InSession[int](ctx, pool, func(second *orm.Session) (int, error) {
+		late := orm.Get[item, itemID](ctx, second, items, added.ID)?
+		if late == nil {
+			return 0, errors.New("second session did not load seed row")
+		}
+		_, firstErr := orm.InSession[int](ctx, pool, func(first *orm.Session) (int, error) {
+			early := orm.Get[item, itemID](ctx, first, items, added.ID)?
+			if early == nil {
+				return 0, errors.New("sessions did not load the same row version")
+			}
+			if early.Version != late.Version {
+				return 0, errors.New("sessions did not load the same row version")
+			}
+			early.Name = "winner"
+			first.Flush(ctx)?
+			return 0, nil
+		})
+		if firstErr != nil {
+			return 0, firstErr
+		}
+		late.Name = "loser"
+		second.Flush(ctx)?
+		return 0, nil
+	})
+	stale, ok := errors.AsType[*orm.StaleError](staleErr)
+	if !ok || stale == nil || stale.Table != items.Name || stale.Key != fmt.Sprint(added.ID) {
+		return fmt.Errorf("second flush error = %w, want stale row %s/%d", staleErr, items.Name, added.ID)
+	}
+	return checkWinner(ctx, pool)
+}
+
+func checkWinner(ctx context.Context, pool *db.Pool) error {
+	row := db.One[item](ctx, pool, "SELECT id, name, version FROM orm_items")?
+	if row == nil {
+		return fmt.Errorf("database row absent, want winner at version 2")
+	}
+	if row.Name != "winner" || row.Version != 2 {
+		return fmt.Errorf("database after two writes = %+v, want winner at version 2", row)
+	}
+	return nil
+}
+
+type model struct {
+	disk    map[itemID]item
+	draft   map[itemID]item
+	held    map[itemID]*item
+	touched map[itemID]bool
+}
+
+func TestSessionMatchesMap(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := exec(ctx, pool, "CREATE TABLE orm_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		m := model{disk: map[itemID]item{}, draft: map[itemID]item{}, held: map[itemID]*item{}, touched: map[itemID]bool{}}
+		rng := rand.New(rand.NewPCG(29, 30))
+		for step := range 420 {
+			key := itemID(1 + rng.IntN(8))
+			if err := m.step(ctx, s, action{key: key, operation: rng.IntN(6)}); err != nil {
+				return 0, fmt.Errorf("step %d, key %d: %w", step, key, err)
+			}
+			m.checkDisk(ctx, s.Tx())?
+		}
+		return 0, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type action struct {
+	key       itemID
+	operation int
+}
+
+func (m *model) step(ctx context.Context, s *orm.Session, command action) error {
+	key := command.key
+	e, held := m.held[key]
+	draft, exists := m.draft[key]
+	switch command.operation {
+	case 0:
+		return m.checkGet(ctx, s, key)
+	case 1:
+		if held && exists {
+			e.Name += "x"
+			draft.Name += "x"
+			m.draft[key] = draft
+		}
+	case 2:
+		if !held {
+			draft = item{ID: key, Name: "new"}
+			e = &item{ID: key, Name: "new"}
+			m.draft[key], m.held[key] = draft, e
+			orm.Add[item, itemID](s, items, e)
+		}
+	case 3:
+		if held && exists {
+			delete(m.draft, key)
+			orm.Remove[item, itemID](s, items, e)
+		}
+	case 4:
+		if held && exists {
+			m.touched[key] = true
+			orm.Touch[item, itemID](s, items, e)
+		}
+	case 5:
+		return m.flush(ctx, s)
+	}
+	return nil
+}
+
+func (m *model) checkGet(ctx context.Context, s *orm.Session, key itemID) error {
+	got := orm.Get[item, itemID](ctx, s, items, key)?
+	want, held := m.held[key]
+	if !held && got != nil {
+		return fmt.Errorf("Get returned %+v for absent key %d", got, key)
+	}
+	if held {
+		if got == nil {
+			return fmt.Errorf("Get lost held pointer for key %d", key)
+		}
+		if got != want {
+			return fmt.Errorf("Get replaced held pointer for key %d", key)
+		}
+	}
+	if got != nil {
+		attached := orm.Attach[item, itemID](s, items, []item{{ID: key, Name: "do not copy"}})
+		if len(attached) != 1 || attached[0] != got || got.Name == "do not copy" {
+			return fmt.Errorf("Attach replaced held row %d", key)
+		}
+	}
+	return nil
+}
+
+func (m *model) flush(ctx context.Context, s *orm.Session) error {
+	s.Flush(ctx)?
+	for key, e := range m.held {
+		after, exists := m.draft[key]
+		if !exists {
+			delete(m.disk, key)
+			delete(m.held, key)
+			continue
+		}
+		before, onDisk := m.disk[key]
+		if !onDisk || after.Name != before.Name || (m.touched[key] ?? false) {
+			after.Version = before.Version + 1
+		}
+		if *e != after {
+			return fmt.Errorf("held row %d = %+v after Flush, want %+v", key, e, after)
+		}
+		m.disk[key], m.draft[key] = after, after
+	}
+	clear(m.touched)
+	return nil
+}
+
+func (m *model) checkDisk(ctx context.Context, tx *db.Tx) error {
+	rows := db.Query[item](ctx, tx, "SELECT id, name, version FROM orm_items")?
+	if len(rows) != len(m.disk) {
+		return fmt.Errorf("on-disk count %d, want %d", len(rows), len(m.disk))
+	}
+	for _, row := range rows {
+		want, ok := m.disk[row.ID]
+		if !ok || row != want {
+			return fmt.Errorf("on-disk row %+v, want %+v", row, want)
+		}
+	}
+	return nil
+}

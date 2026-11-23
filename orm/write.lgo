@@ -1,0 +1,333 @@
+package orm
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/spira/db"
+)
+
+func quoteIdentifier(d db.Dialect, name string) string {
+	switch d.(type) {
+	case db.MySQL:
+		return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+	case db.MSSQL:
+		return "[" + strings.ReplaceAll(name, "]", "]]") + "]"
+	case db.SQLite, db.Postgres:
+		return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	case nil:
+	}
+	panic("orm: session has no dialect")
+}
+
+func appendBind(out *strings.Builder, d db.Dialect, column string, n int) {
+	out.WriteString(column)
+	out.WriteString(" = ")
+	appendPlaceholder(out, d, n)
+}
+
+func appendPlaceholder(out *strings.Builder, d db.Dialect, n int) {
+	switch d.(type) {
+	case db.Postgres:
+		out.WriteByte('$')
+	case db.MSSQL:
+		out.WriteString("@p")
+	case db.SQLite, db.MySQL:
+		out.WriteByte('?')
+		return
+	case nil:
+		panic("orm: session has no dialect")
+	}
+	var digits [20]byte
+	out.Write(strconv.AppendInt(digits[:0], int64(n), 10))
+}
+
+func (row *entityRow[E, K]) insert(ctx context.Context) error {
+	r := row.table
+	key := *r.keyOf(row.entity)
+	var zero K
+	if key != row.key && key != zero {
+		if _, duplicate := r.byKey[key]; duplicate {
+			return tableFault(r.table.Name, "insert key already held by a different entity")
+		}
+	}
+	query, args := row.insertStatement(key == zero)
+	if key == zero {
+		key = row.generatedKey(ctx, query, args)?
+		if held, dup := r.byKey[key]; dup && held != row {
+			return tableFault(r.table.Name, "generated key already held by a different entity")
+		}
+		*r.keyOf(row.entity) = key
+	} else {
+		r.insertExplicit(ctx, query, args)?
+	}
+	if r.version >= 0 {
+		version := r.columns[r.version].integer
+		if version != nil {
+			version.store(row.entity, 1)
+		}
+	}
+	row.rekey(key)
+	r.byKey[key] = row
+	row.touched = false
+	row.snapshot()
+	r.session.updates = append(r.session.updates, row)
+	return nil
+}
+
+func (row *entityRow[E, K]) insertStatement(generated bool) (string, []any) {
+	r := row.table
+	d := r.session.dialect
+	var names, params, statement strings.Builder
+	args := make([]any, 0, len(r.columns))
+	for i, column := range r.columns {
+		if generated && i == r.key {
+			continue
+		}
+		if len(args) != 0 {
+			names.WriteString(", ")
+			params.WriteString(", ")
+		}
+		names.WriteString(column.quoted)
+		appendPlaceholder(&params, d, len(args)+1)
+		if i == r.version {
+			args = append(args, int64(1))
+		} else {
+			args = append(args, column.value(row.entity))
+		}
+	}
+	statement.WriteString("INSERT INTO ")
+	statement.WriteString(r.name)
+	if len(args) != 0 {
+		statement.WriteString(" (")
+		statement.WriteString(names.String())
+		statement.WriteByte(')')
+	}
+	if _, sqlServer := d.(db.MSSQL); generated && sqlServer {
+		statement.WriteString(" OUTPUT INSERTED.")
+		statement.WriteString(r.columns[r.key].quoted)
+	}
+	appendInsertValues(&statement, d, params.String(), len(args))
+	if _, postgres := d.(db.Postgres); generated && postgres {
+		statement.WriteString(" RETURNING ")
+		statement.WriteString(r.columns[r.key].quoted)
+	}
+	return statement.String(), args
+}
+
+func appendInsertValues(query *strings.Builder, d db.Dialect, params string, count int) {
+	if count != 0 {
+		query.WriteString(" VALUES (")
+		query.WriteString(params)
+		query.WriteByte(')')
+	} else if _, mysql := d.(db.MySQL); mysql {
+		query.WriteString(" () VALUES ()")
+	} else {
+		query.WriteString(" DEFAULT VALUES")
+	}
+}
+
+func (r *MappedTable[E, K]) insertExplicit(ctx context.Context, query string, args []any) error {
+	if _, sqlServer := r.session.dialect.(db.MSSQL); sqlServer {
+		query = r.explicitMSSQL(query)
+	}
+	db.Exec(ctx, r.session.tx, query, args...)?
+	return nil
+}
+
+func (r *MappedTable[E, K]) explicitMSSQL(insert string) string {
+	name := strings.ReplaceAll(r.name, "'", "''")
+	key := strings.ReplaceAll(r.table.Key, "'", "''")
+	on := "SET IDENTITY_INSERT " + r.name + " ON; "
+	off := "SET IDENTITY_INSERT " + r.name + " OFF; "
+	return "DECLARE @orm_identity int = COLUMNPROPERTY(OBJECT_ID(N'" + name + "'), N'" + key + "', 'IsIdentity'); " +
+		"IF @orm_identity = 1 " + on + "BEGIN TRY " + insert + "; IF @orm_identity = 1 " + off + "END TRY " +
+		"BEGIN CATCH IF @orm_identity = 1 " + off + "THROW; END CATCH;"
+}
+
+func (row *entityRow[E, K]) generatedKey(ctx context.Context, query string, args []any) (K, error) {
+	r := row.table
+	s := r.session
+	switch s.dialect.(type) {
+	case db.Postgres, db.MSSQL:
+		return returningKey[K](ctx, s, query, args)
+	case db.SQLite, db.MySQL:
+		result := db.Exec(ctx, s.tx, query, args...)?
+		id, err := result.LastInsertId()
+		if err != nil {
+			var zero K
+			return zero, db.ClassifyDriverError(s.dialect, err)
+		}
+		return keyScan[K](id)
+	case nil:
+	}
+	panic("orm: session has no dialect")
+}
+
+func returningKey[K comparable](ctx context.Context, s *Session, query string, args []any) (K, error) {
+	var key sql.Null[K]
+	rows := s.tx.QueryContext(ctx, query, args...)?
+	if rows == nil {
+		return key.V, db.ErrStatementFailed.Wrap(errors.New("db: query returned no rows handle"))
+	}
+	defer rows.Close()?
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return key.V, db.ClassifyDriverError(s.dialect, err)
+		}
+		return key.V, sql.ErrNoRows
+	}
+	if err := rows.Scan(&key); err != nil {
+		return key.V, db.ClassifyDriverError(s.dialect, err)
+	}
+	if !key.Valid {
+		return key.V, db.ErrNullInNonOptional.Wrap(errors.New("db: NULL in generated key"))
+	}
+	if rows.Next() {
+		return key.V, db.ErrShapeMismatch.Wrap(errors.New("db: insert returned more than one key"))
+	}
+	if err := rows.Err(); err != nil {
+		return key.V, db.ClassifyDriverError(s.dialect, err)
+	}
+	return key.V, nil
+}
+
+func (row *entityRow[E, K]) update(ctx context.Context) error {
+	if row.removing {
+		return nil
+	}
+	r := row.table
+	var query strings.Builder
+	args := row.changes(&query)
+	if len(args) == 0 && !row.touched {
+		return nil
+	}
+	key := *r.keyOf(row.entity)
+	if key != row.key {
+		if _, exists := r.byKey[key]; exists {
+			return tableFault(r.table.Name, "updated key already held by a different entity")
+		}
+	}
+	args = row.updateVersion(&query, args)?
+	row.expectOne(ctx, query.String(), args)?
+	if r.version >= 0 {
+		version := r.columns[r.version].integer
+		if version != nil {
+			version.store(row.entity, version.load(&row.saved)+1)
+		}
+	}
+	row.rekey(key)
+	row.snapshot()
+	row.touched = false
+	return nil
+}
+
+func (row *entityRow[E, K]) changes(query *strings.Builder) []any {
+	r := row.table
+	var args []any
+	for i, column := range r.columns {
+		if i == r.version {
+			continue
+		}
+		if column.same(row.entity, &row.saved) {
+			continue
+		}
+		if len(args) == 0 {
+			query.WriteString("UPDATE ")
+			query.WriteString(r.name)
+			query.WriteString(" SET ")
+		} else {
+			query.WriteString(", ")
+		}
+		appendBind(query, r.session.dialect, column.quoted, len(args)+1)
+		args = append(args, column.value(row.entity))
+	}
+	return args
+}
+
+func (row *entityRow[E, K]) updateVersion(query *strings.Builder, args []any) ([]any, error) {
+	r := row.table
+	if r.version >= 0 {
+		column := r.columns[r.version]
+		version := column.integer
+		if version == nil {
+			return nil, tableFault(r.table.Name, "version column must hold an integer")
+		}
+		if version.load(&row.saved) == version.maxValue {
+			return nil, tableFault(r.table.Name, "version increment overflows the entity field")
+		}
+		if len(args) == 0 {
+			query.WriteString("UPDATE ")
+			query.WriteString(r.name)
+			query.WriteString(" SET ")
+		} else {
+			query.WriteString(", ")
+		}
+		query.WriteString(column.quoted)
+		query.WriteString(" = ")
+		query.WriteString(column.quoted)
+		query.WriteString(" + 1")
+	}
+	return row.predicate(query, args), nil
+}
+
+func (row *entityRow[E, K]) predicate(query *strings.Builder, args []any) []any {
+	r := row.table
+	d := r.session.dialect
+	query.WriteString(" WHERE ")
+	appendBind(query, d, r.columns[r.key].quoted, len(args)+1)
+	args = append(args, row.key)
+	if r.version >= 0 {
+		column := r.columns[r.version]
+		query.WriteString(" AND ")
+		appendBind(query, d, column.quoted, len(args)+1)
+		args = append(args, column.value(&row.saved))
+	}
+	return args
+}
+
+func (row *entityRow[E, K]) remove(ctx context.Context) error {
+	r := row.table
+	var query strings.Builder
+	query.WriteString("DELETE FROM ")
+	query.WriteString(r.name)
+	args := row.predicate(&query, nil)
+	if r.version >= 0 {
+		row.expectOne(ctx, query.String(), args)?
+	} else {
+		db.Exec(ctx, r.session.tx, query.String(), args...)?
+	}
+	delete(r.byKey, row.key)
+	delete(r.byPointer, row.entity)
+	row.removed = true
+	return nil
+}
+
+func (row *entityRow[E, K]) expectOne(ctx context.Context, query string, args []any) error {
+	s := row.table.session
+	result := db.Exec(ctx, s.tx, query, args...)?
+	count, err := result.RowsAffected()
+	if err != nil {
+		return db.ClassifyDriverError(s.dialect, err)
+	}
+	if count != 1 {
+		return &StaleError{Table: row.table.table.Name, Key: fmt.Sprint(row.key)}
+	}
+	return nil
+}
+
+func (row *entityRow[E, K]) rekey(key K) {
+	if key == row.key {
+		return
+	}
+	r := row.table
+	if held, ok := r.byKey[row.key]; ok && held == row {
+		delete(r.byKey, row.key)
+	}
+	row.key = key
+	r.byKey[key] = row
+}

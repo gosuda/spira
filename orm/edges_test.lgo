@@ -1,0 +1,114 @@
+package orm_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/orm"
+)
+
+type payload struct {
+	ID   int64   `col:"id"`
+	Data []byte  `col:"data"`
+	Note string? `col:"select"`
+}
+
+var payloads = orm.Table[payload, int64]{Name: "orm payloads", Key: "id"}
+
+func TestUnversionedChangedColumnsOnly(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, statement := range []string{
+		`CREATE TABLE "orm payloads" (id INTEGER PRIMARY KEY, data BLOB NOT NULL, "select" TEXT)`,
+		`INSERT INTO "orm payloads" (id, data, "select") VALUES (1, X'61', NULL)`,
+		`CREATE TRIGGER notes_are_read_only BEFORE UPDATE OF "select" ON "orm payloads" BEGIN SELECT RAISE(ABORT, 'unchanged note was written'); END`,
+	} {
+		if err := exec(ctx, pool, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		row := attachPayload(ctx, s)?
+		if row == nil {
+			return 0, errors.New("payload not attached")
+		}
+		row.Data[0] = 'b'
+		checkPayload(ctx, s.Tx(), "a")?
+		orm.Touch[payload, int64](s, payloads, row)
+		s.Flush(ctx)?
+		checkPayload(ctx, s.Tx(), "b")?
+		orm.Remove[payload, int64](s, payloads, row)
+		s.Flush(ctx)?
+		missing := orm.Get[payload, int64](ctx, s, payloads, 1)?
+		if missing != nil {
+			return 0, fmt.Errorf("unversioned row still present after delete: %+v", missing)
+		}
+		return 0, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func attachPayload(ctx context.Context, s *orm.Session) (*payload?, error) {
+	loaded := db.Query[payload](ctx, s.Tx(), `SELECT id, data, "select" FROM "orm payloads" WHERE id = 1`)?
+	held := orm.Attach[payload, int64](s, payloads, loaded)
+	if len(held) != 1 || held[0].Note != nil {
+		return nil, fmt.Errorf("Attach returned %+v, want a row with SQL NULL note", held)
+	}
+	loaded[0].Data[0] = 'z'
+	s.Flush(ctx)?
+	checkPayload(ctx, s.Tx(), "a")?
+	return held[0], nil
+}
+
+func checkPayload(ctx context.Context, tx *db.Tx, want string) error {
+	row := db.One[payload](ctx, tx, `SELECT id, data, "select" FROM "orm payloads" WHERE id = 1`)?
+	if row == nil {
+		return fmt.Errorf("payload row absent, want data %q", want)
+	}
+	if row.Note != nil || string(row.Data) != want {
+		return fmt.Errorf("payload = %+v, want data %q and SQL NULL note", row, want)
+	}
+	return nil
+}
+
+func TestSessionRollsBackWrites(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := exec(ctx, pool, "CREATE TABLE orm_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("work failed after flush")
+	_, err := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		orm.Add[item, itemID](s, items, &item{ID: 1, Name: "no commit"})
+		s.Flush(ctx)?
+		return 0, failure
+	})
+	if !errors.Is(err, failure) {
+		t.Fatalf("work error = %v, want %v", err, failure)
+	}
+	_, err = orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		orm.Add[item, itemID](s, items, &item{ID: 2, Name: "no partial commit"})
+		exec(ctx, s.Tx(), "INSERT INTO orm_items (id, name, version) VALUES (3, 'duplicate', 1)")?
+		orm.Add[item, itemID](s, items, &item{ID: 3, Name: "must fail"})
+		return 0, nil
+	})
+	if !errors.Is(err, db.ErrConstraintViolation) {
+		t.Fatalf("flush error = %v, want database constraint error", err)
+	}
+	count, countErr := db.One[int64](ctx, pool, "SELECT COUNT(*) FROM orm_items")
+	if countErr != nil {
+		t.Fatal(countErr)
+		return
+	}
+	if (count ?? -1) != 0 {
+		t.Fatalf("database count = %v; want 0", count)
+	}
+}

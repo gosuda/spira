@@ -1,0 +1,367 @@
+package orm
+
+import (
+	"bytes"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"logos/rt"
+
+	"github.com/gosuda/spira/db"
+)
+
+type mappedColumn[E any] struct {
+	quoted  string
+	value   func(*E) any
+	same    func(*E, *E) bool
+	integer integerColumn[E]?
+}
+
+type integerColumn[E any] struct {
+	load     func(*E) int64
+	store    func(*E, int64)
+	maxValue int64
+}
+
+// MappedTable is the compiler bridge between a caller's concrete entity fields
+// and the session's private identity map. The ORM entry points own its use.
+type MappedTable[E any, K comparable] struct {
+	session    *Session
+	table      Table[E, K]
+	name       string
+	columns    []mappedColumn[E]
+	clones     []func(*E, *E)
+	key        int
+	keyOf      func(*E) *K
+	version    int
+	selectSQL  string
+	fault      error
+	sealed     bool
+	byKey      map[K]*entityRow[E, K]
+	byPointer  map[*E]*entityRow[E, K]
+}
+
+type entityRow[E any, K comparable] struct {
+	table    *MappedTable[E, K]
+	entity   *E
+	saved    E
+	key      K
+	removing bool
+	removed  bool
+	touched  bool
+}
+
+// ResolveTable initializes the runtime table state when the compiler bridge
+// first uses this entity in a session.
+func ResolveTable[E any, K comparable](s *Session, t Table[E, K], mapColumns func(*MappedTable[E, K])) *MappedTable[E, K] {
+	if current, found := s.tables[t.Name]; found {
+		rows, ok := current.(*MappedTable[E, K])
+		if ok && rows.table == t {
+			return rows
+		}
+		return &MappedTable[E, K]{session: s, table: t, sealed: true, fault: tableFault(t.Name, "conflicting table mapping")}
+	}
+	rows := &MappedTable[E, K]{session: s, table: t, key: -1, version: -1, byKey: make(map[K]*entityRow[E, K]), byPointer: make(map[*E]*entityRow[E, K])}
+	mapColumns(rows)
+	rows.seal()
+	rows.sealed = true
+	s.tables[t.Name] = rows
+	return rows
+}
+
+// MapColumn registers a col-tag field access projected by the caller's compiler.
+func MapColumn[E any, K comparable, F any](r *MappedTable[E, K], name string, project func(*E) *F) {
+	if r.sealed {
+		r.session.rememberFailure(tableFault(r.table.Name, "entity mapping is already sealed"))
+		return
+	}
+	if name == "" {
+		r.fail("entity field has no col tag")
+		return
+	}
+	column := mappedColumn[E]{
+		quoted: quoteIdentifier(r.session.dialect, name),
+		value:  func(e *E) any { return fieldValue(project(e)) },
+		same:   func(a, b *E) bool { return comparableFields(fieldValue(project(a)), fieldValue(project(b))) },
+	}
+	var probe F
+	if _, blob := any(&probe).(*[]byte); blob {
+		r.clones = append(r.clones, func(next, previous *E) {
+			p, _ := any(project(next)).(*[]byte)
+			last, _ := any(project(previous)).(*[]byte)
+			if *p == nil || *last == nil {
+				*p = bytes.Clone(*p)
+				return
+			}
+			*p = append((*last)[:0], (*p)...)
+		})
+	}
+	if strings.EqualFold(name, r.table.Key) {
+		mapKey(r, project)
+	}
+	if strings.EqualFold(name, r.table.Version) {
+		column.integer = versionColumn[E, F](project)
+		if column.integer == nil || strings.EqualFold(name, r.table.Key) {
+			r.fail("version must be a signed integer column distinct from the key")
+		}
+		r.version = len(r.columns)
+	}
+	r.columns = append(r.columns, column)
+}
+
+func mapKey[E any, K comparable, F any](r *MappedTable[E, K], project func(*E) *F) {
+	var probe F
+	if _, ok := any(&probe).(*K); !ok {
+		r.fail("entity key type does not match Table key type")
+		return
+	}
+	if r.key >= 0 {
+		r.fail("key is mapped by more than one field")
+		return
+	}
+	r.keyOf = func(e *E) *K {
+		key, _ := any(project(e)).(*K)
+		return key
+	}
+	r.key = len(r.columns)
+}
+
+func versionColumn[E any, F any](project func(*E) *F) integerColumn[E]? {
+	const switch F {
+	case ~int:
+		return signedColumn[E, F](project, int64(int(^uint(0)>>1)))
+	case ~int8:
+		return signedColumn[E, F](project, 127)
+	case ~int16:
+		return signedColumn[E, F](project, 32767)
+	case ~int32:
+		return signedColumn[E, F](project, 2147483647)
+	case ~int64:
+		return signedColumn[E, F](project, 9223372036854775807)
+	}
+	return nil
+}
+
+func signedColumn[E any, F ~int | ~int8 | ~int16 | ~int32 | ~int64](project func(*E) *F, maxValue int64) integerColumn[E] {
+	return integerColumn[E]{
+		load: func(e *E) int64 { return int64(*project(e)) },
+		store: func(e *E, version int64) { *project(e) = F(version) },
+		maxValue: maxValue,
+	}
+}
+
+func tableFault(name string, problem string) error {
+	return db.ErrShapeMismatch.Wrap(fmt.Errorf("db: table %q: %s", name, problem))
+}
+
+func (r *MappedTable[E, K]) fail(problem string) {
+	if r.fault == nil {
+		r.fault = tableFault(r.table.Name, problem)
+	}
+}
+
+func (r *MappedTable[E, K]) seal() {
+	if r.table.Name == "" || r.key < 0 || (r.table.Version != "" && r.version < 0) {
+		r.fail("missing table name, key, or version mapping")
+	}
+	if r.fault != nil {
+		return
+	}
+	r.name = quoteIdentifier(r.session.dialect, r.table.Name)
+	var query strings.Builder
+	query.WriteString("SELECT ")
+	for i, column := range r.columns {
+		if i != 0 {
+			query.WriteString(", ")
+		}
+		query.WriteString(column.quoted)
+	}
+	query.WriteString(" FROM ")
+	query.WriteString(r.name)
+	query.WriteString(" WHERE ")
+	appendBind(&query, r.session.dialect, r.columns[r.key].quoted, 1)
+	r.selectSQL = query.String()
+}
+
+func (r *MappedTable[E, K]) Get(key K, read func(string) (E?, error)) (*E?, error) {
+	if r.fault != nil {
+		return nil, r.fault
+	}
+	if held, ok := r.byKey[key]; ok {
+		return held.entity, nil
+	}
+	row := read(r.selectSQL)?
+	if row == nil {
+		return nil, nil
+	}
+	var entity E = row
+	return r.hold(&entity).entity, nil
+}
+
+func (r *MappedTable[E, K]) Attach(source []E) []*E {
+	if r.fault != nil {
+		r.session.rememberFailure(r.fault)
+		return nil
+	}
+	out := make([]*E, 0, len(source))
+	var empty E
+	for i := range source {
+		key := *r.keyOf(&source[i])
+		if existing, ok := r.byKey[key]; ok {
+			out = append(out, existing.entity)
+			continue
+		}
+		entity := source[i]
+		for _, clone := range r.clones {
+			clone(&entity, &empty)
+		}
+		out = append(out, r.hold(&entity).entity)
+	}
+	return out
+}
+
+func (r *MappedTable[E, K]) hold(entity *E) *entityRow[E, K] {
+	if row, ok := r.byPointer[entity]; ok {
+		return row
+	}
+	key := *r.keyOf(entity)
+	if row, ok := r.byKey[key]; ok {
+		return row
+	}
+	row := &entityRow[E, K]{table: r, entity: entity, key: key}
+	row.snapshot()
+	r.byKey[key], r.byPointer[entity] = row, row
+	r.session.updates = append(r.session.updates, row)
+	return row
+}
+
+func (r *MappedTable[E, K]) Add(entity *E) {
+	if r.fault != nil {
+		r.session.rememberFailure(r.fault)
+		return
+	}
+	if _, same := r.byPointer[entity]; same {
+		r.session.rememberFailure(tableFault(r.table.Name, "entity already held by this session"))
+		return
+	}
+	key := *r.keyOf(entity)
+	var zero K
+	if key != zero {
+		if _, dup := r.byKey[key]; dup {
+			r.session.rememberFailure(tableFault(r.table.Name, "key already held by a different entity"))
+			return
+		}
+	}
+	row := &entityRow[E, K]{table: r, entity: entity, key: key}
+	r.byPointer[entity] = row
+	if key != zero {
+		r.byKey[key] = row
+	}
+	r.session.inserts = append(r.session.inserts, row)
+}
+
+func (r *MappedTable[E, K]) Remove(entity *E) {
+	if r.fault != nil {
+		r.session.rememberFailure(r.fault)
+		return
+	}
+	row := r.held(entity)
+	if row == nil {
+		return
+	}
+	if row.removing {
+		return
+	}
+	row.removing = true
+	r.session.deletes = append(r.session.deletes, row)
+}
+
+func (r *MappedTable[E, K]) Touch(entity *E) {
+	if r.fault != nil {
+		r.session.rememberFailure(r.fault)
+		return
+	}
+	if r.version < 0 {
+		return
+	}
+	if row := r.held(entity); row != nil {
+		row.touched = true
+	}
+}
+
+func (r *MappedTable[E, K]) held(entity *E) *entityRow[E, K]? {
+	if row, ok := r.byPointer[entity]; ok {
+		return row
+	}
+	if row, ok := r.byKey[*r.keyOf(entity)]; ok {
+		return row
+	}
+	r.session.rememberFailure(tableFault(r.table.Name, "entity is not held by this session"))
+	return nil
+}
+
+func (row *entityRow[E, K]) snapshot() {
+	next := *row.entity
+	for _, clone := range row.table.clones {
+		clone(&next, &row.saved)
+	}
+	row.saved = next
+}
+
+func (row *entityRow[E, K]) deleted() bool {
+	return row.removed
+}
+
+func presentValue[T any](option *rt.Option[T]) any {
+	if option.Present {
+		return option.Value
+	}
+	return nil
+}
+
+func fieldValue[F any](address *F) any {
+	switch p := any(address).(type) {
+	case *rt.Option[string]:
+		return presentValue(p)
+	case *rt.Option[bool]:
+		return presentValue(p)
+	case *rt.Option[int16]:
+		return presentValue(p)
+	case *rt.Option[int32]:
+		return presentValue(p)
+	case *rt.Option[int64]:
+		return presentValue(p)
+	case *rt.Option[float32]:
+		return presentValue(p)
+	case *rt.Option[float64]:
+		return presentValue(p)
+	case *rt.Option[time.Time]:
+		return presentValue(p)
+	}
+	return *address
+}
+
+func comparableFields(left any, right any) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	switch a := left.(type) {
+	case []byte:
+		b, _ := right.([]byte)
+		return (a == nil) == (b == nil) && bytes.Equal(a, b)
+	case time.Time:
+		b, _ := right.(time.Time)
+		return a.Equal(b)
+	}
+	return left == right
+}
+
+func keyScan[K comparable](src int64) (K, error) {
+	var key sql.Null[K]
+	if err := key.Scan(src); err != nil {
+		return key.V, db.ErrShapeMismatch.Wrap(err)
+	}
+	return key.V, nil
+}

@@ -193,13 +193,13 @@ Each package has a specification under [docs/specs](docs/specs/README.md). These
 | Lifecycle and configuration | `app`, `config` | `app.Run` over one struct; `config.Load[T]` over ordered environment, map, file and remote sources |
 | HTTP core | `web`, `schema`, `validate` | `ServeMux` method patterns, ordered `web.Stage` lists, typed context keys, the closed `web.Reply` union, RFC 9457 problems, `web.Server`, type schemas, field checks |
 | Pages and browser | `view`, `asset`, `frontend/`, `live`, `bus`, `websocket` | HTML as values with escaping and a URL scheme filter; Vite manifest tags; React, Svelte 5, Solid and WASM island adapters; server-sent events; in-process topics; RFC 6455 connections |
-| Data | `db`, `migrate`, `cmd/sqlc-gen-spira` | Pools and transactions for four engines, checked scans, a 256-entry statement cache, reversible migration pairs, generated table types and query functions |
+| Data | `db`, `migrate`, `orm`, `cmd/sqlc-gen-spira` | Pools and transactions for four engines, checked scans, a 256-entry statement cache, reversible migration pairs, entity sessions with identity and version checks, generated table types and query functions |
 | Security and operations | `auth`, `fault`, `meter`, `ops`, `admin` | Argon2id passwords, cookie sessions, bearer and guard stages, a stable public error vocabulary, Prometheus text, guarded `/ops` endpoints, an admin console |
 | Outbound and background | `client`, `resilience`, `cache`, `gateway`, `job` | Typed JSON calls under timeout, retry and a breaker; one-flight LRU cache; reverse proxy; scheduler, queue and chunked batch |
 | Model calls | `ai`, `ai/openai`, `ai/anthropic`, `ai/ollama`, `ai/session`, `ai/rag`, `ai/mcp` | Messages, tools, `ai.Run`, `ai.Collect` stream merge, layers, structured output, OpenAI-compatible, Anthropic and Ollama providers, sessions, retrieval, an MCP client and server mount |
 | Tools | `cmd/spira`, `fault/faulttest` | `spira dev`; the spec-backed fault disclosure test kit |
 
-`orm`, `openapi` and `spira new` are specified but not in the tree yet. Generated code for a table with a `key` imports `orm.Table`, so leave keyed `tables` entries empty until `orm` lands; rename-only entries are safe. The full map from Spring concepts to spira packages, including what spira does not build, is in [scope and lexicon](docs/specs/scope-and-lexicon.md).
+`openapi` and `spira new` are in the tree. `orm` holds identity, change detection and optimistic version checks over the generated table types. The full map from Spring concepts to spira packages, including what spira does not build, is in [scope and lexicon](docs/specs/scope-and-lexicon.md).
 
 ## Documentation
 
