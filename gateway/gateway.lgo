@@ -116,8 +116,26 @@ func routePatterns(host string?, prefix string) []string {
 
 func proxyHandler(px *httputil.ReverseProxy) web.Handler {
 	return func(ctx *web.Context) (web.Reply, error) {
+		if escapesRoute(ctx.Request.URL.EscapedPath()) {
+			return nil, ErrDotSegment.Err()
+		}
 		return web.Delegate{To: withBodyReadInterrupt(px)}, nil
 	}
+}
+
+func escapesRoute(escaped string) bool {
+	for seg := range strings.SplitSeq(escaped, "/") {
+		dec, err := url.PathUnescape(seg)
+		if err != nil {
+			return true
+		}
+		for part := range strings.SplitSeq(dec, "/") {
+			if part == "." || part == ".." {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type bodyReadInterruptKey struct{}

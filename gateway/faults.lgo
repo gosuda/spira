@@ -6,6 +6,8 @@ import (
 
 var ErrBadGateway = fault.New("gateway.upstream_unavailable", fault.Unavailable, "The gateway could not reach an upstream.")
 
+var ErrDotSegment = fault.New("gateway.dot_segment", fault.Invalid, "The request path holds a dot segment.")
+
 func Faults() []*fault.Error {
-	return []*fault.Error{ErrBadGateway}
+	return []*fault.Error{ErrBadGateway, ErrDotSegment}
 }

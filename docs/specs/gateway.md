@@ -65,6 +65,7 @@ func Faults() []*fault.Error
 - Each route stage boundary MUST be settled as in [web](web.md).
 - A route stage MUST read the upstream status from `ctx.Status()` after `next`.
 - The proxy MUST NOT forward a client `Forwarded` header.
+- The proxy MUST refuse a request whose escaped path holds a segment that decodes to `.` or `..`, alone or between encoded slashes, with the `gateway.dot_segment` fault (400), before any upstream sees it. RFC 3986 makes `%2e` equal to `.`, so an upstream that decodes and then removes dot segments would otherwise resolve such a path outside the mounted prefix or the upstream base path. A segment that does not decode MUST be refused the same way.
 
 ### Failure
 
@@ -103,6 +104,7 @@ func Faults() []*fault.Error
 | Code | Kind | Message |
 |---|---|---|
 | `gateway.upstream_unavailable` | unavailable | "The gateway could not reach an upstream." |
+| `gateway.dot_segment` | invalid | "The request path holds a dot segment." |
 
 ## Errors
 
@@ -161,6 +163,7 @@ func Faults() []*fault.Error
 - `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.
 - `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.
 - `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
+- `TestDotSegmentsAreRefusedBeforeAnyUpstream` proves the 400 problem for encoded dot segments in every spelling, with and without `StripPrefix`, and that no upstream receives them.
 
 ## Not in scope
 
