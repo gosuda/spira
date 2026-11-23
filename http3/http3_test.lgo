@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	stdsync "sync"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -1108,19 +1109,26 @@ func TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure(t *testing.T) {
 
 func bindH3CallerSockets(t *testing.T) (net.Listener, net.PacketConn) {
 	t.Helper()
-	packet, perr := net.ListenPacket("udp", "127.0.0.1:0")
-	if perr != nil {
-		t.Fatalf("listen caller UDP: %v", perr)
-		return nil, nil
+	var taken error
+	for range 8 {
+		packet, perr := net.ListenPacket("udp", "127.0.0.1:0")
+		if perr != nil {
+			t.Fatalf("listen caller UDP: %v", perr)
+			return nil, nil
+		}
+		addr := packet.LocalAddr().String()
+		listener, lerr := net.Listen("tcp", addr)
+		if lerr == nil {
+			return listener, packet
+		}
+		if cerr := packet.Close(); cerr != nil || !errors.Is(lerr, syscall.EADDRINUSE) {
+			t.Fatalf("listen caller TCP on %s: %v; close caller UDP: %v", addr, lerr, cerr)
+			return nil, nil
+		}
+		taken = lerr
 	}
-	addr := packet.LocalAddr().String()
-	listener, lerr := net.Listen("tcp", addr)
-	if lerr != nil {
-		cerr := packet.Close()
-		t.Fatalf("listen caller TCP on %s: %v; close caller UDP: %v", addr, lerr, cerr)
-		return nil, nil
-	}
-	return listener, packet
+	t.Fatalf("listen caller TCP: the TCP twin of every drawn UDP port was taken: %v", taken)
+	return nil, nil
 }
 
 func closeH3CallerSockets(t *testing.T, listener net.Listener, packet net.PacketConn) {
