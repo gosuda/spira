@@ -27,6 +27,7 @@ beforeEach(() => {
 			<button type="button" data-live-toggle aria-pressed="false" hidden>Pause live status updates</button>
 			<span id="shop-status">up</span>
 			<div id="admin-sink" sse-swap="instance" hx-swap="none"></div>
+			<table><tbody><tr id="instance-shop"><td>shop</td><td>up</td></tr></tbody></table>
 		</section>
 		<div id="outside-stock"></div>`;
 	document.body.dispatchEvent(new CustomEvent("htmx:load", { bubbles: true }));
@@ -148,4 +149,31 @@ test("resume applies the instance updates paused in the region", () => {
 	toggle.click();
 	expect(toggle.getAttribute("aria-pressed")).toBe("false");
 	expect(fixtureElement("shop-status").textContent).toBe("down");
+});
+
+test("resume replays the bare dashboard row paused in the region", async () => {
+	// happy-dom drops a bare tr parsed through DOMParser, so this asserts the
+	// replay mechanism instead of the DOM: the retained row payload must reach
+	// htmx.swap with the sink swap style when the region resumes.
+	const { default: htmx } = await import("htmx.org");
+	const swapSpy = vi.spyOn(htmx, "swap");
+	try {
+		const toggle = adminToggle();
+		toggle.click();
+		expect(toggle.getAttribute("aria-pressed")).toBe("true");
+		const down =
+			'<tr id="instance-shop" hx-swap-oob="outerHTML"><td>shop</td><td>down</td></tr>';
+		expect(dispatchMessage("admin-sink", "instance", down)).toBe(false);
+		swapSpy.mockClear();
+		toggle.click();
+		expect(toggle.getAttribute("aria-pressed")).toBe("false");
+		const calls = swapSpy.mock.calls.filter(
+			(call) =>
+				typeof call[1] === "string" &&
+				(call[1] as string).includes('id="instance-shop"'),
+		);
+		expect(calls.length).toBe(1);
+	} finally {
+		swapSpy.mockRestore();
+	}
 });
