@@ -116,7 +116,31 @@ func routePatterns(host string?, prefix string) []string {
 
 func proxyHandler(px *httputil.ReverseProxy) web.Handler {
 	return func(ctx *web.Context) (web.Reply, error) {
-		return web.Delegate{To: px}, nil
+		return web.Delegate{To: withBodyReadInterrupt(px)}, nil
+	}
+}
+
+type bodyReadInterruptKey struct{}
+
+// withBodyReadInterrupt lets the relay end a body read that is still blocked
+// when it gives up on the body. net/http holds the body lock for the whole
+// read, and the proxy closes the body before the handler returns, so a read
+// that is never interrupted keeps the answer back until the server read
+// timeout.
+func withBodyReadInterrupt(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		interrupt := func() {
+			if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err != nil {
+				slog.Warn("gateway: cannot interrupt a stalled body read", "error", err)
+			}
+		}
+		next.ServeHTTP(w, req.WithContext(context.WithValue(req.Context(), bodyReadInterruptKey{}, interrupt)))
+	})
+}
+
+func interruptBodyRead(ctx context.Context) {
+	if interrupt, ok := ctx.Value(bodyReadInterruptKey{}).(func()); ok {
+		interrupt()
 	}
 }
 
@@ -250,8 +274,10 @@ func peekEmpty(req *http.Request, wait time.Duration) (bool, io.ReadCloser, erro
 		}
 		return false, req.Body, nil
 	case <-timer.C:
+		interruptBodyRead(req.Context())
 		return false, nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: body of unknown length yielded nothing in %s", wait))
 	case <-req.Context().Done():
+		interruptBodyRead(req.Context())
 		return false, nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: body of unknown length wait ended: %w", req.Context().Err()))
 	}
 }

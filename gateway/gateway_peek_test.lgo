@@ -1,14 +1,18 @@
 package gateway_test
 
 import (
+	"bufio"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/gosuda/spira/gateway"
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
 )
 
 func TestPeekEmptyFailsClosedOnStalledBody(t *testing.T) {
@@ -58,6 +62,45 @@ func TestPeekEmptyPushesBackReadyByte(t *testing.T) {
 	}
 	if string(kept) != "x" {
 		t.Fatalf("pushed-back body holds %q want %q", kept, "x")
+		return
+	}
+}
+
+func TestStalledBodyPeekAnswersWhileTheBodyStaysOpen(t *testing.T) {
+	routes := []gateway.Route{{PathPrefix: "/shop", To: []string{deadUpstream(t)}}}
+	router := web.NewRouter()
+	gateway.Mount(router, routes, resilience.Policy{Timeout: 200 * time.Millisecond})
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	t.Cleanup(func() {
+		if cerr := conn.Close(); cerr != nil {
+			t.Logf("close client connection: %v", cerr)
+		}
+	})
+	if derr := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); derr != nil {
+		t.Fatal(derr)
+		return
+	}
+	head := "POST /shop/order HTTP/1.1\r\nHost: gateway\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n"
+	if _, werr := io.WriteString(conn, head); werr != nil {
+		t.Fatal(werr)
+		return
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+	if err != nil {
+		t.Fatalf("no answer within 3s while the request body stays open: the stalled peek read was never interrupted: %v", err)
+		return
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Logf("close response body: %v", cerr)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502 once the stalled body outlives the relay timeout", resp.StatusCode)
 		return
 	}
 }
