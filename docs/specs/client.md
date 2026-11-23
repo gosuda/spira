@@ -37,7 +37,9 @@ func Faults() []*fault.Error
 
 ### Request
 
-- `New` MUST set `HTTP` to `http.DefaultClient`.
+- `New` MUST set `HTTP` to a fresh `http.Client` whose redirect policy follows a redirect only to the scheme and host of the first request, and stops after ten requests.
+- A redirect to another scheme or host MUST NOT be followed, so caller headers never reach another origin. Go strips only `Authorization`, `Cookie` and the proxy credentials on such a hop, and a caller may carry a key in any header.
+- A redirect that is not followed MUST end the attempt with that redirect answer, so it is a status outside 200 to 299.
 - An omitted `MaxBody` MUST be 1048576 bytes.
 - `Get` MUST call `Send` with method `GET` and no body.
 - `Send` MUST change the method to upper case before it chooses a retry.
@@ -145,6 +147,9 @@ func Faults() []*fault.Error
 - `TestHeadSuccessSkipsDecode` proves that `HEAD` skips decode.
 - `TestNoContentAndResetContentSkipDecode` proves that status 204 and status 205 skip decode.
 - `TestGetEmptyBodyStillADecodeError` proves that an empty `GET` body is a decode error.
+- `TestCrossOriginRedirectIsNotFollowed` proves that a redirect to another host ends as a 302 status fault and that the other host receives no request and no caller header.
+- `TestSameOriginRedirectIsFollowed` proves that a redirect on the same origin is followed with the caller headers.
+- `TestRedirectLoopStopsAfterTenRequests` proves that a redirect loop ends after ten requests as a 302 status fault.
 
 ## Not in scope
 
