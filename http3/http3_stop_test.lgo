@@ -3,6 +3,7 @@ package http3_test
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -13,8 +14,8 @@ import (
 	"logos/sync"
 
 	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/internal/http3peer"
 	"github.com/gosuda/spira/web"
-	qhttp3 "github.com/quic-go/quic-go/http3"
 )
 
 func TestH3StopClosesUDPListener(t *testing.T) {
@@ -72,7 +73,7 @@ func TestH3StopClosesUDPListener(t *testing.T) {
 type drainProbe struct {
 	entered chan struct{}
 	release chan struct{}
-	tr      *qhttp3.Transport
+	tr      http.RoundTripper
 	url     string
 	tcpAddr string
 	srv     *http3.Server
@@ -170,7 +171,7 @@ func TestH3StopShutsTCPWhileH3Drains(t *testing.T) {
 		t.Fatal("server bound no address")
 		return
 	}
-	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
 	defer closeH3Transport(t, tr)
 	p := &drainProbe{entered: entered, release: release, tr: tr, url: "https://" + udpAddr + "/slow", tcpAddr: tcpAddr, srv: s}
 	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -195,7 +196,7 @@ func TestH3StopShutsTCPWhileH3Drains(t *testing.T) {
 
 type deadlineProbe struct {
 	entered chan struct{}
-	tr      *qhttp3.Transport
+	tr      http.RoundTripper
 	url     string
 	srv     *http3.Server
 	stopErr sync.Locked[error]
@@ -227,7 +228,8 @@ func fetchSyncDeadline(ctx context.Context, p *deadlineProbe) error {
 	return nil
 }
 
-func stopSyncAfterEntered(ctx context.Context, p *deadlineProbe) error {
+func stopSyncAfterEntered(ctx context.Context, p *deadlineProbe, endFetch context.CancelFunc) error {
+	defer endFetch()
 	if err := waitH3Entered(ctx, p.entered); err != nil {
 		p.stopErr.WithLock(func(e *error) { *e = err })
 		return nil
@@ -241,9 +243,11 @@ func stopSyncAfterEntered(ctx context.Context, p *deadlineProbe) error {
 }
 
 func driveSyncDeadline(ctx context.Context, p *deadlineProbe) error {
+	fetchCtx, endFetch := context.WithCancel(ctx)
+	defer endFetch()
 	go group (ctx) {
-		go fetchSyncDeadline(ctx, p)
-		go stopSyncAfterEntered(ctx, p)
+		go fetchSyncDeadline(fetchCtx, p)
+		go stopSyncAfterEntered(ctx, p, endFetch)
 	}
 	return nil
 }
@@ -267,7 +271,7 @@ func TestH3StopMeetsCallerDeadline(t *testing.T) {
 		t.Fatal("no UDP bound address")
 		return
 	}
-	tr := &qhttp3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
+	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
 	defer closeH3Transport(t, tr)
 	p := &deadlineProbe{entered: entered, tr: tr, url: "https://" + udpAddr + "/sync", srv: s}
 	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -287,6 +291,130 @@ func TestH3StopMeetsCallerDeadline(t *testing.T) {
 	}
 	if dur > 1500*time.Millisecond {
 		t.Fatalf("Stop blocked %v past the 300ms caller deadline", dur)
+		return
+	}
+}
+
+type h3GraceProbe struct {
+	entered chan struct{}
+	release chan struct{}
+	exited  chan struct{}
+	stopped chan struct{}
+}
+
+func stopH3AtGrace(ctx context.Context, s *http3.Server, p *h3GraceProbe) error {
+	defer close(p.stopped)
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		return fmt.Errorf("HTTP/3 handler did not enter: %w", err)
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	started := time.Now()
+	err := s.Stop(stopCtx)
+	if elapsed := time.Since(started); elapsed < s.ShutdownGrace {
+		if err != nil {
+			return fmt.Errorf("Stop returned in %v before ShutdownGrace %v: %w", elapsed, s.ShutdownGrace, err)
+		}
+		return fmt.Errorf("Stop reported success in %v before ShutdownGrace %v", elapsed, s.ShutdownGrace)
+	}
+	if stopCtx.Err() != nil {
+		return fmt.Errorf("Stop reached the caller deadline: %w", stopCtx.Err())
+	}
+	if err == nil {
+		return fmt.Errorf("Stop reported success after ShutdownGrace %v with an active HTTP/3 request", s.ShutdownGrace)
+	}
+	return nil
+}
+
+func releaseH3AfterGraceStop(ctx context.Context, p *h3GraceProbe) error {
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		close(p.release)
+		return fmt.Errorf("HTTP/3 handler did not enter: %w", err)
+	}
+	const fallback = 5 * time.Second
+	waitCtx, cancel := context.WithTimeout(ctx, fallback)
+	defer cancel()
+	stopErr := waitH3Entered(waitCtx, p.stopped)
+	close(p.release)
+	exitErr := waitH3Entered(ctx, p.exited)
+	if stopErr != nil {
+		return fmt.Errorf("Stop still waiting after %v with the HTTP/3 handler held: %w", fallback, stopErr)
+	}
+	if exitErr != nil {
+		return fmt.Errorf("HTTP/3 handler did not exit after release: %w", exitErr)
+	}
+	return nil
+}
+
+func TestH3StopMeetsShutdownGrace(t *testing.T) {
+	p := &h3GraceProbe{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		exited:  make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+	r := web.NewRouter()
+	r.Handle("GET", "/stuck", func(_ *web.Context) (web.Reply, error) {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		close(p.entered)
+		defer close(p.exited)
+		select {
+		case <-p.release:
+		case <-releaseCtx.Done():
+			return nil, releaseCtx.Err()
+		}
+		return web.Empty{}, nil
+	})
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 250*time.Millisecond)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	addr := s.BoundUDPAddrForTest()
+	if addr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
+	defer closeH3Transport(t, tr)
+	url := "https://" + addr + "/stuck"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := func() error {
+		go group (ctx) {
+			go fetchH3Stuck(ctx, tr, url)
+			go stopH3AtGrace(ctx, s, p)
+			go releaseH3AfterGraceStop(ctx, p)
+		}
+		return nil
+	}(); err != nil {
+		t.Fatal(err)
+		return
+	}
+}
+
+func TestH3StopBeforeStartReturnsNil(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, H3: true}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop before Start: %v", err)
+		return
+	}
+	if got := s.BoundTCPAddrForTest(); got != "" {
+		t.Fatalf("TCP listener %q present after Stop before Start", got)
+		return
+	}
+	if got := s.BoundUDPAddrForTest(); got != "" {
+		t.Fatalf("UDP listener %q present after Stop before Start", got)
 		return
 	}
 }

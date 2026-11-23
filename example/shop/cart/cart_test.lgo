@@ -1,0 +1,264 @@
+package cart_test
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/example/shop/cart"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+
+	_ "modernc.org/sqlite"
+)
+
+func openPool(t *testing.T) *db.Pool? {
+	t.Helper()
+	key := strings.NewReplacer("/", "_").Replace(t.Name())
+	pool, err := db.Open("sqlite", fmt.Sprintf("file:spira_cart_%s?mode=memory&cache=shared", key))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatalf("open: no pool")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+		return nil
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+		return nil
+	}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+		return nil
+	}
+	seedProducts(t, pool)
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func seedProducts(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	rows := []string{
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'Widget', 1299, 10, '2026-01-02 10:00:00')",
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (2, 'Gadget', 2500, 5, '2026-01-03 10:00:00')",
+	}
+	for _, q := range rows {
+		if _, err := pool.ExecContext(t.Context(), q); err != nil {
+			t.Fatalf("seed: %v", err)
+			return
+		}
+	}
+}
+
+func testRouter(pool *db.Pool) *web.Router {
+	r := web.NewRouter()
+	r.Layout = layoutPage()
+	feature := &cart.Feature{DB: pool}
+	feature.Register(r)
+	return r
+}
+
+func layoutPage() func(ctx *web.Context, p web.Page) view.Node {
+	return func(ctx *web.Context, p web.Page) view.Node {
+		return view.Html(view.Head(view.Title(view.T(p.Title))), view.Body(p.Body))
+	}
+}
+
+type formCall struct {
+	values  url.Values
+	hx      bool
+	cookies []*http.Cookie
+}
+
+func postForm(t *testing.T, r *web.Router, target string, call formCall) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(call.values.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if call.hx {
+		req.Header.Set("HX-Request", "true")
+	}
+	for _, c := range call.cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func getWith(t *testing.T, r *web.Router, target string, cookies []*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func addValues(product string, quantity string) url.Values {
+	return url.Values{"product_id": []string{product}, "quantity": []string{quantity}}
+}
+
+func TestAddItemValidationRejectsNegativeQuantity(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := postForm(t, testRouter(pool), "/cart/items", formCall{values: addValues("1", "-1")})
+	if rec.Code != 422 {
+		t.Fatalf("status = %d, want 422", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "quantity") {
+		t.Fatalf("body lacks the field name: %q", body)
+	}
+	if !strings.Contains(body, "between 1 and 99") {
+		t.Fatalf("body lacks the field message: %q", body)
+	}
+}
+
+func TestAddItemValidationRejectsUnknownProduct(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := postForm(t, testRouter(pool), "/cart/items", formCall{values: addValues("999", "1")})
+	if rec.Code != 422 {
+		t.Fatalf("status = %d, want 422", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "product_id") {
+		t.Fatalf("body lacks the product field message")
+	}
+}
+
+func TestAddItemHtmxReturnsFragmentAndTrigger(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := postForm(t, testRouter(pool), "/cart/items", formCall{values: addValues("1", "2"), hx: true})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "Added") {
+		t.Fatalf("fragment lacks the confirmation")
+	}
+	if trigger := rec.Header().Get("HX-Trigger"); !strings.Contains(trigger, "cart-updated") {
+		t.Fatalf("HX-Trigger = %q, want the cart-updated event", trigger)
+	}
+	if len(rec.Result().Cookies()) == 0 {
+		t.Fatalf("response sets no cart cookie")
+	}
+}
+
+func TestAddItemPlainPostRedirects(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := postForm(t, testRouter(pool), "/cart/items", formCall{values: addValues("1", "1")})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rec.Code)
+		return
+	}
+	if loc := rec.Header().Get("Location"); loc != "/cart" {
+		t.Fatalf("Location = %q, want /cart", loc)
+	}
+}
+
+func TestCartPageShowsAddedItems(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	router := testRouter(pool)
+	added := postForm(t, router, "/cart/items", formCall{values: addValues("1", "1")})
+	cookies := added.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatalf("add sets no cart cookie")
+		return
+	}
+	postForm(t, router, "/cart/items", formCall{values: addValues("1", "2"), cookies: cookies})
+	rec := getWith(t, router, "/cart", cookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cart status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Widget") {
+		t.Fatalf("cart page lacks the added product")
+	}
+	if !strings.Contains(body, "x 3") {
+		t.Fatalf("cart page lacks the summed quantity")
+	}
+	if !strings.Contains(body, "Cart (3)") {
+		t.Fatalf("cart page lacks the badge fallback count")
+	}
+	if !strings.Contains(body, `entry="example/shop/cart/islands/badge.svelte"`) {
+		t.Fatalf("cart page lacks the badge island")
+	}
+}
+
+func TestRemoveItem(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	router := testRouter(pool)
+	added := postForm(t, router, "/cart/items", formCall{values: addValues("2", "1")})
+	cookies := added.Result().Cookies()
+	removed := postForm(t, router, "/cart/items/1/remove", formCall{values: url.Values{}, hx: true, cookies: cookies})
+	if removed.Code != http.StatusOK {
+		t.Fatalf("remove status = %d, want 200", removed.Code)
+		return
+	}
+	if trigger := removed.Header().Get("HX-Trigger"); !strings.Contains(trigger, "cart-updated") {
+		t.Fatalf("HX-Trigger = %q, want the cart-updated event", trigger)
+	}
+	rec := getWith(t, router, "/cart", cookies)
+	if !strings.Contains(rec.Body.String(), "empty") {
+		t.Fatalf("cart still lists the removed item")
+	}
+}
+
+func TestCountAPIReportsSummedQuantity(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	router := testRouter(pool)
+	added := postForm(t, router, "/cart/items", formCall{values: addValues("1", "2")})
+	cookies := added.Result().Cookies()
+	postForm(t, router, "/cart/items", formCall{values: addValues("2", "1"), cookies: cookies})
+	rec := getWith(t, router, "/api/cart/count", cookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("count status = %d, want 200", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), `"count":3`) {
+		t.Fatalf("count body = %q, want the summed quantity 3", rec.Body.String())
+	}
+}

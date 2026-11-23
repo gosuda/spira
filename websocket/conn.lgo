@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	stdsync "sync"
 	"time"
 	"unicode/utf8"
 
@@ -32,10 +34,12 @@ type Config struct {
 type Conn struct {
 	conn net.Conn
 	reader *bufio.Reader
-	writer *bufio.Writer
+	writer *bufio.Writer?
+	stream *connectStream?
 	engine *engine
 	subprotocol string
 	guard sync.Locked[connGuard]
+	writes sync.Locked[struct{}]
 }
 
 type connGuard struct {
@@ -62,16 +66,217 @@ func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error)
 		writeHandshakeError(w, err)
 		return nil, ErrHandshakeFailed.Wrap(err)
 	}
+	sub, err := handshakeOptions(w, r, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return serveUpgrade(w, r, sub, limitOf(cfg))
+}
+
+func handshakeOptions(w http.ResponseWriter, r *http.Request, cfg Config) (string, error) {
 	if err := checkOrigin(r, cfg.AllowedOrigins); err != nil {
 		writeHandshakeError(w, err)
-		return nil, ErrForbiddenOrigin.Wrap(err)
+		return "", ErrForbiddenOrigin.Wrap(err)
 	}
 	sub, err := pickSubprotocol(r.Header.Values("Sec-WebSocket-Protocol"), cfg.Subprotocols)
 	if err != nil {
 		writeHandshakeError(w, err)
-		return nil, ErrHandshakeFailed.Wrap(err)
+		return "", ErrHandshakeFailed.Wrap(err)
 	}
-	return serveUpgrade(w, r, sub, limitOf(cfg))
+	return sub, nil
+}
+
+// Serve runs session in the HTTP handler. Return from the handler after Serve to finish an HTTP/2 or HTTP/3 stream.
+func Serve(w http.ResponseWriter, r *http.Request, cfg Config, session func(*Conn) error) (err error) {
+	if r.ProtoMajor != 2 && r.ProtoMajor != 3 {
+		c, err := Upgrade(w, r, cfg)
+		if err != nil {
+			return err
+		}
+		if c == nil {
+			return ErrHandshakeFailed.Err()
+		}
+		return runSession(c, session)
+	}
+	if err := checkExtendedConnect(r); err != nil {
+		writeHandshakeError(w, err)
+		return ErrHandshakeFailed.Wrap(err)
+	}
+	sub, err := handshakeOptions(w, r, cfg)
+	if err != nil {
+		return err
+	}
+	limit := limitOf(cfg)
+	stream := newConnectStream(w, r)
+	defer func() { err = errors.Join(err, stream.finish()) }()
+	if err := stream.accept(sub); err != nil {
+		return fmt.Errorf("websocket: accept extended CONNECT: %w", err)
+	}
+	reader := bufio.NewReader(stream)
+	c := &Conn{conn: stream, reader: reader, stream: stream, subprotocol: sub, engine: newEngine(reader, limit, true)}
+	return runSession(c, session)
+}
+
+func runSession(c *Conn, session func(*Conn) error) (err error) {
+	defer func() { err = errors.Join(err, c.Close()) }()
+	return session(c)
+}
+
+type connectStream struct {
+	body io.ReadCloser
+	writer http.ResponseWriter
+	controller *http.ResponseController
+	local net.Addr
+	remote streamAddr
+	state sync.Locked[connectStreamState]
+	reads sync.Locked[struct{}]
+	writes sync.Locked[struct{}]
+}
+
+type connectStreamState struct {
+	closed bool
+	writing bool
+}
+
+type streamAddr struct {
+	network string
+	address string
+}
+
+func (a streamAddr) Network() string { return a.network }
+func (a streamAddr) String() string { return a.address }
+
+func newConnectStream(w http.ResponseWriter, r *http.Request) *connectStream {
+	local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	network := "tcp"
+	if r.ProtoMajor == 3 {
+		network = "udp"
+	}
+	return &connectStream{
+		body: r.Body, writer: w, controller: http.NewResponseController(w),
+		local: local, remote: streamAddr{network: network, address: r.RemoteAddr},
+	}
+}
+
+func (s *connectStream) accept(subprotocol string) error {
+	if err := s.controller.EnableFullDuplex(); err != nil {
+		return err
+	}
+	if err := s.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	h := s.writer.Header()
+	for _, name := range [...]string{"Connection", "Upgrade", "Content-Length", "Transfer-Encoding", "Sec-WebSocket-Accept", "Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol"} {
+		h.Del(name)
+	}
+	if subprotocol != "" {
+		h.Set("Sec-WebSocket-Protocol", subprotocol)
+	}
+	s.writer.WriteHeader(http.StatusOK)
+	return s.controller.Flush()
+}
+
+func (s *connectStream) Read(p []byte) (int, error) {
+	var n int
+	var err error
+	s.reads.WithLock(func(_ *struct{}) {
+		var closed bool
+		s.state.WithLock(func(st *connectStreamState) { closed = st.closed })
+		if closed {
+			err = net.ErrClosed
+			return
+		}
+		n, err = s.body.Read(p)
+	})
+	return n, err
+}
+
+func (s *connectStream) Write(p []byte) (int, error) {
+	return s.write(p, nil)
+}
+
+func (s *connectStream) write(first []byte, last []byte) (int, error) {
+	var n int
+	var err error
+	s.writes.WithLock(func(_ *struct{}) {
+		if !s.beginWrite() {
+			err = net.ErrClosed
+			return
+		}
+		defer s.state.WithLock(func(st *connectStreamState) { st.writing = false })
+		n, err = s.writer.Write(first)
+		if err == nil {
+			err = s.flushWrite(last)
+		}
+	})
+	return n, err
+}
+
+func (s *connectStream) beginWrite() bool {
+	var open bool
+	s.state.WithLock(func(st *connectStreamState) {
+		open = !st.closed
+		st.writing = open
+	})
+	return open
+}
+
+func (s *connectStream) flushWrite(last []byte) error {
+	if len(last) != 0 {
+		if _, err := s.writer.Write(last); err != nil {
+			return err
+		}
+	}
+	return s.controller.Flush()
+}
+
+func (s *connectStream) Close() error {
+	var err error
+	s.state.WithLock(func(st *connectStreamState) {
+		if st.closed {
+			return
+		}
+		st.closed = true
+		if st.writing {
+			err = s.controller.SetWriteDeadline(time.Now())
+		}
+		err = errors.Join(err, s.body.Close())
+	})
+	return err
+}
+
+func (s *connectStream) finish() error {
+	err := s.Close()
+	s.writes.WithLock(func(_ *struct{}) {})
+	s.reads.WithLock(func(_ *struct{}) {})
+	return err
+}
+
+func (s *connectStream) LocalAddr() net.Addr { return s.local }
+func (s *connectStream) RemoteAddr() net.Addr { return s.remote }
+
+func (s *connectStream) SetDeadline(deadline time.Time) error {
+	return errors.Join(s.SetReadDeadline(deadline), s.SetWriteDeadline(deadline))
+}
+
+func (s *connectStream) SetReadDeadline(deadline time.Time) error {
+	var err error = net.ErrClosed
+	s.state.WithLock(func(st *connectStreamState) {
+		if !st.closed {
+			err = s.controller.SetReadDeadline(deadline)
+		}
+	})
+	return err
+}
+
+func (s *connectStream) SetWriteDeadline(deadline time.Time) error {
+	var err error = net.ErrClosed
+	s.state.WithLock(func(st *connectStreamState) {
+		if !st.closed {
+			err = s.controller.SetWriteDeadline(deadline)
+		}
+	})
+	return err
 }
 
 func limitOf(cfg Config) int64 {
@@ -171,16 +376,32 @@ func ParseClose(payload []byte) (uint16, string, error) {
 	return parseClose(payload)
 }
 
-func (c *Conn) Next(ctx context.Context) (Kind, []byte, error) {
+func (c *Conn) Next(ctx context.Context) (messageKind Kind, message []byte, err error) {
 	if c.isClosed() {
 		return 0, nil, ErrClosed.Err()
 	}
+	if c.stream != nil && ctx.Done() != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+		defer c.joinStreamCancellation(ctx, &err)()
+	}
 	if err := c.readDeadline(ctx); err != nil {
+		if c.stream != nil && ctx.Err() != nil {
+			return 0, nil, errors.Join(ctx.Err(), c.closeConn())
+		}
 		return 0, nil, err
 	}
+	return c.nextMessage(ctx)
+}
+
+func (c *Conn) nextMessage(ctx context.Context) (Kind, []byte, error) {
 	for {
 		k, payload, err := c.engine.next()
 		if err != nil {
+			if c.stream != nil && ctx.Err() != nil {
+				return 0, nil, errors.Join(ctx.Err(), c.closeConn())
+			}
 			return 0, nil, c.failClosed(ctx, err)
 		}
 		if k == kindClose {
@@ -300,36 +521,64 @@ func (c *Conn) sendControl(ctx context.Context, opcode uint8, payload []byte) er
 	return c.sendFrame(ctx, opcode, payload)
 }
 
-func (c *Conn) sendFrame(ctx context.Context, opcode uint8, payload []byte) error {
-	if c.isClosed() {
-		return ErrClosed.Err()
-	}
-	if err := c.writeDeadline(ctx); err != nil {
-		return err
+func (c *Conn) sendFrame(ctx context.Context, opcode uint8, payload []byte) (err error) {
+	if c.stream != nil && ctx.Done() != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		defer c.joinStreamCancellation(ctx, &err)()
 	}
 	var werr error
-	c.guard.WithLock(func(g *connGuard) {
-		if g.closed {
-			werr = ErrClosed.Err()
-			return
+	c.writes.WithLock(func(_ *struct{}) {
+		werr = c.writeDeadline(ctx)
+		if werr == nil {
+			werr = c.writeLocked(opcode, payload)
 		}
-		werr = c.writeLocked(opcode, payload)
 	})
-	if werr != nil {
-		return closedErr(werr)
+	if werr != nil && c.stream != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return nil
+	return closedErr(werr)
+}
+
+func (c *Conn) joinStreamCancellation(ctx context.Context, operationErr *error) func() {
+	var cleanup stdsync.WaitGroup
+	var closeErr error
+	cleanup.Add(1)
+	stop := context.AfterFunc(ctx, func() {
+		defer cleanup.Done()
+		closeErr = c.closeConn()
+	})
+	return func() {
+		if stop() {
+			cleanup.Done()
+		}
+		cleanup.Wait()
+		if closeErr != nil {
+			*operationErr = errors.Join(*operationErr, closeErr)
+		}
+	}
 }
 
 func (c *Conn) writeLocked(opcode uint8, payload []byte) error {
 	out := appendHeader(nil, header{fin: true, opcode: opcode, length: int64(len(payload))})
-	if _, err := c.writer.Write(out); err != nil {
+	if stream := c.stream; stream != nil {
+		if _, err := stream.write(out, payload); err != nil {
+			return fmt.Errorf("websocket: write stream frame: %w", err)
+		}
+		return nil
+	}
+	writer := c.writer
+	if writer == nil {
+		panic("websocket: missing hijacked frame writer")
+	}
+	if _, err := writer.Write(out); err != nil {
 		return fmt.Errorf("websocket: write frame header: %w", err)
 	}
-	if _, err := c.writer.Write(payload); err != nil {
+	if _, err := writer.Write(payload); err != nil {
 		return fmt.Errorf("websocket: write frame payload: %w", err)
 	}
-	if err := c.writer.Flush(); err != nil {
+	if err := writer.Flush(); err != nil {
 		return fmt.Errorf("websocket: flush frame: %w", err)
 	}
 	return nil
@@ -389,9 +638,11 @@ func (c *Conn) writeDeadline(ctx context.Context) error {
 	if c.isClosed() {
 		return ErrClosed.Err()
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Time{}
+	// A stream write timeout can cancel the request context. Let the operation
+	// context record its cause before its callback interrupts the stream write.
+	var deadline time.Time
+	if c.stream == nil {
+		deadline, _ = ctx.Deadline()
 	}
 	if err := c.conn.SetWriteDeadline(deadline); err != nil {
 		return closedErr(fmt.Errorf("websocket: set write deadline: %w", err))

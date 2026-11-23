@@ -1,0 +1,561 @@
+package http3
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/quic-go/qpack"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
+	"logos/rt"
+)
+
+type h3OwnedTestPeer struct {
+	server  *h3OwnedServer
+	conn    *quic.Conn
+	control *bufio.Reader
+}
+
+func openH3OwnedTestPeer(ctx context.Context, t *testing.T, handler http.Handler) (*h3OwnedTestPeer?, error) {
+	serverTLS, clientTLS := h3ControlTestTLS()?
+	serverTLS.NextProtos = []string{"h2"}
+	fallback := serverTLS.Clone()
+	serverTLS.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) { return fallback, nil }
+	clientTLS.NextProtos = []string{"h2", "h3"}
+	pc := net.ListenPacket("udp4", "127.0.0.1:0")?
+	server := newH3OwnedServer(handler, serverTLS)
+	workers, _ := rt.NewGroup(context.WithoutCancel(ctx), 0)
+	workers.Go(func(_ context.Context) error {
+		err := server.Serve(pc)
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	})
+	t.Cleanup(func() { closeH3OwnedTestServer(t, server, pc, workers) })
+
+	conn := quic.DialAddr(ctx, pc.LocalAddr().String(), clientTLS, &quic.Config{EnableDatagrams: true})?
+	t.Cleanup(func() { closeH3RequestTestConn(t, conn) })
+	state := conn.ConnectionState()
+	if state.TLS.NegotiatedProtocol != "h3" || state.TLS.Version != tls.VersionTLS13 || state.SupportsDatagrams.Remote || state.Used0RTT {
+		return nil, errors.New("unexpected negotiated QUIC capabilities")
+	}
+	if len(fallback.NextProtos) != 1 || fallback.NextProtos[0] != "h2" || serverTLS.NextProtos[0] != "h2" {
+		return nil, errors.New("server modified caller TLS config")
+	}
+	control := readH3OwnedServerSettings(ctx, conn)?
+	if control == nil {
+		return nil, errors.New("missing server control reader")
+	}
+	return &h3OwnedTestPeer{server: server, conn: conn, control: control}, nil
+}
+
+func closeH3OwnedTestServer(t *testing.T, server *h3OwnedServer, pc net.PacketConn, workers *rt.Group) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	closePacket := func() {
+		if err := pc.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("close packet connection: %v", err)
+		}
+	}
+	stop := context.AfterFunc(ctx, closePacket)
+	defer stop()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Errorf("shutdown owned server: %v", err)
+	}
+	closePacket()
+	if err := workers.Wait(); err != nil {
+		t.Errorf("serve HTTP/3: %v", err)
+	}
+}
+
+func readH3OwnedServerSettings(ctx context.Context, conn *quic.Conn) (*bufio.Reader?, error) {
+	stream := conn.AcceptUniStream(ctx)?
+	deadline, _ := ctx.Deadline()
+	stream.SetReadDeadline(deadline)?
+	reader := bufio.NewReader(stream)
+	kind := quicvarint.Read(reader)?
+	frame := readH3FrameHeader(reader)?
+	if kind != 0 || frame.kind != 4 || frame.length > 64 {
+		return nil, errors.New("missing server SETTINGS on the control stream")
+	}
+	var payload [64]byte
+	io.ReadFull(reader, payload[:frame.length])?
+	settings := decodeH3Settings(payload[:frame.length])?
+	if !settings.enableConnectProtocol || settings.enableDatagram || settings.maxFieldSectionSize != http.DefaultMaxHeaderBytes {
+		return nil, fmt.Errorf("unexpected server SETTINGS: %+v", settings)
+	}
+	return reader, nil
+}
+
+func (p *h3OwnedTestPeer) sendSettings(ctx context.Context, t *testing.T, payload []byte) error {
+	wire := appendH3FrameHeader([]byte{0}, 4, uint64(len(payload)))
+	return p.sendControl(ctx, t, append(wire, payload...))
+}
+
+func (p *h3OwnedTestPeer) sendControl(ctx context.Context, t *testing.T, wire []byte) error {
+	stream := p.conn.OpenUniStreamSync(ctx)?
+	t.Cleanup(func() {
+		closeH3RequestTestConn(t, p.conn)
+		if err := stream.Close(); err != nil {
+			t.Errorf("close peer control stream: %v", err)
+		}
+	})
+	deadline, _ := ctx.Deadline()
+	stream.SetWriteDeadline(deadline)?
+	_, err := stream.Write(wire)
+	return err
+}
+
+func (p *h3OwnedTestPeer) sendHeaders(ctx context.Context, headers []byte) (*quic.Stream?, error) {
+	stream := p.conn.OpenStreamSync(ctx)?
+	deadline, _ := ctx.Deadline()
+	stream.SetDeadline(deadline)?
+	stream.Write(headers)?
+	return stream, nil
+}
+
+func TestH3OwnedServerGETAndExtendedCONNECT(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Date"] = nil
+		if r.Method == http.MethodGet {
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				t.Errorf("read GET body: %v", err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if err := respondH3OwnedTunnel(w, r); err != nil {
+			t.Errorf("serve extended CONNECT: %v", err)
+		}
+	})
+	peer, err := openH3OwnedTestPeer(ctx, t, handler)
+	if err != nil {
+		t.Fatalf("open HTTP/3 peer: %v", err)
+		return
+	}
+	if peer == nil {
+		t.Fatal("open HTTP/3 peer returned nil")
+		return
+	}
+	if err := driveH3OwnedGETAndTunnel(ctx, t, peer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func driveH3OwnedGETAndTunnel(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer) error {
+	peer.sendSettings(ctx, t, nil)?
+	get := peer.sendHeaders(ctx, h3StreamTestHeaders(t, h3TestRequestFields()))?
+	if get == nil {
+		return errors.New("missing GET stream")
+	}
+	get.Close()?
+	response := h3StreamTestResponse(t, get)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	h3ExpectNoResponseFrames(t, response)
+
+	connect := peer.sendHeaders(ctx, h3StreamTestHeaders(t, []qpack.HeaderField{
+		{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: "websocket"},
+		{Name: ":scheme", Value: "https"}, {Name: ":authority", Value: "example.com"}, {Name: ":path", Value: "/tunnel"},
+	}))?
+	if connect == nil {
+		return errors.New("missing CONNECT stream")
+	}
+	readH3OwnedTunnelStatus(connect)?
+	connect.Write([]byte("\x00\x04ping"))?
+	connect.Close()?
+	response = h3StreamTestResponse(t, connect)
+	h3ExpectResponseData(t, response, "pong")
+	h3ExpectNoResponseFrames(t, response)
+	return nil
+}
+
+func respondH3OwnedTunnel(w http.ResponseWriter, r *http.Request) error {
+	if r.Proto != "HTTP/3.0" || r.Method != http.MethodConnect || r.Header.Get(":protocol") != "websocket" || r.URL.Path != "/tunnel" {
+		return errors.New("handler did not receive an extended CONNECT request")
+	}
+	controller := http.NewResponseController(w)
+	controller.EnableFullDuplex()?
+	w.WriteHeader(http.StatusOK)
+	controller.Flush()?
+	data := io.ReadAll(r.Body)?
+	if string(data) != "ping" {
+		return fmt.Errorf("CONNECT DATA = %q, want ping", data)
+	}
+	_, err := w.Write([]byte("pong"))
+	return err
+}
+
+func readH3OwnedTunnelStatus(stream *quic.Stream) error {
+	reader := quicvarint.NewReader(stream)
+	frame := readH3FrameHeader(reader)?
+	if frame.kind != 1 || frame.length > 64 {
+		return errors.New("missing flushed CONNECT response HEADERS")
+	}
+	var payload [64]byte
+	io.ReadFull(stream, payload[:frame.length])?
+	next := qpack.NewDecoder().Decode(payload[:frame.length])
+	status := next()?
+	if status.Name != ":status" || status.Value != "200" {
+		return fmt.Errorf("CONNECT response status = %+v, want 200", status)
+	}
+	return nil
+}
+
+func TestH3OwnedServerPeerSettingsGateAndResponseLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	dispatched := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case dispatched <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		w.Header()["Date"] = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
+	peer, err := openH3OwnedTestPeer(ctx, t, handler)
+	if err != nil {
+		t.Fatalf("open HTTP/3 peer: %v", err)
+		return
+	}
+	if peer == nil {
+		t.Fatal("open HTTP/3 peer returned nil")
+		return
+	}
+	if err := checkH3OwnedPeerSettings(ctx, t, peer, dispatched); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkH3OwnedPeerSettings(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer, dispatched <-chan struct{}) error {
+	stream := peer.sendHeaders(ctx, h3StreamTestHeaders(t, h3TestRequestFields()))?
+	if stream == nil {
+		return errors.New("missing request stream")
+	}
+	stream.Close()?
+	stream.SetReadDeadline(time.Now().Add(150 * time.Millisecond))?
+	var data [1]byte
+	if _, err := stream.Read(data[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("request spoke before peer SETTINGS: %w", err)
+	}
+	select {
+	case <-dispatched:
+		return errors.New("request reached the handler before peer SETTINGS")
+	default:
+	}
+	deadline, _ := ctx.Deadline()
+	stream.SetReadDeadline(deadline)?
+	// :status alone costs 42 bytes, including field overhead.
+	peer.sendSettings(ctx, t, []byte{6, 41})?
+	if err := awaitH3OwnedSignal(ctx, dispatched); err != nil {
+		return fmt.Errorf("request did not resume after SETTINGS: %w", err)
+	}
+	_, err := stream.Read(data[:])
+	if reset, ok := errors.AsType[*quic.StreamError](err); !ok || !reset.Remote || reset.ErrorCode != 0x10c {
+		return fmt.Errorf("response ignoring peer field-section limit: %w", err)
+	}
+	return nil
+}
+
+func TestH3OwnedServerRejectsInvalidPeerSettings(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("invalid SETTINGS allowed handler dispatch")
+	})
+	peer, err := openH3OwnedTestPeer(ctx, t, handler)
+	if err != nil {
+		t.Fatalf("open HTTP/3 peer: %v", err)
+		return
+	}
+	if peer == nil {
+		t.Fatal("open HTTP/3 peer returned nil")
+		return
+	}
+	if err := rejectH3OwnedInvalidSettings(ctx, t, peer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rejectH3OwnedInvalidSettings(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer) error {
+	stream := peer.sendHeaders(ctx, h3StreamTestHeaders(t, h3TestRequestFields()))?
+	if stream == nil {
+		return errors.New("missing request stream")
+	}
+	stream.Close()?
+	peer.sendSettings(ctx, t, []byte{6, 41, 6, 42})?
+	closed := peer.conn.Context()
+	select {
+	case <-closed.Done():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	cause := context.Cause(closed)
+	if failure, ok := errors.AsType[*quic.ApplicationError](cause); !ok || !failure.Remote || failure.ErrorCode != 0x109 {
+		return fmt.Errorf("duplicate setting did not result in H3_SETTINGS_ERROR: %w", cause)
+	}
+	return peer.server.Shutdown(ctx)
+}
+
+func TestH3OwnedServerJoinsPeerThatClosesBeforeSettings(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	peer, err := openH3OwnedTestPeer(ctx, t, http.DefaultServeMux)
+	if err != nil {
+		t.Fatalf("open HTTP/3 peer: %v", err)
+		return
+	}
+	if peer == nil {
+		t.Fatal("open HTTP/3 peer returned nil")
+		return
+	}
+	if err := closeH3OwnedPeerBeforeSettings(ctx, t, peer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func closeH3OwnedPeerBeforeSettings(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer) error {
+	peer.sendControl(ctx, t, []byte{0, 4, 1})?
+	peer.conn.CloseWithError(0x100, "")?
+	stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return peer.server.Shutdown(stopCtx)
+}
+
+func TestH3OwnedServerConcurrentShutdownSendsGOAWAYBeforeDrain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/late" {
+			t.Error("dispatched a stream opened after GOAWAY")
+			return
+		}
+		close(entered)
+		select {
+		case <-release:
+			w.Header()["Date"] = nil
+			w.WriteHeader(http.StatusNoContent)
+		case <-r.Context().Done():
+			t.Error("shutdown canceled the running handler before release")
+		}
+	})
+	peer, err := openH3OwnedTestPeer(ctx, t, handler)
+	if err != nil {
+		t.Fatalf("open HTTP/3 peer: %v", err)
+		return
+	}
+	if peer == nil {
+		t.Fatal("open HTTP/3 peer returned nil")
+		return
+	}
+	if err := driveH3OwnedDrain(ctx, t, peer, h3OwnedDrainProbe{entered: entered, release: release}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type h3OwnedDrainProbe struct {
+	entered <-chan struct{}
+	release chan struct{}
+}
+
+func driveH3OwnedDrain(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer, probe h3OwnedDrainProbe) error {
+	peer.sendSettings(ctx, t, nil)?
+	first := peer.sendHeaders(ctx, h3StreamTestHeaders(t, h3TestRequestFields()))?
+	if first == nil {
+		return errors.New("missing first request stream")
+	}
+	first.Close()?
+	awaitH3OwnedSignal(ctx, probe.entered)?
+	results := make(chan error, 2)
+	workers, _ := rt.NewGroup(ctx, 0)
+	for range 2 {
+		workers.Go(func(_ context.Context) error {
+			err := peer.server.Shutdown(ctx)
+			select {
+			case results <- err:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}
+	defer workers.Wait()?
+	stopPeer := context.AfterFunc(ctx, func() { _ = peer.conn.CloseWithError(0x100, "") })
+	defer stopPeer()
+	if err := expectH3OwnedGOAWAY(peer.control, uint64(first.StreamID()+4)); err != nil {
+		return err
+	}
+	rejectH3OwnedLateRequest(ctx, t, peer)?
+	select {
+	case err := <-results:
+		return fmt.Errorf("Shutdown returned with an admitted handler blocked: %w", err)
+	default:
+	}
+	close(probe.release)
+	response := h3StreamTestResponse(t, first)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	peer.conn.CloseWithError(0x100, "")?
+	for range 2 {
+		select {
+		case err := <-results:
+			if err != nil {
+				return fmt.Errorf("Shutdown after drain: %w", err)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return peer.server.Shutdown(ctx)
+}
+
+func expectH3OwnedGOAWAY(reader *bufio.Reader, want uint64) error {
+	frame := readH3FrameHeader(reader)?
+	if frame.kind != 7 || frame.length == 0 || frame.length > 8 {
+		return fmt.Errorf("invalid GOAWAY frame: %+v", frame)
+	}
+	var payload [8]byte
+	io.ReadFull(reader, payload[:frame.length])?
+	id, used := quicvarint.Parse(payload[:frame.length])?
+	if id != want || uint64(used) != frame.length {
+		return fmt.Errorf("GOAWAY ID = %d, want %d", id, want)
+	}
+	return nil
+}
+
+func rejectH3OwnedLateRequest(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer) error {
+	fields := h3TestRequestFields()
+	fields[3].Value = "/late"
+	late := peer.sendHeaders(ctx, h3StreamTestHeaders(t, fields))?
+	if late == nil {
+		return errors.New("missing late request stream")
+	}
+	var data [1]byte
+	_, err := late.Read(data[:])
+	if reset, ok := errors.AsType[*quic.StreamError](err); !ok || !reset.Remote || reset.ErrorCode != 0x10b {
+		return fmt.Errorf("late request not rejected: %w", err)
+	}
+	return nil
+}
+
+func TestH3OwnedServerTimeoutClosesBlockedRequest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered := make(chan struct{})
+	ended := make(chan error, 1)
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(entered)
+		var data [1]byte
+		_, err := r.Body.Read(data[:])
+		select {
+		case ended <- err:
+		case <-ctx.Done():
+		}
+	})
+	peer, err := openH3OwnedTestPeer(ctx, t, handler)
+	if err != nil {
+		t.Fatalf("open HTTP/3 peer: %v", err)
+		return
+	}
+	if peer == nil {
+		t.Fatal("open HTTP/3 peer returned nil")
+		return
+	}
+	if err := driveH3OwnedTimeout(ctx, t, peer, h3OwnedTimeoutProbe{entered: entered, ended: ended}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type h3OwnedTimeoutProbe struct {
+	entered <-chan struct{}
+	ended   <-chan error
+}
+
+func driveH3OwnedTimeout(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer, probe h3OwnedTimeoutProbe) error {
+	peer.sendSettings(ctx, t, nil)?
+	fields := append(h3TestRequestFields(), qpack.HeaderField{Name: "content-length", Value: "1"})
+	stream := peer.sendHeaders(ctx, h3StreamTestHeaders(t, fields))?
+	if stream == nil {
+		return errors.New("missing blocked request stream")
+	}
+	awaitH3OwnedSignal(ctx, probe.entered)?
+	stopCtx, stop := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer stop()
+	if err := peer.server.Shutdown(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("Shutdown = %w, want deadline exceeded", err)
+	}
+	var data [1]byte
+	_, err := stream.Read(data[:])
+	if closed, ok := errors.AsType[*quic.ApplicationError](err); !ok || !closed.Remote {
+		return fmt.Errorf("peer did not receive CONNECTION_CLOSE: %w", err)
+	}
+	select {
+	case err := <-probe.ended:
+		if err == nil {
+			return errors.New("blocked body read did not fail on connection shutdown")
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return peer.server.Shutdown(ctx)
+}
+
+func awaitH3OwnedSignal(ctx context.Context, signal <-chan struct{}) error {
+	select {
+	case <-signal:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestH3OwnedServerSetupFailureAndPreStartShutdownKeepSocket(t *testing.T) {
+	if err := checkH3OwnedSocketSurvives(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkH3OwnedSocketSurvives(ctx context.Context) error {
+	pc := net.ListenPacket("udp4", "127.0.0.1:0")?
+	defer pc.Close()?
+	addr := pc.LocalAddr()
+	bad := newH3OwnedServer(http.DefaultServeMux, &tls.Config{MaxVersion: tls.VersionTLS12})
+	defer bad.Close()?
+	if err := bad.Serve(pc); err == nil || errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("Serve with TLS capped at 1.2 = %w, want setup failure", err)
+	}
+	closed := newH3OwnedServer(http.DefaultServeMux, &tls.Config{})
+	closed.Shutdown(ctx)?
+	closed.Close()?
+	if err := closed.Serve(pc); !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("Serve after pre-start Shutdown = %w, want http.ErrServerClosed", err)
+	}
+	sender := net.ListenPacket("udp4", "127.0.0.1:0")?
+	defer sender.Close()?
+	deadline := time.Now().Add(time.Second)
+	pc.SetReadDeadline(deadline)?
+	sender.SetWriteDeadline(deadline)?
+	sender.WriteTo([]byte("open"), addr)?
+	var payload [4]byte
+	n, _ := pc.ReadFrom(payload[:])?
+	if string(payload[:n]) != "open" {
+		return errors.New("caller packet connection did not receive data after failed Serve")
+	}
+	return nil
+}

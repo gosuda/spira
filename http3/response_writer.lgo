@@ -1,0 +1,426 @@
+package http3
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/quic-go/qpack"
+	"golang.org/x/net/http/httpguts"
+)
+
+type h3ResponseStream interface {
+	io.Writer
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+type h3ResponseWriter struct {
+	stream              h3ResponseStream
+	method              string
+	maxFieldSectionSize uint64
+	header              http.Header
+	pending             *h3ResponseFieldSection?
+	connectionFields    map[string]struct{}
+	declaredTrailers     map[string]struct{}
+	status              int
+	remainingBody       int64
+	sniff               bool
+	finished            bool
+	err                 error
+	frameHeader         [16]byte
+}
+
+func newH3ResponseWriter(stream h3ResponseStream, method string, maxFieldSectionSize uint64) *h3ResponseWriter {
+	return &h3ResponseWriter{
+		stream: stream, method: method, maxFieldSectionSize: maxFieldSectionSize,
+		header: make(http.Header), remainingBody: -1,
+	}
+}
+
+func (w *h3ResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *h3ResponseWriter) WriteHeader(status int) {
+	if w.status != 0 || w.finished || w.err != nil {
+		return
+	}
+	if status < 100 || status > 999 || status == http.StatusSwitchingProtocols {
+		panic($"http3: invalid WriteHeader code {status}")
+	}
+	section := newH3ResponseFieldSection(w.maxFieldSectionSize)
+	w.err = w.encodeInitialFields(section, status)
+	if w.err != nil {
+		return
+	}
+	if status < 200 {
+		w.err = w.sendFieldSection(section)
+		return
+	}
+	w.status = status
+	w.pending = section
+}
+
+func (w *h3ResponseWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.finished {
+		return 0, io.ErrClosedPipe
+	}
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+		if w.err != nil {
+			return 0, w.err
+		}
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !h3ResponseAllowsBody(w.status) {
+		return 0, http.ErrBodyNotAllowed
+	}
+	if w.remainingBody >= 0 {
+		if int64(len(p)) > w.remainingBody {
+			return 0, http.ErrContentLength
+		}
+		w.remainingBody -= int64(len(p))
+	}
+	w.sendPendingFields(p)?
+	if w.method == http.MethodHead {
+		return len(p), nil
+	}
+	return w.writeFrame(0x0, p)
+}
+
+func (w *h3ResponseWriter) FlushError() error {
+	if w.err != nil || w.finished {
+		return w.err
+	}
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.sendPendingFields(nil)
+}
+
+func (w *h3ResponseWriter) Flush() {
+	w.err = w.FlushError()
+}
+
+func (w *h3ResponseWriter) SetReadDeadline(deadline time.Time) error {
+	return w.stream.SetReadDeadline(deadline)
+}
+
+func (w *h3ResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	return w.stream.SetWriteDeadline(deadline)
+}
+
+func (w *h3ResponseWriter) EnableFullDuplex() error {
+	return nil
+}
+
+func (w *h3ResponseWriter) finish() error {
+	if !w.finished {
+		w.err = w.finishResponse()
+		w.pending = nil
+		w.finished = true
+	}
+	return w.err
+}
+
+func (w *h3ResponseWriter) finishResponse() error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+		if w.err != nil {
+			return w.err
+		}
+	}
+	if w.method != http.MethodHead && h3ResponseAllowsBody(w.status) && w.remainingBody > 0 {
+		return fmt.Errorf("http3: %d response bytes missing: %w", w.remainingBody, http.ErrContentLength)
+	}
+	w.sendPendingFields(nil)?
+	if !w.allowsTrailers(w.status) {
+		return nil
+	}
+	return w.writeTrailers()
+}
+
+func h3ResponseAllowsBody(status int) bool {
+	return status >= 200 && status != http.StatusNoContent && status != http.StatusResetContent && status != http.StatusNotModified
+}
+
+func (w *h3ResponseWriter) isTunnel(status int) bool {
+	return w.method == http.MethodConnect && status >= 200 && status < 300
+}
+
+func (w *h3ResponseWriter) allowsTrailers(status int) bool {
+	return w.method != http.MethodHead && h3ResponseAllowsBody(status) && !w.isTunnel(status)
+}
+
+func (w *h3ResponseWriter) sendPendingFields(body []byte) error {
+	if w.err != nil {
+		return w.err
+	}
+	section := w.pending
+	if section == nil {
+		return nil
+	}
+	w.pending = nil
+	if w.sniff && len(body) != 0 {
+		w.err = section.writeField("content-type", http.DetectContentType(body))
+		if w.err != nil {
+			return w.err
+		}
+	}
+	w.err = w.sendFieldSection(section)
+	return w.err
+}
+
+func (w *h3ResponseWriter) sendFieldSection(section *h3ResponseFieldSection) error {
+	if section.payload.Len() == 0 {
+		return nil
+	}
+	_, err := w.writeFrame(0x1, section.payload.Bytes())
+	return err
+}
+
+func (w *h3ResponseWriter) writeFrame(kind uint64, p []byte) (int, error) {
+	if uint64(len(p)) >= 1<<62 {
+		w.err = fmt.Errorf("http3: response frame exceeds the QUIC variable integer limit")
+		return 0, w.err
+	}
+	prefix := appendH3FrameHeader(w.frameHeader[:0], kind, uint64(len(p)))
+	_, err := w.writeWire(prefix)
+	if err != nil {
+		return 0, err
+	}
+	return w.writeWire(p)
+}
+
+func (w *h3ResponseWriter) writeWire(p []byte) (int, error) {
+	n, err := w.stream.Write(p)
+	if n < 0 || n > len(p) {
+		n = 0
+	}
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+type h3ResponseFieldSection struct {
+	payload   *bytes.Buffer
+	encoder   *qpack.Encoder
+	remaining uint64
+}
+
+func newH3ResponseFieldSection(limit uint64) *h3ResponseFieldSection {
+	payload := &bytes.Buffer{}
+	return &h3ResponseFieldSection{payload: payload, encoder: qpack.NewEncoder(payload), remaining: limit}
+}
+
+func (s *h3ResponseFieldSection) writeField(name string, value string) error {
+	const overhead = 32
+	if s.remaining < overhead || uint64(len(name)) > s.remaining-overhead || uint64(len(value)) > s.remaining-overhead-uint64(len(name)) {
+		return fmt.Errorf("http3: response field section exceeds peer limit")
+	}
+	s.remaining -= overhead + uint64(len(name)) + uint64(len(value))
+	return s.encoder.WriteField(qpack.HeaderField{Name: name, Value: value})
+}
+
+func (s *h3ResponseFieldSection) writeValues(name string, values []string) error {
+	for _, value := range values {
+		if !httpguts.ValidHeaderFieldValue(value) {
+			return fmt.Errorf("http3: invalid response field value for %q", name)
+		}
+		s.writeField(name, strings.Trim(value, " \t"))?
+	}
+	return nil
+}
+
+type h3InitialResponseFields struct {
+	status           int
+	tunnel           bool
+	allowTrailers    bool
+	connectionFields map[string]struct{}
+	trailers         map[string]struct{}
+	contentLength    int64
+	hasDate          bool
+	hasType          bool
+	encoded          bool
+}
+
+func (w *h3ResponseWriter) encodeInitialFields(section *h3ResponseFieldSection, status int) error {
+	section.writeField(":status", strconv.Itoa(status))?
+	connectionFields := h3ResponseConnectionFields(w.header)?
+	initial := h3InitialResponseFields{
+		status: status, tunnel: w.isTunnel(status), allowTrailers: w.allowsTrailers(status),
+		connectionFields: connectionFields, contentLength: -1,
+	}
+	if initial.allowTrailers && !h3OmitResponseField("trailer", connectionFields) {
+		initial.trailers = h3DeclaredResponseTrailers(w.header, connectionFields)?
+	}
+	for key, values := range w.header {
+		initial.writeHeaderField(section, key, values)?
+	}
+	if initial.contentLength >= 0 {
+		section.writeField("content-length", strconv.FormatInt(initial.contentLength, 10))?
+	}
+	if status >= 200 && !initial.hasDate && !h3OmitResponseField("date", connectionFields) {
+		section.writeField("date", time.Now().UTC().Format(http.TimeFormat))?
+	}
+	if status >= 200 {
+		w.remainingBody = initial.contentLength
+		w.connectionFields = connectionFields
+		w.declaredTrailers = initial.trailers
+		w.sniff = h3ResponseAllowsBody(status) && !initial.tunnel && !initial.hasType && !initial.encoded && !h3OmitResponseField("content-type", connectionFields)
+	}
+	return nil
+}
+
+func (f *h3InitialResponseFields) writeHeaderField(section *h3ResponseFieldSection, key string, values []string) error {
+	if strings.HasPrefix(key, http.TrailerPrefix) {
+		return nil
+	}
+	if !httpguts.ValidHeaderFieldName(key) {
+		return fmt.Errorf("http3: invalid response field name %q", key)
+	}
+	name := strings.ToLower(key)
+	_, trailer := f.trailers[name]
+	if trailer || h3OmitResponseField(name, f.connectionFields) {
+		return nil
+	}
+	switch name {
+	case "content-length":
+		return f.acceptContentLength(values)
+	case "trailer":
+		if !f.allowTrailers {
+			return nil
+		}
+	case "date":
+		f.hasDate = true
+	case "content-type":
+		f.hasType = true
+	case "content-encoding":
+		for _, value := range values {
+			f.encoded = f.encoded || strings.Trim(value, " \t") != ""
+		}
+	}
+	return section.writeValues(name, values)
+}
+
+func (f *h3InitialResponseFields) acceptContentLength(values []string) error {
+	if f.status < 200 || f.status == http.StatusNoContent || f.tunnel {
+		return nil
+	}
+	f.contentLength = h3ParseResponseLength(f.contentLength, values)?
+	if f.status == http.StatusResetContent && f.contentLength > 0 {
+		return http.ErrContentLength
+	}
+	return nil
+}
+
+func h3ParseResponseLength(length int64, values []string) (int64, error) {
+	for _, value := range values {
+		for item := range strings.SplitSeq(value, ",") {
+			n, err := strconv.ParseUint(strings.Trim(item, " \t"), 10, 63)
+			if err != nil || (length >= 0 && uint64(length) != n) {
+				return -1, fmt.Errorf("http3: invalid response Content-Length: %w", http.ErrContentLength)
+			}
+			length = int64(n)
+		}
+	}
+	return length, nil
+}
+
+func h3OmitResponseField(name string, connectionFields map[string]struct{}) bool {
+	switch name {
+	case "connection", "keep-alive", "proxy-connection", "te", "transfer-encoding", "upgrade":
+		return true
+	}
+	_, omit := connectionFields[name]
+	return omit
+}
+
+func h3ResponseConnectionFields(header http.Header) (map[string]struct{}, error) {
+	var fields map[string]struct{}
+	for name, values := range header {
+		if !strings.EqualFold(name, "connection") {
+			continue
+		}
+		fields = h3ResponseFieldNames(fields, values)?
+	}
+	return fields, nil
+}
+
+func h3ResponseFieldNames(names map[string]struct{}, values []string) (map[string]struct{}, error) {
+	for _, value := range values {
+		for item := range strings.SplitSeq(value, ",") {
+			name := strings.Trim(item, " \t")
+			if name == "" {
+				continue
+			}
+			if !httpguts.ValidHeaderFieldName(name) {
+				return nil, fmt.Errorf("http3: invalid response field list")
+			}
+			if names == nil {
+				names = make(map[string]struct{})
+			}
+			names[strings.ToLower(name)] = struct{}{}
+		}
+	}
+	return names, nil
+}
+
+func h3DeclaredResponseTrailers(header http.Header, connectionFields map[string]struct{}) (map[string]struct{}, error) {
+	var names map[string]struct{}
+	for name, values := range header {
+		if strings.EqualFold(name, "trailer") {
+			names = h3ResponseFieldNames(names, values)?
+		}
+	}
+	for name := range names {
+		if !httpguts.ValidTrailerHeader(name) || h3OmitResponseField(name, connectionFields) {
+			return nil, fmt.Errorf("http3: invalid response trailer name %q", name)
+		}
+	}
+	return names, nil
+}
+
+func (w *h3ResponseWriter) writeTrailers() error {
+	var section *h3ResponseFieldSection?
+	for key, values := range w.header {
+		name, prefixed := strings.CutPrefix(key, http.TrailerPrefix)
+		if !prefixed && len(w.declaredTrailers) == 0 {
+			continue
+		}
+		name = strings.ToLower(name)
+		if _, declared := w.declaredTrailers[name]; !declared && !prefixed {
+			continue
+		}
+		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidTrailerHeader(name) || h3OmitResponseField(name, w.connectionFields) {
+			return fmt.Errorf("http3: invalid response trailer name %q", name)
+		}
+		if len(values) == 0 {
+			continue
+		}
+		current := section ?? newH3ResponseFieldSection(w.maxFieldSectionSize)
+		current.writeValues(name, values)?
+		section = current
+	}
+	if final := section; final != nil {
+		return w.sendFieldSection(final)
+	}
+	return nil
+}

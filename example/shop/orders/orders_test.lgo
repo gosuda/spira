@@ -1,0 +1,642 @@
+package orders_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	json "encoding/json/v2"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/example/shop/orders"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/web"
+
+	_ "modernc.org/sqlite"
+)
+
+const callTimeout = 30 * time.Second
+
+func dsnFor(t *testing.T) string {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", "_", ")", "_", "$", "_").Replace(t.Name())
+	return fmt.Sprintf("file:spira_orders_%s?mode=memory&cache=shared&_pragma=foreign_keys(1)", key)
+}
+
+func bounded(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func openPool(t *testing.T) *db.Pool? {
+	t.Helper()
+	pool, err := db.OpenSQLiteImmediate(dsnFor(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatalf("open: no pool and no error")
+		return nil
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	if err := pool.Start(bounded(t)); err != nil {
+		t.Fatalf("start: %v", err)
+		return nil
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return nil
+	}
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return nil
+	}
+	return pool
+}
+
+func seedUser(t *testing.T, pool *db.Pool, name string) int64 {
+	t.Helper()
+	hash, err := auth.HashPassword("s3cret")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+		return 0
+	}
+	id, err := store.CreateUser(bounded(t), pool, name, hash)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+		return 0
+	}
+	return id
+}
+
+func seedProducts(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	rows := []string{
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'mug', 900, 5, '2026-01-01 10:00:00')",
+		"INSERT INTO products (id, name, price, stock, created_at) VALUES (2, 'lamp', 1500, 3, '2026-01-01 10:00:00')",
+	}
+	for _, q := range rows {
+		if _, err := pool.ExecContext(bounded(t), q); err != nil {
+			t.Fatalf("seed product: %v", err)
+			return
+		}
+	}
+}
+
+func seedCart(t *testing.T, pool *db.Pool, key string) {
+	t.Helper()
+	items := []struct {
+		product int64
+		qty     int64
+	}{{product: 1, qty: 2}, {product: 2, qty: 1}}
+	for _, item := range items {
+		args := store.UpsertCartItemArgs{OwnerKind: "user", OwnerKey: key, ProductID: store.ProductID(item.product), Quantity: item.qty}
+		if _, err := store.UpsertCartItem(bounded(t), pool, args); err != nil {
+			t.Fatalf("seed cart: %v", err)
+			return
+		}
+	}
+}
+
+func seedOrder(t *testing.T, pool *db.Pool, user int64) int64 {
+	t.Helper()
+	res, err := pool.ExecContext(bounded(t), "INSERT INTO orders (user_id, status, total, created_at) VALUES (?, 'open', 100, '2026-01-01 10:00:00')", user)
+	if err != nil {
+		t.Fatalf("seed order: %v", err)
+		return 0
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("seed order id: %v", err)
+		return 0
+	}
+	return id
+}
+
+func testRouter(pool *db.Pool) (*web.Router, *auth.Sessions) {
+	sessions := &auth.Sessions{Store: auth.NewMemoryStore()}
+	r := web.NewRouter()
+	r.Use(auth.Authenticate(sessions.Authenticator()))
+	(&orders.Feature{DB: pool}).Register(r)
+	return r, sessions
+}
+
+func sessionCookie(t *testing.T, sessions *auth.Sessions, uid int64) string {
+	t.Helper()
+	raw := $"test-session-{uid}"
+	sum := sha256.Sum256([]byte(raw))
+	key := hex.EncodeToString(sum[:])
+	if err := sessions.Store.Save(bounded(t), key, auth.Principal{ID: $"{uid}"}, time.Hour); err != nil {
+		t.Fatalf("save session: %v", err)
+		return ""
+	}
+	return raw
+}
+
+func postOrder(t *testing.T, r *web.Router, sessions *auth.Sessions, uid int64) *httptest.ResponseRecorder? {
+	t.Helper()
+	cookie := sessionCookie(t, sessions, uid)
+	if cookie == "" {
+		return nil
+	}
+	req := httptest.NewRequest(http.MethodPost, "/orders", nil)
+	req.Header.Set("Cookie", "__Host-spira="+cookie)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func cancelRequest(id string, cookie string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, $"/orders/{id}/cancel", nil)
+	if cookie != "" {
+		req.Header.Set("Cookie", "__Host-spira="+cookie)
+	}
+	return req
+}
+
+func checkCancelProblem(t *testing.T, rec *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status %d want %d, body %s", rec.Code, status, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type %q want application/problem+json", ct)
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode failure response: %v", err)
+	}
+	if body.Code != code {
+		t.Fatalf("problem code %q want %q, body %s", body.Code, code, rec.Body.String())
+	}
+}
+
+type orderState struct {
+	userID    int64
+	status    string
+	total     int64
+	version   int64
+	createdAt string
+}
+
+func fetchedOrder(t *testing.T, pool *db.Pool, id int64) orderState? {
+	t.Helper()
+	rows, err := pool.QueryContext(bounded(t), `
+		SELECT user_id, status, total, version, CAST(created_at AS TEXT)
+		FROM orders WHERE id = ?`, id)
+	if err != nil {
+		t.Fatalf("lookup order %d: %v", id, err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatalf("lookup order %d: query returned no result set", id)
+		return nil
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close order rows: %v", err)
+		}
+	}()
+	if !rows.Next() {
+		t.Fatalf("lookup order %d: no row (query error: %v)", id, rows.Err())
+		return nil
+	}
+	var found orderState
+	if err := rows.Scan(&found.userID, &found.status, &found.total, &found.version, &found.createdAt); err != nil {
+		t.Fatalf("scan order %d: %v", id, err)
+		return nil
+	}
+	return found
+}
+
+func checkUnchangedOrder(t *testing.T, pool *db.Pool, id int64, before orderState) {
+	t.Helper()
+	after := fetchedOrder(t, pool, id)
+	if after == nil {
+		return
+	}
+	if after != before {
+		t.Errorf("order %d changed: before %+v, after %+v", id, before, after)
+	}
+}
+
+func TestCreateOrderTurnsCartIntoOrderLines(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	if user == 0 {
+		return
+	}
+	seedProducts(t, pool)
+	seedCart(t, pool, $"{user}")
+	r, sessions := testRouter(pool)
+	rec := postOrder(t, r, sessions, user)
+	if rec == nil {
+		return
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d want 201 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "totals 3300") {
+		t.Fatalf("body %q lacks the cart total", body)
+		return
+	}
+	listed, err := store.ListOrdersForUser(bounded(t), pool, store.UserID(user))
+	if err != nil {
+		t.Fatalf("list orders: %v", err)
+		return
+	}
+	if len(listed) != 1 {
+		t.Fatalf("orders for user = %d, want 1", len(listed))
+		return
+	}
+	lines, err := store.ListOrderLines(bounded(t), pool, listed[0].ID)
+	if err != nil {
+		t.Fatalf("list lines: %v", err)
+		return
+	}
+	if len(lines) != 2 {
+		t.Fatalf("order lines = %d, want 2", len(lines))
+		return
+	}
+	cart, err := store.ListCartItems(bounded(t), pool, "user", $"{user}")
+	if err != nil {
+		t.Fatalf("list cart: %v", err)
+		return
+	}
+	if len(cart) != 0 {
+		t.Fatalf("cart holds %d items after the order, want none", len(cart))
+		return
+	}
+}
+
+func TestCreateOrderFailsWithoutSession(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	r, _ := testRouter(pool)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/orders", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+		return
+	}
+}
+
+func TestCreateOrderFailsOnEmptyCart(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	if user == 0 {
+		return
+	}
+	seedProducts(t, pool)
+	r, sessions := testRouter(pool)
+	rec := postOrder(t, r, sessions, user)
+	if rec == nil {
+		return
+	}
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d want 422 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type %q want application/problem+json", ct)
+		return
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "cart") {
+		t.Fatalf("body %q lacks the cart field message", body)
+		return
+	}
+}
+
+func TestCancelOrderWithoutSession(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	id := seedOrder(t, pool, user)
+	before := fetchedOrder(t, pool, id)
+	if before == nil {
+		return
+	}
+	r, _ := testRouter(pool)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, cancelRequest($"{id}", ""))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status %d want 401 body %s", rec.Code, rec.Body.String())
+	}
+	checkUnchangedOrder(t, pool, id, before)
+}
+
+func TestCancelOrderWithDifferentUser(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	owner := seedUser(t, pool, "ada")
+	other := seedUser(t, pool, "grace")
+	if other == owner {
+		t.Fatalf("owner and other user share id %d", owner)
+		return
+	}
+	id := seedOrder(t, pool, owner)
+	before := fetchedOrder(t, pool, id)
+	if before == nil {
+		return
+	}
+	r, sessions := testRouter(pool)
+	cookie := sessionCookie(t, sessions, other)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, cancelRequest($"{id}", cookie))
+	checkCancelProblem(t, rec, http.StatusNotFound, "orders.unknown_order")
+	checkUnchangedOrder(t, pool, id, before)
+}
+
+func TestCancelOrder(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	if user == 0 {
+		return
+	}
+	id := seedOrder(t, pool, user)
+	if id == 0 {
+		return
+	}
+	r, sessions := testRouter(pool)
+	cookie := sessionCookie(t, sessions, user)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, cancelRequest($"{id}", cookie))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d want 200 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "cancelled") {
+		t.Fatalf("body %q lacks the cancelled status", body)
+		return
+	}
+	after := fetchedOrder(t, pool, id)
+	if after == nil {
+		return
+	}
+	if after.status != "cancelled" || after.version != 2 {
+		t.Fatalf("first cancel persisted %+v, want cancelled at version 2", after)
+	}
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, cancelRequest($"{id}", cookie))
+	checkCancelProblem(t, rec, http.StatusConflict, "orders.already_cancelled")
+	checkUnchangedOrder(t, pool, id, after)
+}
+
+func TestCancelMissingOrder(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	rec := httptest.NewRecorder()
+	r, sessions := testRouter(pool)
+	r.ServeHTTP(rec, cancelRequest("999", sessionCookie(t, sessions, user)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d want 404 body %s", rec.Code, rec.Body.String())
+		return
+	}
+}
+
+func TestCancelMalformedID(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	rec := httptest.NewRecorder()
+	r, sessions := testRouter(pool)
+	r.ServeHTTP(rec, cancelRequest("abc", sessionCookie(t, sessions, user)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d want 404 body %s", rec.Code, rec.Body.String())
+		return
+	}
+}
+
+type cancelRace struct {
+	router  *web.Router
+	request *http.Request
+	reply   *httptest.ResponseRecorder
+	loaded  chan struct{}
+	release chan struct{}
+	done    chan struct{}
+}
+
+func (box *cancelRace) probe(call context.Context) error {
+	close(box.loaded)
+	select {
+	case <-box.release:
+		return nil
+	case <-call.Done():
+		return call.Err()
+	}
+}
+
+func serveFirst(box *cancelRace) error {
+	defer close(box.done)
+	box.router.ServeHTTP(box.reply, box.request)
+	return nil
+}
+
+func afterSnapshot(ctx context.Context, box *cancelRace, compete func(context.Context) error) error {
+	defer close(box.release)
+	select {
+	case <-box.loaded:
+	case <-box.done:
+		return errors.New("orders_test: first cancel finished without loading")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return compete(ctx)
+}
+
+func runCancelRace(ctx context.Context, r *web.Router, req *http.Request, compete func(context.Context) error) (*httptest.ResponseRecorder, error) {
+	box := &cancelRace{
+		router:  r,
+		request: req,
+		reply:   httptest.NewRecorder(),
+		loaded:  make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	box.request = req.WithContext(orders.ContextWithProbe(ctx, box.probe))
+	go group (ctx) {
+		go { serveFirst(box) }
+		go { afterSnapshot(ctx, box, compete)? }
+	}
+	return box.reply, nil
+}
+
+func TestConcurrentCancelsAnswer200And409(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	if user == 0 {
+		return
+	}
+	id := seedOrder(t, pool, user)
+	if id == 0 {
+		return
+	}
+	r, sessions := testRouter(pool)
+	cookie := sessionCookie(t, sessions, user)
+	winner := httptest.NewRecorder()
+	loser, err := runCancelRace(bounded(t), r, cancelRequest($"{id}", cookie), func(ctx context.Context) error {
+		req := cancelRequest($"{id}", cookie)
+		r.ServeHTTP(winner, req.WithContext(ctx))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("cancel race: %v", err)
+		return
+	}
+	if winner.Code != http.StatusOK {
+		t.Fatalf("second status %d want 200, body %s", winner.Code, winner.Body.String())
+	}
+	checkCancelProblem(t, loser, http.StatusConflict, "orders.stale_order")
+	got := fetchedOrder(t, pool, id)
+	if got == nil {
+		t.Fatal("order is missing after concurrent cancels")
+		return
+	}
+	if got.status != "cancelled" || got.version != 2 {
+		t.Errorf("concurrent cancels persisted %+v, want cancelled at version 2", got)
+	}
+}
+
+func TestCancelConcealsOrderLostAfterSnapshot(t *testing.T) {
+	t.Run("deleted", func(t *testing.T) { checkOrderLostAfterSnapshot(t, "deleted") })
+	t.Run("replaced", func(t *testing.T) { checkOrderLostAfterSnapshot(t, "replaced") })
+}
+
+func checkOrderLostAfterSnapshot(t *testing.T, change string) {
+	t.Helper()
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	owner := seedUser(t, pool, "owner")
+	other := seedUser(t, pool, "replacement owner")
+	id := seedOrder(t, pool, owner)
+	r, sessions := testRouter(pool)
+	cookie := sessionCookie(t, sessions, owner)
+	req := cancelRequest($"{id}", cookie)
+	rec, err := runCancelRace(bounded(t), r, req, func(ctx context.Context) error {
+		return replaceOrderDuringCancel(ctx, pool, orderReplacement{id: id, owner: other, change: change})
+	})
+	if err != nil {
+		t.Fatalf("cancel race: %v", err)
+		return
+	}
+	checkCancelProblem(t, rec, http.StatusNotFound, "orders.unknown_order")
+	missing := httptest.NewRecorder()
+	r.ServeHTTP(missing, cancelRequest("999", cookie))
+	if rec.Body.String() != missing.Body.String() {
+		t.Errorf("lost order response %q discloses state; missing order response %q", rec.Body.String(), missing.Body.String())
+	}
+	got, err := store.GetOrder(bounded(t), pool, store.OrderID(id))
+	if err != nil {
+		t.Fatalf("read final order: %v", err)
+		return
+	}
+	if change == "deleted" {
+		if got != nil {
+			t.Errorf("cancel recreated the deleted order: %+v", got)
+		}
+		return
+	}
+	if got == nil {
+		t.Fatal("replacement order is missing")
+		return
+	}
+	if got.UserID != store.UserID(other) || got.Status != "open" || got.Version != 1 || got.Total != 200 {
+		t.Errorf("cancel changed the replacement order: %+v", got)
+	}
+}
+
+type orderReplacement struct {
+	id     int64
+	owner  int64
+	change string
+}
+
+func replaceOrderDuringCancel(ctx context.Context, pool *db.Pool, replacement orderReplacement) error {
+	_, err := pool.ExecContext(ctx, "DELETE FROM orders WHERE id = ?", replacement.id)
+	if err != nil || replacement.change == "deleted" {
+		return err
+	}
+	res := pool.ExecContext(ctx, `INSERT INTO orders (user_id, status, total, created_at)
+		VALUES (?, 'open', 200, '2026-01-02 10:00:00')`, replacement.owner)?
+	got := res.LastInsertId()?
+	if got != replacement.id {
+		return fmt.Errorf("SQLite allocated replacement ID %d, want reused ID %d", got, replacement.id)
+	}
+	return nil
+}
+
+func TestCancelDeadlineWhileWriterReserved(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	user := seedUser(t, pool, "ada")
+	id := seedOrder(t, pool, user)
+	before := fetchedOrder(t, pool, id)
+	if before == nil {
+		return
+	}
+	r, sessions := testRouter(pool)
+	req := cancelRequest($"{id}", sessionCookie(t, sessions, user))
+	reply := httptest.NewRecorder()
+	ctx := bounded(t)
+	_, err := db.InSQLiteImmediateTx(ctx, pool, func(_ *db.Tx) (struct{}, error) {
+		wait, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		r.ServeHTTP(reply, req.WithContext(wait))
+		return struct{}{}, nil
+	})
+	if err != nil {
+		t.Fatalf("hold SQLite writer reservation: %v", err)
+		return
+	}
+	checkCancelProblem(t, reply, http.StatusInternalServerError, "internal")
+	checkUnchangedOrder(t, pool, id, before)
+}

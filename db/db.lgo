@@ -3,10 +3,15 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"logos/sync"
+	"net/url"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Querier interface {
@@ -83,10 +88,74 @@ func Open(driver string, dsn string) (*Pool?, error) {
 	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}}, nil
 }
 
+// OpenSQLiteImmediate opens a SQLite pool whose writable transactions begin
+// with a writer reservation. Use InSQLiteImmediateTx to require that mode.
+func OpenSQLiteImmediate(dsn string) (*Pool?, error) {
+	configured := sqliteImmediateDSN(dsn)?
+	pool := Open("sqlite", configured)?
+	if pool == nil {
+		return nil, ErrStatementFailed.Wrap(errors.New("db: SQLite open returned no pool"))
+	}
+	pool.sqliteImmediate = true
+	return pool, nil
+}
+
+func sqliteImmediateDSN(dsn string) (string, error) {
+	name, query, _ := strings.Cut(dsn, "?")
+	if name == "" || strings.ContainsRune(dsn, 0) {
+		return "", errors.New("db: SQLite immediate transactions require a database name")
+	}
+	params, err := url.ParseQuery(query)
+	if err != nil {
+		return "", errors.New("db: invalid SQLite DSN query")
+	}
+	if params.Has("vfs") || params.Has("nolock") || params.Has("immutable") {
+		return "", errors.New("db: SQLite immediate transactions require the default locking VFS")
+	}
+	mode, _ := params["mode"]
+	cache, _ := params["cache"]
+	if len(mode) > 1 || len(cache) > 1 {
+		return "", errors.New("db: ambiguous SQLite URI mode or cache")
+	}
+	if err := checkSQLiteDatabaseName(dsn, name, params.Get("mode"), params.Get("cache")); err != nil {
+		return "", err
+	}
+	configured := name + "?_txlock=immediate"
+	if query != "" {
+		configured += "&" + query
+	}
+	return configured, nil
+}
+
+func checkSQLiteDatabaseName(dsn string, name string, mode string, cache string) error {
+	if name == ":memory:" {
+		return errors.New("db: SQLite immediate transactions require a shared in-memory database")
+	}
+	path, uri := strings.CutPrefix(name, "file:")
+	if !uri {
+		return nil
+	}
+	if strings.ContainsRune(dsn, '#') || strings.Contains(dsn, "%00") {
+		return errors.New("db: SQLite immediate transactions do not accept URI fragments or encoded NULs")
+	}
+	path, err := url.PathUnescape(path)
+	if err != nil {
+		return errors.New("db: invalid SQLite URI path")
+	}
+	if path == "" || path == "//localhost" {
+		return errors.New("db: SQLite immediate transactions require a database name")
+	}
+	if (path == ":memory:" || mode == "memory") && cache != "shared" {
+		return errors.New("db: SQLite immediate transactions require a shared in-memory database")
+	}
+	return nil
+}
+
 type Pool struct {
-	handle  *sql.DB
-	dialect Dialect
-	stmts   *stmtCache
+	handle          *sql.DB
+	dialect         Dialect
+	stmts           *stmtCache
+	sqliteImmediate bool
 }
 
 func (p *Pool) Dialect() Dialect {
@@ -290,12 +359,91 @@ func InTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (T,
 	if err != nil {
 		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: begin: %w", err))
 	}
-	v, workErr := runTxWork(&Tx{tx: tx, pool: p}, work)
+	return finishTx(&Tx{tx: tx, pool: p}, work)
+}
+
+// InSQLiteImmediateTx requires a writer reservation before calling work.
+func InSQLiteImmediateTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (value T, err error) {
+	var zero T
+	if !p.sqliteImmediate {
+		return zero, ErrStatementFailed.Wrap(errors.New("db: SQLite immediate transaction requires an immediate SQLite pool"))
+	}
+	conn, err := p.handle.Conn(ctx)
+	if err != nil {
+		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: lease SQLite connection: %w", err))
+	}
+	if conn == nil {
+		return zero, ErrStatementFailed.Wrap(errors.New("db: SQLite lease returned no connection"))
+	}
+	defer closeSQLiteConn(conn)?
+	var busyMillis int
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyMillis); err != nil {
+		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: read SQLite busy timeout: %w", err))
+	}
+	const writerBusyMillis = 30000
+	if busyMillis != writerBusyMillis {
+		defer restoreSQLiteBusyTimeout(ctx, conn, busyMillis, &err)
+		if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = "+strconv.Itoa(writerBusyMillis)); err != nil {
+			return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: set SQLite busy timeout: %w", err))
+		}
+	}
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: begin immediate: %w", err))
+	}
+	return finishTx(&Tx{tx: tx, pool: p}, func(run *Tx) (T, error) {
+		requireSQLiteRollback(ctx, tx)?
+		return work(run)
+	})
+}
+
+func requireSQLiteRollback(ctx context.Context, tx *sql.Tx) error {
+	var journalMode string
+	row := tx.QueryRowContext(ctx, "PRAGMA main.journal_mode")
+	if err := row.Scan(&journalMode); err != nil {
+		return ClassifyDriverError(SQLite{}, fmt.Errorf("db: read SQLite journal mode: %w", err))
+	}
+	if journalMode == "off" {
+		return ErrStatementFailed.Wrap(errors.New("db: SQLite immediate transactions require rollback journaling"))
+	}
+	return nil
+}
+
+func restoreSQLiteBusyTimeout(ctx context.Context, conn *sql.Conn, millis int, outcome *error) {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	_, err := conn.ExecContext(cleanup, "PRAGMA busy_timeout = "+strconv.Itoa(millis))
+	if err == nil || errors.Is(err, sql.ErrConnDone) {
+		return
+	}
+	restoreErr := fmt.Errorf("db: restore SQLite busy timeout: %w", err)
+	discardErr := conn.Raw(func(_ any) error { return driver.ErrBadConn })
+	if !errors.Is(discardErr, driver.ErrBadConn) && !errors.Is(discardErr, sql.ErrConnDone) {
+		restoreErr = errors.Join(restoreErr, fmt.Errorf("db: discard SQLite connection: %w", discardErr))
+	}
+	if *outcome != nil {
+		*outcome = errors.Join(*outcome, restoreErr)
+		return
+	}
+	slog.Error("db: SQLite connection cleanup after immediate transaction", "error", restoreErr)
+}
+
+func closeSQLiteConn(conn *sql.Conn) error {
+	err := conn.Close()
+	if errors.Is(err, sql.ErrConnDone) {
+		return nil
+	}
+	return err
+}
+
+func finishTx[T any](run *Tx, work func(tx *Tx) (T, error)) (T, error) {
+	var zero T
+	v, workErr := runTxWork(run, work)
 	if workErr != nil {
 		return zero, workErr
 	}
-	if err := tx.Commit(); err != nil {
-		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: commit: %w", err))
+	if err := run.tx.Commit(); err != nil {
+		return zero, ClassifyDriverError(run.pool.dialect, fmt.Errorf("db: commit: %w", err))
 	}
 	return v, nil
 }

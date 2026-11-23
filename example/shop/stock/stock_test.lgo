@@ -1,0 +1,350 @@
+package stock_test
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/bus"
+	"github.com/gosuda/spira/example/shop/stock"
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+	"golang.org/x/net/html"
+)
+
+func serve(t *testing.T, topic *bus.Topic[live.Event]) *httptest.Server {
+	t.Helper()
+	f := &stock.Feature{Topic: topic}
+	r := web.NewRouter()
+	f.Register(r)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func openEvents(t *testing.T, ctx context.Context, url string) *http.Response? {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+		return nil
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("content type %q, want text/event-stream", got)
+	}
+	return resp
+}
+
+func readBlock(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	var b strings.Builder
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read event block: %v", err)
+			return ""
+		}
+		b.WriteString(line)
+		if line == "\n" {
+			return b.String()
+		}
+	}
+}
+
+func eventBlocks(t *testing.T, r *bufio.Reader, n int) []string {
+	t.Helper()
+	var out []string
+	for i := 0; i < 2*n+2 && len(out) < n; i++ {
+		if block := readBlock(t, r); strings.HasPrefix(block, "event:") {
+			out = append(out, block)
+		}
+	}
+	if len(out) < n {
+		t.Fatalf("read %d event blocks, want %d", len(out), n)
+	}
+	return out
+}
+
+func closeBody(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("close stream body: %v", err)
+	}
+}
+
+func TestRegisterRequiresTopic(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("Register with a nil Topic did not panic")
+		}
+		if got := fmt.Sprint(r); got != "stock: Feature.Topic is required" {
+			t.Fatalf("panic = %q, want the missing Topic message", got)
+		}
+	}()
+	var f stock.Feature
+	f.Register(web.NewRouter())
+}
+
+func TestEventsYieldsTwoTicksAndEndsOnDisconnect(t *testing.T) {
+	topic := bus.NewTopic[live.Event](8)
+	srv := serve(t, topic)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	resp := openEvents(t, ctx, srv.URL+"/stock/events")
+	if resp == nil {
+		return
+	}
+	defer closeBody(t, resp)
+	reader := bufio.NewReader(resp.Body)
+	first := stock.Tick{ID: 1, Name: "Blue mug", Stock: 7, Price: 1200}
+	second := stock.Tick{ID: 2, Name: "Red plate", Stock: 3, Price: 800}
+	topic.Publish(live.Event{Name: "stock", Body: stock.Row(first)})
+	topic.Publish(live.Event{Name: "stock", Body: stock.Row(second)})
+	events := eventBlocks(t, reader, 2)
+	if !strings.HasPrefix(events[0], "event: stock\n") || !strings.Contains(events[0], "Blue mug") || !strings.Contains(events[0], "7") {
+		t.Fatalf("first event %q misses the first tick", events[0])
+	}
+	if !strings.HasPrefix(events[1], "event: stock\n") || !strings.Contains(events[1], "Red plate") {
+		t.Fatalf("second event %q misses the second tick", events[1])
+	}
+	cancel()
+	if _, err := reader.ReadString('\n'); err == nil {
+		t.Fatal("the stream did not end after the disconnect")
+	}
+}
+
+func TestTickNameIsEscaped(t *testing.T) {
+	topic := bus.NewTopic[live.Event](8)
+	srv := serve(t, topic)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	resp := openEvents(t, ctx, srv.URL+"/stock/events")
+	if resp == nil {
+		return
+	}
+	defer closeBody(t, resp)
+	reader := bufio.NewReader(resp.Body)
+	tick := stock.Tick{ID: 9, Name: "<script>alert(1)</script>", Stock: 1, Price: 100}
+	topic.Publish(live.Event{Name: "stock", Body: stock.Row(tick)})
+	events := eventBlocks(t, reader, 1)
+	if !strings.Contains(events[0], "&lt;script&gt;") {
+		t.Fatalf("event %q misses the escaped name", events[0])
+	}
+	if strings.Contains(events[0], "<script>") {
+		t.Fatalf("event %q carries a raw script tag", events[0])
+	}
+}
+
+func TestRowHoldsNoTickerIsland(t *testing.T) {
+	tick := stock.Tick{ID: 3, Name: "Red plate", Stock: 7, Price: 100}
+	var body strings.Builder
+	if err := view.Render(t.Context(), &body, stock.Row(tick)); err != nil {
+		t.Fatalf("render row: %v", err)
+	}
+	out := body.String()
+	if strings.Contains(out, "ticker.wasm") {
+		t.Fatalf("row %q keeps the over-budget ticker island", out)
+	}
+	if !strings.Contains(out, "Red plate: 7") {
+		t.Fatalf("row %q lacks the stock text", out)
+	}
+	if !strings.Contains(out, "$1.00") {
+		t.Fatalf("row %q lacks the formatted price", out)
+	}
+}
+
+func attrVal(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func hasAttr(n *html.Node, key string) bool {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func find(root *html.Node, match func(n *html.Node) bool) *html.Node? {
+	for n := range root.Descendants() {
+		if match(n) {
+			return n
+		}
+	}
+	return nil
+}
+
+func within(outer *html.Node, inner *html.Node) bool {
+	if outer == inner {
+		return true
+	}
+	for n := range outer.Descendants() {
+		if n == inner {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRowPayloadMatchesTheClientContract(t *testing.T) {
+	tick := stock.Tick{ID: 3, Name: "Red plate", Stock: 7, Price: 100}
+	var body strings.Builder
+	if err := view.Render(t.Context(), &body, stock.Row(tick)); err != nil {
+		t.Fatalf("render row: %v", err)
+	}
+	out := body.String()
+	if !strings.HasPrefix(out, `<span id="stock-3" hx-swap-oob="outerHTML">`) {
+		t.Fatalf("row starts %q, want the single oob span the client filter parses", out[:min(64, len(out))])
+	}
+	if strings.Count(out, "hx-swap-oob") != 1 {
+		t.Fatalf("row carries %d oob attributes, want one root update", strings.Count(out, "hx-swap-oob"))
+	}
+}
+
+func TestDisplayIsTheRowMarkupWithoutOob(t *testing.T) {
+	tick := stock.Tick{ID: 9, Name: "<script>alert(1)</script>", Stock: 1, Price: 100}
+	var row strings.Builder
+	if err := view.Render(t.Context(), &row, stock.Row(tick)); err != nil {
+		t.Fatalf("render row: %v", err)
+	}
+	var display strings.Builder
+	if err := view.Render(t.Context(), &display, stock.Display(tick)); err != nil {
+		t.Fatalf("render display: %v", err)
+	}
+	page := display.String()
+	if want := strings.ReplaceAll(row.String(), ` hx-swap-oob="outerHTML"`, ""); page != want {
+		t.Fatalf("display = %q, want the row markup without the oob marker: %q", page, want)
+	}
+	if strings.Contains(page, "hx-swap-oob") {
+		t.Fatal("display carries hx-swap-oob; htmx would strip the row from every normal swap")
+	}
+	if !strings.Contains(page, "&lt;script&gt;") {
+		t.Fatalf("display %q misses the escaped name", page)
+	}
+	if strings.Contains(page, "<script>") {
+		t.Fatalf("display %q carries a raw script tag", page)
+	}
+}
+
+func renderRegion(t *testing.T) *html.Node? {
+	t.Helper()
+	tick := stock.Tick{ID: 4, Name: "Teapot", Stock: 2, Price: 4500}
+	content := view.Ul(
+		view.Attr("id", "results"),
+		view.Li(stock.Display(tick)),
+	)
+	var body strings.Builder
+	if err := view.Render(t.Context(), &body, stock.Region(content)); err != nil {
+		t.Fatalf("render region: %v", err)
+		return nil
+	}
+	doc, err := html.Parse(strings.NewReader(body.String()))
+	if err != nil {
+		t.Fatalf("parse region: %v", err)
+		return nil
+	}
+	return doc
+}
+
+func onlyStockRegion(t *testing.T, doc *html.Node) *html.Node? {
+	t.Helper()
+	var regions []*html.Node
+	for n := range doc.Descendants() {
+		if attrVal(n, "data-live-region") == "stock" {
+			regions = append(regions, n)
+		}
+	}
+	if len(regions) != 1 {
+		t.Fatalf("stock regions = %d, want one stable region", len(regions))
+		return nil
+	}
+	return regions[0]
+}
+
+func stockResults(t *testing.T, region *html.Node) *html.Node? {
+	t.Helper()
+	results := find(region, func(n *html.Node) bool { return attrVal(n, "id") == "results" })
+	if results == nil {
+		t.Fatal("region does not hold the stock targets")
+		return nil
+	}
+	return results
+}
+
+func TestRegionIsTheOnlyStockLiveRegion(t *testing.T) {
+	doc := renderRegion(t)
+	if doc == nil {
+		return
+	}
+	region := onlyStockRegion(t, doc)
+	if region == nil {
+		return
+	}
+	if got := attrVal(region, "hx-ext"); got != "sse" {
+		t.Fatalf("region hx-ext = %q, want sse", got)
+	}
+	if got := attrVal(region, "sse-connect"); got != "/stock/events" {
+		t.Fatalf("region sse-connect = %q, want /stock/events", got)
+	}
+	for n := range region.Descendants() {
+		if n != region && attrVal(n, "data-live-region") == "stock" {
+			t.Fatal("region holds a nested live region")
+		}
+	}
+}
+
+func TestRegionHoldsContentSinkAndToggle(t *testing.T) {
+	doc := renderRegion(t)
+	if doc == nil {
+		return
+	}
+	region := onlyStockRegion(t, doc)
+	if region == nil {
+		return
+	}
+	results := stockResults(t, region)
+	if results == nil {
+		return
+	}
+	sink := find(region, func(n *html.Node) bool {
+		return !within(results, n) && attrVal(n, "sse-swap") == "stock"
+	})
+	if sink == nil {
+		t.Fatal("region lacks the stock SSE sink outside the results")
+		return
+	}
+	if got := attrVal(sink, "hx-swap"); got != "none" {
+		t.Fatalf("sink hx-swap = %q, want none", got)
+	}
+	toggle := find(region, func(n *html.Node) bool {
+		return !within(results, n) && n.Data == "button" && hasAttr(n, "data-live-toggle")
+	})
+	if toggle == nil {
+		t.Fatal("region lacks the pause toggle")
+		return
+	}
+	if got := attrVal(toggle, "aria-pressed"); got != "false" {
+		t.Fatalf("toggle aria-pressed = %q, want false", got)
+	}
+	if !hasAttr(toggle, "hidden") {
+		t.Fatal("toggle does not start hidden")
+	}
+}

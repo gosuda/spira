@@ -1,0 +1,305 @@
+package http3
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net/http"
+	"runtime/debug"
+	"sync/atomic"
+	"time"
+
+	"github.com/quic-go/quic-go"
+)
+
+const (
+	h3RequestCodeNoError        = 0x100
+	h3RequestCodeInternal       = 0x102
+	h3RequestCodeUnexpected     = 0x105
+	h3RequestCodeFrameError     = 0x106
+	h3RequestCodeExcessiveLoad  = 0x107
+	h3RequestCodeCancelled      = 0x10c
+	h3RequestCodeIncomplete     = 0x10d
+	h3RequestCodeMessageError   = 0x10e
+	h3RequestCodeQPACK          = 0x200
+)
+
+var errH3MissingRequestHeaders = errors.New("http3: request stream ended before HEADERS")
+
+type h3RequestStreamConfig struct {
+	handler              http.Handler
+	maxHeaderBytes       uint64 = http.DefaultMaxHeaderBytes
+	maxFieldSectionSize  uint64 = http.DefaultMaxHeaderBytes
+	peerFieldSectionSize uint64 = h3UnlimitedFieldSectionSize
+	readHeaderTimeout    time.Duration
+}
+
+// serveH3RequestStream owns both halves of one accepted client bidirectional stream.
+// The caller derives ctx from conn.Context and supplies the field section size advertised on this connection.
+func serveH3RequestStream(ctx context.Context, conn *quic.Conn, stream *quic.Stream, cfg h3RequestStreamConfig) {
+	defer stream.ReleaseStreamCredit()
+	ctx, cancel := context.WithCancelCause(context.WithValue(ctx, http.LocalAddrContextKey, conn.LocalAddr()))
+	defer cancel(nil)
+	streamCtx := stream.Context()
+	stop := context.AfterFunc(streamCtx, func() {
+		cause := context.Cause(streamCtx)
+		if errors.Is(cause, quic.ErrStreamClosed) {
+			return
+		}
+		cancel(cause)
+		if failure, ok := errors.AsType[*quic.StreamError](cause); ok && failure.Remote {
+			stream.CancelRead(h3RequestCodeCancelled)
+		}
+	})
+	defer stop()
+
+	reader := bufio.NewReader(stream)
+	decoded, err := readH3RequestHead(stream, reader, cfg)
+	if err != nil {
+		rejectH3RequestHead(conn, stream, cfg.peerFieldSectionSize, err)
+		return
+	}
+	if decoded == nil {
+		stream.CancelRead(h3RequestCodeInternal)
+		stream.CancelWrite(h3RequestCodeInternal)
+		return
+	}
+	if ctx.Err() != nil || streamCtx.Err() != nil {
+		stream.CancelRead(h3RequestCodeCancelled)
+		stream.CancelWrite(h3RequestCodeCancelled)
+		return
+	}
+	if decoded.Trailer == nil {
+		decoded.Trailer = make(http.Header)
+	}
+	body := &h3RequestStreamBody{
+		conn: conn, stream: stream, cancel: cancel,
+		reader: newH3RequestBodyReader(reader, decoded.Trailer, h3RequestBodyLimits{
+			contentLength:       decoded.ContentLength,
+			maxTrailerBytes:     cfg.maxHeaderBytes,
+			maxFieldSectionSize: cfg.maxFieldSectionSize,
+		}),
+	}
+	serveH3Request(ctx, decoded, body, cfg)
+}
+
+func serveH3Request(ctx context.Context, decoded *http.Request, body *h3RequestStreamBody, cfg h3RequestStreamConfig) {
+	req := decoded.WithContext(ctx)
+	req.TLS = new(body.conn.ConnectionState().TLS)
+	req.RemoteAddr = body.conn.RemoteAddr().String()
+	req.Body = body
+	writer := newH3ResponseWriter(body.stream, req.Method, cfg.peerFieldSectionSize)
+	handler := cfg.handler
+	if handler == nil {
+		handler = http.DefaultServeMux
+	}
+	panicked := invokeH3Handler(handler, writer, req)
+	body.cancel(nil)
+	if panicked {
+		body.abort(h3RequestCodeInternal)
+		return
+	}
+	body.finish(writer)
+}
+
+func invokeH3Handler(handler http.Handler, writer http.ResponseWriter, req *http.Request) (panicked bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			panicked = true
+			if err, ok := p.(error); !ok || !errors.Is(err, http.ErrAbortHandler) {
+				slog.Error("http3: panic serving request", "stack", string(debug.Stack()))
+			}
+		}
+	}()
+	handler.ServeHTTP(writer, req)
+	return false
+}
+
+func readH3RequestHead(stream *quic.Stream, reader *bufio.Reader, cfg h3RequestStreamConfig) (*http.Request?, error) {
+	if cfg.readHeaderTimeout > 0 {
+		stream.SetReadDeadline(time.Now().Add(cfg.readHeaderTimeout))?
+		defer stream.SetReadDeadline(time.Time{})?
+	}
+	frame := readH3InitialFrame(reader)?
+	if frame.length > cfg.maxHeaderBytes || frame.length > uint64(math.MaxInt) {
+		return nil, errH3FieldSectionTooLarge
+	}
+	size := int(frame.length)
+	if size <= reader.Size() {
+		block, err := reader.Peek(size)
+		if err != nil {
+			return nil, h3RequestFrameReadError(err)
+		}
+		req := decodeH3Request(block, cfg.maxFieldSectionSize)?
+		reader.Discard(size)?
+		return req, nil
+	}
+	block := make([]byte, size)
+	if _, err := io.ReadFull(reader, block); err != nil {
+		return nil, h3RequestFrameReadError(err)
+	}
+	return decodeH3Request(block, cfg.maxFieldSectionSize)
+}
+
+func readH3InitialFrame(reader *bufio.Reader) (h3FrameHeader, error) {
+	for {
+		if _, err := reader.Peek(1); err != nil {
+			if errors.Is(err, io.EOF) {
+				return h3FrameHeader{}, errH3MissingRequestHeaders
+			}
+			return h3FrameHeader{}, err
+		}
+		frame, err := readH3FrameHeader(reader)
+		if err != nil {
+			return h3FrameHeader{}, h3RequestFrameReadError(err)
+		}
+		switch frame.kind {
+		case 0x1:
+			return frame, nil
+		case 0x0, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xd, 0xf0700, 0xf0701:
+			return h3FrameHeader{}, fmt.Errorf("%w: type %#x before HEADERS", errH3FrameUnexpected, frame.kind)
+		}
+		discardH3RequestExtensionFrame(reader, frame.length)?
+	}
+}
+
+func discardH3RequestExtensionFrame(reader *bufio.Reader, length uint64) error {
+	for length != 0 {
+		size := min(length, uint64(math.MaxInt))
+		if _, err := reader.Discard(int(size)); err != nil {
+			return h3RequestFrameReadError(err)
+		}
+		length -= size
+	}
+	return nil
+}
+
+// RFC 9114 §7.1 scopes forbidden and FIN-truncated frames to the connection.
+// RFC 9204 §2.2.1 does the same for field section decompression failures.
+func h3RequestConnectionError(err error) (quic.ApplicationErrorCode, bool) {
+	switch {
+	case errors.Is(err, errH3FrameUnexpected):
+		return h3RequestCodeUnexpected, true
+	case errors.Is(err, errH3FrameTruncated):
+		return h3RequestCodeFrameError, true
+	case errors.Is(err, errH3QPACK):
+		return h3RequestCodeQPACK, true
+	default:
+		return 0, false
+	}
+}
+
+func closeH3RequestConnection(conn *quic.Conn, code quic.ApplicationErrorCode) {
+	if err := conn.CloseWithError(code, ""); err != nil && conn.Context().Err() == nil {
+		slog.Error("http3: close request connection failed", "code", code)
+	}
+}
+
+func rejectH3RequestHead(conn *quic.Conn, stream *quic.Stream, peerLimit uint64, err error) {
+	if code, ok := h3RequestConnectionError(err); ok {
+		closeH3RequestConnection(conn, code)
+		return
+	}
+	var code quic.StreamErrorCode
+	switch {
+	case errors.Is(err, errH3FieldSectionTooLarge):
+		stream.CancelRead(h3RequestCodeExcessiveLoad)
+		writer := newH3ResponseWriter(stream, http.MethodGet, peerLimit)
+		writer.Header()["Date"] = nil
+		writer.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+		if writer.finish() == nil && stream.Close() == nil {
+			return
+		}
+		stream.CancelWrite(h3RequestCodeExcessiveLoad)
+		return
+	case errors.Is(err, errH3MalformedMessage):
+		code = h3RequestCodeMessageError
+	case errors.Is(err, errH3MissingRequestHeaders):
+		code = h3RequestCodeIncomplete
+	default:
+		code = h3RequestCodeCancelled
+	}
+	stream.CancelRead(code)
+	stream.CancelWrite(code)
+}
+
+type h3RequestStreamBody struct {
+	reader       *h3RequestBodyReader
+	conn         *quic.Conn
+	stream       *quic.Stream
+	cancel       context.CancelCauseFunc
+	readClosed   atomic.Bool
+	responseDone atomic.Bool
+}
+
+func (b *h3RequestStreamBody) Read(p []byte) (int, error) {
+	if b.readClosed.Load() {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	n, err := b.reader.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		b.handleReadError(err)
+	}
+	return n, err
+}
+
+func (b *h3RequestStreamBody) handleReadError(err error) {
+	if code, ok := h3RequestConnectionError(err); ok {
+		b.cancel(err)
+		closeH3RequestConnection(b.conn, code)
+		return
+	}
+	switch {
+	case errors.Is(err, errH3MalformedMessage):
+		b.cancel(err)
+		b.abort(h3RequestCodeMessageError)
+	case errors.Is(err, errH3FieldSectionTooLarge):
+		b.cancel(err)
+		b.abort(h3RequestCodeExcessiveLoad)
+	default:
+		if failure, ok := errors.AsType[*quic.StreamError](err); ok && failure.Remote {
+			b.cancel(err)
+		}
+	}
+}
+
+func (b *h3RequestStreamBody) Close() error {
+	b.stopRead(h3RequestCodeNoError)
+	return nil
+}
+
+func (b *h3RequestStreamBody) stopRead(code quic.StreamErrorCode) {
+	if b.readClosed.CompareAndSwap(false, true) {
+		b.stream.CancelRead(code)
+	}
+}
+
+func (b *h3RequestStreamBody) abort(code quic.StreamErrorCode) {
+	if b.responseDone.CompareAndSwap(false, true) {
+		b.stopRead(code)
+		b.stream.CancelWrite(code)
+	}
+}
+
+func (b *h3RequestStreamBody) finish(writer *h3ResponseWriter) {
+	if b.responseDone.Load() {
+		return
+	}
+	if err := writer.finish(); err != nil {
+		b.abort(h3RequestCodeCancelled)
+		return
+	}
+	if !b.responseDone.CompareAndSwap(false, true) {
+		return
+	}
+	if err := b.stream.Close(); err != nil {
+		b.stopRead(h3RequestCodeCancelled)
+		b.stream.CancelWrite(h3RequestCodeCancelled)
+		return
+	}
+	b.stopRead(h3RequestCodeNoError)
+}

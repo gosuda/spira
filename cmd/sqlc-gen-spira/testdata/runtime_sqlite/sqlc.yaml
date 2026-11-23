@@ -1,0 +1,17 @@
+version: "2"
+plugins:
+  - name: spira
+    process:
+      cmd: sqlc-gen-spira
+      format: json
+sql:
+  - engine: sqlite
+    schema: migrations
+    queries: queries
+    codegen:
+      - plugin: spira
+        out: store
+        options:
+          package: store
+          tables:
+            items: { type: Item }

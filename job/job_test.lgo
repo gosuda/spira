@@ -741,6 +741,50 @@ func waitRun(t *testing.T, runs chan struct{}, what string) {
 	}
 }
 
+func requireSkipped(t *testing.T, s *job.Scheduler, want uint64, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := s.Skipped()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Skipped = %d after one tick on the restart, want %d: %s", got, want, what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func resetAttemptTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(2 * time.Second)
+}
+
+func tickUntilRun(t *testing.T, ticks chan time.Time, entered chan struct{}) uint64 {
+	t.Helper()
+	attemptTimeout := time.NewTimer(2 * time.Second)
+	defer attemptTimeout.Stop()
+	for attempt := range 5 {
+		sendTick(t, ticks)
+		resetAttemptTimer(attemptTimeout)
+		select {
+		case <-entered:
+			return uint64(attempt + 1)
+		case <-t.Context().Done():
+			t.Fatal("test context ended waiting for the run after the earlier run finished")
+		case <-attemptTimeout.C:
+		}
+	}
+	t.Fatal("the job did not run after five ticks on the restarted scheduler: the earlier run finished but its busy mark was kept")
+	return 0
+}
+
 func TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick(t *testing.T) {
 	var s job.Scheduler
 	ticks := make(chan time.Time)
@@ -824,22 +868,24 @@ func TestSchedulerSkipsWhileAnEarlierStartStillRuns(t *testing.T) {
 	if err := s.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stop error = %v, want the deadline while the run is still active", err)
 	}
-	time.Sleep(100 * time.Millisecond)
+	restarted := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return restarted })
 	mustStart(t, &s)
-	sendTick(t, ticks)
-	time.Sleep(100 * time.Millisecond)
-	if got := s.Skipped(); got != 1 {
-		t.Fatalf("Skipped = %d after one tick on the restart, want 1: the earlier run still holds the job", got)
-	}
+	sendTick(t, restarted)
+	requireSkipped(t, &s, 1, "the earlier run still holds the job")
 	select {
 	case <-entered:
 		t.Fatal("the job ran on the restart while the earlier run was still active")
 	default:
 	}
 	close(release)
-	time.Sleep(100 * time.Millisecond)
-	sendTick(t, ticks)
-	waitRun(t, entered, "the run after the earlier run finished")
+	ticksSent := tickUntilRun(t, restarted, entered)
+	if got := s.Skipped(); got != ticksSent {
+		t.Fatalf("Skipped = %d after %d ticks on the restarted scheduler, want %d: one tick skipped on the restart plus one for each later tick that found the earlier run", got, ticksSent, ticksSent)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("the job ran %d times, want 2: once before the restart and once after the earlier run finished", got)
+	}
 	mustStop(t, &s)
 }
 
@@ -897,6 +943,24 @@ func TestSchedulerDoesNotLeakABusyMarkFromACancelledPump(t *testing.T) {
 		t.Fatal("DeliverTick did not find the job")
 	}
 	restartRunsJob(t, &s, ticks, runs)
+}
+
+func TestSchedulerCancelledTickDoesNotCountASkip(t *testing.T) {
+	var s job.Scheduler
+	ticks := make(chan time.Time)
+	job.SetTicker(&s, func(d time.Duration) <-chan time.Time { return ticks })
+	s.Every("held", time.Second, func(ctx context.Context) error { return nil })
+	mustStart(t, &s)
+	mustStop(t, &s)
+	if !job.MarkEntryBusy(&s, "held") {
+		t.Fatal("MarkEntryBusy did not find the job")
+	}
+	if !job.DeliverTick(&s, "held", cancelledContext{}, 1) {
+		t.Fatal("DeliverTick did not find the job")
+	}
+	if got := s.Skipped(); got != 0 {
+		t.Fatalf("Skipped = %d after a tick on an already cancelled context while the job was busy, want 0: a pump that sees the end of the run context must not count a skip", got)
+	}
 }
 
 type flipClaimContext struct {

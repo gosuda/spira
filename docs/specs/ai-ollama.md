@@ -8,10 +8,12 @@ The package holds behavior translated from Spring AI.
 
 ```lgo
 type Client struct {
-	BaseURL string
-	Model   string
-	HTTP    *http.Client
-	Policy  resilience.Policy
+	BaseURL   string
+	Model     string
+	HTTP      *http.Client
+	Policy    resilience.Policy
+	MaxLine   int
+	MaxStream int64
 }
 
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error)
@@ -27,7 +29,7 @@ var ErrInvalidRequest = fault.New("ollama.invalid_request", fault.Invalid, "The 
 func Faults() []*fault.Error
 ```
 
-`Model` names the model for `Embed`, which takes no model argument. Ollama sends no key.
+`Model` names the model for `Embed`, which takes no model argument. Ollama sends no key. A stream line longer than `MaxLine` bytes (1 MiB when zero) or a stream longer than `MaxStream` bytes (64 MiB when zero) ends the stream with `ollama.provider_too_large`.
 
 ## Requirements
 

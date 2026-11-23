@@ -1,0 +1,433 @@
+package http3
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
+	"logos/rt"
+	"logos/sync"
+)
+
+const (
+	h3OwnedHandshakeTimeout = 5 * time.Second
+	h3OwnedIdleTimeout      = 30 * time.Second
+	h3OwnedSettingsTimeout  = 5 * time.Second
+	h3OwnedCloseTimeout     = 5 * time.Second
+	h3OwnedBidiStreams      = 100
+	h3OwnedUniStreams       = 100
+	h3OwnedAbortWorkers     = 16
+	h3OwnedHeaderLimit      = http.DefaultMaxHeaderBytes
+	h3RequestRejected       = 0x10b
+	h3LastClientBidiID      = quic.StreamID(quicvarint.Max &^ 3)
+)
+
+type h3OwnedServer struct {
+	handler http.Handler
+	tls     *tls.Config?
+	state   sync.Locked[h3OwnedServerState]
+}
+
+type h3OwnedServerState struct {
+	closed bool
+	run    *h3OwnedRun?
+}
+
+type h3OwnedRun struct {
+	requests      h3RequestStreamConfig
+	acceptCtx     context.Context
+	stopAccept    context.CancelFunc
+	forceCtx      context.Context
+	forceClose    context.CancelFunc
+	admission     sync.Locked[h3OwnedAdmission]
+	connsDone     chan struct{}
+	transportDone chan struct{}
+	done          chan struct{}
+	closeErr      sync.Locked[error]
+}
+
+type h3OwnedAdmission struct {
+	conns      map[*quic.Conn]struct{}
+	acceptDone bool
+}
+
+type h3OwnedConn struct {
+	conn          *quic.Conn
+	run           *h3OwnedRun
+	nextRequestID quic.StreamID
+}
+
+func newH3OwnedServer(handler http.Handler, config *tls.Config?) *h3OwnedServer {
+	if config == nil {
+		return &h3OwnedServer{handler: handler}
+	}
+	return &h3OwnedServer{handler: handler, tls: h3OwnedTLS(config)}
+}
+
+func h3OwnedTLS(config *tls.Config) *tls.Config {
+	owned := config.Clone()
+	owned.MinVersion = max(owned.MinVersion, tls.VersionTLS13)
+	owned.NextProtos = []string{"h3"}
+	if choose := owned.GetConfigForClient; choose != nil {
+		owned.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			selected, err := choose(hello)
+			if err != nil {
+				return owned, err
+			}
+			if selected == nil {
+				return owned, nil
+			}
+			return h3OwnedTLS(selected), nil
+		}
+	}
+	return owned
+}
+
+func (s *h3OwnedServer) Serve(pc net.PacketConn) error {
+	run := s.beginServe()?
+	if run == nil {
+		return http.ErrServerClosed
+	}
+	defer s.endServe(run)
+	setupDone := false
+	defer func() {
+		if !setupDone {
+			close(run.transportDone)
+		}
+	}()
+
+	cfg := s.tls
+	if cfg == nil {
+		return errors.New("http3: server needs a TLS configuration that allows TLS 1.3")
+	}
+	if cfg.MaxVersion != 0 && cfg.MaxVersion < cfg.MinVersion {
+		return errors.New("http3: server needs a TLS configuration that allows TLS 1.3")
+	}
+	if pc == nil {
+		return errors.New("http3: server needs a packet connection")
+	}
+	transport := &quic.Transport{Conn: pc}
+	listener := transport.Listen(cfg, &quic.Config{
+		HandshakeIdleTimeout: h3OwnedHandshakeTimeout, MaxIdleTimeout: h3OwnedIdleTimeout,
+		MaxIncomingStreams: h3OwnedBidiStreams, MaxIncomingUniStreams: h3OwnedUniStreams,
+		RequireStreamCreditRelease: true, Allow0RTT: false, EnableDatagrams: false,
+	})?
+	setupDone = true
+	return run.serveTransport(listener, transport)
+}
+
+func (s *h3OwnedServer) beginServe() (*h3OwnedRun?, error) {
+	var run *h3OwnedRun?
+	var err error
+	s.state.WithLock(func(state *h3OwnedServerState) {
+		switch {
+		case state.closed:
+			err = http.ErrServerClosed
+		case state.run != nil:
+			err = errors.New("http3: packet connection already being served")
+		default:
+			acceptCtx, stopAccept := context.WithCancel(context.Background())
+			forceCtx, forceClose := context.WithCancel(context.Background())
+			run = &h3OwnedRun{
+				requests: h3RequestStreamConfig{
+					handler: s.handler, maxHeaderBytes: h3OwnedHeaderLimit,
+					maxFieldSectionSize: h3OwnedHeaderLimit, readHeaderTimeout: 0,
+				},
+				acceptCtx: acceptCtx, stopAccept: stopAccept, forceCtx: forceCtx, forceClose: forceClose,
+				connsDone: make(chan struct{}), transportDone: make(chan struct{}), done: make(chan struct{}),
+			}
+			state.run = run
+		}
+	})
+	return run, err
+}
+
+func (s *h3OwnedServer) endServe(run *h3OwnedRun) {
+	run.stopAccept()
+	run.forceClose()
+	s.state.WithLock(func(state *h3OwnedServerState) {
+		state.run = nil
+		close(run.done)
+	})
+}
+
+func (s *h3OwnedServer) stopServing() *h3OwnedRun? {
+	var run *h3OwnedRun?
+	s.state.WithLock(func(state *h3OwnedServerState) {
+		state.closed = true
+		current := state.run
+		if current != nil {
+			current.startDrain()
+		}
+		run = current
+	})
+	return run
+}
+
+func (s *h3OwnedServer) Shutdown(ctx context.Context) error {
+	run := s.stopServing()
+	if run == nil {
+		return nil
+	}
+	select {
+	case <-run.done:
+		return run.transportError()
+	default:
+	}
+	select {
+	case <-run.done:
+		return run.transportError()
+	case <-ctx.Done():
+		run.forceClose()
+		return ctx.Err()
+	}
+}
+
+func (s *h3OwnedServer) Close() error {
+	run := s.stopServing()
+	if run == nil {
+		return nil
+	}
+	run.forceClose()
+	ctx, cancel := context.WithTimeout(context.Background(), h3OwnedCloseTimeout)
+	defer cancel()
+	select {
+	case <-run.transportDone:
+		return run.transportError()
+	case <-ctx.Done():
+		return fmt.Errorf("http3: close transport: %w", ctx.Err())
+	}
+}
+
+func (r *h3OwnedRun) transportError() error {
+	var err error
+	r.closeErr.WithLock(func(result *error) { err = *result })
+	return err
+}
+
+func (r *h3OwnedRun) startDrain() {
+	r.admission.WithLock(func(_ *h3OwnedAdmission) { r.stopAccept() })
+}
+
+func (r *h3OwnedRun) serveTransport(listener *quic.Listener, transport *quic.Transport) error {
+	workers, _ := rt.NewGroup(context.Background(), 0)
+	acceptErr := r.acceptConnections(listener, workers)
+	if !errors.Is(acceptErr, http.ErrServerClosed) {
+		r.startDrain()
+		r.forceClose()
+	}
+	listenErr := listener.Close()
+	queuedErr := closeH3QueuedConnections(listener)
+	r.admission.WithLock(func(a *h3OwnedAdmission) {
+		a.acceptDone = true
+		if len(a.conns) == 0 {
+			close(r.connsDone)
+		}
+	})
+
+	// QUIC exposes no FIN acknowledgment. Keep the transport up until peers close or shutdown expires.
+	var forceErr error
+	select {
+	case <-r.connsDone:
+	case <-r.forceCtx.Done():
+		forceErr = r.abortConnections()
+	}
+	closeErr := errors.Join(listenErr, queuedErr, forceErr, transport.Close())
+	r.closeErr.WithLock(func(result *error) { *result = closeErr })
+	close(r.transportDone)
+	waitErr := workers.Wait()
+	if errors.Is(acceptErr, http.ErrServerClosed) && closeErr == nil && waitErr == nil {
+		return http.ErrServerClosed
+	}
+	if errors.Is(acceptErr, http.ErrServerClosed) {
+		acceptErr = nil
+	}
+	return errors.Join(acceptErr, closeErr, waitErr)
+}
+
+func (r *h3OwnedRun) acceptConnections(listener *quic.Listener, workers *rt.Group) error {
+	for r.acceptCtx.Err() == nil {
+		conn, err := listener.Accept(r.acceptCtx)
+		if err != nil {
+			if r.acceptCtx.Err() != nil {
+				break
+			}
+			return err
+		}
+		if !r.admitConn(conn) {
+			if err := conn.CloseWithError(h3RequestCodeNoError, ""); err != nil {
+				return err
+			}
+			break
+		}
+		owned := &h3OwnedConn{conn: conn, run: r}
+		workers.Go(func(_ context.Context) error {
+			defer r.releaseConn(conn)
+			if err := owned.serve(); err != nil {
+				slog.Error("http3: connection worker failed", "error", err)
+			}
+			return nil
+		})
+	}
+	return http.ErrServerClosed
+}
+
+func (r *h3OwnedRun) admitConn(conn *quic.Conn) bool {
+	admitted := false
+	r.admission.WithLock(func(a *h3OwnedAdmission) {
+		if r.acceptCtx.Err() != nil {
+			return
+		}
+		if a.conns == nil {
+			a.conns = make(map[*quic.Conn]struct{})
+		}
+		a.conns[conn] = struct{}{}
+		admitted = true
+	})
+	return admitted
+}
+
+func (r *h3OwnedRun) releaseConn(conn *quic.Conn) {
+	r.admission.WithLock(func(a *h3OwnedAdmission) {
+		delete(a.conns, conn)
+		if a.acceptDone && len(a.conns) == 0 {
+			close(r.connsDone)
+		}
+	})
+}
+
+func closeH3QueuedConnections(listener *quic.Listener) error {
+	var closeErr error
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			return closeErr
+		}
+		if err := conn.CloseWithError(h3RequestCodeNoError, ""); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+	}
+}
+
+func (r *h3OwnedRun) abortConnections() error {
+	var conns []*quic.Conn
+	r.admission.WithLock(func(a *h3OwnedAdmission) {
+		conns = make([]*quic.Conn, 0, len(a.conns))
+		for conn := range a.conns {
+			conns = append(conns, conn)
+		}
+	})
+	ctx := context.Background()
+	go group (ctx, limit = h3OwnedAbortWorkers) {
+		for _, conn := range conns {
+			go conn.CloseWithError(h3RequestCodeNoError, "")
+		}
+	}
+	return nil
+}
+
+func (c *h3OwnedConn) serve() error {
+	ctx := c.conn.Context()
+	settingsCtx, cancel := context.WithTimeout(ctx, h3OwnedSettingsTimeout)
+	defer cancel()
+	control, err := startH3Control(settingsCtx, c.conn, h3OwnedHeaderLimit)
+	if err != nil {
+		return c.conn.CloseWithError(h3ControlStreamCreationError, "")
+	}
+	if control == nil {
+		return c.conn.CloseWithError(h3ControlStreamCreationError, "")
+	}
+
+	workers, workCtx := rt.NewGroup(ctx, 0)
+	workers.Go(func(ctx context.Context) error { return control.watchLocal(ctx) })
+	workers.Go(func(ctx context.Context) error { return c.acceptUni(ctx, control) })
+	workers.Go(func(ctx context.Context) error { return c.sendGoAway(ctx, control) })
+	workers.Go(func(ctx context.Context) error {
+		settings, err := control.awaitPeerSettings(settingsCtx)
+		cancel()
+		if err != nil {
+			return c.conn.CloseWithError(h3ControlMissingSettings, "")
+		}
+		cfg := c.run.requests
+		cfg.peerFieldSectionSize = settings.maxFieldSectionSize
+		return c.acceptRequests(ctx, cfg)
+	})
+	<-workCtx.Done()
+	// A transport close wakes stream I/O as well as the control and request workers.
+	closeErr := c.conn.CloseWithError(h3RequestCodeInternal, "")
+	return errors.Join(closeErr, workers.Wait())
+}
+
+func (c *h3OwnedConn) acceptUni(ctx context.Context, control *h3Control) error {
+	workers, workCtx := rt.NewGroup(ctx, h3OwnedUniStreams)
+	for workCtx.Err() == nil {
+		stream, err := c.conn.AcceptUniStream(workCtx)
+		if err != nil {
+			break
+		}
+		workers.Go(func(ctx context.Context) error { return control.handlePeerUni(ctx, stream) })
+	}
+	return workers.Wait()
+}
+
+func (c *h3OwnedConn) sendGoAway(ctx context.Context, control *h3Control) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-c.run.acceptCtx.Done():
+	}
+	var firstRejected quic.StreamID
+	c.run.admission.WithLock(func(_ *h3OwnedAdmission) { firstRejected = c.nextRequestID })
+	err := control.sendGoAway(ctx, firstRejected)
+	if c.conn.Context().Err() != nil {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("http3: send GOAWAY: %w", err)
+	}
+	return nil
+}
+
+func (c *h3OwnedConn) admitRequest(id quic.StreamID) bool {
+	admitted := false
+	c.run.admission.WithLock(func(_ *h3OwnedAdmission) {
+		// Reserve the last wire ID so the next ID always fits in a GOAWAY frame.
+		if c.run.acceptCtx.Err() == nil && id < h3LastClientBidiID {
+			c.nextRequestID = id + 4
+			admitted = true
+		}
+	})
+	return admitted
+}
+
+func (c *h3OwnedConn) acceptRequests(ctx context.Context, cfg h3RequestStreamConfig) error {
+	workers, workCtx := rt.NewGroup(ctx, h3OwnedBidiStreams)
+	for workCtx.Err() == nil {
+		stream, err := c.conn.AcceptStream(workCtx)
+		if err != nil {
+			break
+		}
+		if !c.admitRequest(stream.StreamID()) {
+			stream.CancelRead(h3RequestRejected)
+			stream.CancelWrite(h3RequestRejected)
+			stream.ReleaseStreamCredit()
+			continue
+		}
+		workers.Go(func(ctx context.Context) error {
+			serveH3RequestStream(ctx, c.conn, stream, cfg)
+			return nil
+		})
+	}
+	var closeErr error
+	if ctx.Err() == nil {
+		closeErr = c.conn.CloseWithError(h3RequestCodeInternal, "")
+	}
+	return errors.Join(closeErr, workers.Wait())
+}

@@ -165,6 +165,7 @@ func Faults() []*fault.Error
 - `TestSchedulerRunsJobOnNextTickAfterRunnerCancelledBeforeTick` proves that a cancelled runner does not skip the next tick after a restart.
 - `TestSchedulerSkipsWhileAnEarlierStartStillRuns` proves that a restart skips ticks while a timed-out stop leaves a run active.
 - `TestSchedulerDoesNotLeakABusyMarkFromACancelledPump` proves that a pump cancelled during shutdown leaves no busy mark for a later start.
+- `TestSchedulerCancelledTickDoesNotCountASkip` proves that a tick on an already cancelled context counts no skip while the job is busy.
 - `TestSchedulerReclaimsTickSentBeforeCancel` proves that a pump cancelled after its send takes its tick back and leaves no busy mark.
 - `TestSchedulerReleasesClaimWhenCancelWinsBeforeSend` proves that a pump cancelled before its send clears the claim it just made.
 - `TestQueueClosedThroughEnqueueBeforeStart` and `TestQueueStoppedThroughStartAfterStop` prove the closed and stopped matches through `Enqueue` and `Start`.

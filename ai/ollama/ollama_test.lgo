@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"iter"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -752,5 +753,154 @@ func TestChatBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
+	}
+}
+
+const (
+	lineBound      = 1024
+	streamBound    = 64 << 10
+	boundSlack     = 64 << 10
+	endlessCeiling = 8 << 20
+)
+
+type pipeListener struct {
+	conns  chan net.Conn
+	closed context.Context
+	shut   context.CancelFunc
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed.Done():
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.shut()
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr {
+	return pipeAddr{}
+}
+
+func (l *pipeListener) dial(ctx context.Context, _ string, _ string) (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-ctx.Done():
+		return nil, errors.Join(ctx.Err(), server.Close(), client.Close())
+	case <-l.closed.Done():
+		return nil, errors.Join(net.ErrClosed, server.Close(), client.Close())
+	}
+}
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string {
+	return "pipe"
+}
+
+func (pipeAddr) String() string {
+	return "pipe"
+}
+
+func pipeServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http.Client) {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(handler)
+	if err := srv.Listener.Close(); err != nil {
+		t.Fatalf("close the loopback listener: %v", err)
+	}
+	closed, shut := context.WithCancel(context.Background())
+	pipes := &pipeListener{conns: make(chan net.Conn), closed: closed, shut: shut}
+	srv.Listener = pipes
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv, &http.Client{Transport: &http.Transport{DialContext: pipes.dial, DisableKeepAlives: true}}
+}
+
+func endlessHandler(written *atomic.Int64, piece string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		for written.Load() < endlessCeiling {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			n, err := io.WriteString(w, piece)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func streamOutcome(seq iter.Seq2[ai.Chunk, error]) (int, []error) {
+	chunks := 0
+	var errs []error
+	for _, err := range seq {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		chunks++
+	}
+	return chunks, errs
+}
+
+func TestStreamStopsAtTheLineBound(t *testing.T) {
+	var written atomic.Int64
+	srv, httpClient := pipeServer(t, endlessHandler(&written, strings.Repeat("x", 512)))
+	c := &ollama.Client{BaseURL: srv.URL, Model: "llama3.2", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}, MaxLine: lineBound}
+
+	_, errs := streamOutcome(c.Stream(context.Background(), ai.Request{Model: "llama3.2"}))
+	srv.Close()
+
+	if len(errs) != 1 || !errors.Is(errs[0], ollama.ErrProviderTooLarge) {
+		t.Fatalf("errors = %v, want exactly one size limit error", errs)
+		return
+	}
+	if want := "ai/ollama: stream line exceeds 1024 bytes"; !strings.Contains(errs[0].Error(), want) {
+		t.Errorf("error = %v, want it to name %q", errs[0], want)
+	}
+	if got := written.Load(); got > lineBound+boundSlack {
+		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, lineBound+boundSlack)
+	}
+}
+
+func TestStreamStopsAtTheStreamBound(t *testing.T) {
+	var written atomic.Int64
+	srv, httpClient := pipeServer(t, endlessHandler(&written, ndjsonOneLine))
+	c := &ollama.Client{BaseURL: srv.URL, Model: "llama3.2", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}, MaxStream: streamBound}
+
+	chunks, errs := streamOutcome(c.Stream(context.Background(), ai.Request{Model: "llama3.2"}))
+	srv.Close()
+
+	if len(errs) != 1 || !errors.Is(errs[0], ollama.ErrProviderTooLarge) {
+		t.Fatalf("errors = %v, want exactly one size limit error", errs)
+		return
+	}
+	if want := "ai/ollama: stream exceeds 65536 bytes"; !strings.Contains(errs[0].Error(), want) {
+		t.Errorf("error = %v, want it to name %q", errs[0], want)
+	}
+	if whole := streamBound / len(ndjsonOneLine); chunks < whole {
+		t.Errorf("the stream gave %d chunks, want the %d whole lines inside the bound", chunks, whole)
+	}
+	if got := written.Load(); got > streamBound+boundSlack {
+		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, streamBound+boundSlack)
 	}
 }

@@ -84,7 +84,7 @@ func migrationsDDL(d db.Dialect) string {
 	case db.Postgres => ddlPostgres
 	case db.MySQL => ddlMySQL
 	case db.MSSQL => ddlMSSQL
-	default => boomNil[string]()
+	case nil => boomNil[string]()
 	}
 }
 
@@ -94,7 +94,7 @@ func param(d db.Dialect, n int) string {
 	case db.Postgres => "$" + fmt.Sprint(n)
 	case db.MySQL => "?"
 	case db.MSSQL => "@p" + fmt.Sprint(n)
-	default => boomNil[string]()
+	case nil => boomNil[string]()
 	}
 }
 
@@ -221,6 +221,9 @@ func isMySQLDialect(d db.Dialect) bool {
 }
 
 func Rollback(ctx context.Context, p *db.Pool, steps const []Step, count int) error {
+	if count == 0 {
+		return nil
+	}
 	if err := ensureTable(ctx, p); err != nil {
 		return err
 	}

@@ -1,0 +1,124 @@
+package migrate_test
+
+import (
+	"database/sql"
+	"errors"
+	"slices"
+	"testing"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/migrate"
+)
+
+func TestRollbackZeroPreservesFreshSQLiteSchema(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	before := sqliteSchemaSnapshot(t, pool)
+	if len(before) != 0 {
+		t.Fatalf("fresh SQLite schema = %+v, want empty", before)
+	}
+	if err := migrate.Rollback(t.Context(), pool, steps, 0); err != nil {
+		t.Fatalf("Rollback(0): %v", err)
+	}
+	if after := sqliteSchemaSnapshot(t, pool); !slices.Equal(before, after) {
+		t.Fatalf("SQLite schema changed after Rollback(0): before=%+v, after=%+v", before, after)
+	}
+}
+
+func TestRollbackRejectsNegativeCount(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := migrate.Rollback(t.Context(), pool, steps, -1); !errors.Is(err, migrate.ErrOrderMismatch) {
+		t.Fatalf("Rollback(-1) = %v, want migrate.ErrOrderMismatch", err)
+	}
+}
+
+func TestCheckReversibleSQLiteTableNameBoundary(t *testing.T) {
+	steps := []migrate.Step{{
+		Name: "0001_probe",
+		Up:   "CREATE TABLE probe (id integer primary key)",
+		Down: "DROP TABLE probe",
+	}}
+	for _, tc := range []struct {
+		name  string
+		setup string
+		want  error
+	}{
+		{name: "empty"},
+		{name: "accounts", setup: "CREATE TABLE accounts (id integer primary key)", want: migrate.ErrScratchNotEmpty},
+		{name: "sqliteX", setup: "CREATE TABLE sqliteX (id integer primary key)", want: migrate.ErrScratchNotEmpty},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := openPool(t)
+			if tc.setup != "" {
+				if _, err := pool.ExecContext(t.Context(), tc.setup); err != nil {
+					t.Fatalf("create table %q: %v", tc.name, err)
+				}
+			}
+			before := sqliteSchemaSnapshot(t, pool)
+			if tc.setup == "" && len(before) != 0 {
+				t.Fatalf("fresh SQLite schema = %+v, want empty", before)
+			}
+			if tc.setup != "" && (len(before) != 1 || before[0].kind != "table" || before[0].name != tc.name) {
+				t.Fatalf("initial SQLite schema = %+v, want only table %q", before, tc.name)
+			}
+			if err := migrate.CheckReversible(t.Context(), pool, steps); !errors.Is(err, tc.want) {
+				t.Fatalf("CheckReversible = %v, want %v", err, tc.want)
+			}
+			if after := sqliteSchemaSnapshot(t, pool); !slices.Equal(before, after) {
+				t.Fatalf("SQLite schema changed after CheckReversible: before=%+v, after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestCheckReversibleDetectsLeakedSQLitePrefixTable(t *testing.T) {
+	pool := openPool(t)
+	steps := []migrate.Step{{
+		Name: "0001_leaked",
+		Up:   "CREATE TABLE sqliteX (id integer primary key)",
+		Down: "SELECT 1",
+	}}
+	if err := migrate.CheckReversible(t.Context(), pool, steps); !errors.Is(err, migrate.ErrNotReversible) {
+		t.Fatalf("CheckReversible = %v, want migrate.ErrNotReversible", err)
+	}
+}
+
+type sqliteSchemaRow struct {
+	kind     string
+	name     string
+	table    string
+	rootPage int
+	ddl      sql.NullString
+}
+
+func sqliteSchemaSnapshot(t *testing.T, pool *db.Pool) []sqliteSchemaRow {
+	t.Helper()
+	rows, err := pool.QueryContext(t.Context(), "SELECT type, name, tbl_name, rootpage, sql FROM main.sqlite_master ORDER BY type, name")
+	if err != nil {
+		t.Fatalf("query SQLite schema: %v", err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatal("query SQLite schema returned no rows handle")
+		return nil
+	}
+	defer closeRows(t, rows)
+	var schema []sqliteSchemaRow
+	for rows.Next() {
+		var row sqliteSchemaRow
+		if err := rows.Scan(&row.kind, &row.name, &row.table, &row.rootPage, &row.ddl); err != nil {
+			t.Fatalf("scan SQLite schema: %v", err)
+			return nil
+		}
+		schema = append(schema, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read SQLite schema: %v", err)
+		return nil
+	}
+	return schema
+}

@@ -1,0 +1,9 @@
+package orders
+
+import (
+	"context"
+)
+
+func ContextWithProbe(call context.Context, probe func(context.Context) error) context.Context {
+	return context.WithValue(call, probeKey{}, probe)
+}

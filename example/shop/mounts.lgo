@@ -1,0 +1,32 @@
+package main
+
+import (
+	"github.com/gosuda/spira/admin"
+	"github.com/gosuda/spira/meter"
+	"github.com/gosuda/spira/openapi"
+	"github.com/gosuda/spira/ops"
+	"github.com/gosuda/spira/web"
+)
+
+type Mounts struct {
+	Guard   web.Stage
+	Ops     ops.Options
+	OpenAPI openapi.Info
+	Admin   *admin.Server
+}
+
+func Mount(r *web.Router, m Mounts) {
+	if m.Guard == nil {
+		panic("shop: Mounts.Guard is required")
+	}
+	if m.Ops.Registry == nil {
+		panic("shop: Mounts.Ops.Registry is required")
+	}
+	if m.Admin == nil {
+		panic("shop: Mounts.Admin is required")
+	}
+	r.Use(meter.HTTP(m.Ops.Registry))
+	ops.Mount(r, m.Guard, m.Ops)
+	openapi.Mount(r, m.OpenAPI)
+	m.Admin.Mount(r, m.Guard)
+}

@@ -1,0 +1,77 @@
+//go:build engines
+
+package main_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestEnginePostgresGeneratedQueriesMatchDatabaseSQL(t *testing.T) {
+	if os.Getenv("SPIRA_TEST_POSTGRES_DSN") == "" {
+		t.Fatal("SPIRA_TEST_POSTGRES_DSN is empty; run `just engines` or supply a PostgreSQL test DSN")
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if err := runPostgresGeneratedStore(ctx, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runPostgresGeneratedStore(ctx context.Context, dir string) error {
+	root := filepath.Abs(filepath.Join("..", ".."))?
+	stagePostgresRuntimeModule(root, dir)?
+
+	plugin := filepath.Join(dir, "sqlc-gen-spira")
+	buildPlugin := exec.CommandContext(ctx, "logos", "build", "-o", plugin, "./cmd/sqlc-gen-spira")
+	runPostgresRuntimeCommand(buildPlugin, root)?
+
+	generate := exec.CommandContext(ctx, "go", "tool", "sqlc", "generate", "-f", "../sqlc.yaml")
+	generate.Env = append(generate.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runPostgresRuntimeCommand(generate, filepath.Join(dir, "tools"))?
+
+	binary := filepath.Join(dir, "postgres-runtime")
+	buildFixture := exec.CommandContext(ctx, "logos", "build", "-o", binary, ".")
+	runPostgresRuntimeCommand(buildFixture, dir)?
+	return runPostgresRuntimeCommand(exec.CommandContext(ctx, binary), dir)
+}
+
+func stagePostgresRuntimeModule(root string, dir string) error {
+	os.CopyFS(dir, os.DirFS(filepath.Join("testdata", "runtime_postgres")))?
+	os.Rename(filepath.Join(dir, "main.lgo.tmpl"), filepath.Join(dir, "main.lgo"))?
+	mod := os.ReadFile(filepath.Join(root, "go.mod"))?
+	body, ok := bytes.CutPrefix(mod, []byte("module github.com/gosuda/spira\n"))
+	if !ok {
+		return fmt.Errorf("postgres runtime fixture: unexpected module path in %s", filepath.Join(root, "go.mod"))
+	}
+	fixtureMod := fmt.Appendf(nil, "module example.com/spira-sqlc-postgres-runtime\n%s\nrequire github.com/gosuda/spira v0.0.0\nreplace github.com/gosuda/spira => %q\n", body, root)
+	os.WriteFile(filepath.Join(dir, "go.mod"), fixtureMod, 0o600)?
+	for _, name := range []string{"go.sum", "logos.toml", "tools/go.mod", "tools/go.sum"} {
+		data := os.ReadFile(filepath.Join(root, name))?
+		dest := filepath.Join(dir, name)
+		os.MkdirAll(filepath.Dir(dest), 0o700)?
+		os.WriteFile(dest, data, 0o600)?
+	}
+	return nil
+}
+
+func runPostgresRuntimeCommand(cmd *exec.Cmd, dir string) error {
+	cmd.Dir = dir
+	cmd.Env = append(cmd.Environ(),
+		"GOWORK=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", "CGO_ENABLED=0",
+		"GOPROXY=off", "GONOPROXY=none", "GOSUMDB=off", "GOTELEMETRY=off",
+	)
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v in %s: %w\n%s", cmd.Args, dir, err, out)
+	}
+	return nil
+}

@@ -1,0 +1,11 @@
+package catalog
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrUnknownProduct = fault.New("catalog.unknown_product", fault.NotFound, "The product was not found.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrUnknownProduct}
+}

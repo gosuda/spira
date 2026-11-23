@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"iter"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1051,16 +1052,11 @@ func serveToolFragments(t *testing.T) *httptest.Server {
 	t.Helper()
 	pieces := []string{`{\"`, `ci`, `ty`, `\":`, `\"S`, `eo`, `ul`, `\"}`}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		record := func(delta string, finish string) string {
-			return `data: {"id":"chatcmpl-123","model":"gpt-6-astra","choices":[{"index":0,"delta":{` + delta + `},"finish_reason":` + finish + `}]}` + "\n\n"
-		}
-		head := record(`"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]`, `null`)
-		records := []string{head}
+		records := []string{sseDeltaRecord(`"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]`, `null`)}
 		for _, piece := range pieces {
-			records = append(records, record(`"tool_calls":[{"index":0,"function":{"arguments":"`+piece+`"}}]`, `null`))
+			records = append(records, sseDeltaRecord(`"tool_calls":[{"index":0,"function":{"arguments":"`+piece+`"}}]`, `null`))
 		}
-		records = append(records, record(``, `"tool_calls"`), "data: [DONE]\n\n")
+		records = append(records, sseDeltaRecord(``, `"tool_calls"`), "data: [DONE]\n\n")
 		for _, text := range records {
 			if _, err := io.WriteString(w, text); err != nil {
 				return
@@ -1128,6 +1124,132 @@ func TestStreamResetsBeforeTheFirstChunk(t *testing.T) {
 	}
 }
 
+const sseKeepAliveComment = ": keep-alive\n\n"
+
+func sseDeltaRecord(delta string, finish string) string {
+	return `data: {"id":"chatcmpl-123","model":"gpt-6-astra","choices":[{"index":0,"delta":{` + delta + `},"finish_reason":` + finish + `}]}` + "\n\n"
+}
+
+func pacedSSE(t *testing.T, records []string, gap time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		for _, record := range records {
+			if _, err := io.WriteString(w, record); err != nil {
+				return
+			}
+			flusher.Flush()
+			time.Sleep(gap)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestStreamKeepAliveCommentsHoldTheIdleBoundPastTheTimeout(t *testing.T) {
+	var records []string
+	for range 6 {
+		records = append(records, sseKeepAliveComment)
+	}
+	records = append(records, "data: [DONE]\n\n")
+	srv := pacedSSE(t, records, 120*time.Millisecond)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 500 * time.Millisecond}
+
+	chunks, errs := streamOutcome(c.Stream(context.Background(), askHello()))
+
+	if len(errs) != 0 {
+		t.Fatalf("errors = %v, want keep-alive comments to hold the stream past the timeout", errs)
+	}
+	if chunks != 0 {
+		t.Fatalf("chunks = %d, want none: a comment is not an event", chunks)
+	}
+}
+
+func TestStreamToolFragmentsSpanningBeyondTheTimeoutAssemble(t *testing.T) {
+	pieces := []string{`{\"`, `ci`, `ty`, `\":`, `\"S`, `eo`, `ul`, `\"}`}
+	records := []string{
+		sseDeltaRecord(`"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]`, `null`),
+	}
+	for _, piece := range pieces {
+		records = append(records, sseDeltaRecord(`"tool_calls":[{"index":0,"function":{"arguments":"`+piece+`"}}]`, `null`))
+	}
+	records = append(records, sseDeltaRecord(``, `"tool_calls"`), "data: [DONE]\n\n")
+	srv := pacedSSE(t, records, 120*time.Millisecond)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 500 * time.Millisecond}
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	if calls[0].ID != "call_abc" || calls[0].Name != "get_weather" || calls[0].Arguments != `{"city":"Seoul"}` {
+		t.Fatalf("assembled call: %+v", calls[0])
+	}
+}
+
+func TestStreamIdleBoundRefreshesOnLinesThatYieldNothing(t *testing.T) {
+	body := sseKeepAliveComment + sseKeepAliveComment +
+		sseDeltaRecord(`"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]`, `null`) +
+		sseDeltaRecord(`"tool_calls":[{"index":0,"function":{"arguments":"a"}}]`, `null`) +
+		sseDeltaRecord(`"tool_calls":[{"index":0,"function":{"arguments":"b"}}]`, `null`) +
+		sseDeltaRecord(`"tool_calls":[{"index":0,"function":{"arguments":"c"}}]`, `"tool_calls"`) +
+		"data: [DONE]\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, body); err != nil {
+			return
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	probe, restore := openai.ArmIdleProbe(c)
+	t.Cleanup(restore)
+
+	reply, err := ai.Collect(c.Stream(context.Background(), askHello()))
+
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+		return
+	}
+	if reply.Finish != ai.FinishToolCall {
+		t.Fatalf("finish: %+v", reply.Finish)
+	}
+	var calls []ai.ToolCall
+	for _, p := range reply.Message.Parts {
+		if call, ok := p.(ai.ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 || calls[0].Arguments != "abc" {
+		t.Fatalf("tool calls: %+v", reply.Message.Parts)
+	}
+	if probe.Fired {
+		t.Errorf("the idle timer fired although every line arrived")
+	}
+	if probe.Resets < 14 {
+		t.Errorf("the idle timer reset %d times, want at least one reset per line read (14)", probe.Resets)
+	}
+}
+
 func TestStreamCanceledBeforeHeadersKeepsThePackagePrefix(t *testing.T) {
 	rec := &recorder{}
 	srv := rec.serve(t, http.StatusOK, "text/event-stream", ssePlain)
@@ -1188,6 +1310,9 @@ func TestStreamCancelBetweenChunksKeepsThePackagePrefix(t *testing.T) {
 	}
 	if !errors.Is(cancelErr, context.Canceled) {
 		t.Fatalf("cancel error = %v, want it to match context.Canceled", cancelErr)
+	}
+	if !strings.HasPrefix(cancelErr.Error(), "openai.provider_stream_cut:") {
+		t.Fatalf("cancel error text = %q, want the openai.provider_stream_cut prefix", cancelErr.Error())
 	}
 }
 
@@ -1564,5 +1689,156 @@ func TestEmbedBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
+	}
+}
+
+const (
+	lineBound      = 1024
+	streamBound    = 64 << 10
+	boundSlack     = 64 << 10
+	endlessCeiling = 8 << 20
+)
+
+const sseHelloEvent = `data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}]}` + "\n\n"
+
+type pipeListener struct {
+	conns  chan net.Conn
+	closed context.Context
+	shut   context.CancelFunc
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed.Done():
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.shut()
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr {
+	return pipeAddr{}
+}
+
+func (l *pipeListener) dial(ctx context.Context, _ string, _ string) (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-ctx.Done():
+		return nil, errors.Join(ctx.Err(), server.Close(), client.Close())
+	case <-l.closed.Done():
+		return nil, errors.Join(net.ErrClosed, server.Close(), client.Close())
+	}
+}
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string {
+	return "pipe"
+}
+
+func (pipeAddr) String() string {
+	return "pipe"
+}
+
+func pipeServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http.Client) {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(handler)
+	if err := srv.Listener.Close(); err != nil {
+		t.Fatalf("close the loopback listener: %v", err)
+	}
+	closed, shut := context.WithCancel(context.Background())
+	pipes := &pipeListener{conns: make(chan net.Conn), closed: closed, shut: shut}
+	srv.Listener = pipes
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv, &http.Client{Transport: &http.Transport{DialContext: pipes.dial, DisableKeepAlives: true}}
+}
+
+func endlessHandler(written *atomic.Int64, piece string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		for written.Load() < endlessCeiling {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			n, err := io.WriteString(w, piece)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func streamOutcome(seq iter.Seq2[ai.Chunk, error]) (int, []error) {
+	chunks := 0
+	var errs []error
+	for _, err := range seq {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		chunks++
+	}
+	return chunks, errs
+}
+
+func TestStreamStopsAtTheLineBound(t *testing.T) {
+	var written atomic.Int64
+	srv, httpClient := pipeServer(t, endlessHandler(&written, strings.Repeat("x", 512)))
+	c := &openai.Client{BaseURL: srv.URL, Model: "gpt-6-astra", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}, MaxLine: lineBound}
+
+	_, errs := streamOutcome(c.Stream(context.Background(), askHello()))
+	srv.Close()
+
+	if len(errs) != 1 || !errors.Is(errs[0], openai.ErrProviderTooLarge) {
+		t.Fatalf("errors = %v, want exactly one size limit error", errs)
+		return
+	}
+	if want := "ai/openai: stream line exceeds 1024 bytes"; !strings.Contains(errs[0].Error(), want) {
+		t.Errorf("error = %v, want it to name %q", errs[0], want)
+	}
+	if got := written.Load(); got > lineBound+boundSlack {
+		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, lineBound+boundSlack)
+	}
+}
+
+func TestStreamStopsAtTheStreamBound(t *testing.T) {
+	var written atomic.Int64
+	srv, httpClient := pipeServer(t, endlessHandler(&written, sseHelloEvent))
+	c := &openai.Client{BaseURL: srv.URL, Model: "gpt-6-astra", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}, MaxStream: streamBound}
+
+	chunks, errs := streamOutcome(c.Stream(context.Background(), askHello()))
+	srv.Close()
+
+	if len(errs) != 1 || !errors.Is(errs[0], openai.ErrProviderTooLarge) {
+		t.Fatalf("errors = %v, want exactly one size limit error", errs)
+		return
+	}
+	if want := "ai/openai: stream exceeds 65536 bytes"; !strings.Contains(errs[0].Error(), want) {
+		t.Errorf("error = %v, want it to name %q", errs[0], want)
+	}
+	if whole := streamBound / len(sseHelloEvent); chunks < whole {
+		t.Errorf("the stream gave %d chunks, want the %d whole events inside the bound", chunks, whole)
+	}
+	if got := written.Load(); got > streamBound+boundSlack {
+		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, streamBound+boundSlack)
 	}
 }

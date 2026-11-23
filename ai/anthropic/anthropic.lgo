@@ -8,7 +8,6 @@
 package anthropic
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json/v2"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/internal/bounded"
 	"github.com/gosuda/spira/resilience"
 )
 
@@ -39,8 +39,22 @@ type Client struct {
 	HTTP      *http.Client
 	Policy    resilience.Policy
 	MaxTokens int
+	MaxLine   int
+	MaxStream int64
+	idleTimer func(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool)
 }
 
+func (c *Client) newTimer(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool) {
+	if c.idleTimer != nil {
+		return c.idleTimer(limit, onIdle)
+	}
+	return realIdleTimer(limit, onIdle)
+}
+
+func realIdleTimer(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool) {
+	timer := time.AfterFunc(limit, onIdle)
+	return timer.Reset, timer.Stop
+}
 func (c *Client) http() *http.Client {
 	if h := c.HTTP; h != nil {
 		return h
@@ -109,51 +123,157 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		budget = retry.Max
 	}
 	var hold time.Time
-	head, err := resilience.Do[streamHead](ctx, c.Policy, func(actx context.Context) (streamHead, error) {
-		if err := holdUntil(ctx, hold); err != nil {
+	outerCtx, cancelOuter := context.WithCancelCause(ctx)
+	defer cancelOuter(nil)
+	policy := c.streamPolicy()
+	head, err := resilience.Do[streamHead](ctx, policy, c.headCall(headAttempt{ctx: ctx, payload: payload, budget: budget, hold: &hold, outer: outerCtx}))
+	if err != nil {
+		yield ai.Chunk{}, err
+		return
+	}
+	watch := c.armIdle(policy.Timeout, cancelOuter)
+	defer watch.stop()
+	defer head.stop(nil)
+	defer closeBody(head.body)
+	for chunk, cerr := range c.streamChunks(ctx, head, watch) {
+		watch.stop()
+		cut := stallCut(head.ctx, cerr)
+		yield chunk, cut
+		watch.touch()
+	}
+}
+
+func (c *Client) streamPolicy() resilience.Policy {
+	policy := c.Policy
+	if policy.Timeout <= 0 {
+		policy.Timeout = 10 * time.Second
+	}
+	return policy
+}
+
+type headAttempt struct {
+	ctx     context.Context
+	payload []byte
+	budget  time.Duration
+	hold    *time.Time
+	outer   context.Context
+}
+
+func (c *Client) headCall(a headAttempt) func(actx context.Context) (streamHead, error) {
+	return func(actx context.Context) (streamHead, error) {
+		if err := holdUntil(a.ctx, *a.hold); err != nil {
 			return streamHead{}, ErrProviderError.Wrap(err)
 		}
-		status, header, body, derr := c.do(actx, payload)
+		streamCtx, stop := context.WithCancelCause(a.outer)
+		detach := context.AfterFunc(actx, func() { stop(context.Cause(actx)) })
+		status, header, body, derr := c.do(streamCtx, a.payload)
 		if derr != nil {
-			return streamHead{}, transportFault(derr)
+			stop(nil)
+			return streamHead{}, stallAttempt(a.outer, derr)
 		}
-		if status >= 200 && status <= 299 {
-			return streamHead{body: body}, nil
+		if status >= 200 && status <= 299 && detach() {
+			return streamHead{ctx: streamCtx, body: body, stop: stop}, nil
 		}
+		defer stop(nil)
 		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
 		failure := classifyStatus(status, statusDetailOf(status, data))
 		closeBody(body)
 		if rerr != nil {
 			failure = classifyStatus(status, fmt.Errorf("%w: body read ended early: %w", statusDetailOf(status, data), rerr))
 		}
-		if wait := retryWait(header, budget); wait > 0 {
+		if wait := retryWait(header, a.budget); wait > 0 {
 			failure = &deferred{cause: failure, wait: wait}
 		}
 		if wait := deferredWait(failure); wait > 0 {
 			when := time.Now().Add(wait)
-			if when.After(hold) {
-				hold = when
+			if when.After(*a.hold) {
+				*a.hold = when
 			}
 		}
 		if callerFault(failure) {
 			return streamHead{}, resilience.Ignored(failure)
 		}
 		return streamHead{}, failure
-	})
-	if err != nil {
-		yield ai.Chunk{}, err
-		return
 	}
-	defer closeBody(head.body)
-	for chunk, cerr := range streamEvents(ctx, head.body) {
-		yield chunk, cerr
+}
+
+type idleWatch struct {
+	reset func(time.Duration) bool
+	stop  func() bool
+	limit time.Duration
+}
+
+func (w idleWatch) touch() {
+	w.reset(w.limit)
+}
+
+func (c *Client) armIdle(limit time.Duration, cancel context.CancelCauseFunc) idleWatch {
+	if limit <= 0 {
+		limit = 10 * time.Second
+	}
+	reset, stop := c.newTimer(limit, func() { cancel(&stallError{limit: limit}) })
+	return idleWatch{reset: reset, stop: stop, limit: limit}
+}
+
+func (c *Client) streamChunks(ctx context.Context, head streamHead, watch idleWatch) iter.Seq2[ai.Chunk, error] {
+	alive := &touchReader{source: head.body, touch: watch.touch}
+	for chunk, cerr := range streamEvents(ctx, bounded.NewLines(alive, c.MaxLine, c.MaxStream), watch.touch) {
+		yield chunk, stallCut(head.ctx, cerr)
 	}
 }
 
 type streamHead struct {
+	ctx  context.Context
 	body io.ReadCloser
+	stop context.CancelCauseFunc
 }
 
+type touchReader struct {
+	source io.Reader
+	touch  func()
+}
+
+func (r *touchReader) Read(p []byte) (int, error) {
+	n, err := r.source.Read(p)
+	if n > 0 {
+		r.touch()
+	}
+	return n, err
+}
+func stallAttempt(outerCtx context.Context, derr error) error {
+	cause := context.Cause(outerCtx)
+	stall := &stallError{}
+	if cause != nil && errors.As(cause, &stall) {
+		return resilience.Ignored(ErrProviderStreamCut.Wrap(cause))
+	}
+	return transportFault(derr)
+}
+
+
+type stallError struct {
+	limit time.Duration
+}
+
+func (e *stallError) Error() string {
+	return fmt.Sprintf("ai/anthropic: no stream event for %s", e.limit)
+}
+
+func isStall(err error) bool {
+	stall := &stallError{}
+	return errors.As(err, &stall)
+}
+
+func stallCut(streamCtx context.Context, err error) error {
+	cause := context.Cause(streamCtx)
+	if cause == nil {
+		return err
+	}
+	stall := &stallError{}
+	if errors.As(cause, &stall) {
+		return ErrProviderStreamCut.Wrap(cause)
+	}
+	return err
+}
 func closeBody(body io.Closer) {
 	if err := body.Close(); err != nil {
 		return
@@ -300,23 +420,21 @@ func deferredWait(err error) time.Duration {
 	return 0
 }
 
-func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
-	reader := bufio.NewReader(body)
+func streamEvents(ctx context.Context, lines *bounded.Lines, touch func()) iter.Seq2[ai.Chunk, error] {
 	state := &streamState{tools: map[int32]*toolBlock{}}
 	for {
-		line, rerr := reader.ReadString('\n')
-		for chunk, err := range state.line(strings.TrimRight(line, "\r\n"), rerr != nil) {
+		line, rerr := lines.Next()
+		if rerr != nil {
+			for chunk, err := range streamEnd(ctx, rerr, state) {
+				yield chunk, err
+			}
+			return
+		}
+		touch()
+		for chunk, err := range state.line(strings.TrimRight(line, "\r\n")) {
 			yield chunk, err
 		}
 		if state.ended {
-			return
-		}
-		if rerr != nil {
-			if err := ctx.Err(); err != nil {
-				yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
-				return
-			}
-			yield ai.Chunk{}, ErrProviderStreamCut.Err()
 			return
 		}
 		if err := ctx.Err(); err != nil {
@@ -324,6 +442,24 @@ func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error
 			return
 		}
 	}
+}
+
+func streamEnd(ctx context.Context, rerr error, state *streamState) iter.Seq2[ai.Chunk, error] {
+	if errors.Is(rerr, bounded.ErrTooLarge) {
+		yield ai.Chunk{}, ErrProviderTooLarge.Wrap(fmt.Errorf("ai/anthropic: %w", rerr))
+		return
+	}
+	for chunk, err := range state.line("") {
+		yield chunk, err
+	}
+	if state.ended {
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
+		return
+	}
+	yield ai.Chunk{}, ErrProviderStreamCut.Err()
 }
 
 type toolBlock struct {
@@ -346,7 +482,7 @@ type streamState struct {
 	tools    map[int32]*toolBlock
 }
 
-func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
+func (s *streamState) line(line string) iter.Seq2[ai.Chunk, error] {
 	if name, isEvent := strings.CutPrefix(line, "event:"); isEvent && strings.TrimSpace(name) == "message_stop" {
 		s.ended = true
 		yield s.final(), nil
@@ -356,7 +492,7 @@ func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
 		s.data.WriteString(value)
 		s.data.WriteByte('\n')
 	}
-	if line != "" && !last {
+	if line != "" {
 		return
 	}
 	data := s.data.String()

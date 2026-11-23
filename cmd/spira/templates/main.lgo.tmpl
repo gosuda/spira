@@ -35,6 +35,9 @@ func main() {
 
 func run(ctx context.Context) error {
 	pool := openPool()?
+	if pool == nil {
+		return fmt.Errorf("demo: no database pool")
+	}
 	steps := migrate.Load(appdb.FS())?
 	if err := migrate.Apply(ctx, pool, steps); err != nil {
 		return err
@@ -42,7 +45,7 @@ func run(ctx context.Context) error {
 	if err := store.PrepareAll(ctx, pool); err != nil {
 		return err
 	}
-	if err := ensureDemoUser(ctx, pool); err != nil {
+	if err := seedDemoUser(ctx, pool); err != nil {
 		return err
 	}
 	manifest := loadManifest()?
@@ -68,16 +71,12 @@ func run(ctx context.Context) error {
 	return app.Run(ctx, &application{DB: pool, Web: srv})
 }
 
-func openPool() (*db.Pool, error) {
+func openPool() (*db.Pool?, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "{{DSN}}"
 	}
-	pool := db.Open("{{DRIVER_NAME}}", dsn)?
-	if pool == nil {
-		return nil, fmt.Errorf("demo: no database pool")
-	}
-	return pool, nil
+	return db.Open("{{DRIVER_NAME}}", dsn)
 }
 
 func loadManifest() (*asset.Manifest?, error) {
@@ -88,12 +87,16 @@ func loadManifest() (*asset.Manifest?, error) {
 	return asset.Load(os.DirFS("frontend/dist"), ".vite/manifest.json")
 }
 
-func ensureDemoUser(ctx context.Context, pool *db.Pool) error {
-	found := store.GetUserByName(ctx, pool, "demo")?
-	if found != nil {
+func seedDemoUser(ctx context.Context, pool *db.Pool) error {
+	password := os.Getenv("SPIRA_SEED_DEMO_PASSWORD")
+	if password == "" {
 		return nil
 	}
-	hash := auth.HashPassword("demo")?
+	hash := auth.HashPassword(password)?
+	found := store.GetUserByName(ctx, pool, "demo")?
+	if found != nil {
+		return store.SetUserPassword(ctx, pool, hash, "demo")
+	}
 	_, err := account.CreateUser(ctx, pool, "demo", hash)
 	return err
 }

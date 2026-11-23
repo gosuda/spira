@@ -1,0 +1,165 @@
+package orm
+
+import (
+	"comptime"
+	"context"
+	"fmt"
+	"slices"
+
+	"github.com/gosuda/spira/db"
+)
+
+// Table names a generated entity's table, key, and optional version column.
+type Table[E any, K comparable] struct {
+	Name    string
+	Key     string
+	Version string
+}
+
+// StaleError reports that a write affected a different number of rows than expected.
+type StaleError struct {
+	Table string
+	Key   string
+}
+
+func (e *StaleError) Error() string {
+	return fmt.Sprintf("orm: stale row in %s with key %s", e.Table, e.Key)
+}
+
+type trackedRow interface {
+	insert(ctx context.Context) error
+	update(ctx context.Context) error
+	remove(ctx context.Context) error
+	deleted() bool
+}
+
+// Session owns the identity map for one transaction. Only its work callback may
+// use it, from one goroutine.
+type Session struct {
+	tx      *db.Tx
+	dialect db.Dialect
+	tables  map[string]any
+	inserts []trackedRow
+	updates []trackedRow
+	deletes []trackedRow
+	failure error
+}
+
+// InSession commits only after work and the final flush succeed.
+func InSession[T any](ctx context.Context, p *db.Pool, work func(s *Session) (T, error)) (T, error) {
+	return db.InTx[T](ctx, p, func(tx *db.Tx) (T, error) {
+		return runSession(ctx, p.Dialect(), tx, work)
+	})
+}
+
+// InSQLiteImmediateSession holds the SQLite writer reservation through Flush.
+func InSQLiteImmediateSession[T any](ctx context.Context, p *db.Pool, work func(s *Session) (T, error)) (T, error) {
+	return db.InSQLiteImmediateTx[T](ctx, p, func(tx *db.Tx) (T, error) {
+		return runSession(ctx, p.Dialect(), tx, work)
+	})
+}
+
+func runSession[T any](ctx context.Context, dialect db.Dialect, tx *db.Tx, work func(s *Session) (T, error)) (T, error) {
+	s := &Session{tx: tx, dialect: dialect, tables: make(map[string]any)}
+	value := work(s)?
+	s.Flush(ctx)?
+	return value, nil
+}
+
+// Tx borrows the active transaction for checked queries without flushing.
+func (s *Session) Tx() *db.Tx {
+	return s.tx
+}
+
+// Flush writes inserts, changed rows, and deletes in their respective orders.
+// A failed flush leaves the transaction eligible only for rollback.
+func (s *Session) Flush(ctx context.Context) error {
+	if s.failure == nil {
+		s.failure = s.flush(ctx)
+	}
+	return s.failure
+}
+
+func (s *Session) rememberFailure(err error) {
+	if s.failure == nil {
+		s.failure = err
+	}
+}
+
+func (s *Session) flush(ctx context.Context) error {
+	for _, row := range s.inserts {
+		row.insert(ctx)?
+	}
+	clear(s.inserts)
+	s.inserts = s.inserts[:0]
+	for _, row := range s.updates {
+		row.update(ctx)?
+	}
+	for _, row := range s.deletes {
+		row.remove(ctx)?
+	}
+	if len(s.deletes) != 0 {
+		s.updates = slices.DeleteFunc(s.updates, func(row trackedRow) bool { return row.deleted() })
+		clear(s.deletes)
+		s.deletes = s.deletes[:0]
+	}
+	return nil
+}
+
+// Get returns the held pointer or reads the row by key without flushing.
+func Get[E any, K comparable](ctx context.Context, s *Session, t Table[E, K], key K) (*E?, error) {
+	const if !comptime.IsStruct[E]() {
+		comptime.Error("orm: entity must be a struct")
+	}
+	return MapTable[E, K](s, t).Get(key, func(query string) (E?, error) {
+		return db.One[E](ctx, s.Tx(), query, key)
+	})
+}
+
+// Attach tracks query results without overwriting entities already held.
+func Attach[E any, K comparable](s *Session, t Table[E, K], rows []E) []*E {
+	const if !comptime.IsStruct[E]() {
+		comptime.Error("orm: entity must be a struct")
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return MapTable[E, K](s, t).Attach(rows)
+}
+
+// Add schedules an insert and retains e as the held entity pointer.
+func Add[E any, K comparable](s *Session, t Table[E, K], e *E) {
+	const if !comptime.IsStruct[E]() {
+		comptime.Error("orm: entity must be a struct")
+	}
+	MapTable[E, K](s, t).Add(e)
+}
+
+// Remove schedules a delete using the held key and loaded version.
+func Remove[E any, K comparable](s *Session, t Table[E, K], e *E) {
+	const if !comptime.IsStruct[E]() {
+		comptime.Error("orm: entity must be a struct")
+	}
+	MapTable[E, K](s, t).Remove(e)
+}
+
+// Touch schedules a version increment even when no data column changed.
+func Touch[E any, K comparable](s *Session, t Table[E, K], e *E) {
+	const if !comptime.IsStruct[E]() {
+		comptime.Error("orm: entity must be a struct")
+	}
+	MapTable[E, K](s, t).Touch(e)
+}
+
+// MapTable is the caller-side comptime bridge for the ORM entry points.
+func MapTable[E any, K comparable](s *Session, t Table[E, K]) *MappedTable[E, K] {
+	return ResolveTable[E, K](s, t, func(rows *MappedTable[E, K]) {
+		const if comptime.IsStruct[E]() {
+			const for _, f := range comptime.Fields[E]() {
+				MapColumn[E, K, f.Type](rows, f.Tag.Get("col"), func(e *E) *f.Type { return &e.[f] })
+			}
+		} else {
+			comptime.Error("orm: entity must be a struct")
+		}
+	})
+}

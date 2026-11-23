@@ -15,12 +15,15 @@ import (
 )
 
 type Server struct {
-	Addr              string = ":8080"
-	Router            *Router
-	ReadHeaderTimeout time.Duration = 5 * time.Second
-	ShutdownGrace     time.Duration = 20 * time.Second
-	TLS               *tls.Config?
-	H2C               bool
+	Addr                 string = ":8080"
+	Router               *Router
+	ReadHeaderTimeout    time.Duration = 5 * time.Second
+	ReadTimeout          time.Duration = 30 * time.Second
+	IdleTimeout          time.Duration = 120 * time.Second
+	ShutdownGrace        time.Duration = 20 * time.Second
+	TLS                  *tls.Config?
+	H2C                  bool
+	HTTP2ExtendedConnect bool
 
 	state sync.Locked[serverState]
 }
@@ -34,6 +37,15 @@ type serverRun struct {
 	join       *joinState
 	upgrades   *upgrades
 	listener   net.Listener
+}
+
+func (s *statusWriter) FlushError() error {
+	err := http.NewResponseController(s.inner).Flush()
+	if err == nil && !s.wrote {
+		s.status = http.StatusOK
+		s.wrote = true
+	}
+	return err
 }
 
 type upgradesKey struct{}
@@ -229,9 +241,16 @@ func (s *Server) serveStored(ctx context.Context, l net.Listener) error {
 
 func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 	ups := newUpgrades()
-	srv := &http.Server{Handler: s.Router, DisableGeneralOptionsHandler: true, ReadHeaderTimeout: s.ReadHeaderTimeout, BaseContext: func(_ net.Listener) context.Context {
-		return context.WithValue(context.Background(), upgradesKey{}, ups)
-	}}
+	srv := &http.Server{
+		Handler:                      s.Router,
+		DisableGeneralOptionsHandler: true,
+		ReadHeaderTimeout:            s.ReadHeaderTimeout,
+		ReadTimeout:                  s.ReadTimeout,
+		IdleTimeout:                  s.IdleTimeout,
+		BaseContext: func(_ net.Listener) context.Context {
+			return context.WithValue(context.Background(), upgradesKey{}, ups)
+		},
+	}
 	cfg := s.cloneTLS()
 	if cfg != nil {
 		srv.TLSConfig = cfg
@@ -244,6 +263,9 @@ func (s *Server) serve(startCtx context.Context, l net.Listener) *serverRun {
 			protos.SetHTTP2(true)
 		}
 		srv.Protocols = protos
+	}
+	if s.HTTP2ExtendedConnect && (cfg != nil || s.H2C) {
+		srv.EnableHTTP2ExtendedConnect()
 	}
 	g, _ := rt.NewGroup(context.WithoutCancel(startCtx), 0)
 	if cfg != nil {

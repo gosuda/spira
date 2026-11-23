@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -140,7 +140,7 @@ func rawFingerprint(t *testing.T) string {
 		t.Fatalf("raw rows: %v", serr)
 		return ""
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return strings.Join(parts, "\n")
 }
 

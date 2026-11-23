@@ -1,0 +1,324 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/web"
+	"github.com/gosuda/spira/websocket"
+)
+
+func startH2WebSocket(t *testing.T, handler http.Handler) (*http.Transport, string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+		panic("listen failed")
+	}
+	router := web.NewRouter()
+	router.Handle(http.MethodConnect, "/ws", func(_ *web.Context) (web.Reply, error) {
+		return web.Delegate{To: handler}, nil
+	})
+	router.Handle(http.MethodGet, "/peer", func(c *web.Context) (web.Reply, error) {
+		c.ResponseHeader().Set("X-Test-Peer", c.Request.RemoteAddr)
+		return web.Empty{}, nil
+	})
+	server := &web.Server{Router: router, H2C: true, HTTP2ExtendedConnect: true}
+	if err := server.Serve(t.Context(), listener); err != nil {
+		t.Fatalf("serve: %v (close: %v)", err, listener.Close())
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := server.Stop(ctx); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	protocols := &http.Protocols{}
+	protocols.SetUnencryptedHTTP2(true)
+	transport := &http.Transport{
+		Protocols: protocols,
+		HTTP2: &http.HTTP2Config{MaxReceiveBufferPerStream: 65535},
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+	return transport, "http://" + listener.Addr().String()
+}
+
+func newH2WebSocketRequest(t *testing.T, base string, body io.Reader) *http.Request {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, base+"/ws", body)
+	if err != nil {
+		t.Fatalf("build CONNECT: %v", err)
+		panic("build CONNECT failed")
+	}
+	req.Header.Set(":protocol", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Protocol", "first, echo")
+	return req
+}
+
+func h2Echo(w http.ResponseWriter, r *http.Request) {
+	if err := h2EchoSession(w, r); err != nil {
+		slog.ErrorContext(r.Context(), "HTTP/2 WebSocket echo failed", "error", err)
+	}
+}
+
+func h2EchoSession(w http.ResponseWriter, r *http.Request) error {
+	w.Header().Set("X-Test-Peer", r.RemoteAddr)
+	cfg := websocket.Config{Subprotocols: []string{"echo", "first"}}
+	return websocket.Serve(w, r, cfg, func(c *websocket.Conn) error {
+		ctx := r.Context()
+		kind, data := c.Next(ctx)?
+		if kind != websocket.Text {
+			return fmt.Errorf("first frame kind %d, want text", kind)
+		}
+		c.WriteText(ctx, data)?
+		last, _ := c.Next(ctx)?
+		if last != websocket.Close {
+			return fmt.Errorf("second frame kind %d, want close", last)
+		}
+		return nil
+	})
+}
+
+func observeH2Session(t *testing.T, result chan<- error, run func(http.ResponseWriter, *http.Request) error) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := run(w, r)
+		select {
+		case result <- err:
+		default:
+			t.Errorf("uncollected WebSocket session result: %v", err)
+		}
+	})
+}
+
+func awaitH2Session(t *testing.T, ctx context.Context, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		t.Fatalf("WebSocket session did not return: %v", ctx.Err())
+		return ctx.Err()
+	}
+}
+
+func closeH2TestStream(t *testing.T, stream io.Closer) {
+	t.Helper()
+	if err := stream.Close(); err != nil {
+		t.Errorf("close HTTP/2 test stream: %v", err)
+	}
+}
+
+func openH2WebSocket(t *testing.T, tr *http.Transport, req *http.Request) *http.Response {
+	t.Helper()
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("HTTP/2 extended CONNECT: %v", err)
+		panic("CONNECT failed")
+	}
+	t.Cleanup(func() { closeH2TestStream(t, resp.Body) })
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT response = %s %s, want HTTP/2 200", resp.Proto, resp.Status)
+	}
+	return resp
+}
+
+func TestHTTP2WebSocketEchoAndClose(t *testing.T) {
+	result := make(chan error, 1)
+	tr, base := startH2WebSocket(t, observeH2Session(t, result, h2EchoSession))
+	input, send := io.Pipe()
+	t.Cleanup(func() { closeH2TestStream(t, send) })
+	req := newH2WebSocketRequest(t, base, input)
+	resp := openH2WebSocket(t, tr, req)
+	checkH2EchoHeaders(t, resp.Header)
+	if _, err := send.Write([]byte{0x81, 0x85, 1, 2, 3, 4, 'i', 'g', 'o', 'h', 'n'}); err != nil {
+		t.Fatalf("send masked text: %v", err)
+	}
+	frames := bufio.NewReader(resp.Body)
+	first, body, err := readServerBytes(frames)
+	if err != nil {
+		t.Fatalf("read text frame: %v", err)
+		return
+	}
+	if first != 0x1 || string(body) != "hello" {
+		t.Fatalf("text frame = %02x %q", first, body)
+	}
+	if _, err := send.Write([]byte{0x88, 0x82, 1, 2, 3, 4, 2, 0xea}); err != nil {
+		t.Fatalf("send masked close: %v", err)
+	}
+	if err := send.Close(); err != nil {
+		t.Fatalf("end request stream: %v", err)
+	}
+	first, body, err = readServerBytes(frames)
+	if err != nil {
+		t.Fatalf("read close frame: %v", err)
+		return
+	}
+	if first != 0x8 || !bytes.Equal(body, []byte{3, 0xe8}) {
+		t.Fatalf("close frame = %02x %x", first, body)
+	}
+	if _, err := frames.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after close = %v, want end of stream", err)
+	}
+	if err := awaitH2Session(t, req.Context(), result); err != nil {
+		t.Fatalf("echo handler: %v", err)
+	}
+	checkH2WebSocketPeer(t, tr, base, resp.Header.Get("X-Test-Peer"))
+}
+
+func checkH2EchoHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	if got := header.Get("Sec-WebSocket-Protocol"); got != "echo" {
+		t.Fatalf("negotiated subprotocol = %q, want echo", got)
+	}
+	for _, name := range [...]string{"Connection", "Upgrade", "Sec-WebSocket-Accept", "Content-Length"} {
+		if values := header.Values(name); len(values) != 0 {
+			t.Fatalf("CONNECT response included %s: %v", name, values)
+		}
+	}
+}
+
+func checkH2WebSocketPeer(t *testing.T, tr *http.Transport, base string, want string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/peer", nil)
+	if err != nil {
+		t.Fatalf("build sibling request: %v", err)
+		return
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("sibling request after WebSocket close: %v", err)
+		return
+	}
+	defer closeH2TestStream(t, resp.Body)
+	if got := resp.Header.Get("X-Test-Peer"); want == "" || got != want || resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("sibling request = %s, peer %q, want 204 from same peer %q", resp.Status, got, want)
+	}
+}
+
+func TestHTTP2WebSocketRejectsInvalidHandshake(t *testing.T) {
+	result := make(chan error, 1)
+	tr, base := startH2WebSocket(t, observeH2Session(t, result, h2EchoSession))
+	cases := []struct {
+		name string
+		header string
+		value string
+		status int
+	}{
+		{"protocol", ":protocol", "other", http.StatusBadRequest},
+		{"key", "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==", http.StatusBadRequest},
+		{"version", "Sec-WebSocket-Version", "12", http.StatusUpgradeRequired},
+		{"subprotocol", "Sec-WebSocket-Protocol", "echo, echo", http.StatusBadRequest},
+		{"origin", "Origin", "https://foreign.example", http.StatusForbidden},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			input, send := io.Pipe()
+			defer closeH2TestStream(t, send)
+			req := newH2WebSocketRequest(t, base, input)
+			req.Header.Set(test.header, test.value)
+			resp, err := tr.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("CONNECT: %v", err)
+				return
+			}
+			defer closeH2TestStream(t, resp.Body)
+			if resp.StatusCode != test.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, test.status)
+			}
+			if test.status == http.StatusUpgradeRequired && resp.Header.Get("Sec-WebSocket-Version") != "13" {
+				t.Fatalf("version response = %v, want 13", resp.Header)
+			}
+			if err := awaitH2Session(t, req.Context(), result); err == nil {
+				t.Fatal("handler returned no error for a rejected handshake")
+			}
+		})
+	}
+}
+
+func TestHTTP2WebSocketReadDeadlineAndCancellation(t *testing.T) {
+	for _, cause := range []string{"deadline", "cancel"} {
+		t.Run(cause, func(t *testing.T) {
+			op, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			handler := observeH2Session(t, result, func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Set("X-Test-Peer", r.RemoteAddr)
+				return websocket.Serve(w, r, websocket.Config{}, func(c *websocket.Conn) error {
+					if cause == "deadline" {
+						ctx, stop := context.WithTimeout(op, 100*time.Millisecond)
+						defer stop()
+						_, _, err := c.Next(ctx)
+						return err
+					}
+					_, _, err := c.Next(op)
+					return err
+				})
+			})
+			tr, base := startH2WebSocket(t, handler)
+			input, send := io.Pipe()
+			t.Cleanup(func() { closeH2TestStream(t, send) })
+			req := newH2WebSocketRequest(t, base, input)
+			resp := openH2WebSocket(t, tr, req)
+			if cause == "cancel" {
+				cancel()
+			}
+			select {
+			case err := <-result:
+				if cause == "deadline" && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("read error = %v, want deadline exceeded", err)
+				}
+				if cause == "cancel" && !errors.Is(err, context.Canceled) {
+					t.Fatalf("read error = %v, want context canceled", err)
+				}
+			case <-req.Context().Done():
+				t.Fatal("WebSocket read did not end")
+			}
+			if _, err := bufio.NewReader(resp.Body).ReadByte(); !errors.Is(err, io.EOF) {
+				t.Fatalf("read after handler returned = %v, want end of stream", err)
+			}
+			checkH2WebSocketPeer(t, tr, base, resp.Header.Get("X-Test-Peer"))
+		})
+	}
+}
+
+func TestHTTP2WebSocketWriteDeadline(t *testing.T) {
+	result := make(chan error, 1)
+	handler := observeH2Session(t, result, func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Test-Peer", r.RemoteAddr)
+		return websocket.Serve(w, r, websocket.Config{}, func(c *websocket.Conn) error {
+			ctx, cancel := context.WithTimeout(r.Context(), 100*time.Millisecond)
+			defer cancel()
+			return c.WriteBinary(ctx, make([]byte, 128<<10))
+		})
+	})
+	tr, base := startH2WebSocket(t, handler)
+	input, send := io.Pipe()
+	t.Cleanup(func() { closeH2TestStream(t, send) })
+	req := newH2WebSocketRequest(t, base, input)
+	resp := openH2WebSocket(t, tr, req)
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("write without peer window updates = %v, want deadline exceeded", err)
+		}
+	case <-req.Context().Done():
+		t.Fatal("WebSocket write did not end")
+	}
+	checkH2WebSocketPeer(t, tr, base, resp.Header.Get("X-Test-Peer"))
+}

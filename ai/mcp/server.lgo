@@ -43,11 +43,14 @@ func handlePost(ctx *web.Context, tools []ai.Tool) (web.Reply, error) {
 	if err != nil {
 		return nil, ErrTransportFailed.Wrap(fmt.Errorf("mcp: read request body: %w", err))
 	}
-	msg, err := decodeEnvelope(body)
-	if err != nil {
+	var msg Envelope
+	if err := json.Unmarshal(body, &msg); err != nil {
 		return fail(nil, http.StatusBadRequest, rpcFailure{code: -32700, message: "parse error", fault: ErrParseError})
 	}
-	if len(msg.ID) == 0 || msg.Method == "" {
+	if msg.JSONRPC != jsonRPCVersion || msg.Method == "" {
+		return fail(nil, http.StatusBadRequest, rpcFailure{code: -32600, message: "Invalid Request", fault: ErrProtocolError})
+	}
+	if len(msg.ID) == 0 {
 		return web.Empty{Status: http.StatusAccepted}, nil
 	}
 	return dispatch(ctx.Ctx(), tools, msg)
@@ -141,7 +144,7 @@ func respond(id jsontext.Value, result any) (web.Reply, error) {
 	if err != nil {
 		return nil, ErrTransportFailed.Wrap(fmt.Errorf("mcp: encode result: %w", err))
 	}
-	return web.Data{Value: Envelope{JSONRPC: "2.0", ID: id, Result: raw}}, nil
+	return web.Data{Value: Envelope{JSONRPC: jsonRPCVersion, ID: id, Result: raw}}, nil
 }
 
 type rpcFailure struct {
@@ -152,7 +155,7 @@ type rpcFailure struct {
 
 func fail(id jsontext.Value, status int, e rpcFailure) (web.Reply, error) {
 	return web.Data{
-		Value:  Envelope{JSONRPC: "2.0", ID: id, Error: &RPCError{Code: e.code, Message: e.message, Data: faultCode(e.fault)}},
+		Value:  Envelope{JSONRPC: jsonRPCVersion, ID: id, Error: &RPCError{Code: e.code, Message: e.message, Data: faultCode(e.fault)}},
 		Status: status,
 	}, nil
 }

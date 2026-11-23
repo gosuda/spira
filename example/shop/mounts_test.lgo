@@ -1,0 +1,113 @@
+package main_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/admin"
+	shopmain "github.com/gosuda/spira/example/shop"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/meter"
+	"github.com/gosuda/spira/openapi"
+	"github.com/gosuda/spira/ops"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+const shopToken = "shop-test-token"
+
+func shopGuard() web.Stage {
+	return func(next web.Handler) web.Handler {
+		return func(ctx *web.Context) (web.Reply, error) {
+			if ctx.Request.Header.Get("Authorization") != "Bearer "+shopToken {
+				return nil, auth.ErrInvalidCredentials.Err()
+			}
+			return next(ctx)
+		}
+	}
+}
+
+func mounted(t *testing.T) (*web.Router, *meter.Registry) {
+	t.Helper()
+	reg := meter.NewRegistry()
+	r := web.NewRouter()
+	r.Layout = layout.Page(view.Group{})
+	shopmain.Mount(r, shopmain.Mounts{
+		Guard: shopGuard(),
+		Ops: ops.Options{
+			Checks:         map[string]func(ctx context.Context) error{"db": func(ctx context.Context) error { return nil }},
+			Info:           map[string]string{"env": "test"},
+			Registry:       reg,
+			CheckTimeout:   50 * time.Millisecond,
+		},
+		OpenAPI: openapi.Info{},
+		Admin:   &admin.Server{},
+	})
+	r.Handle("GET", "/catalog", func(ctx *web.Context) (web.Reply, error) {
+		return web.Data{Value: "ok"}, nil
+	})
+	return r, reg
+}
+
+func shopGet(r *web.Router, path string, withToken bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if withToken {
+		req.Header.Set("Authorization", "Bearer "+shopToken)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestMetricsNeedsCredentials(t *testing.T) {
+	r, _ := mounted(t)
+	rec := shopGet(r, "/ops/metrics", false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d, want 401", rec.Code)
+	}
+}
+
+func TestMetricsListsDurationWithRouteLabel(t *testing.T) {
+	r, _ := mounted(t)
+	if rec := shopGet(r, "/catalog", true); rec.Code != http.StatusOK {
+		t.Fatalf("catalog status %d, want 200", rec.Code)
+	}
+	rec := shopGet(r, "/ops/metrics", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "http_request_duration_seconds") {
+		t.Fatalf("metrics body %q misses the duration series", body)
+	}
+	if !strings.Contains(body, `route="GET /catalog"`) {
+		t.Fatalf("metrics body %q misses the catalog route label", body)
+	}
+}
+
+func TestOpenAPIDocumentIsServed(t *testing.T) {
+	r, _ := mounted(t)
+	rec := shopGet(r, "/openapi.json", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"openapi"`) || !strings.Contains(body, "3.1.0") {
+		t.Fatalf("document %q is not an OpenAPI 3.1 document", body)
+	}
+}
+
+func TestAdminPageIsGuarded(t *testing.T) {
+	r, _ := mounted(t)
+	if rec := shopGet(r, "/admin", false); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unguarded admin status %d, want 401", rec.Code)
+	}
+	if rec := shopGet(r, "/admin", true); rec.Code != http.StatusOK {
+		t.Fatalf("admin status %d, want 200", rec.Code)
+	}
+}

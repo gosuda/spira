@@ -1,0 +1,59 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gosuda/spira/app"
+	"github.com/gosuda/spira/gateway"
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
+)
+
+type application struct {
+	Web *web.Server
+}
+
+func Router(shop string) *web.Router {
+	r := web.NewRouter()
+	gateway.Mount(r, []gateway.Route{{
+		PathPrefix: "/shop/catalog",
+		To:         []string{shop},
+		Stages:     []web.Stage{stripShopPrefix},
+	}}, resilience.Policy{Timeout: 10 * time.Second})
+	return r
+}
+
+func stripShopPrefix(next web.Handler) web.Handler {
+	return func(ctx *web.Context) (web.Reply, error) {
+		req := ctx.Request
+		target := *req.URL
+		if target.RawPath != "" {
+			escaped := target.EscapedPath()
+			shopEnd := 1 + strings.IndexByte(escaped[1:], '/')
+			target.RawPath = escaped[shopEnd:]
+		}
+		target.Path = strings.TrimPrefix(target.Path, "/shop")
+
+		forward := req.WithContext(req.Context())
+		forward.URL = &target
+		ctx.Request = forward
+		defer func() { ctx.Request = req }()
+		return next(ctx)
+	}
+}
+
+func main() {
+	shop := os.Getenv("SHOP_URL")
+	if shop == "" {
+		shop = "http://localhost:8080"
+	}
+	root := &application{Web: &web.Server{Addr: ":8081", Router: Router(shop)}}
+	if err := app.Run(context.Background(), root); err != nil {
+		slog.Error("edge: run", "error", err)
+		os.Exit(1)
+	}
+}

@@ -5,12 +5,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gosuda/spira/db"
 
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/microsoft/go-mssqldb"
 	_ "modernc.org/sqlite"
 )
 
@@ -378,6 +382,234 @@ func TestInTxCommitFailureReturnsCommitErrorAlone(t *testing.T) {
 	}
 	if errors.Unwrap(err) == nil {
 		t.Fatalf("InTx error = %q is joined with a second error, want the commit error alone", err)
+	}
+}
+
+func openImmediatePool(t *testing.T, dsn string) *db.Pool {
+	t.Helper()
+	pool, err := db.OpenSQLiteImmediate(dsn)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: open immediate pool: %v", err))
+	}
+	if pool == nil {
+		panic("db_test: open immediate returned no pool")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := txTimeout()
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("stop immediate pool: %v", err)
+		}
+	})
+	return pool
+}
+
+func TestSQLiteImmediateTxReservesWriterBeforeWork(t *testing.T) {
+	t.Run("file", func(t *testing.T) {
+		dsn := filepath.Join(t.TempDir(), "orders.db") + "?_pragma=busy_timeout(0)"
+		checkSQLiteWriterReservation(t, dsn)
+	})
+	t.Run("shared_cache", func(t *testing.T) {
+		dsn := "file:" + txPoolKey(t) + "?mode=memory&cache=shared"
+		checkSQLiteWriterReservation(t, dsn)
+	})
+}
+
+func checkSQLiteWriterReservation(t *testing.T, dsn string) {
+	t.Helper()
+	pool := openImmediatePool(t, dsn+"&_txlock=deferred&_txlock=exclusive")
+	ctx, cancel := txTimeout()
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, "CREATE TABLE immediate_t (n integer not null)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	_, err := db.InSQLiteImmediateTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		checkSQLiteWriterWait(t, ctx, pool)
+		_, err := db.Exec(ctx, tx, "INSERT INTO immediate_t (n) VALUES (1)")
+		return struct{}{}, err
+	})
+	if err != nil {
+		t.Fatalf("owner transaction: %v", err)
+	}
+	_, err = db.InSQLiteImmediateTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
+		_, err := db.Exec(ctx, tx, "INSERT INTO immediate_t (n) VALUES (2)")
+		return struct{}{}, err
+	})
+	if err != nil {
+		t.Fatalf("write after canceled admission: %v", err)
+	}
+}
+
+func checkSQLiteWriterWait(t *testing.T, ctx context.Context, pool *db.Pool) {
+	t.Helper()
+	if _, err := pool.ExecContext(ctx, "CREATE TEMP TABLE original_connection (marker int)"); err != nil {
+		t.Fatalf("mark competing connection: %v", err)
+	}
+	wait, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	_, err := db.InSQLiteImmediateTx(wait, pool, func(_ *db.Tx) (struct{}, error) {
+		return struct{}{}, errors.New("second callback ran before the writer released its reservation")
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("competing admission = %v, want context deadline", err)
+	}
+	checkSQLiteBusyTimeout(t, ctx, pool, 0)
+}
+
+func TestSQLiteImmediateTxRestoresBusyTimeout(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "orders.db") + "?_foreign_keys=1&_busy_timeout=250&_pragma=busy_timeout(17)"
+	pool := openImmediatePool(t, dsn)
+	ctx, cancel := txTimeout()
+	defer cancel()
+	for _, ddl := range []string{
+		"CREATE TEMP TABLE original_connection (marker int)",
+		"CREATE TABLE cleanup_parent (id integer primary key)",
+		"CREATE TABLE cleanup_child (id integer references cleanup_parent(id) deferrable initially deferred)",
+	} {
+		if _, err := pool.ExecContext(ctx, ddl); err != nil {
+			t.Fatalf("prepare cleanup fixture: %v", err)
+		}
+	}
+	checkSQLiteBusyTimeout(t, ctx, pool, 17)
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"commit", nil},
+		{"commit_error", db.ErrConstraintViolation},
+		{"rollback", errors.New("work failed")},
+		{"cancel", context.Canceled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			checkSQLiteBusyTimeoutAfter(t, pool, tc.err)
+		})
+	}
+}
+
+func checkSQLiteBusyTimeoutAfter(t *testing.T, pool *db.Pool, want error) {
+	t.Helper()
+	check, stop := txTimeout()
+	defer stop()
+	call, cancel := context.WithCancel(check)
+	defer cancel()
+	_, err := db.InSQLiteImmediateTx(call, pool, func(tx *db.Tx) (struct{}, error) {
+		checkSQLiteBusyTimeout(t, call, tx, 30000)
+		if errors.Is(want, context.Canceled) {
+			cancel()
+			return struct{}{}, call.Err()
+		}
+		if errors.Is(want, db.ErrConstraintViolation) {
+			_, err := tx.ExecContext(call, "INSERT INTO cleanup_child (id) VALUES (42)")
+			if err != nil {
+				t.Fatalf("deferred constraint failed during work, not commit: %v", err)
+			}
+			return struct{}{}, nil
+		}
+		return struct{}{}, want
+	})
+	if !errors.Is(err, want) {
+		t.Errorf("immediate transaction error = %v, want %v", err, want)
+	} else if errors.Is(want, db.ErrConstraintViolation) && !strings.Contains(err.Error(), "db: commit:") {
+		t.Errorf("deferred constraint failed outside commit: %v", err)
+	}
+	checkSQLiteBusyTimeout(t, check, pool, 17)
+}
+
+func checkSQLiteBusyTimeout(t *testing.T, ctx context.Context, q db.Querier, want int64) {
+	t.Helper()
+	_, err := db.One[int64](ctx, q, "SELECT COUNT(marker) FROM temp.original_connection")
+	if err != nil {
+		t.Fatalf("did not reuse the marked physical connection: %v", err)
+	}
+	got, err := db.One[int64](ctx, q, "PRAGMA busy_timeout")
+	if err != nil {
+		t.Fatalf("read busy timeout: %v", err)
+		return
+	}
+	if got == nil {
+		t.Errorf("busy timeout missing, want %d", want)
+		return
+	}
+	var millis int64 = got
+	if millis != want {
+		t.Errorf("busy timeout = %d, want %d", millis, want)
+	}
+}
+
+func TestSQLiteImmediateTxRejectsPoolsWithoutReservation(t *testing.T) {
+	for _, config := range []struct {
+		driver string
+		dsn    string
+	}{
+		{"sqlite", "file:unprovisioned?mode=memory&cache=shared"},
+		{"pgx", "postgres://127.0.0.1:1/test?sslmode=disable"},
+		{"mysql", "user@tcp(127.0.0.1:1)/test?parseTime=true"},
+		{"sqlserver", "sqlserver://127.0.0.1:1?database=master"},
+	} {
+		t.Run(config.driver, func(t *testing.T) {
+			checkUnprovisionedPool(t, config.driver, config.dsn)
+		})
+	}
+}
+
+func checkUnprovisionedPool(t *testing.T, driver string, dsn string) {
+	t.Helper()
+	pool, err := db.Open(driver, dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", driver, err)
+		return
+	}
+	if pool == nil {
+		t.Fatal("open returned no pool")
+		return
+	}
+	ctx, cancel := txTimeout()
+	defer cancel()
+	defer func() {
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("stop %s: %v", driver, err)
+		}
+	}()
+	_, err = db.InSQLiteImmediateTx(ctx, pool, func(_ *db.Tx) (struct{}, error) {
+		t.Errorf("%s reached immediate transaction callback", driver)
+		return struct{}{}, nil
+	})
+	if !errors.Is(err, db.ErrStatementFailed) || !strings.Contains(err.Error(), "requires an immediate SQLite pool") {
+		t.Errorf("%s transaction error = %v, want immediate-pool rejection", driver, err)
+	}
+}
+
+func TestOpenSQLiteImmediateRejectsUnprovableReservations(t *testing.T) {
+	for _, dsn := range []string{
+		":memory:",
+		"file:unshared?mode=memory",
+		"file:ignored.db?nolock=1",
+		"file:ignored.db?no%6cock%00extra=1",
+		"file:ignored.db?vfs=unix-none",
+	} {
+		pool, err := db.OpenSQLiteImmediate(dsn)
+		if err != nil {
+			continue
+		}
+		if pool != nil {
+			t.Errorf("open %q returned a pool, want rejection", dsn)
+		} else {
+			t.Errorf("open %q returned no error, want rejection", dsn)
+		}
+	}
+}
+
+func TestSQLiteImmediateTxRequiresRollbackJournaling(t *testing.T) {
+	pool := openImmediatePool(t, filepath.Join(t.TempDir(), "orders.db")+"?_journal_mode=off")
+	ctx, cancel := txTimeout()
+	defer cancel()
+	_, err := db.InSQLiteImmediateTx(ctx, pool, func(_ *db.Tx) (struct{}, error) {
+		t.Error("transaction entered work with rollback journaling disabled")
+		return struct{}{}, nil
+	})
+	if !errors.Is(err, db.ErrStatementFailed) || !strings.Contains(err.Error(), "require rollback journaling") {
+		t.Errorf("transaction error = %v, want rollback-journaling rejection", err)
 	}
 }
 

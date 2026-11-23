@@ -6,13 +6,11 @@ import (
 	"math"
 	"net/http"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
 	"logos/sync"
 )
-
 const maxSeries = 1000
 
 type metricKind int
@@ -320,9 +318,11 @@ func (s HistogramSeries) Observe(v float64) {
 }
 
 func bucketIndex(buckets []float64, v float64) int {
-	return sort.Search(len(buckets), func(i int) bool {
-		return v <= buckets[i]
-	})
+	if math.IsNaN(v) {
+		return len(buckets)
+	}
+	i, _ := slices.BinarySearch(buckets, v)
+	return i
 }
 
 func (r *Registry) Handler() http.Handler {

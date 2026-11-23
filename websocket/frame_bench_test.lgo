@@ -3,8 +3,14 @@ package websocket_test
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
+	"net"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/gosuda/spira/websocket"
 )
@@ -39,6 +45,7 @@ func BenchmarkFrameEcho1KiB(b *testing.B) {
 			b.Fatalf("payload: %v", err)
 			return
 		}
+		websocket.ExposedMask(h.Key, 0, scratch)
 		out := websocket.ExposedAppendHeader(enc[:0], h)
 		if !bytes.Equal(out, raw[:len(out)]) {
 			b.Fatalf("header round trip mismatch")
@@ -47,4 +54,93 @@ func BenchmarkFrameEcho1KiB(b *testing.B) {
 			b.Fatalf("payload mismatch")
 		}
 	}
+}
+
+const websocketEchoBenchmarkIterations = 256
+
+func echoBenchmarkServer(ctx context.Context, conn *websocket.Conn, done <-chan struct{}) error {
+	for {
+		err := echoOnce(ctx, conn)
+		if err == nil {
+			continue
+		}
+		select {
+		case <-done:
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, websocket.ErrClosed) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+		default:
+		}
+		return err
+	}
+}
+
+func echoBenchmarkClient(b *testing.B, peer net.Conn, latencies []int64, done chan<- struct{}) (result error) {
+	defer func() {
+		close(done)
+		result = errors.Join(result, peer.Close())
+	}()
+	payload := frameBytes1024()
+	reader := bufio.NewReader(peer)
+	b.ResetTimer()
+	defer b.StopTimer()
+	for i := range latencies {
+		started := time.Now()
+		if err := writeClientBytes(peer, 0x82, payload); err != nil {
+			return fmt.Errorf("write echo: %w", err)
+		}
+		opcode, got, err := readServerBytes(reader)
+		latencies[i] = time.Since(started).Nanoseconds()
+		if err != nil {
+			return fmt.Errorf("read echo: %w", err)
+		}
+		if opcode != 0x2 {
+			return fmt.Errorf("echo opcode = %d, want 2", opcode)
+		}
+		if !bytes.Equal(got, payload) {
+			return errors.New("echo payload differs from sent payload")
+		}
+	}
+	return nil
+}
+
+func runEchoBenchmark(b *testing.B, latencies []int64) (result error) {
+	socket, peer := net.Pipe()
+	defer func() {
+		result = errors.Join(result, socket.Close())
+	}()
+	if err := peer.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return errors.Join(err, peer.Close())
+	}
+	server := websocket.ServeHijacked(socket, bufio.NewReadWriter(bufio.NewReader(socket), bufio.NewWriter(socket)), "", 1<<20)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go group (ctx) {
+		go echoBenchmarkServer(ctx, server, done)
+		go echoBenchmarkClient(b, peer, latencies, done)
+	}
+	return nil
+}
+
+func BenchmarkWebSocketEcho1KiBInMemory(b *testing.B) {
+	if b.N != 1 && b.N != websocketEchoBenchmarkIterations {
+		b.Skipf("run with -benchtime=%dx", websocketEchoBenchmarkIterations)
+		return
+	}
+	latencies := make([]int64, b.N)
+	b.ReportAllocs()
+	if err := runEchoBenchmark(b, latencies); err != nil {
+		b.Fatalf("echo benchmark: %v", err)
+		return
+	}
+	slices.Sort(latencies)
+	last := len(latencies) - 1
+	p50 := (len(latencies)*50+99)/100 - 1
+	p95 := (len(latencies)*95+99)/100 - 1
+	p99 := (len(latencies)*99+99)/100 - 1
+	b.ReportMetric(float64(latencies[p50]), "p50-ns")
+	b.ReportMetric(float64(latencies[p95]), "p95-ns")
+	b.ReportMetric(float64(latencies[p99]), "p99-ns")
+	b.ReportMetric(float64(latencies[last]), "max-ns")
 }

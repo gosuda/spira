@@ -1,0 +1,141 @@
+package bounded_test
+
+import (
+	"errors"
+	"io"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai/internal/bounded"
+)
+
+type endless struct {
+	pattern string
+	at      int
+	given   int64
+}
+
+func (e *endless) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = e.pattern[e.at]
+		e.at = (e.at + 1) % len(e.pattern)
+	}
+	e.given += int64(len(p))
+	return len(p), nil
+}
+
+type drained struct {
+	lines []string
+	err   error
+}
+
+func drain(lines *bounded.Lines, most int) drained {
+	var out drained
+	for range most {
+		line, err := lines.Next()
+		if err != nil {
+			out.err = err
+			return out
+		}
+		out.lines = append(out.lines, line)
+	}
+	return out
+}
+
+func TestEndlessLineEndsAtTheLineBound(t *testing.T) {
+	source := &endless{pattern: "x"}
+
+	got := drain(bounded.NewLines(source, 1024, 1<<30), 4)
+
+	if !errors.Is(got.err, bounded.ErrTooLarge) || len(got.lines) != 0 {
+		t.Fatalf("lines = %d, error = %v; want no line and the limit error", len(got.lines), got.err)
+		return
+	}
+	if got.err.Error() != "stream line exceeds 1024 bytes" {
+		t.Errorf("error = %q, want the line bound and its value", got.err.Error())
+	}
+	if source.given > 1024+4096 {
+		t.Errorf("the reader gave %d bytes, want at most the line bound plus one 4096-byte buffer", source.given)
+	}
+}
+
+func TestEndlessSmallLinesEndAtTheStreamBound(t *testing.T) {
+	source := &endless{pattern: "abc\n"}
+
+	got := drain(bounded.NewLines(source, 1024, 64<<10), 1<<20)
+
+	if !errors.Is(got.err, bounded.ErrTooLarge) {
+		t.Fatalf("error = %v after %d lines, want the limit error", got.err, len(got.lines))
+		return
+	}
+	if got.err.Error() != "stream exceeds 65536 bytes" {
+		t.Errorf("error = %q, want the stream bound and its value", got.err.Error())
+	}
+	if len(got.lines) != (64<<10)/4 {
+		t.Errorf("lines = %d, want every one of the %d lines inside the bound", len(got.lines), (64<<10)/4)
+	}
+	if i := slices.IndexFunc(got.lines, func(line string) bool { return line != "abc\n" }); i >= 0 {
+		t.Errorf("line %d = %q, want %q", i, got.lines[i], "abc\n")
+	}
+	if source.given > 64<<10+1 {
+		t.Errorf("the reader gave %d bytes, want at most the stream bound plus one", source.given)
+	}
+}
+
+func TestBoundsAreExact(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		maxLine  int
+		maxTotal int64
+		want     []string
+		err      error
+		message  string
+	}{
+		{name: "a line of exactly the line bound passes", input: "aaaa\nb\n", maxLine: 4, maxTotal: 1 << 20, want: []string{"aaaa\n", "b\n"}, err: io.EOF},
+		{name: "a line one byte over the line bound fails", input: "aaaaa\nb\n", maxLine: 4, maxTotal: 1 << 20, err: bounded.ErrTooLarge, message: "stream line exceeds 4 bytes"},
+		{name: "a final line of exactly the line bound passes", input: "b\naaaa", maxLine: 4, maxTotal: 1 << 20, want: []string{"b\n", "aaaa"}, err: io.EOF},
+		{name: "a final line one byte over the line bound fails", input: "b\naaaaa", maxLine: 4, maxTotal: 1 << 20, want: []string{"b\n"}, err: bounded.ErrTooLarge, message: "stream line exceeds 4 bytes"},
+		{name: "a stream of exactly the stream bound passes", input: "ab\ncd\n", maxLine: 64, maxTotal: 6, want: []string{"ab\n", "cd\n"}, err: io.EOF},
+		{name: "a stream one byte over the stream bound fails", input: "ab\ncd\n\n", maxLine: 64, maxTotal: 6, want: []string{"ab\n", "cd\n"}, err: bounded.ErrTooLarge, message: "stream exceeds 6 bytes"},
+		{name: "a final line without a newline is delivered", input: "ab\ncd", maxLine: 64, maxTotal: 1 << 20, want: []string{"ab\n", "cd"}, err: io.EOF},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lines := bounded.NewLines(strings.NewReader(tc.input), tc.maxLine, tc.maxTotal)
+			got := drain(lines, 16)
+			if !errors.Is(got.err, tc.err) {
+				t.Fatalf("error = %v, want %v", got.err, tc.err)
+				return
+			}
+			if tc.message != "" && got.err.Error() != tc.message {
+				t.Errorf("error = %q, want %q", got.err.Error(), tc.message)
+			}
+			if !slices.Equal(got.lines, tc.want) {
+				t.Errorf("lines = %q, want %q", got.lines, tc.want)
+			}
+			if again := drain(lines, 1); again.err != got.err || len(again.lines) != 0 {
+				t.Errorf("the next read gave %q and %v, want only the same error %v", again.lines, again.err, got.err)
+			}
+		})
+	}
+}
+
+func TestZeroBoundsTakeTheDefaultLineBound(t *testing.T) {
+	longest := strings.Repeat("x", 1<<20)
+	input := longest + "\n" + longest + "y\n"
+
+	got := drain(bounded.NewLines(strings.NewReader(input), 0, 0), 4)
+
+	if !errors.Is(got.err, bounded.ErrTooLarge) {
+		t.Fatalf("error = %v, want the limit error for the second line", got.err)
+		return
+	}
+	if got.err.Error() != "stream line exceeds 1048576 bytes" {
+		t.Errorf("error = %q, want the default line bound of 1 MiB", got.err.Error())
+	}
+	if len(got.lines) != 1 || got.lines[0] != longest+"\n" {
+		t.Errorf("lines = %d, want the one line of exactly 1 MiB", len(got.lines))
+	}
+}

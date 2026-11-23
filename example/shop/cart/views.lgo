@@ -1,0 +1,60 @@
+package cart
+
+import (
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/view"
+)
+
+func Cart(items const []store.ListCartItemsRow) view.Group {
+	var total int64
+	for _, item := range items {
+		total += item.Quantity
+	}
+	return view.Group{Nodes: []view.Node{
+		view.H1(view.T("Cart")),
+		Badge(total),
+		Items(items),
+		view.Form(
+			view.Attr("method", "post"),
+			view.Attr("action", "/orders"),
+			view.Button(view.Attr("type", "submit"), view.T("Checkout")),
+		),
+		view.P(view.A(view.Attr("href", "/catalog"), view.T("Continue shopping"))),
+	}}
+}
+
+func Items(items const []store.ListCartItemsRow) view.Node {
+	if len(items) == 0 {
+		return view.P(view.T("The cart is empty."))
+	}
+	return view.Ul(
+		view.Each(items, func(item const store.ListCartItemsRow) view.Node {
+			return view.Li(
+				view.Span(view.T(item.Product.Name)),
+				layout.Price(item.Product.Price),
+				view.Span(view.T($"x {item.Quantity}")),
+				view.Form(
+					view.Attr("method", "post"),
+					view.Attr("action", $"/cart/items/{item.ID}/remove"),
+					view.Hx("post", $"/cart/items/{item.ID}/remove"),
+					view.Hx("target", "closest li"),
+					view.Hx("swap", "outerHTML"),
+					view.Button(view.Attr("type", "submit"), view.T("Remove")),
+				),
+			)
+		}),
+	)
+}
+
+func Badge(total int64) view.Node {
+	return &view.Island{
+		Entry:    "example/shop/cart/islands/badge.svelte",
+		Props:    map[string]any{"count": total},
+		Fallback: layout.Fallback(view.Span(view.T($"Cart ({total})"))),
+	}
+}
+
+func Note(message string) view.Node {
+	return view.P(view.Attr("id", "cart-note"), view.T(message))
+}

@@ -1,0 +1,153 @@
+package mcp_test
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/mcp"
+	"github.com/gosuda/spira/web"
+)
+
+func TestJSONRPCBoundaryRequests(t *testing.T) {
+	const id = `{"id":7,`
+	const v2 = `"jsonrpc":"2.0",`
+	const call = `"method":"tools/call",`
+	const params = `"params":{"name":"probe","arguments":{}}}`
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantCalls int
+	}{
+		{"valid", id + v2 + call + params, 1},
+		{"wrong_version", id + `"jsonrpc":"1.0",` + call + params, 0},
+		{"missing_version", id + call + params, 0},
+		{"id_without_method", id + v2 + params, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkJSONRPCRequest(t, tc.body, tc.wantCalls)
+		})
+	}
+}
+
+func checkJSONRPCRequest(t *testing.T, body string, wantCalls int) {
+	t.Helper()
+	var calls sync.Locked[int]
+	tool := ai.Tool{
+		Name: "probe",
+		Call: func(_ context.Context, _ string) (string, error) {
+			calls.WithLock(func(n *int) { *n += 1 })
+			return "probe ran", nil
+		},
+	}
+	ts := mountServer(t, []ai.Tool{tool}, func(next web.Handler) web.Handler { return next })
+	ts.Client().Timeout = 5 * time.Second
+	status, raw := postRaw(t, ts, body, nil)
+	var gotCalls int
+	calls.WithLock(func(n *int) { gotCalls = *n })
+	if gotCalls != wantCalls {
+		t.Errorf("tool ran %d times, want %d", gotCalls, wantCalls)
+	}
+	if wantCalls == 0 {
+		checkJSONRPCRejection(t, status, raw)
+		return
+	}
+	if status != http.StatusOK {
+		t.Fatalf("valid tool call returned HTTP %d: %s", status, raw)
+		return
+	}
+	reply := decodeEnvelope(t, raw)
+	if reply.JSONRPC != "2.0" || string(reply.ID) != "7" || len(reply.Result) == 0 || reply.Error != nil {
+		t.Errorf("valid tool call did not return a JSON-RPC 2.0 result for id 7: %s", raw)
+	}
+}
+
+type boundaryRPCError struct {
+	Code    *int32? `json:"code"`
+	Message string  `json:"message"`
+	Data    struct {
+		Code string `json:"code"`
+	} `json:"data"`
+}
+
+func checkJSONRPCRejection(t *testing.T, status int, raw []byte) {
+	t.Helper()
+	if status == http.StatusAccepted {
+		t.Fatalf("invalid request was acknowledged as a notification: HTTP %d, body %q", status, raw)
+		return
+	}
+	var reply struct {
+		JSONRPC string            `json:"jsonrpc"`
+		ID      json.RawMessage   `json:"id"`
+		Result  json.RawMessage   `json:"result"`
+		Error   *boundaryRPCError? `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		t.Fatalf("rejection did not carry a JSON-RPC error: HTTP %d, body %q: %v", status, raw, err)
+		return
+	}
+	rpcErr := reply.Error
+	if rpcErr == nil {
+		t.Fatalf("invalid request returned no protocol error: HTTP %d, body %s", status, raw)
+		return
+	}
+	if reply.JSONRPC != "2.0" || len(reply.Result) != 0 || rpcErr.Code == nil || rpcErr.Message == "" || rpcErr.Data.Code == "" {
+		t.Errorf("invalid request returned an incomplete JSON-RPC 2.0 error: HTTP %d, body %s", status, raw)
+	}
+	if status == http.StatusOK && string(reply.ID) != "7" {
+		t.Errorf("HTTP 200 protocol error did not echo id 7: %s", raw)
+	}
+}
+
+func TestJSONRPCBoundaryResponses(t *testing.T) {
+	const result = `"id":7,"result":{"tools":[]}}`
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantError bool
+	}{
+		{"valid", `{"jsonrpc":"2.0",` + result, false},
+		{"wrong_version", `{"jsonrpc":"1.0",` + result, true},
+		{"missing_version", `{` + result, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if _, err := io.WriteString(w, tc.body); err != nil {
+					t.Errorf("write fixture response: %v", err)
+				}
+			}))
+			t.Cleanup(ts.Close)
+			transport := mcp.NewHTTP(ts.URL, ts.Client())
+			defer func() {
+				if err := transport.Close(); err != nil {
+					t.Errorf("close transport: %v", err)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			reply, err := transport.Request(ctx, mcp.Envelope{ID: jsontext.Value("7"), Method: "tools/list"})
+			if tc.wantError {
+				if err == nil {
+					t.Errorf("accepted invalid JSON-RPC response: %s", tc.body)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rejected valid JSON-RPC response: %v", err)
+				return
+			}
+			if reply.JSONRPC != "2.0" || string(reply.ID) != "7" || string(reply.Result) != `{"tools":[]}` || reply.Error != nil {
+				t.Errorf("did not return the matching tools/list reply: %+v", reply)
+			}
+		})
+	}
+}

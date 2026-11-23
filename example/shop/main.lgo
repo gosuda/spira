@@ -1,0 +1,344 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+	"github.com/gosuda/spira/admin"
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/app"
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/bus"
+	"github.com/gosuda/spira/config"
+	"github.com/gosuda/spira/db"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/example/shop/account"
+	"github.com/gosuda/spira/example/shop/assist"
+	"github.com/gosuda/spira/example/shop/cart"
+	"github.com/gosuda/spira/example/shop/catalog"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/example/shop/orders"
+	"github.com/gosuda/spira/example/shop/stock"
+	"github.com/gosuda/spira/job"
+	"github.com/gosuda/spira/live"
+	"github.com/gosuda/spira/meter"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/openapi"
+	"github.com/gosuda/spira/ops"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+
+	_ "modernc.org/sqlite"
+)
+
+type Settings struct {
+	Addr       string = ":8080"                      `env:"SPIRA_ADDR"`
+	DSN        string = "file:spira_shop?mode=memory&cache=shared" `env:"SPIRA_DSN"`
+	ViteOrigin string = ""                           `env:"SPIRA_VITE_ORIGIN"`
+	PublicURL  string = "http://localhost:8080"      `env:"SPIRA_PUBLIC_URL"`
+	ModelURL   string = ""                           `env:"SPIRA_MODEL_URL"`
+	ModelName  string = ""                           `env:"SPIRA_MODEL_NAME"`
+	ModelKey   string = ""                           `env:"SPIRA_MODEL_KEY"`
+}
+
+type Application struct {
+	DB       *db.Pool
+	Jobs     *job.Scheduler
+	Web      *web.Server
+	Registry *admin.Server
+	Admin    *admin.Client
+}
+
+func main() {
+	if err := run(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "shop:", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
+	settings, err := loadShopSettings(config.Env())
+	if err != nil {
+		return fmt.Errorf("shop: load settings: %w", err)
+	}
+	application, err := assemble(ctx, settings, nil)
+	if err != nil {
+		return err
+	}
+	if application == nil {
+		return fmt.Errorf("shop: assemble: no application")
+	}
+	return app.Run(ctx, application)
+}
+
+func assemble(ctx context.Context, settings Settings, service *admin.Server?) (*Application?, error) {
+	pool, err := openShopPool(ctx, settings.DSN)
+	if err != nil {
+		return nil, err
+	}
+	if pool == nil {
+		return nil, fmt.Errorf("shop: open pool: no pool")
+	}
+	assets, tags, dev, err := loadShopTags(settings.ViteOrigin)
+	if err != nil {
+		return nil, err
+	}
+	if assets == nil {
+		return nil, fmt.Errorf("shop: load assets: no manifest")
+	}
+	token, err := newServiceToken()
+	if err != nil {
+		return nil, err
+	}
+	host, err := opsHost(settings.PublicURL)
+	if err != nil {
+		return nil, err
+	}
+	inner, err := loopbackServerURL(settings.Addr)
+	if err != nil {
+		return nil, err
+	}
+	innerHost, err := opsHost(inner)
+	if err != nil {
+		return nil, err
+	}
+	svc := service ?? &admin.Server{}
+	if len(svc.AllowedHosts) == 0 {
+		svc.AllowedHosts = []string{host, innerHost}
+	}
+	svc.ProbeToken = token
+	router, scheduler := buildRouter(shopParts{settings: settings, pool: pool, assets: assets, tags: tags, dev: dev, admin: svc, serviceToken: token})
+	application := &Application{DB: pool, Jobs: scheduler, Web: &web.Server{Addr: settings.Addr, Router: router}, Registry: svc, Admin: shopAdmin(inner, token)}
+	return application, nil
+}
+
+func loopbackServerURL(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("shop: address %q needs host:port", addr)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port), nil
+}
+
+func newServiceToken() (string, error) {
+	var entropy [32]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", fmt.Errorf("shop: service token entropy: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(entropy[:]), nil
+}
+
+func verifyServiceToken(token string) auth.Authenticator {
+	return auth.Bearer(func(ctx context.Context, presented string) (auth.Principal?, error) {
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(token)) != 1 {
+			return nil, nil
+		}
+		return auth.Principal{ID: "service"}, nil
+	})
+}
+
+func opsHost(publicURL string) (string, error) {
+	u, err := url.Parse(publicURL)
+	if err != nil || u == nil || u.Host == "" {
+		return "", fmt.Errorf("shop: public URL %q needs a host", publicURL)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("shop: public URL %q needs an http or https scheme", publicURL)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("shop: public URL %q must not hold user info", publicURL)
+	}
+	return u.Host, nil
+}
+
+func loadShopSettings(source config.Source) (Settings, error) {
+	settings := Settings{}
+	loader := config.NewLoader([]config.Source{source})
+	config.Fill[Settings](loader, &settings, "")
+	return settings, loader.Err()
+}
+
+type shopParts struct {
+	settings     Settings
+	pool         *db.Pool
+	assets       *asset.Manifest
+	tags         view.Node
+	dev          bool
+	admin        *admin.Server?
+	serviceToken string
+}
+func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
+	reg := meter.NewRegistry()
+	router := web.NewRouter()
+	router.Layout = layout.Page(p.tags)
+	for _, stage := range web.Defaults() {
+		router.Use(stage)
+	}
+	if p.dev {
+		router.Use(auth.DevHeaders())
+	} else {
+		router.Use(auth.SecureHeaders())
+		mountAssets(router, p.assets)
+	}
+	router.Use(meter.HTTP(reg))
+	sessions := &auth.Sessions{Store: auth.NewMemoryStore()}
+	router.Use(auth.Authenticate(sessions.Authenticator(), verifyServiceToken(p.serviceToken)))
+	catalogFeature := &catalog.Feature{DB: p.pool, Assets: p.assets}
+	catalogFeature.Register(router)
+	cartFeature := &cart.Feature{DB: p.pool}
+	cartFeature.Register(router)
+	ordersFeature := &orders.Feature{DB: p.pool}
+	ordersFeature.Register(router)
+	accountFeature := &account.Feature{DB: p.pool, Sessions: sessions}
+	accountFeature.Register(router)
+	stockEvents := bus.NewTopic[live.Event](64)
+	scheduler := &job.Scheduler{}
+	const stockInterval = time.Second
+	pool := p.pool
+	scheduler.Every("stock", stockInterval, func(ctx context.Context) error {
+		queryCtx, cancel := context.WithTimeout(ctx, stockInterval)
+		defer cancel()
+		products, err := store.ListProducts(queryCtx, pool)
+		if err != nil {
+			return fmt.Errorf("shop: list stock products: %w", err)
+		}
+		for i := range products {
+			product := &products[i]
+			tick := stock.Tick{ID: int64(product.ID), Name: product.Name, Stock: product.Stock, Price: product.Price}
+			stockEvents.Publish(live.Event{Name: "stock", Body: stock.Row(tick)})
+		}
+		return nil
+	})
+	stockFeature := &stock.Feature{Topic: stockEvents}
+	stockFeature.Register(router)
+	brain := &openai.Client{BaseURL: p.settings.ModelURL, Model: p.settings.ModelName, Key: p.settings.ModelKey}
+	catalogMemory := &rag.Memory{Embed: brain}
+	assistFeature := &assist.Feature{Model: brain, Catalog: catalogMemory}
+	assistFeature.Register(router)
+	guard := auth.Require(auth.Authenticated())
+	ops.Mount(router, guard, ops.Options{
+		Registry: reg,
+		Info:     map[string]string{"service": "shop"},
+		Checks:   map[string]func(ctx context.Context) error{"db": p.pool.Start},
+	})
+	openapi.Mount(router, openapi.Info{Title: "Shop", Version: "1.0.0"})
+	service := p.admin ?? &admin.Server{}
+	service.Mount(router, registryWritesOnly(guard, auth.Require(isService)))
+	return router, scheduler
+}
+
+func isService(p auth.Principal?) bool {
+	if p == nil {
+		return false
+	}
+	return p.ID == "service"
+}
+
+func registryWritesOnly(reader web.Stage, writer web.Stage) web.Stage {
+	return func(next web.Handler) web.Handler {
+		read := reader(next)
+		write := writer(next)
+		return func(ctx *web.Context) (web.Reply, error) {
+			if writesRegistry(ctx) {
+				return write(ctx)
+			}
+			return read(ctx)
+		}
+	}
+}
+
+func writesRegistry(ctx *web.Context) bool {
+	if method := ctx.Request.Method; method != http.MethodPost && method != http.MethodDelete {
+		return false
+	}
+	return strings.HasPrefix(ctx.Request.URL.Path, "/admin/instances")
+}
+
+func shopAdmin(serverURL string, token string) *admin.Client {
+	return &admin.Client{Server: serverURL, Self: admin.Instance{Name: "shop", OpsURL: serverURL}, Token: token}
+}
+
+func mountAssets(r *web.Router, assets *asset.Manifest) {
+	dist := os.DirFS("frontend/dist")
+	files := assets.Files(dist)
+	r.Handle("GET", "/assets/", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: files}, nil
+	})
+	r.Handle("GET", "/islands/", func(ctx *web.Context) (web.Reply, error) {
+		return web.Delegate{To: IslandFiles(files)}, nil
+	})
+}
+
+func IslandFiles(files http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, ".wasm") {
+			w.Header().Set("Content-Type", "application/wasm")
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		files.ServeHTTP(w, req)
+	})
+}
+
+func openShopPool(ctx context.Context, dsn string) (*db.Pool?, error) {
+	boot, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	pool, err := db.OpenSQLiteImmediate(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("shop: open pool: %w", err)
+	}
+	if pool == nil {
+		return nil, fmt.Errorf("shop: open pool: no pool")
+	}
+	if err := pool.Start(boot); err != nil {
+		return nil, fmt.Errorf("shop: start pool: %w", err)
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		return nil, fmt.Errorf("shop: load migrations: %w", err)
+	}
+	if err := migrate.Apply(boot, pool, steps); err != nil {
+		return nil, fmt.Errorf("shop: apply migrations: %w", err)
+	}
+	if err := store.PrepareAll(boot, pool); err != nil {
+		return nil, fmt.Errorf("shop: prepare store: %w", err)
+	}
+	return pool, nil
+}
+
+func loadShopTags(viteOrigin string) (*asset.Manifest?, view.Node, bool, error) {
+	if viteOrigin != "" {
+		dev := asset.Dev(viteOrigin)
+		tags, err := dev.Tags("src/entry.ts")
+		if err != nil {
+			return nil, view.Group{}, false, fmt.Errorf("shop: dev tags: %w", err)
+		}
+		return dev, tags, true, nil
+	}
+	loaded, err := asset.Load(os.DirFS("frontend/dist"), ".vite/manifest.json")
+	if err != nil {
+		return nil, view.Group{}, false, fmt.Errorf("shop: load assets: %w", err)
+	}
+	if loaded == nil {
+		return nil, view.Group{}, false, fmt.Errorf("shop: load assets: no manifest")
+	}
+	tags, err := loaded.Tags("src/entry.ts")
+	if err != nil {
+		return nil, view.Group{}, false, fmt.Errorf("shop: entry tags: %w", err)
+	}
+	return loaded, tags, false, nil
+}

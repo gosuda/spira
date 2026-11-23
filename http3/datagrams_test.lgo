@@ -1,0 +1,58 @@
+package http3_test
+
+import (
+	"context"
+	"crypto/tls"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/internal/http3peer"
+	"github.com/gosuda/spira/web"
+	"github.com/quic-go/quic-go"
+)
+
+func TestH3DatagramsStayDisabled(t *testing.T) {
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	server := startH3Server(t, web.NewRouter(), cert, 2*time.Second)
+	if server == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	clientTLS := &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}}
+	conn, err := quic.DialAddr(ctx, server.BoundUDPAddrForTest(), clientTLS, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		return
+	}
+	defer func() {
+		if err := conn.CloseWithError(0, ""); err != nil {
+			t.Errorf("close connection: %v", err)
+		}
+	}()
+	state := conn.ConnectionState().SupportsDatagrams
+	if !state.Local {
+		t.Fatal("client did not enable QUIC datagrams")
+	}
+	if state.Remote {
+		t.Error("server advertised QUIC datagrams")
+	}
+	_ = http3peer.NewRawDatagramClientConn(conn)
+	control, err := h3ControlStream(ctx, conn)
+	if err != nil {
+		t.Fatalf("control stream: %v", err)
+		return
+	}
+	hasDatagrams, err := readH3Settings(control)
+	if err != nil {
+		t.Fatalf("SETTINGS: %v", err)
+		return
+	}
+	if hasDatagrams {
+		t.Error("server advertised HTTP/3 datagrams")
+	}
+}

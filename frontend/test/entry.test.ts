@@ -1,19 +1,6 @@
-class FakeXPathExpression {
-	evaluate(): { iterateNext: () => null } {
-		return { iterateNext: () => null };
-	}
-}
+import { stubDomGlobals } from "./dom-stubs";
 
-class FakeXPathEvaluator {
-	createExpression(): FakeXPathExpression {
-		return new FakeXPathExpression();
-	}
-	createNSResolver(): () => null {
-		return () => null;
-	}
-}
-vi.stubGlobal("XPathEvaluator", FakeXPathEvaluator);
-vi.stubGlobal("XPathResult", {});
+stubDomGlobals();
 
 type HtmxWithSse = {
 	createEventSource?: unknown;

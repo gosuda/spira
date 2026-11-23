@@ -218,22 +218,36 @@ func systemTexts(m ai.Message) []string {
 func blocksOf(m ai.Message) ([]any, error) {
 	var out []any
 	for _, p := range m.Parts {
-		switch v := p.(type) {
-		case ai.Text:
-			if v.Text != "" {
-				out = append(out, textBlock{Type: "text", Text: v.Text})
-			}
-		case ai.ToolCall:
-			input, err := rawJSON(v.Arguments, `{}`)
-			if err != nil {
-				return nil, fmt.Errorf("ai/anthropic: tool call %s: arguments: %w", v.ID, err)
-			}
-			out = append(out, toolUseBlock{Type: "tool_use", ID: v.ID, Name: v.Name, Input: input})
-		case ai.ToolResult:
-			out = append(out, toolResultBlock{Type: "tool_result", ToolUseID: v.ID, Content: v.Content})
+		block, ok, err := blockOf(p)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, block)
 		}
 	}
 	return out, nil
+}
+
+func blockOf(p ai.Part) (any, bool, error) {
+	switch v := p.(type) {
+	case ai.Text:
+		if v.Text == "" {
+			return nil, false, nil
+		}
+		return textBlock{Type: "text", Text: v.Text}, true, nil
+	case ai.ToolCall:
+		input, err := rawJSON(v.Arguments, `{}`)
+		if err != nil {
+			return nil, false, fmt.Errorf("ai/anthropic: tool call %s: arguments: %w", v.ID, err)
+		}
+		return toolUseBlock{Type: "tool_use", ID: v.ID, Name: v.Name, Input: input}, true, nil
+	case ai.ToolResult:
+		return toolResultBlock{Type: "tool_result", ToolUseID: v.ID, Content: v.Content}, true, nil
+	case ai.Reasoning:
+	case nil:
+	}
+	return nil, false, nil
 }
 
 func rawJSON(text string, fallback string) (jsontext.Value, error) {

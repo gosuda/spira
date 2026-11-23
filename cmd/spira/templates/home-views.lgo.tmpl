@@ -8,6 +8,7 @@ func page() view.Node {
 	return view.Main(
 		view.H1(view.T("Hello")),
 		greetingForm(),
+		view.P(view.Attr("id", "greeting")),
 		&view.Island{Entry: "features/home/islands/greet.svelte", Props: map[string]string{"name": "Demo"}, When: "visible", Fallback: view.P(view.T("Loading greeting."))},
 	)
 }

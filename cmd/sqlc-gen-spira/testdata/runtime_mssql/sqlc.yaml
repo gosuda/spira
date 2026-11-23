@@ -1,0 +1,18 @@
+version: "2"
+plugins:
+  - name: spira
+    process:
+      cmd: sqlc-gen-spira
+      format: json
+sql:
+  - engine: mssql
+    schema: db/migrations
+    queries: db/queries
+    codegen:
+      - plugin: spira
+        out: store
+        options:
+          package: store
+          tables:
+            spira_sqlc_runtime_mssql_items:
+              type: Item

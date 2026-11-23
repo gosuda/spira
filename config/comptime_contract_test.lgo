@@ -1,0 +1,96 @@
+package config_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+const configConsumerModule = `module example.com/spira-config-consumer
+
+go 1.27
+
+require github.com/gosuda/spira v0.0.0
+replace github.com/gosuda/spira => %q
+`
+
+const configConsumerSource = `package consumer
+
+import "github.com/gosuda/spira/config"
+
+type Settings struct {
+	Value %s
+}
+
+func Load() (Settings, error) {
+	return config.Load[Settings]()
+}
+`
+
+func TestLoadRejectsUnsupportedFieldTypesAtCompileTime(t *testing.T) {
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatalf("locate Spira module: %v", err)
+		return
+	}
+	dir := t.TempDir()
+	mod := fmt.Appendf(nil, configConsumerModule, root)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), mod, 0o600); err != nil {
+		t.Fatalf("write consumer module: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	var out bytes.Buffer
+	if err := buildConfigConsumer(ctx, dir, "float64", &out); err != nil {
+		t.Fatalf("config consumer setup: supported float64 field did not build: %v (context: %v)\n%s", err, ctx.Err(), out.Bytes())
+		return
+	}
+	for _, fieldType := range []string{"map[string]string", "float32"} {
+		assertUnsupportedConfigConsumer(t, ctx, dir, fieldType)
+	}
+}
+
+func assertUnsupportedConfigConsumer(t *testing.T, ctx context.Context, dir string, fieldType string) {
+	t.Helper()
+	var out bytes.Buffer
+	err := buildConfigConsumer(ctx, dir, fieldType, &out)
+	if err == nil {
+		t.Errorf("logos build accepted config.Load with a %s field", fieldType)
+		return
+	}
+	if interrupted := ctx.Err(); interrupted != nil {
+		t.Errorf("config consumer build for %s was interrupted: %v\n%s", fieldType, interrupted, out.Bytes())
+		return
+	}
+	exit, exited := errors.AsType[*exec.ExitError](err)
+	if !exited || exit.ExitCode() != 1 {
+		t.Errorf("config consumer build for %s did not complete with a compiler rejection: %v\n%s", fieldType, err, out.Bytes())
+		return
+	}
+	const want = "[comptime::error] config: unsupported field type"
+	if !bytes.Contains(out.Bytes(), []byte(want)) {
+		t.Errorf("config consumer build for %s failed without %q:\n%s", fieldType, want, out.Bytes())
+	}
+}
+
+func buildConfigConsumer(ctx context.Context, dir string, fieldType string, out *bytes.Buffer) error {
+	source := fmt.Appendf(nil, configConsumerSource, fieldType)
+	os.WriteFile(filepath.Join(dir, "consumer.lgo"), source, 0o600)?
+	cmd := exec.CommandContext(ctx, "logos", "build", ".")
+	cmd.Dir = dir
+	cmd.Stdout = out
+	cmd.Stderr = out
+	cmd.Env = append(cmd.Environ(),
+		"GOWORK=off", "GOTOOLCHAIN=local", "GOENV=off", "GOFLAGS=-mod=mod", "CGO_ENABLED=0",
+		"GOPROXY=off", "GONOPROXY=none", "GOSUMDB=off", "GOVCS=*:off", "GOTELEMETRY=off",
+	)
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.Run()
+}

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -763,6 +764,9 @@ func partTexts(parts []ai.Part) (reasoning string, text string) {
 			reasoning += v.Text
 		case ai.Text:
 			text += v.Text
+		case ai.ToolCall:
+		case ai.ToolResult:
+		case nil:
 		}
 	}
 	return reasoning, text
@@ -1891,5 +1895,385 @@ func TestChatBodyOverLimitWithCutConnectionIsFinal(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("transport saw %d calls, want 1: the same body would come again", calls.Load())
+	}
+}
+
+const (
+	lineBound      = 1024
+	streamBound    = 64 << 10
+	boundSlack     = 64 << 10
+	endlessCeiling = 8 << 20
+)
+
+const helloDelta = "event: content_block_delta\n" + `data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}` + "\n\n"
+
+type pipeListener struct {
+	conns  chan net.Conn
+	closed context.Context
+	shut   context.CancelFunc
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed.Done():
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.shut()
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr {
+	return pipeAddr{}
+}
+
+func (l *pipeListener) dial(ctx context.Context, _ string, _ string) (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-ctx.Done():
+		return nil, errors.Join(ctx.Err(), server.Close(), client.Close())
+	case <-l.closed.Done():
+		return nil, errors.Join(net.ErrClosed, server.Close(), client.Close())
+	}
+}
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string {
+	return "pipe"
+}
+
+func (pipeAddr) String() string {
+	return "pipe"
+}
+
+func pipeServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *http.Client) {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(handler)
+	if err := srv.Listener.Close(); err != nil {
+		t.Fatalf("close the loopback listener: %v", err)
+	}
+	closed, shut := context.WithCancel(context.Background())
+	pipes := &pipeListener{conns: make(chan net.Conn), closed: closed, shut: shut}
+	srv.Listener = pipes
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv, &http.Client{Transport: &http.Transport{DialContext: pipes.dial, DisableKeepAlives: true}}
+}
+
+func endlessHandler(written *atomic.Int64, piece string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		for written.Load() < endlessCeiling {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			n, err := io.WriteString(w, piece)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func streamOutcome(seq iter.Seq2[ai.Chunk, error]) (int, []error) {
+	chunks := 0
+	var errs []error
+	for _, err := range seq {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		chunks++
+	}
+	return chunks, errs
+}
+
+func TestStreamStopsAtTheLineBound(t *testing.T) {
+	var written atomic.Int64
+	srv, httpClient := pipeServer(t, endlessHandler(&written, strings.Repeat("x", 512)))
+	c := &anthropic.Client{BaseURL: srv.URL, Key: "test-key", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}, MaxLine: lineBound}
+
+	_, errs := streamOutcome(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	srv.Close()
+
+	if len(errs) != 1 || !errors.Is(errs[0], anthropic.ErrProviderTooLarge) {
+		t.Fatalf("errors = %v, want exactly one size limit error", errs)
+		return
+	}
+	if want := "ai/anthropic: stream line exceeds 1024 bytes"; !strings.Contains(errs[0].Error(), want) {
+		t.Errorf("error = %v, want it to name %q", errs[0], want)
+	}
+	if got := written.Load(); got > lineBound+boundSlack {
+		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, lineBound+boundSlack)
+	}
+}
+
+func TestStreamStopsAtTheStreamBound(t *testing.T) {
+	var written atomic.Int64
+	srv, httpClient := pipeServer(t, endlessHandler(&written, helloDelta))
+	c := &anthropic.Client{BaseURL: srv.URL, Key: "test-key", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}, MaxStream: streamBound}
+
+	chunks, errs := streamOutcome(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+	srv.Close()
+
+	if len(errs) != 1 || !errors.Is(errs[0], anthropic.ErrProviderTooLarge) {
+		t.Fatalf("errors = %v, want exactly one size limit error", errs)
+		return
+	}
+	if want := "ai/anthropic: stream exceeds 65536 bytes"; !strings.Contains(errs[0].Error(), want) {
+		t.Errorf("error = %v, want it to name %q", errs[0], want)
+	}
+	if whole := streamBound / len(helloDelta); chunks < whole {
+		t.Errorf("the stream gave %d chunks, want the %d whole events inside the bound", chunks, whole)
+	}
+	if got := written.Load(); got > streamBound+boundSlack {
+		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, streamBound+boundSlack)
+	}
+}
+
+func TestStreamOutlivesTheHeadAttempt(t *testing.T) {
+	const deltas = 400
+	body := strings.Repeat(helloDelta, deltas) + "event: message_stop\n" + `data: {"type": "message_stop"}` + "\n\n"
+	srv, httpClient := pipeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for event := range strings.SplitAfterSeq(body, "\n\n") {
+			if _, err := io.WriteString(w, event); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+	c := &anthropic.Client{BaseURL: srv.URL, Key: "test-key", HTTP: httpClient, Policy: resilience.Policy{Timeout: 2 * time.Second}}
+
+	reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("hi")}}))
+
+	if err != nil {
+		t.Fatalf("a stream longer than the bytes that came with the headers failed: %v", err)
+		return
+	}
+	if _, text := partTexts(reply.Message.Parts); text != strings.Repeat("Hello", deltas) {
+		t.Errorf("stream text has %d bytes, want the %d bytes of every delta", len(text), 5*deltas)
+	}
+}
+
+func TestStreamOfAStalledProviderEndsAtTheIdleBound(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stall\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := ai.Collect(c.Stream(ctx, ai.Request{
+		Model:     "claude-opus-5-5",
+		MaxTokens: 1024,
+		Messages:  []ai.Message{userTurn("Say hello")},
+	}))
+	if err == nil || !errors.Is(err, anthropic.ErrProviderStreamCut) {
+		t.Fatalf("collect error = %v, want the stream cut fault", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("stall error = %v, want the named stall error, not a cancel", err)
+	}
+	if !anthropic.IsStall(err) {
+		t.Fatalf("stall error = %v, want the named stall error", err)
+	}
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("stalled stream ended after %v, want at least the 200ms idle bound", elapsed)
+	}
+}
+
+func TestStreamRetriesWhenTheFirstAttemptHangs(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			time.Sleep(2 * time.Second)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, helloDelta); err != nil {
+			return
+		}
+		if _, err := io.WriteString(w, "event: message_stop\n"+`data: {"type": "message_stop"}`+"\n\n"); err != nil {
+			return
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 500 * time.Millisecond, Retry: resilience.Retry{Attempts: 2, Base: time.Millisecond, Max: 2 * time.Millisecond}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	reply, err := ai.Collect(c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+	if err != nil {
+		t.Fatalf("stream with a hanging first attempt failed: %v", err)
+		return
+	}
+	if _, text := partTexts(reply.Message.Parts); text != "Hello" {
+		t.Errorf("stream text = %q, want %q", text, "Hello")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("server saw %d requests, want exactly 2", got)
+	}
+}
+
+func TestStreamZeroTimeoutUsesFallbackBound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_zero\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"); err != nil {
+			return
+		}
+		if _, err := io.WriteString(w, helloDelta); err != nil {
+			return
+		}
+		if _, err := io.WriteString(w, "event: message_stop\n"+`data: {"type": "message_stop"}`+"\n\n"); err != nil {
+			return
+		}
+	}))
+	t.Cleanup(srv.Close)
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		c := testClient(srv)
+		c.Policy = resilience.Policy{Timeout: timeout}
+		reply, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+		if err != nil {
+			t.Fatalf("stream with timeout %v failed: %v", timeout, err)
+			return
+		}
+		if _, text := partTexts(reply.Message.Parts); text != "Hello" {
+			t.Errorf("stream with timeout %v text = %q, want %q", timeout, text, "Hello")
+		}
+	}
+}
+
+func TestStreamStalledHeadUsesFallbackBound(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 0}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, err := ai.Collect(c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+	elapsed := time.Since(start)
+	if err == nil || !errors.Is(err, resilience.ErrTimeout) {
+		t.Fatalf("stalled head error = %v, want the resilience timeout", err)
+		return
+	}
+	if elapsed < 10*time.Second {
+		t.Errorf("stalled head ended after %v, want at least the ten-second fallback bound", elapsed)
+	}
+	if elapsed > 30*time.Second {
+		t.Errorf("stalled head took %v, want the ten-second bound to fire near it", elapsed)
+	}
+}
+
+func TestStreamAttemptTimeoutComesFromPolicy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 300 * time.Millisecond}
+	start := time.Now()
+	_, err := ai.Collect(c.Stream(context.Background(), ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}))
+	elapsed := time.Since(start)
+	if err == nil || !errors.Is(err, resilience.ErrTimeout) {
+		t.Fatalf("slow head error = %v, want the resilience timeout", err)
+		return
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Errorf("slow head took %v, want under 1.5s so the policy bound fires first", elapsed)
+	}
+}
+
+func TestStreamSurvivesASlowConsumer(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, helloDelta); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(300 * time.Millisecond)
+		if _, err := io.WriteString(w, helloDelta); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if _, err := io.WriteString(w, "event: message_stop\n"+`data: {"type": "message_stop"}`+"\n\n"); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	c := testClient(srv)
+	c.Policy = resilience.Policy{Timeout: 200 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var text strings.Builder
+	slept := false
+	for chunk, err := range c.Stream(ctx, ai.Request{Model: "claude-opus-5-5", Messages: []ai.Message{userTurn("Say hello")}}) {
+		if err != nil {
+			t.Fatalf("slow consumer cut the stream: %v", err)
+			return
+		}
+		part := chunk.Part
+		if part == nil {
+			continue
+		}
+		if _, piece := partTexts([]ai.Part{part}); piece != "" {
+			if !slept {
+				time.Sleep(500 * time.Millisecond)
+				slept = true
+			}
+			text.WriteString(piece)
+		}
+	}
+	if got := text.String(); got != "HelloHello" {
+		t.Errorf("stream text = %q, want %q", got, "HelloHello")
 	}
 }

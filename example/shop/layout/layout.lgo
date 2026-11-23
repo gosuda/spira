@@ -1,0 +1,81 @@
+package layout
+
+import (
+	"fmt"
+
+	"github.com/gosuda/spira/validate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+func Fallback(n view.Node) view.Node {
+	return n
+}
+
+func Page(tags view.Node) func(ctx *web.Context, p web.Page) view.Node {
+	return func(ctx *web.Context, p web.Page) view.Node {
+		return Document(tags, p.Title, p.Body)
+	}
+}
+
+func Document(tags view.Node, title string, body view.Node) view.Node {
+	return view.Html(
+		view.Attr("lang", "en"),
+		view.Head(
+			view.Meta(view.Attr("charset", "utf-8")),
+			view.Meta(view.Attr("name", "viewport"), view.Attr("content", "width=device-width, initial-scale=1")),
+			view.Title(view.T(title)),
+			tags,
+		),
+		view.Body(
+			Nav(),
+			view.Main(body),
+			view.Footer(view.P(view.T("spira shop"))),
+		),
+	)
+}
+
+func Nav() view.Node {
+	return view.Nav(
+		view.A(view.Attr("href", "/catalog"), view.T("Catalog")),
+		view.A(view.Attr("href", "/cart"), view.T("Cart")),
+		view.A(view.Attr("href", "/account"), view.T("Account")),
+		view.A(view.Attr("href", "/catalog"), view.T("Stock")),
+	)
+}
+
+func Price(cents int64) view.Node {
+	return view.Span(view.T(fmt.Sprintf("$%d.%02d", cents/100, cents%100)))
+}
+
+func AddForm(productID string, productName string, quantity string, errs validate.Errors) view.Node {
+	return view.Form(
+		view.Attr("method", "post"),
+		view.Attr("action", "/cart/items"),
+		view.Hx("post", "/cart/items"),
+		view.Hx("target", "#cart-note"),
+		view.Hx("swap", "outerHTML"),
+		view.Input(view.Attr("type", "hidden"), view.Attr("name", "product_id"), view.Attr("value", productID)),
+		view.Label(view.T("Quantity")),
+		view.Input(view.Attr("type", "number"), view.Attr("name", "quantity"), view.Attr("value", quantity), view.Attr("min", "1"), view.Attr("max", "99")),
+		view.Button(view.Attr("type", "submit"), view.T("Add "+productName+" to cart")),
+		FieldErrors(errs),
+	)
+}
+
+func WantsFragment(ctx *web.Context) bool {
+	htmx := ctx.Htmx()
+	return htmx.Request && !htmx.Boosted && !htmx.HistoryRestore
+}
+
+func FieldErrors(errs validate.Errors) view.Node {
+	if len(errs) == 0 {
+		return view.Group{}
+	}
+	return view.Ul(
+		view.Attr("class", "field-errors"),
+		view.Each(errs, func(e const validate.FieldError) view.Node {
+			return view.Li(view.T(e.Field+": "+e.Message))
+		}),
+	)
+}

@@ -251,6 +251,9 @@ func ScanOption(dst any, path string, dests *[]any) bool {
 	case *rt.Option[float64]:
 		*dests = append(*dests, &OptionDest[float64]{dst: p, path: path})
 		return true
+	case *rt.Option[[]byte]:
+		*dests = append(*dests, &OptionDest[[]byte]{dst: p, path: path})
+		return true
 	}
 	return false
 }

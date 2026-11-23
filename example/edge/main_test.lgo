@@ -1,0 +1,116 @@
+package main_test
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"logos/sync"
+
+	edge "github.com/gosuda/spira/example/edge"
+)
+
+type upstreamNote struct {
+	Method string
+	Path   string
+	Query  string
+	Body   string
+}
+
+type notes struct {
+	seen sync.Locked[[]upstreamNote]
+}
+
+func (n *notes) add(note upstreamNote) {
+	n.seen.WithLock(func(v *[]upstreamNote) {
+		*v = append(*v, note)
+	})
+}
+
+func (n *notes) first() (upstreamNote, bool) {
+	var out upstreamNote
+	found := false
+	n.seen.WithLock(func(v *[]upstreamNote) {
+		if len(*v) > 0 {
+			out = (*v)[0]
+			found = true
+		}
+	})
+	return out, found
+}
+
+func TestForwardsCatalogAndStripsPrefix(t *testing.T) {
+	box := &notes{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("upstream read: %v", err)
+		}
+		box.add(upstreamNote{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Body: string(raw)})
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	srv := httptest.NewServer(edge.Router(upstream.URL))
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/shop/catalog?color=blue")
+	if err != nil {
+		t.Fatalf("edge get: %v", err)
+		return
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close edge body: %v", err)
+		}
+	}()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain edge body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	note, found := box.first()
+	if !found {
+		t.Fatal("the upstream saw no request")
+		return
+	}
+	if note.Method != http.MethodGet {
+		t.Fatalf("method %q, want GET", note.Method)
+	}
+	if note.Path != "/catalog" {
+		t.Fatalf("path %q, want /catalog", note.Path)
+	}
+	if note.Query != "color=blue" {
+		t.Fatalf("query %q, want color=blue", note.Query)
+	}
+}
+
+func TestCatalogPreservesEscapedPath(t *testing.T) {
+	box := &notes{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		box.add(upstreamNote{Path: r.URL.EscapedPath()})
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	srv := httptest.NewServer(edge.Router(upstream.URL))
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/shop/catalog/a%2Fb")
+	if err != nil {
+		t.Fatalf("edge get: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close edge body: %v", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	note, found := box.first()
+	if !found {
+		t.Fatal("the upstream saw no request")
+	}
+	if note.Path != "/catalog/a%2Fb" {
+		t.Fatalf("escaped path %q, want /catalog/a%%2Fb", note.Path)
+	}
+}

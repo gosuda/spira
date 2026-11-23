@@ -1,0 +1,24 @@
+package http3peer
+
+import (
+	"crypto/tls"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+)
+
+func NewTransport(config *tls.Config) *http3.Transport {
+	return &http3.Transport{TLSClientConfig: config}
+}
+
+func NewRawClientConn(conn *quic.Conn) *http3.RawClientConn {
+	return (&http3.Transport{}).NewRawClientConn(conn)
+}
+
+func NewRawDatagramClientConn(conn *quic.Conn) *http3.RawClientConn {
+	return (&http3.Transport{EnableDatagrams: true}).NewRawClientConn(conn)
+}
+
+func NewClientConn(conn *quic.Conn) *http3.ClientConn {
+	return (&http3.Transport{}).NewClientConn(conn)
+}

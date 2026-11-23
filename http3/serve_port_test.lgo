@@ -1,0 +1,79 @@
+package http3_test
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/web"
+)
+
+func TestH3ServeRejectsCallerUDPPortMismatch(t *testing.T) {
+	cert, _ := testCert(t)
+	router := web.NewRouter()
+	router.Handle("GET", "/hello", h3Hello)
+	server := &http3.Server{Router: router, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true, ShutdownGrace: 10 * time.Second}
+
+	listener, matchingPacket := bindH3CallerSockets(t)
+	strayPacket, serr := net.ListenPacket("udp", "127.0.0.1:0")
+	if serr != nil {
+		cerr := errors.Join(listener.Close(), matchingPacket.Close())
+		t.Fatalf("listen stray caller UDP: %v; close caller sockets: %v", serr, cerr)
+		return
+	}
+
+	t.Cleanup(func() {
+		stopH3Server(t, server)
+		closeH3CallerSockets(t, listener, strayPacket)
+		if cerr := matchingPacket.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("close matching caller UDP connection: %v", cerr)
+		}
+	})
+
+	tcpPort, strayPort := assertH3CallerUDPPortMismatch(t, listener, matchingPacket, strayPacket)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	serr = server.Serve(ctx, listener, strayPacket)
+	if serr == nil {
+		t.Fatalf("Serve accepted caller TCP port %d with caller UDP port %d", tcpPort, strayPort)
+		return
+	}
+	if errors.Is(serr, http3.ErrListenUDP) {
+		t.Fatal("mismatched caller ports were reported as a UDP listen failure")
+	}
+
+	assertH3CallerSocketsUsable(t, listener, strayPacket)
+}
+
+func assertH3CallerUDPPortMismatch(t *testing.T, listener net.Listener, matchingPacket net.PacketConn, strayPacket net.PacketConn) (int, int) {
+	t.Helper()
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("caller TCP listener address type %T, want *net.TCPAddr", listener.Addr())
+		return 0, 0
+	}
+	matchingAddr, ok := matchingPacket.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("caller UDP address type %T, want *net.UDPAddr", matchingPacket.LocalAddr())
+		return 0, 0
+	}
+	strayAddr, ok := strayPacket.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("stray UDP address type %T, want *net.UDPAddr", strayPacket.LocalAddr())
+		return 0, 0
+	}
+	if matchingAddr.Port != tcpAddr.Port {
+		t.Fatalf("caller TCP port %d and caller UDP port %d differ", tcpAddr.Port, matchingAddr.Port)
+		return 0, 0
+	}
+	if strayAddr.Port == matchingAddr.Port {
+		t.Fatalf("stray UDP reused caller port %d while the caller UDP socket was bound", strayAddr.Port)
+		return 0, 0
+	}
+	return tcpAddr.Port, strayAddr.Port
+}

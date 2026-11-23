@@ -1,0 +1,344 @@
+package assist_test
+
+import (
+	"context"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"logos/sync"
+
+	"github.com/gosuda/spira/example/shop/assist"
+	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/rag"
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
+)
+
+const toolCallBody = `{
+  "id": "chatcmpl-ask-1",
+  "object": "chat.completion",
+  "created": 1694268190,
+  "model": "gpt-6-astra",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "tool_calls": [{"id": "call_search_1", "type": "function", "function": {"name": "search_products", "arguments": "{\"query\":\"blue mug\"}"}}]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
+}`
+
+const replayedAnswer = "Blue mug & matching <saucers> restocked."
+
+const answerBody = `{
+  "id": "chatcmpl-ask-2",
+  "object": "chat.completion",
+  "created": 1694268190,
+  "model": "gpt-6-astra",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "` + replayedAnswer + `"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48}
+}`
+
+type fixedEmbed struct {
+	vector []float32
+}
+
+func (e fixedEmbed) Embed(ctx context.Context, texts const []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = e.vector
+	}
+	return out, nil
+}
+
+type bodies struct {
+	seen sync.Locked[[]string]
+}
+
+func (b *bodies) add(s string) {
+	b.seen.WithLock(func(v *[]string) {
+		*v = append(*v, s)
+	})
+}
+
+func (b *bodies) all() []string {
+	var out []string
+	b.seen.WithLock(func(v *[]string) {
+		out = append(out, (*v)...)
+	})
+	return out
+}
+
+func seedCatalog(t *testing.T) *rag.Memory? {
+	t.Helper()
+	store := &rag.Memory{Embed: fixedEmbed{vector: []float32{1, 0}}}
+	docs := []rag.Document{
+		{ID: "p-blue-mug", Text: "Blue mug holds 300ml, in stock."},
+		{ID: "p-red-plate", Text: "Red plate, out of stock."},
+	}
+	if err := store.Add(t.Context(), docs); err != nil {
+		t.Fatalf("seed catalog: %v", err)
+		return nil
+	}
+	return store
+}
+
+func replay(t *testing.T, rec *bodies, calls *atomic.Int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("replay read: %v", err)
+		}
+		rec.add(string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			if _, err := io.WriteString(w, toolCallBody); err != nil {
+				t.Errorf("replay write: %v", err)
+			}
+			return
+		}
+		if _, err := io.WriteString(w, answerBody); err != nil {
+			t.Errorf("replay write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func serve(t *testing.T, seen *bodies, calls *atomic.Int64) *httptest.Server? {
+	t.Helper()
+	catalog := seedCatalog(t)
+	if catalog == nil {
+		return nil
+	}
+	replaySrv := replay(t, seen, calls)
+	client := &openai.Client{BaseURL: replaySrv.URL, Model: "gpt-6-astra", HTTP: replaySrv.Client(), Policy: resilience.Policy{Timeout: 2 * time.Second}}
+	f := &assist.Feature{Model: client, Catalog: catalog}
+	r := web.NewRouter()
+	f.Register(r)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func postAsk(t *testing.T, ctx context.Context, target string, query string) *http.Response? {
+	t.Helper()
+	form := url.Values{"q": []string{query}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post ask: %v", err)
+		return nil
+	}
+	return resp
+}
+
+func readAnswer(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close ask body: %v", err)
+		}
+	}()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read answer: %v", err)
+		return ""
+	}
+	var lines []string
+	for _, block := range strings.Split(string(raw), "\n\n") {
+		if !strings.HasPrefix(block, "event: answer\n") {
+			continue
+		}
+		for _, line := range strings.Split(block, "\n") {
+			if rest, ok := strings.CutPrefix(line, "data: "); ok {
+				lines = append(lines, rest)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		t.Fatalf("answer stream %q holds no answer event", string(raw))
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func answerFragmentText(t *testing.T, fragment string) string {
+	t.Helper()
+	decoder := xml.NewDecoder(strings.NewReader(fragment))
+	decoder.Strict = false
+	decoder.AutoClose = xml.HTMLAutoClose
+	decoder.Entity = xml.HTMLEntity
+
+	var text strings.Builder
+	hasElement := false
+	for token, err := decoder.Token(); err != io.EOF; token, err = decoder.Token() {
+		if err != nil {
+			t.Fatalf("parse answer fragment %q: %v", fragment, err)
+		}
+		switch token := token.(type) {
+		case xml.Directive:
+			t.Fatalf("answer %q has a document directive", fragment)
+		case xml.StartElement:
+			checkFragmentElement(t, token.Name.Local, fragment)
+			hasElement = true
+		case xml.CharData:
+			text.WriteString(string(token))
+		}
+	}
+	if !hasElement {
+		t.Fatalf("answer %q has no HTML element", fragment)
+	}
+	return strings.TrimSpace(text.String())
+}
+
+func checkFragmentElement(t *testing.T, name string, fragment string) {
+	t.Helper()
+	switch strings.ToLower(name) {
+	case "html", "head", "body":
+		t.Fatalf("answer %q contains a document shell", fragment)
+	}
+}
+
+type stubModel struct{}
+
+func (stubModel) Chat(ctx context.Context, req ai.Request) (ai.Reply, error) {
+	return ai.Reply{}, fmt.Errorf("assist_test: stub model has no reply")
+}
+
+func (stubModel) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
+	yield ai.Chunk{}, fmt.Errorf("assist_test: stub model has no stream")
+	return
+}
+
+func TestAskStreamsTheReplayedAnswer(t *testing.T) {
+	seen := &bodies{}
+	var calls atomic.Int64
+	srv := serve(t, seen, &calls)
+	if srv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	resp := postAsk(t, ctx, srv.URL+"/assist/ask", "Which mug is in stock?")
+	if resp == nil {
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("content type %q, want text/event-stream", got)
+	}
+	if got := answerFragmentText(t, readAnswer(t, resp)); got != replayedAnswer {
+		t.Fatalf("answer text %q, want %q", got, replayedAnswer)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("model calls = %d, want 2 for one tool round", got)
+	}
+	requests := seen.all()
+	if len(requests) != 2 {
+		t.Fatalf("replay saw %d requests, want 2", len(requests))
+	}
+	if !strings.Contains(requests[0], "Context information is below") {
+		t.Fatalf("first request %q misses the retrieved context", requests[0])
+	}
+	if !strings.Contains(requests[1], "Blue mug holds 300ml") {
+		t.Fatalf("second request %q misses the tool result", requests[1])
+	}
+
+}
+
+func TestAskRequiresQuery(t *testing.T) {
+	seen := &bodies{}
+	var calls atomic.Int64
+	srv := serve(t, seen, &calls)
+	if srv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	resp := postAsk(t, ctx, srv.URL+"/assist/ask", "")
+	if resp == nil {
+		return
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close ask body: %v", err)
+		}
+	}()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("drain error body: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/problem+json" {
+		t.Fatalf("content type %q, want application/problem+json", got)
+	}
+	if !strings.Contains(string(raw), `"code":"assist.missing_query"`) {
+		t.Fatalf("error body %q misses the fault code", string(raw))
+	}
+	if !strings.Contains(string(raw), "A query is required.") {
+		t.Fatalf("error body %q misses the constant message", string(raw))
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("model calls = %d, want none for a missing query", got)
+	}
+}
+
+func TestRegisterRequiresModelAndCatalog(t *testing.T) {
+	catalog := seedCatalog(t)
+	if catalog == nil {
+		return
+	}
+	missingModel := &assist.Feature{Catalog: catalog}
+	missingCatalog := &assist.Feature{Model: stubModel{}}
+	r := web.NewRouter()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Register with a nil Model did not panic")
+			}
+		}()
+		missingModel.Register(r)
+	}()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Register with a nil Catalog did not panic")
+			}
+		}()
+		missingCatalog.Register(r)
+	}()
+}

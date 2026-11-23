@@ -1,0 +1,103 @@
+package main_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/migrate"
+
+	app "{{MODULE}}"
+	appdb "{{MODULE}}/db"
+	"{{MODULE}}/db/store"
+
+	_ "modernc.org/sqlite"
+)
+
+func TestSeedDemoUserFollowsTheEnvironment(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv("SPIRA_SEED_DEMO_PASSWORD", "")
+		withMigratedPool(t, ctx, "file:seed-unset?mode=memory&cache=shared", func(pool *db.Pool) {
+			if err := app.SeedDemoUser(ctx, pool); err != nil {
+				t.Fatalf("seed: %v", err)
+				return
+			}
+			found, err := store.GetUserByName(ctx, pool, "demo")
+			if err != nil {
+				t.Fatalf("lookup: %v", err)
+				return
+			}
+			if found != nil {
+				t.Fatalf("seed created user demo while SPIRA_SEED_DEMO_PASSWORD is unset")
+			}
+		})
+	})
+	t.Run("set", func(t *testing.T) {
+		withMigratedPool(t, ctx, "file:seed-set?mode=memory&cache=shared", func(pool *db.Pool) {
+			for _, password := range []string{"first-test-password", "second-test-password"} {
+				t.Setenv("SPIRA_SEED_DEMO_PASSWORD", password)
+				if err := app.SeedDemoUser(ctx, pool); err != nil {
+					t.Fatalf("seed: %v", err)
+					return
+				}
+				assertDemoPassword(t, ctx, pool, password)
+			}
+		})
+	})
+}
+
+func assertDemoPassword(t *testing.T, ctx context.Context, pool *db.Pool, password string) {
+	t.Helper()
+	found, err := store.GetUserByName(ctx, pool, "demo")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+		return
+	}
+	if found == nil {
+		t.Fatalf("seed left no user demo while SPIRA_SEED_DEMO_PASSWORD is set")
+		return
+	}
+	user := found ?? store.User{}
+	ok, err := auth.VerifyPassword(user.PasswordHash, password)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+		return
+	}
+	if !ok {
+		t.Fatalf("user demo does not accept the SPIRA_SEED_DEMO_PASSWORD value %q", password)
+	}
+}
+
+func withMigratedPool(t *testing.T, ctx context.Context, dsn string, run func(pool *db.Pool)) {
+	t.Helper()
+	pool, err := db.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatalf("open left no pool")
+		return
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if serr := pool.Stop(stopCtx); serr != nil {
+			t.Errorf("stop: %v", serr)
+		}
+	}()
+	steps, err := migrate.Load(appdb.FS())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+		return
+	}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("apply: %v", err)
+		return
+	}
+	run(pool)
+}

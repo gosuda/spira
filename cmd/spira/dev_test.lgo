@@ -565,6 +565,103 @@ func lastViteOrigin(env []string) string {
 	return last
 }
 
+func TestWatchGivesOneDemoPasswordToEveryServerStart(t *testing.T) {
+	cases := []struct {
+		name      string
+		inherited string
+	}{
+		{"unset", ""},
+		{"inherited", "chosen-by-the-developer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SPIRA_SEED_DEMO_PASSWORD", tc.inherited)
+			first, second, err := demoPasswordsAcrossRestart(t)
+			if err != nil {
+				t.Fatalf("watch loop: %v", err)
+				return
+			}
+			if first == "" {
+				t.Fatalf("server start carries no SPIRA_SEED_DEMO_PASSWORD")
+				return
+			}
+			if tc.inherited != "" && first != tc.inherited {
+				t.Fatalf("SPIRA_SEED_DEMO_PASSWORD = %q, want the inherited %q", first, tc.inherited)
+				return
+			}
+			if second != first {
+				t.Fatalf("restart changed SPIRA_SEED_DEMO_PASSWORD from %q to %q", first, second)
+			}
+		})
+	}
+}
+
+func demoPasswordsAcrossRestart(t *testing.T) (string, string, error) {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(source, []byte("package main\n"), 0o644); err != nil {
+		return "", "", err
+	}
+	started := make(chan spira.Start, 8)
+	cfg := spira.Loop{
+		ServerCmd:   []string{"sh", "-c", "sleep 300"},
+		FrontendCmd: []string{"sh", "-c", "sleep 300"},
+		Root:        dir,
+		Interval:    20 * time.Millisecond,
+		Started:     started,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	first := ""
+	second := ""
+	scenario := func(sctx context.Context) error {
+		serverEnv, err := waitForStarts(sctx, started, backstop(t))
+		if err != nil {
+			return err
+		}
+		first = envValue(serverEnv, "SPIRA_SEED_DEMO_PASSWORD")
+		if err := touchLater(source); err != nil {
+			return err
+		}
+		restartEnv, err := nextServerEnv(sctx, started, backstop(t))
+		if err != nil {
+			return err
+		}
+		second = envValue(restartEnv, "SPIRA_SEED_DEMO_PASSWORD")
+		cancel()
+		return nil
+	}
+	err := driveWatch(ctx, cfg, scenario)
+	return first, second, err
+}
+
+func nextServerEnv(ctx context.Context, started <-chan spira.Start, budget time.Duration) ([]string, error) {
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	for {
+		select {
+		case ev := <-started:
+			if ev.Role == "server" {
+				return ev.Env, nil
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("cmd/spira test: cancelled while waiting for the server restart")
+		case <-timer.C:
+			return nil, fmt.Errorf("cmd/spira test: backstop expired waiting for the server restart")
+		}
+	}
+}
+
+func envValue(env []string, key string) string {
+	value := ""
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, key+"="); ok {
+			value = v
+		}
+	}
+	return value
+}
+
 func TestFrontendCancelDuringStartupReturnsNil(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

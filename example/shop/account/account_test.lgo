@@ -1,0 +1,282 @@
+package account_test
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/example/shop/account"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+	_ "modernc.org/sqlite"
+)
+
+const callTimeout = 30 * time.Second
+
+func dsnFor(t *testing.T) string {
+	t.Helper()
+	key := strings.NewReplacer("/", "_", "(", "_", ")", "_", "$", "_").Replace(t.Name())
+	return fmt.Sprintf("file:spira_account_%s?mode=memory&cache=shared&_pragma=foreign_keys(1)", key)
+}
+
+func bounded(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func openPool(t *testing.T) *db.Pool? {
+	t.Helper()
+	pool, err := db.Open("sqlite", dsnFor(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatalf("open: no pool and no error")
+		return nil
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	if err := pool.Start(bounded(t)); err != nil {
+		t.Fatalf("start: %v", err)
+		return nil
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return nil
+	}
+	if err := migrate.Apply(bounded(t), pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return nil
+	}
+	return pool
+}
+
+func seedUser(t *testing.T, pool *db.Pool) {
+	t.Helper()
+	hash, err := auth.HashPassword("s3cret")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+		return
+	}
+	if _, err := store.CreateUser(bounded(t), pool, "ada", hash); err != nil {
+		t.Fatalf("create user: %v", err)
+		return
+	}
+}
+
+func shellLayout(ctx *web.Context, p web.Page) view.Node {
+	return view.Html(view.Head(view.Title(view.T(p.Title))), view.Body(view.H1(view.T(p.Title)), p.Body))
+}
+
+func testRouter(pool *db.Pool) *web.Router {
+	r := web.NewRouter()
+	r.Layout = shellLayout
+	(&account.Feature{DB: pool, Sessions: &auth.Sessions{Store: account.NewSessionStore(pool)}}).Register(r)
+	return r
+}
+
+func loginRequest(user string, secret string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/account/login", strings.NewReader(url.Values{"user": []string{user}, "password": []string{secret}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req
+}
+
+func withCookie(req *http.Request, value string) *http.Request {
+	req.Header.Set("Cookie", "__Host-spira="+value)
+	return req
+}
+
+func sessionValue(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("want one cookie, got %d", len(cookies))
+		return ""
+	}
+	return cookies[0].Value
+}
+
+func login(t *testing.T, r *web.Router) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, loginRequest("ada", "s3cret"))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("login status %d want 303 body %s", rec.Code, rec.Body.String())
+		return ""
+	}
+	value := sessionValue(t, rec)
+	if value == "" {
+		return ""
+	}
+	cookie := rec.Result().Cookies()[0]
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" {
+		t.Fatalf("cookie flags secure=%v httpOnly=%v sameSite=%v path=%q", cookie.Secure, cookie.HttpOnly, cookie.SameSite, cookie.Path)
+		return ""
+	}
+	if cookie.Name != "__Host-spira" {
+		t.Fatalf("cookie name %q want __Host-spira", cookie.Name)
+		return ""
+	}
+	return value
+}
+
+func TestAccountNeedsSession(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	seedUser(t, pool)
+	rec := httptest.NewRecorder()
+	testRouter(pool).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/account", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+		return
+	}
+}
+
+func TestLoginPageRendersForm(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := httptest.NewRecorder()
+	testRouter(pool).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/account/login", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d want 200 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="user"`) || !strings.Contains(body, `name="password"`) {
+		t.Fatalf("body %q lacks the login form fields", body)
+		return
+	}
+}
+
+func TestLoginLogoutFlow(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	seedUser(t, pool)
+	r := testRouter(pool)
+	value := login(t, r)
+	if value == "" {
+		return
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, withCookie(httptest.NewRequest(http.MethodGet, "/account", nil), value))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("account status %d want 200 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "Signed in as") {
+		t.Fatalf("body %q lacks the account marker", body)
+		return
+	}
+	out := httptest.NewRecorder()
+	r.ServeHTTP(out, withCookie(httptest.NewRequest(http.MethodPost, "/account/logout", nil), value))
+	if out.Code != http.StatusSeeOther {
+		t.Fatalf("logout status %d want 303 body %s", out.Code, out.Body.String())
+		return
+	}
+	expired := out.Result().Cookies()
+	if len(expired) != 1 || expired[0].Value != "" {
+		t.Fatalf("logout did not expire the cookie: %v", expired)
+		return
+	}
+	gone := httptest.NewRecorder()
+	r.ServeHTTP(gone, withCookie(httptest.NewRequest(http.MethodGet, "/account", nil), value))
+	if gone.Code != http.StatusUnauthorized {
+		t.Fatalf("status after logout %d want 401 body %s", gone.Code, gone.Body.String())
+		return
+	}
+}
+
+func TestLoginRotatesSessionID(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	seedUser(t, pool)
+	r := testRouter(pool)
+	first := login(t, r)
+	if first == "" {
+		return
+	}
+	second := httptest.NewRecorder()
+	r.ServeHTTP(second, withCookie(loginRequest("ada", "s3cret"), first))
+	if second.Code != http.StatusSeeOther {
+		t.Fatalf("second login status %d want 303", second.Code)
+		return
+	}
+	rotated := sessionValue(t, second)
+	if rotated == "" {
+		return
+	}
+	if rotated == first {
+		t.Fatalf("login reused session id %q", first)
+		return
+	}
+	stale := httptest.NewRecorder()
+	r.ServeHTTP(stale, withCookie(httptest.NewRequest(http.MethodGet, "/account", nil), first))
+	if stale.Code != http.StatusUnauthorized {
+		t.Fatalf("old session status %d want 401", stale.Code)
+		return
+	}
+	fresh := httptest.NewRecorder()
+	r.ServeHTTP(fresh, withCookie(httptest.NewRequest(http.MethodGet, "/account", nil), rotated))
+	if fresh.Code != http.StatusOK {
+		t.Fatalf("new session status %d want 200", fresh.Code)
+		return
+	}
+}
+
+func TestLoginRejectsWrongPassword(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	seedUser(t, pool)
+	rec := httptest.NewRecorder()
+	testRouter(pool).ServeHTTP(rec, loginRequest("ada", "wrong"))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("failed login set a cookie")
+		return
+	}
+}
+
+func TestLoginRejectsUnknownUser(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := httptest.NewRecorder()
+	testRouter(pool).ServeHTTP(rec, loginRequest("bob", "s3cret"))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+		return
+	}
+}

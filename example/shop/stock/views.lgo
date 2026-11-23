@@ -1,0 +1,46 @@
+package stock
+
+import (
+	"strconv"
+
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/view"
+)
+
+func Row(t Tick) view.Node {
+	return view.Span(
+		view.Attr("id", "stock-"+strconv.FormatInt(t.ID, 10)),
+		view.Attr("hx-swap-oob", "outerHTML"),
+		view.Span(view.T(t.Name+": "+strconv.FormatInt(t.Stock, 10))),
+		layout.Price(t.Price),
+	)
+}
+
+func Display(t Tick) view.Node {
+	return view.Span(
+		view.Attr("id", "stock-"+strconv.FormatInt(t.ID, 10)),
+		view.Span(view.T(t.Name+": "+strconv.FormatInt(t.Stock, 10))),
+		layout.Price(t.Price),
+	)
+}
+
+func Region(content view.Node) view.Node {
+	return view.Section(
+		view.Attr("data-live-region", "stock"),
+		view.Hx("ext", "sse"),
+		view.Attr("sse-connect", "/stock/events"),
+		content,
+		view.Span(
+			view.Hx("ext", "sse"),
+			view.Attr("sse-swap", "stock"),
+			view.Hx("swap", "none"),
+		),
+		view.Button(
+			view.Attr("type", "button"),
+			view.Flag("data-live-toggle"),
+			view.Attr("aria-pressed", "false"),
+			view.Flag("hidden"),
+			view.T("Pause live stock updates"),
+		),
+	)
+}

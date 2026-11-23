@@ -1,0 +1,142 @@
+package main_test
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/gosuda/spira/db"
+	shopmain "github.com/gosuda/spira/example/shop"
+	shopdb "github.com/gosuda/spira/example/shop/db"
+	"github.com/gosuda/spira/example/shop/cart"
+	"github.com/gosuda/spira/example/shop/catalog"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+
+	_ "modernc.org/sqlite"
+)
+
+func openPool(t *testing.T) *db.Pool? {
+	t.Helper()
+	key := strings.NewReplacer("/", "_").Replace(t.Name())
+	pool, err := db.Open("sqlite", fmt.Sprintf("file:spira_shop_%s?mode=memory&cache=shared", key))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatalf("open: no pool")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+		return nil
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+		return nil
+	}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+		return nil
+	}
+	if _, err := pool.ExecContext(ctx, "INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'Widget', 1299, 10, '2026-01-02 10:00:00')"); err != nil {
+		t.Fatalf("seed: %v", err)
+		return nil
+	}
+	t.Cleanup(func() {
+		if err := pool.Stop(context.Background()); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	return pool
+}
+
+func jointRouter(pool *db.Pool) *web.Router {
+	r := web.NewRouter()
+	r.Layout = layout.Page(view.Group{})
+	catalogFeature := &catalog.Feature{DB: pool, Assets: asset.Dev("http://localhost:5173")}
+	catalogFeature.Register(r)
+	cartFeature := &cart.Feature{DB: pool}
+	cartFeature.Register(r)
+	return r
+}
+
+func TestJointRouterServesCatalog(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	req := httptest.NewRequest(http.MethodGet, "/catalog", nil)
+	rec := httptest.NewRecorder()
+	jointRouter(pool).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	if !strings.HasPrefix(rec.Body.String(), "<!doctype html>") {
+		t.Fatalf("joint catalog lacks the doctype")
+	}
+}
+
+func TestJointAddToCartAppearsOnCartPage(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	router := jointRouter(pool)
+	form := url.Values{"product_id": []string{"1"}, "quantity": []string{"1"}}
+	add := httptest.NewRequest(http.MethodPost, "/cart/items", strings.NewReader(form.Encode()))
+	add.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	added := httptest.NewRecorder()
+	router.ServeHTTP(added, add)
+	if added.Code != http.StatusSeeOther {
+		t.Fatalf("add status = %d, want 303", added.Code)
+		return
+	}
+	page := httptest.NewRequest(http.MethodGet, "/cart", nil)
+	for _, c := range added.Result().Cookies() {
+		page.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, page)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cart status = %d, want 200", rec.Code)
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "Widget") {
+		t.Fatalf("joint cart page lacks the added product")
+	}
+}
+
+func TestIslandsServeWasmWithContentType(t *testing.T) {
+	sys := fstest.MapFS{
+		"islands/ticker.wasm": {Data: []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}},
+	}
+	handler := shopmain.IslandFiles(http.FileServerFS(sys))
+	req := httptest.NewRequest(http.MethodGet, "/islands/ticker.wasm", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/wasm" {
+		t.Fatalf("content type = %q, want application/wasm", ct)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Fatalf("cache control = %q, want no-cache", cc)
+	}
+}

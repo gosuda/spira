@@ -1,7 +1,8 @@
 package http3
 
 import (
-	"github.com/quic-go/quic-go/http3"
+	"context"
+	"errors"
 )
 
 func (s *Server) BoundTCPAddrForTest() string {
@@ -28,14 +29,19 @@ func (s *Server) BoundUDPAddrForTest() string {
 	return run.udpAddr
 }
 
-func (s *Server) H3ForTest() *http3.Server? {
+func (s *Server) WaitH3ServeForTest(ctx context.Context) error {
 	var held *serverRun?
-	s.state.WithLock(func(st *serverState) {
-		held = st.run
-	})
+	s.state.WithLock(func(st *serverState) { held = st.run })
 	run := held
 	if run == nil {
-		return nil
+		return errors.New("http3: no active run")
 	}
-	return run.h3
+	select {
+	case <-run.join.done:
+		var err error
+		run.join.err.WithLock(func(value *error) { err = *value })
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

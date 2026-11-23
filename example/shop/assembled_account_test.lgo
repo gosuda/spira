@@ -1,0 +1,172 @@
+package main
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/asset"
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/view"
+)
+
+const (
+	assembledAccountUser     = "Spira+ shopper"
+	assembledAccountPassword = "fixture &+% password"
+	assembledSessionCookie   = "__Host-spira"
+)
+
+func TestAssembledShopAccount(t *testing.T) {
+	pool := scheduledStockPool(t)
+	if pool == nil {
+		return
+	}
+	hash, err := auth.HashPassword(assembledAccountPassword)
+	if err != nil {
+		t.Fatalf("hash account fixture password: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	_, err = store.CreateUser(ctx, pool, assembledAccountUser, hash)
+	cancel()
+	if err != nil {
+		t.Fatalf("create account fixture user: %v", err)
+	}
+
+	assets := asset.Dev("http://localhost:5173")
+	router, _ := buildRouter(shopParts{pool: pool, assets: assets, tags: view.Group{}, dev: true})
+	shop := scheduledStockServer(t, router)
+	shop.Client().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	for _, tc := range []struct {
+		name     string
+		user     string
+		password string
+	}{
+		{"WrongPassword", assembledAccountUser, "wrong password"},
+		{"MissingUser", "unseeded shopper", assembledAccountPassword},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reply := postAssembledAccountLogin(t, shop, tc.user, tc.password)
+			if reply.status != http.StatusUnauthorized {
+				t.Errorf("POST /account/login: status %d, want 401", reply.status)
+			}
+			if reply.session != nil {
+				t.Error("POST /account/login: rejected credentials issued a session cookie")
+			}
+		})
+	}
+	t.Run("SessionLifecycle", func(t *testing.T) {
+		testAssembledAccountSession(t, shop)
+	})
+}
+
+func testAssembledAccountSession(t *testing.T, shop *httptest.Server) {
+	t.Helper()
+	account := assembledAccountRequest{method: http.MethodGet, path: "/account"}
+	if reply := sendAssembledAccount(t, shop, account); reply.status != http.StatusUnauthorized {
+		t.Fatalf("GET /account without a session: status %d, want 401", reply.status)
+	}
+
+	login := postAssembledAccountLogin(t, shop, assembledAccountUser, assembledAccountPassword)
+	if login.status != http.StatusSeeOther || login.location != "/account" {
+		t.Fatalf("POST /account/login: status %d, location %q, want 303 to /account", login.status, login.location)
+	}
+	cookie := login.session
+	if cookie == nil {
+		t.Fatalf("POST /account/login: missing %s Set-Cookie", assembledSessionCookie)
+		return
+	}
+	if cookie.Value == "" {
+		t.Fatal("POST /account/login: empty session cookie value")
+	}
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" {
+		t.Fatalf("session cookie: Secure=%t HttpOnly=%t SameSite=%v Path=%q; want Secure, HttpOnly, SameSite=Lax and Path=/",
+			cookie.Secure, cookie.HttpOnly, cookie.SameSite, cookie.Path)
+	}
+
+	account.cookie = cookie
+	if reply := sendAssembledAccount(t, shop, account); reply.status != http.StatusOK {
+		t.Fatalf("GET /account with the session cookie: status %d, want 200", reply.status)
+	}
+	logout := assembledAccountRequest{method: http.MethodPost, path: "/account/logout", cookie: cookie}
+	if reply := sendAssembledAccount(t, shop, logout); reply.status != http.StatusSeeOther || reply.location != "/account/login" {
+		t.Fatalf("POST /account/logout: status %d, location %q, want 303 to /account/login", reply.status, reply.location)
+	}
+	if reply := sendAssembledAccount(t, shop, account); reply.status != http.StatusUnauthorized {
+		t.Fatalf("GET /account replaying the old session cookie: status %d, want 401", reply.status)
+	}
+}
+
+type assembledAccountRequest struct {
+	method string
+	path   string
+	form   url.Values
+	cookie *http.Cookie?
+}
+
+type assembledAccountReply struct {
+	status   int
+	location string
+	session  *http.Cookie?
+}
+
+func postAssembledAccountLogin(t *testing.T, shop *httptest.Server, user string, password string) assembledAccountReply {
+	t.Helper()
+	return sendAssembledAccount(t, shop, assembledAccountRequest{
+		method: http.MethodPost,
+		path:   "/account/login",
+		form:   url.Values{"user": {user}, "password": {password}},
+	})
+}
+
+func sendAssembledAccount(t *testing.T, shop *httptest.Server, input assembledAccountRequest) assembledAccountReply {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var body io.Reader
+	if input.form != nil {
+		body = strings.NewReader(input.form.Encode())
+	}
+	req, err := http.NewRequestWithContext(ctx, input.method, shop.URL+input.path, body)
+	if err != nil {
+		t.Fatalf("prepare %s %s: %v", input.method, input.path, err)
+		return assembledAccountReply{}
+	}
+	if input.form != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	cookie := input.cookie
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	resp, err := shop.Client().Do(req)
+	if err != nil {
+		t.Fatalf("send %s %s: %v", input.method, input.path, err)
+		return assembledAccountReply{}
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close response to %s %s: %v", input.method, input.path, err)
+		}
+	}()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read response to %s %s: %v", input.method, input.path, err)
+	}
+	reply := assembledAccountReply{status: resp.StatusCode, location: resp.Header.Get("Location")}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == assembledSessionCookie {
+			reply.session = cookie
+			break
+		}
+	}
+	return reply
+}

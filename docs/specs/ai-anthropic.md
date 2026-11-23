@@ -13,6 +13,8 @@ type Client struct {
 	HTTP      *http.Client
 	Policy    resilience.Policy
 	MaxTokens int
+	MaxLine   int
+	MaxStream int64
 }
 
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error)
@@ -28,7 +30,7 @@ var ErrTooManyRedirects = fault.New("anthropic.too_many_redirects", fault.Unavai
 func Faults() []*fault.Error
 ```
 
-`Key` is sent as the `x-api-key` header when it is not empty. `Policy` governs retries and the breaker. `MaxTokens` is the fallback for a request with no `MaxTokens`; the default is 4096. The provider requires `max_tokens`, so a fallback avoids a failing call, while the request value always wins.
+`Key` is sent as the `x-api-key` header when it is not empty. `Policy` governs retries and the breaker. `MaxTokens` is the fallback for a request with no `MaxTokens`; the default is 4096. The provider requires `max_tokens`, so a fallback avoids a failing call, while the request value always wins. A stream line longer than `MaxLine` bytes (1 MiB when zero) or a stream longer than `MaxStream` bytes (64 MiB when zero) ends the stream with `anthropic.provider_too_large`.
 
 ## Requirements
 
@@ -58,6 +60,12 @@ func Faults() []*fault.Error
 - `Chat` MUST retry a 429 answer as `anthropic.provider_rate_limited`, after a valid `Retry-After`.
 - `Stream` MUST retry a failing initial answer as `Chat` does.
 - `Stream` MUST NOT make a second request after one event.
+- `Stream` MUST arm an idle bound of `Policy.Timeout` after the initial answer succeeds.
+- Ten seconds MUST be that bound when the timeout is not positive.
+- Each read byte and line MUST reset that bound.
+- An idle expiry MUST end the stream as `anthropic.provider_stream_cut`.
+- A nonpositive `Policy.Timeout` MUST bound attempts at ten seconds.
+- `Stream` MUST pause the idle bound while yielding a chunk.
 - `Stream` MUST hold the next attempt for a valid `Retry-After`, within `Retry.Max`.
 - A response body over 1 MiB MUST end the call as `anthropic.provider_too_large`.
 - The body of a failing status MUST be cut at 1 MiB.

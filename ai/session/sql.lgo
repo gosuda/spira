@@ -210,7 +210,7 @@ func stmtsFor(d db.Dialect) sessionStmts {
 	case db.Postgres => postgresSessionStmts()
 	case db.MySQL => mysqlSessionStmts()
 	case db.MSSQL => mssqlSessionStmts()
-	default => panicNilDialect[sessionStmts]()
+	case nil => panicNilDialect[sessionStmts]()
 	}
 }
 
@@ -656,6 +656,8 @@ func encodePart(p ai.Part) (storedPart, error) {
 		return storedPart{Kind: "call", ID: v.ID, Name: v.Name, Arguments: v.Arguments}, nil
 	case ai.ToolResult:
 		return storedPart{Kind: "result", ID: v.ID, Name: v.Name, Content: v.Content, Skipped: v.Skipped}, nil
+	case nil:
+		return storedPart{}, ErrStoredMessage.Err()
 	}
 	return storedPart{}, ErrStoredMessage.Err()
 }

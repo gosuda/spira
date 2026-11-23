@@ -7,3 +7,8 @@ WHERE name = @name;
 INSERT INTO users (name, password_hash)
 OUTPUT INSERTED.id
 VALUES (@name, @password_hash);
+
+-- name: SetUserPassword :exec
+UPDATE users
+SET password_hash = @password_hash
+WHERE name = @name;

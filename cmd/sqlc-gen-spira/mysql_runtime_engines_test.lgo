@@ -1,0 +1,68 @@
+//go:build engines
+
+package main_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestEngineMySQLGeneratedQueriesMatchDatabaseSQL(t *testing.T) {
+	if os.Getenv("SPIRA_TEST_MYSQL_DSN") == "" {
+		t.Fatal("SPIRA_TEST_MYSQL_DSN is empty; run `just engines` or supply a test DSN with parseTime=true")
+	}
+	if err := runMySQLGeneratedStore(t.Context(), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runMySQLGeneratedStore(ctx context.Context, dir string) error {
+	root := filepath.Abs(filepath.Join("..", ".."))?
+	stageMySQLRuntimeModule(root, dir)?
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+	defer cancel()
+	env := append(os.Environ(),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GOWORK=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOSUMDB=off", "GOFLAGS=-mod=readonly",
+	)
+	plugin := filepath.Join(dir, "sqlc-gen-spira")
+	runMySQLFixtureCommand(ctx, root, env, []string{"logos", "build", "-o", plugin, "./cmd/sqlc-gen-spira"})?
+	runMySQLFixtureCommand(ctx, filepath.Join(root, "tools"), env, []string{"go", "tool", "sqlc", "generate", "-f", filepath.Join(dir, "sqlc.yaml")})?
+	binary := filepath.Join(dir, "mysql-runtime")
+	runMySQLFixtureCommand(ctx, dir, env, []string{"logos", "build", "-o", binary, "."})?
+	return runMySQLFixtureCommand(ctx, dir, env, []string{binary})
+}
+
+func stageMySQLRuntimeModule(root string, dir string) error {
+	os.CopyFS(dir, os.DirFS("testdata/runtime_mysql"))?
+	os.Rename(filepath.Join(dir, "main.lgo.tmpl"), filepath.Join(dir, "main.lgo"))?
+	mod := os.ReadFile(filepath.Join(root, "go.mod"))?
+	body, ok := bytes.CutPrefix(mod, []byte("module github.com/gosuda/spira\n"))
+	if !ok {
+		return fmt.Errorf("mysql runtime fixture: unexpected module path in %s", filepath.Join(root, "go.mod"))
+	}
+	fixture := fmt.Appendf(nil, "module example.com/spira-sqlc-mysql-runtime\n%s\nrequire github.com/gosuda/spira v0.0.0\nreplace github.com/gosuda/spira => %q\n", body, root)
+	os.WriteFile(filepath.Join(dir, "go.mod"), fixture, 0o600)?
+	for _, name := range []string{"go.sum", "logos.toml"} {
+		data := os.ReadFile(filepath.Join(root, name))?
+		os.WriteFile(filepath.Join(dir, name), data, 0o600)?
+	}
+	return nil
+}
+
+func runMySQLFixtureCommand(ctx context.Context, dir string, env []string, argv []string) error {
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v in %s: %w\n%s", argv, dir, err, out)
+	}
+	return nil
+}

@@ -1,0 +1,158 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"example.com/spira-mssql-runtime/store"
+	"github.com/gosuda/spira/db"
+	_ "github.com/microsoft/go-mssqldb"
+)
+
+const oracleGet = `SELECT id, note, name, version FROM spira_sqlc_runtime_mssql_items WHERE id = @id;`
+const oracleList = `SELECT id, note, name, version FROM spira_sqlc_runtime_mssql_items WHERE id <= @lastId AND version >= @minVersion ORDER BY id;`
+const oracleUpdate = `UPDATE spira_sqlc_runtime_mssql_items SET version = @nextVersion, name = @name WHERE version = @version AND id = @id;`
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := compareMSSQLRuntime(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func compareMSSQLRuntime(ctx context.Context) error {
+	dsn := os.Getenv("SPIRA_TEST_MSSQL_DSN")
+	oracle, err := sql.Open("sqlserver", dsn)
+	if err != nil {
+		return errors.New("database/sql could not open SPIRA_TEST_MSSQL_DSN")
+	}
+	defer oracle.Close()?
+	up := os.ReadFile("db/migrations/0001_create_items.up.sql")?
+	down := os.ReadFile("db/migrations/0001_create_items.down.sql")?
+	oracle.ExecContext(ctx, string(up))?
+	defer dropMSSQLItems(oracle, string(down))?
+	oracle.ExecContext(ctx, `INSERT INTO spira_sqlc_runtime_mssql_items (id, note, name, version) VALUES
+		(11, NULL, N'below minimum', 1),
+		(22, N'', N'initial name', 3),
+		(33, N'café', N'initial name', 3),
+		(44, N'not selected', N'above maximum', 4);`)?
+
+	pool := db.Open("sqlserver", dsn)?
+	if pool == nil {
+		return errors.New("db.Open returned no pool")
+	}
+	defer pool.Stop(ctx)?
+	comparePreparedMSSQL(ctx, pool, oracle)?
+	compareMSSQLWrites(ctx, pool, oracle)?
+	for _, id := range []int64{11, 22, 33, 44, 99} {
+		compareMSSQLGet(ctx, pool, oracle, id)?
+	}
+	return compareMSSQLList(ctx, pool, oracle)
+}
+
+func dropMSSQLItems(oracle *sql.DB, down string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	oracle.ExecContext(ctx, down)?
+	return nil
+}
+
+func comparePreparedMSSQL(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	queries := []string{oracleGet, oracleList, oracleUpdate}
+	for _, query := range queries {
+		stmt := oracle.PrepareContext(ctx, query)?
+		stmt.Close()?
+	}
+	store.PrepareAll(ctx, pool)?
+	if got := pool.Prepared(); got != len(queries) {
+		return fmt.Errorf("PrepareAll prepared %d statements, database/sql prepared %d", got, len(queries))
+	}
+	return nil
+}
+
+func compareMSSQLWrites(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	const generatedID int64 = 22
+	const oracleID int64 = 33
+	const version int32 = 3
+	for _, name := range []string{"renamed 東京", "stale update"} {
+		got := store.UpdateItem(ctx, pool, store.UpdateItemArgs{P1: name, P2: generatedID, P3: version})?
+		result := oracle.ExecContext(ctx, oracleUpdate, sql.Named("version", version), sql.Named("id", oracleID), sql.Named("name", name), sql.Named("nextVersion", version+1))?
+		want := result.RowsAffected()?
+		if got != want {
+			return fmt.Errorf("UpdateItem(%q) affected %d rows, database/sql affected %d", name, got, want)
+		}
+	}
+	var generatedName, oracleName string
+	var generatedVersion, oracleVersion int32
+	const state = `SELECT name, version FROM spira_sqlc_runtime_mssql_items WHERE id = @id;`
+	oracle.QueryRowContext(ctx, state, sql.Named("id", generatedID)).Scan(&generatedName, &generatedVersion)?
+	oracle.QueryRowContext(ctx, state, sql.Named("id", oracleID)).Scan(&oracleName, &oracleVersion)?
+	if generatedName != oracleName || generatedVersion != oracleVersion {
+		return fmt.Errorf("generated update left (%q, %d), direct update left (%q, %d)", generatedName, generatedVersion, oracleName, oracleVersion)
+	}
+	return nil
+}
+
+type oracleMSSQLItem struct {
+	id      int64
+	note    sql.NullString
+	name    string
+	version int32
+}
+
+func compareMSSQLGet(ctx context.Context, pool *db.Pool, oracle *sql.DB, id int64) error {
+	got := store.GetItem(ctx, pool, id)?
+	var want oracleMSSQLItem
+	err := oracle.QueryRowContext(ctx, oracleGet, sql.Named("id", id)).Scan(&want.id, &want.note, &want.name, &want.version)
+	if errors.Is(err, sql.ErrNoRows) {
+		if got != nil {
+			return fmt.Errorf("GetItem(%d) returned a row where database/sql found none", id)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("database/sql get %d: %w", id, err)
+	}
+	if got == nil {
+		return fmt.Errorf("GetItem(%d) returned no row where database/sql found one", id)
+	}
+	return compareMSSQLItem(got, want)
+}
+
+func compareMSSQLList(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	const minVersion int32 = 3
+	const lastID int64 = 33
+	got := store.ListItems(ctx, pool, minVersion, lastID)?
+	rows := oracle.QueryContext(ctx, oracleList, sql.Named("minVersion", minVersion), sql.Named("lastId", lastID))?
+	defer rows.Close()?
+	index := 0
+	for rows.Next() {
+		if index == len(got) {
+			return fmt.Errorf("ListItems omitted rows after position %d", index)
+		}
+		var want oracleMSSQLItem
+		rows.Scan(&want.id, &want.note, &want.name, &want.version)?
+		compareMSSQLItem(got[index], want)?
+		index++
+	}
+	rows.Err()?
+	if len(got) != index {
+		return fmt.Errorf("ListItems returned %d rows, database/sql returned %d", len(got), index)
+	}
+	return nil
+}
+
+func compareMSSQLItem(got store.Item, want oracleMSSQLItem) error {
+	note := got.Note
+	if got.ID != want.id || got.Name != want.name || got.Version != want.version ||
+		(note != nil) != want.note.Valid || (note ?? "") != want.note.String {
+		return fmt.Errorf("generated row %v differs from database/sql row %+v", got, want)
+	}
+	return nil
+}

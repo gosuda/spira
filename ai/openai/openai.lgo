@@ -8,7 +8,6 @@
 package openai
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json/v2"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/internal/bounded"
 	"github.com/gosuda/spira/resilience"
 )
 
@@ -32,6 +32,8 @@ type Client struct {
 	RandomSeed int?
 	HTTP       *http.Client
 	Policy     resilience.Policy
+	MaxLine    int
+	MaxStream  int64
 	idleTimer  func(limit time.Duration, onIdle func()) (func(time.Duration) bool, func() bool)
 }
 
@@ -75,42 +77,42 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 	if limit <= 0 {
 		limit = 10 * time.Second
 	}
-	bounded, cancel := context.WithCancelCause(ctx)
+	streamCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	reset, stop := c.newTimer(limit, func() {
 		cancel(&stallError{limit: limit})
 	})
 	defer stop()
-	status, body, err := c.do(bounded, "/chat/completions", payload)
+	status, body, err := c.do(streamCtx, "/chat/completions", payload)
 	if err != nil {
-		yield ai.Chunk{}, streamDoError(bounded, err)
+		yield ai.Chunk{}, streamDoError(streamCtx, err)
 		return
 	}
 	defer closeBody(body)
 	if status < 200 || status > 299 {
-		yield ai.Chunk{}, failure(bounded, status, body)
+		yield ai.Chunk{}, failure(streamCtx, status, body)
 		return
 	}
 	alive := &touchReader{source: body, touch: func() { reset(limit) }}
-	for chunk, err := range streamEvents(bounded, alive, func() { reset(limit) }) {
+	for chunk, err := range streamEvents(streamCtx, bounded.NewLines(alive, c.MaxLine, c.MaxStream), func() { reset(limit) }) {
 		stop()
 		if err != nil {
-			yield chunk, streamDoError(bounded, err)
+			yield chunk, streamDoError(streamCtx, err)
 			return
 		}
-		if cause := context.Cause(bounded); cause != nil {
-			yield ai.Chunk{}, streamDoError(bounded, cause)
+		if cause := context.Cause(streamCtx); cause != nil {
+			yield ai.Chunk{}, streamDoError(streamCtx, cause)
 			return
 		}
 		yield chunk, nil
-		if cause := context.Cause(bounded); cause != nil {
-			yield ai.Chunk{}, streamDoError(bounded, cause)
+		if cause := context.Cause(streamCtx); cause != nil {
+			yield ai.Chunk{}, streamDoError(streamCtx, cause)
 			return
 		}
 		reset(limit)
 	}
-	if cause := context.Cause(bounded); cause != nil {
-		yield ai.Chunk{}, streamDoError(bounded, cause)
+	if cause := context.Cause(streamCtx); cause != nil {
+		yield ai.Chunk{}, streamDoError(streamCtx, cause)
 		return
 	}
 }
@@ -119,7 +121,7 @@ func streamDoError(ctx context.Context, err error) error {
 	if cause := context.Cause(ctx); cause != nil {
 		return ErrProviderStreamCut.Wrap(cause)
 	}
-	if errors.Is(err, ErrProviderStreamCut) {
+	if errors.Is(err, ErrProviderStreamCut) || errors.Is(err, ErrProviderTooLarge) {
 		return err
 	}
 	return ErrProviderError.Wrap(err)
@@ -397,6 +399,8 @@ func assistantOf(m ai.Message) wireMessage {
 				Type:     "function",
 				Function: wireReqCallFunc{Name: v.Name, Arguments: v.Arguments},
 			})
+		case ai.ToolResult:
+		case nil:
 		}
 	}
 	if text.Len() > 0 || len(w.ToolCalls) == 0 {
@@ -502,17 +506,17 @@ func (s *streamState) flushCalls() iter.Seq2[ai.Chunk, error] {
 	}
 }
 
-func streamEvents(ctx context.Context, body io.Reader, touch func()) iter.Seq2[ai.Chunk, error] {
-	lines := &lineReader{reader: bufio.NewReader(body)}
+func streamEvents(ctx context.Context, lines *bounded.Lines, touch func()) iter.Seq2[ai.Chunk, error] {
 	state := &streamState{byIndex: map[int]*pendingCall{}}
 	for {
-		line, err := lines.next(touch)
+		line, err := lines.Next()
 		if err != nil {
 			for chunk, cerr := range streamEnd(ctx, err, state) {
 				yield chunk, cerr
 			}
 			return
 		}
+		touch()
 		if text := strings.TrimSpace(line); text != "" {
 			for chunk, cerr := range eventLine(text, state) {
 				yield chunk, cerr
@@ -537,31 +541,12 @@ func (r *touchReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-type lineReader struct {
-	reader  *bufio.Reader
-	waiting bool
-	lateErr error
-}
-
-func (l *lineReader) next(touch func()) (string, error) {
-	if l.waiting {
-		l.waiting = false
-		return "", l.lateErr
-	}
-	line, err := l.reader.ReadString('\n')
-	if len(line) > 0 {
-		touch()
-	}
-	if err != nil && line != "" {
-		l.lateErr = err
-		l.waiting = true
-		return line, nil
-	}
-	return line, err
-}
-
 func streamEnd(ctx context.Context, err error, state *streamState) iter.Seq2[ai.Chunk, error] {
 	if state.done {
+		return
+	}
+	if errors.Is(err, bounded.ErrTooLarge) {
+		yield ai.Chunk{}, ErrProviderTooLarge.Wrap(fmt.Errorf("ai/openai: %w", err))
 		return
 	}
 	if cause := context.Cause(ctx); cause != nil {

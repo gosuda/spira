@@ -1,8 +1,8 @@
 # http3
 
-HTTP/3 for `web.Server` uses `github.com/quic-go/quic-go/http3`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
+`http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-The standard library cannot serve HTTP/3. It keeps the glue in the unexported `http3ServerHandler` type in `src/net/http/server.go`. That file states that HTTP/3 is not yet accessible to end-users. `golang.org/x/net` holds a `quic` package but no `http3` package in the checked releases. A package under `internal` is not importable from outside its module. The `quic-go` `http3.Server` type is exported with `Serve`, `Shutdown` and `SetQUICHeaders`. Its licence is MIT. Its non-test code holds no `import "C"`.
+`H3Server` uses the vendored `golang.org/x/net/quic` transport. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
 
 ## Interface
 
@@ -48,8 +48,9 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - The UDP listener MUST use TLS 1.3 with no older version.
 - `ReadHeaderTimeout` MUST bound the TCP listener header reads only.
 - `ReadHeaderTimeout` MUST NOT be presented as bounding HTTP/3 header reads.
-- `quic-go` v0.65.0 parses HEADERS with no per-stream deadline, only a `MaxHeaderBytes` size cap.
-- A stalled header block therefore outlives the setting while other streams keep the connection alive.
+- The LoGOs backend limits the encoded header block by size.
+- The LoGOs backend limits the decoded field section by size.
+- The LoGOs backend sets no separate deadline for reading HTTP/3 request headers.
 - The TCP listener MUST keep the ALPN list that [web](web.md) fixes.
 - Each HTTPS response MUST carry `Alt-Svc: h3=":<port>"; ma=2592000` while the UDP listener is open, with the actual UDP port.
 - A cleartext response MUST NOT carry that header.
@@ -72,12 +73,11 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 ### Early data
 
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
-- Extended CONNECT over HTTP/3 MUST stay unbuilt, as [web](web.md) states for HTTP/2.
+- Extended CONNECT over HTTP/3 MUST stay unbuilt in this server.
 - The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
-- `quic-go` v0.65.0 sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` on every connection.
-- `http3.Server.settings` hardcodes `ExtendedConnect: true` with no knob.
-- `AdditionalSettings` MUST refuse RFC 9114 ids.
-- Peers may therefore attempt extended CONNECT; the 501 boundary above is the enforcement.
+- `H3Server` sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`.
+- Peers can therefore attempt extended CONNECT.
+- The backend answers extended CONNECT with 501 and does not call the request handler.
 
 ### Faults
 
@@ -116,7 +116,7 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - `TestH3StopShutsTCPWhileH3Drains` proves that TCP stops accepting while an HTTP/3 request drains.
 - `TestH3RefusesExtendedConnect` proves that an extended CONNECT request answers 501 without reaching the router while plain H3 traffic still passes.
 - `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
-- `TestH3RefusesEarlyData` proves that the QUIC config refuses 0-RTT.
+- `TestH3RefusesEarlyData` sends QUIC 0-RTT data and checks that the server resumes the TLS session without accepting that data.
 - `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
@@ -125,6 +125,6 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 ## Not in scope
 
 - WebTransport. No requirement names it.
-- Datagrams (RFC 9297). `EnableDatagrams` stays false.
+- Datagrams (RFC 9297). The server advertises neither QUIC nor HTTP/3 datagram support.
 - An HTTP/3 client. `client` stays on TCP.
 - A 0-RTT opt-in. The server refuses early data with no per-route exception.

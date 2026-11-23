@@ -1,0 +1,28 @@
+package home
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/view"
+)
+
+func TestPageHoldsTheSwapTargetOfItsForm(t *testing.T) {
+	var out bytes.Buffer
+	if err := view.Render(context.Background(), &out, page()); err != nil {
+		t.Fatalf("render page: %v", err)
+		return
+	}
+	html := out.String()
+	_, rest, found := strings.Cut(html, `hx-target="#`)
+	if !found {
+		t.Fatalf("page has no hx-target: %s", html)
+		return
+	}
+	id, _, _ := strings.Cut(rest, `"`)
+	if !strings.Contains(html, `id="`+id+`"`) {
+		t.Fatalf("hx-target #%s names no element of the first page: %s", id, html)
+	}
+}

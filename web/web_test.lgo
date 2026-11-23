@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/schema"
 	"github.com/gosuda/spira/validate"
 	"github.com/gosuda/spira/view"
 	"github.com/gosuda/spira/web"
@@ -227,6 +228,67 @@ func TestRedirectUnderHtmxAndPlain(t *testing.T) {
 	}
 	if got := plain.Header().Get("Location"); got != "/next" {
 		t.Fatalf("Location %q want /next", got)
+	}
+}
+
+func redirectRecorders(t *testing.T, to string) (*httptest.ResponseRecorder, *httptest.ResponseRecorder) {
+	t.Helper()
+	r := web.NewRouter()
+	r.Handle("GET", "/go", func(ctx *web.Context) (web.Reply, error) {
+		return web.Redirect{To: to}, nil
+	})
+	htmx := call(t, r, reqWithHeaders("/go", http.Header{"HX-Request": []string{"true"}}))
+	plain := call(t, r, httptest.NewRequest(http.MethodGet, "/go", nil))
+	return htmx, plain
+}
+
+func TestRedirectRefusesScriptSchemes(t *testing.T) {
+	for _, to := range []string{"javascript:alert(1)", " JaVaScRiPt:alert(1)", "\tjavascript:alert(1)", "java\nscript:alert(1)", "data:text/html,x", "vbscript:x"} {
+		htmx, plain := redirectRecorders(t, to)
+		for name, rec := range map[string]*httptest.ResponseRecorder{"htmx": htmx, "plain": plain} {
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("%s redirect to %q status %d want 500", name, to, rec.Code)
+			}
+			if got := rec.Header().Get("HX-Redirect") + rec.Header().Get("Location"); got != "" {
+				t.Fatalf("%s redirect to %q still set %q", name, to, got)
+			}
+		}
+	}
+}
+
+func TestRedirectKeepsOrdinaryTargets(t *testing.T) {
+	for _, to := range []string{"/next", "next/page?x=1", "?a=b", "#top", "https://example.com/x", "HTTP://example.com"} {
+		htmx, plain := redirectRecorders(t, to)
+		if htmx.Code != http.StatusOK || htmx.Header().Get("HX-Redirect") != to {
+			t.Fatalf("htmx redirect to %q gave status %d HX-Redirect %q", to, htmx.Code, htmx.Header().Get("HX-Redirect"))
+		}
+		if plain.Code != http.StatusSeeOther || plain.Header().Get("Location") != to {
+			t.Fatalf("plain redirect to %q gave status %d Location %q", to, plain.Code, plain.Header().Get("Location"))
+		}
+	}
+}
+
+type hiddenBound struct {
+	Token string `header:"X-Token" json:"-"`
+	Page  int64  `query:"page"`
+}
+
+func TestRouteSchemaKeepsBoundFieldsThatJSONHides(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/things", func(ctx *web.Context, in hiddenBound) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	obj, ok := r.Routes()[0].In.(schema.Object)
+	if !ok {
+		t.Fatalf("route schema is %T, want schema.Object", r.Routes()[0].In)
+		return
+	}
+	sources := map[string]string{}
+	for _, f := range obj.Fields {
+		sources[f.Wire] = f.Source
+	}
+	if (sources["X-Token"] ?? "") != "header" || (sources["page"] ?? "") != "query" {
+		t.Fatalf("bound fields = %v, want X-Token from header and page from query", sources)
 	}
 }
 

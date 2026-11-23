@@ -1,0 +1,35 @@
+package account
+
+import (
+	"github.com/gosuda/spira/view"
+)
+
+func LoginPage() view.Node {
+	return view.Div(
+		view.H1(view.T("Sign in")),
+		view.Form(
+			view.Attr("method", "post"),
+			view.Attr("action", "/account/login"),
+			view.Hx("post", "/account/login"),
+			view.Label(view.Attr("for", "user"), view.T("User")),
+			view.Input(view.Attr("type", "text"), view.Attr("id", "user"), view.Attr("name", "user")),
+			view.Label(view.Attr("for", "password"), view.T("Password")),
+			view.Input(view.Attr("type", "password"), view.Attr("id", "password"), view.Attr("name", "password")),
+			view.Button(view.Attr("type", "submit"), view.T("Sign in")),
+		),
+	)
+}
+
+func AccountPage(id string, roles string) view.Node {
+	return view.Div(
+		view.H1(view.T("Account")),
+		view.P(view.T($"Signed in as {id}.")),
+		view.P(view.T($"Roles: {roles}.")),
+		view.Form(
+			view.Attr("method", "post"),
+			view.Attr("action", "/account/logout"),
+			view.Hx("post", "/account/logout"),
+			view.Button(view.Attr("type", "submit"), view.T("Sign out")),
+		),
+	)
+}

@@ -1,0 +1,144 @@
+package cart
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/gosuda/spira/auth"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/example/shop/db/store"
+	"github.com/gosuda/spira/example/shop/layout"
+	"github.com/gosuda/spira/validate"
+	"github.com/gosuda/spira/view"
+	"github.com/gosuda/spira/web"
+)
+
+const cartCookie = "spira_cart"
+
+type Feature struct {
+	DB *db.Pool
+}
+
+type AddItemInput struct {
+	ProductID int64 `form:"product_id"`
+	Quantity  int64 `form:"quantity"`
+}
+
+func (in AddItemInput) Check() validate.Errors {
+	var errs validate.Errors
+	errs.Require(in.ProductID > 0, "product_id", "present", "choose a product")
+	errs.Require(in.Quantity >= 1 && in.Quantity <= 99, "quantity", "range", "quantity must be between 1 and 99")
+	return errs
+}
+
+func (f *Feature) Register(r *web.Router) {
+	r.Handle("GET", "/cart", f.page)
+	web.Route[AddItemInput](r, "POST", "/cart/items", f.add)
+	r.Handle("POST", "/cart/items/{id}/remove", f.remove)
+	r.Handle("GET", "/api/cart/count", f.count)
+}
+
+func (f *Feature) page(ctx *web.Context) (web.Reply, error) {
+	kind, key, set, err := ownerOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if set != nil {
+		ctx.ResponseHeader().Set("Set-Cookie", set.String())
+	}
+	items, err := store.ListCartItems(ctx.Ctx(), f.DB, kind, key)
+	if err != nil {
+		return nil, fmt.Errorf("cart: list items: %w", err)
+	}
+	return web.Page{Title: "Cart", Body: Cart(items)}, nil
+}
+
+func (f *Feature) add(ctx *web.Context, in AddItemInput) (web.Reply, error) {
+	row, err := store.GetProduct(ctx.Ctx(), f.DB, store.ProductID(in.ProductID))
+	if err != nil {
+		return nil, fmt.Errorf("cart: get product: %w", err)
+	}
+	if row == nil {
+		var errs validate.Errors
+		errs.Require(false, "product_id", "known", "choose a product")
+		return web.Fragment{Body: layout.AddForm($"{in.ProductID}", "this product", $"{in.Quantity}", errs), Status: 422}, nil
+	}
+	product := row ?? store.Product{}
+	kind, key, set, err := ownerOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if set != nil {
+		ctx.ResponseHeader().Set("Set-Cookie", set.String())
+	}
+	args := store.UpsertCartItemArgs{OwnerKind: kind, OwnerKey: key, ProductID: store.ProductID(in.ProductID), Quantity: in.Quantity}
+	if _, err := store.UpsertCartItem(ctx.Ctx(), f.DB, args); err != nil {
+		return nil, fmt.Errorf("cart: add item: %w", err)
+	}
+	items, err := store.ListCartItems(ctx.Ctx(), f.DB, kind, key)
+	if err != nil {
+		return nil, fmt.Errorf("cart: list items: %w", err)
+	}
+	var total int64
+	for _, item := range items {
+		total += item.Quantity
+	}
+	if layout.WantsFragment(ctx) {
+		return web.Fragment{Body: Note($"Added {product.Name} to the cart ({total} items)"), Trigger: "cart-updated"}, nil
+	}
+	return web.Redirect{To: "/cart"}, nil
+}
+
+func (f *Feature) remove(ctx *web.Context) (web.Reply, error) {
+	id, err := strconv.ParseInt(ctx.Request.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		return nil, ErrUnknownItem.Err()
+	}
+	kind, key, _, err := ownerOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	args := store.RemoveCartItemArgs{ID: store.CartItemID(id), OwnerKind: kind, OwnerKey: key}
+	if _, err := store.RemoveCartItem(ctx.Ctx(), f.DB, args); err != nil {
+		return nil, fmt.Errorf("cart: remove item: %w", err)
+	}
+	if layout.WantsFragment(ctx) {
+		return web.Fragment{Body: view.Group{}, Trigger: "cart-updated"}, nil
+	}
+	return web.Redirect{To: "/cart"}, nil
+}
+
+func (f *Feature) count(ctx *web.Context) (web.Reply, error) {
+	kind, key, _, err := ownerOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items, err := store.ListCartItems(ctx.Ctx(), f.DB, kind, key)
+	if err != nil {
+		return nil, fmt.Errorf("cart: list items: %w", err)
+	}
+	var total int64
+	for _, item := range items {
+		total += item.Quantity
+	}
+	return web.Data{Value: map[string]int64{"count": total}}, nil
+}
+
+func ownerOf(ctx *web.Context) (string, string, *http.Cookie?, error) {
+	if p := web.Get(ctx, auth.PrincipalKey); p != nil {
+		return "user", p.ID, nil, nil
+	}
+	if c, err := ctx.Request.Cookie(cartCookie); err == nil && c.Value != "" {
+		return "session", c.Value, nil, nil
+	}
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", "", nil, fmt.Errorf("cart: cart id entropy: %w", err)
+	}
+	id := hex.EncodeToString(entropy[:])
+	fresh := &http.Cookie{Name: cartCookie, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 30 * 24 * 3600}
+	return "session", id, fresh, nil
+}

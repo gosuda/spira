@@ -88,6 +88,7 @@ func Faults() []*fault.Error
 - A request with a body MUST stop after its first upstream.
 - A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`: end of stream counts as no body and retries, and a byte counts as a body that is pushed back and stops after the first upstream.
 - A wait that yields no byte and no end of stream MUST answer 502 without trying an upstream.
+- When that wait ends without a byte, the gateway MUST end the blocked body read through `http.ResponseController.SetReadDeadline`, so that the 502 reaches the client while the client still holds the request body open.
 - When every tried upstream fails, the proxy MUST answer 502.
 - That answer MUST use the content type `application/problem+json`.
 - The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.
@@ -153,6 +154,7 @@ func Faults() []*fault.Error
 - `TestUnknownLengthEmptyBodyFailsOver` proves that an empty body of unknown length fails over.
 - `TestUnknownLengthNonemptyBodyIsPreserved` proves that a nonempty body of unknown length reaches the upstream whole.
 - `TestPeekEmptyFailsClosedOnStalledBody` proves that a stalled body of unknown length answers 502 without an upstream.
+- `TestStalledBodyPeekAnswersWhileTheBodyStaysOpen` proves that a chunked request with no body byte gets its 502 within three seconds while the connection stays open.
 - `TestPeekEmptyPushesBackReadyByte` proves that the empty-proof read hands the byte back.
 - `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
 - `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.

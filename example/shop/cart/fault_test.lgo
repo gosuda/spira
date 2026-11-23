@@ -1,0 +1,22 @@
+package cart_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/example/shop/cart"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestCartUnknownItemStaysClientSafe(t *testing.T) {
+	const secret = "SECRET-CART-61027"
+	raw := faulttest.PublicJSON(t, cart.ErrUnknownItem.Wrap(errors.New(secret)))
+	faulttest.RefuseLeak(t, raw, secret)
+	if !strings.Contains(string(raw), `"cart.unknown_item"`) {
+		t.Fatalf("public view %s lacks the fault code", raw)
+	}
+	if !strings.Contains(string(raw), "The cart item was not found.") {
+		t.Fatalf("public view %s lacks the constant message", raw)
+	}
+}
