@@ -221,6 +221,9 @@ func isMySQLDialect(d db.Dialect) bool {
 }
 
 func Rollback(ctx context.Context, p *db.Pool, steps const []Step, count int) error {
+	if count == 0 {
+		return nil
+	}
 	if err := ensureTable(ctx, p); err != nil {
 		return err
 	}

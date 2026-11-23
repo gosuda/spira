@@ -1,0 +1,163 @@
+//go:build engines
+
+package migrate_test
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/migrate"
+)
+
+const engineAppliedNames = "SELECT name FROM spira_migrations ORDER BY name"
+
+func TestEngineApplyRollbackBookkeeping(t *testing.T) {
+	engines := []struct {
+		name   string
+		driver string
+		dsnVar string
+		schema string
+	}{
+		{"Postgres", "pgx", "SPIRA_TEST_POSTGRES_DSN", "current_schema()"},
+		{"MySQL", "mysql", "SPIRA_TEST_MYSQL_DSN", "DATABASE()"},
+		{"MSSQL", "sqlserver", "SPIRA_TEST_MSSQL_DSN", "SCHEMA_NAME()"},
+	}
+	for _, engine := range engines {
+		t.Run(engine.name, func(t *testing.T) {
+			pool := engineScratchPool(t, engine.driver, engine.dsnVar)
+			if pool == nil {
+				return
+			}
+			exerciseEngineBookkeeping(t, pool, engine.schema)
+		})
+	}
+}
+
+func exerciseEngineBookkeeping(t *testing.T, pool *db.Pool, schema string) {
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	steps := []migrate.Step{
+		{Name: "0001_bookkeeping_root", Up: "CREATE TABLE bk_root (id BIGINT PRIMARY KEY)", Down: "DROP TABLE bk_root"},
+		{Name: "0002_bookkeeping_child", Up: "CREATE TABLE bk_child (id BIGINT PRIMARY KEY, root_id BIGINT NOT NULL, FOREIGN KEY (root_id) REFERENCES bk_root(id))", Down: "DROP TABLE bk_child"},
+	}
+	tablesQuery := "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema = " + schema + " ORDER BY table_name"
+	assertState := func(wantTables []string, wantApplied []string) {
+		t.Helper()
+		if got := engineBookkeepingColumn(ctx, t, pool, tablesQuery); !slices.Equal(got, wantTables) {
+			t.Errorf("tables = %v, want %v", got, wantTables)
+		}
+		if got := engineBookkeepingColumn(ctx, t, pool, engineAppliedNames); !slices.Equal(got, wantApplied) {
+			t.Errorf("bookkeeping names = %v, want %v", got, wantApplied)
+		}
+	}
+	allTables := []string{"bk_child", "bk_root", "spira_migrations"}
+	allApplied := []string{"0001_bookkeeping_root", "0002_bookkeeping_child"}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	assertState(allTables, allApplied)
+
+	unexpected := migrate.Step{Name: "0003_unexpected", Up: "CREATE TABLE bk_unexpected (id BIGINT PRIMARY KEY)", Down: "DROP TABLE bk_unexpected"}
+	requireEngineOrderMismatch(t, migrate.Apply(ctx, pool, []migrate.Step{steps[1], steps[0], unexpected}), "Apply reordered")
+	assertState(allTables, allApplied)
+	requireEngineOrderMismatch(t, migrate.Apply(ctx, pool, steps[:1]), "Apply missing")
+	assertState(allTables, allApplied)
+	requireEngineOrderMismatch(t, migrate.Rollback(ctx, pool, steps[:1], 1), "Rollback missing")
+	assertState(allTables, allApplied)
+
+	if err := migrate.Rollback(ctx, pool, steps, 1); err != nil {
+		t.Fatalf("Rollback latest: %v", err)
+		return
+	}
+	assertState([]string{"bk_root", "spira_migrations"}, allApplied[:1])
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("Apply after rollback: %v", err)
+		return
+	}
+	assertState(allTables, allApplied)
+	if err := migrate.Rollback(ctx, pool, steps, len(steps)); err != nil {
+		t.Fatalf("Rollback all: %v", err)
+		return
+	}
+	assertState([]string{"spira_migrations"}, nil)
+}
+
+func TestEngineRollbackMySQLPartialDDL(t *testing.T) {
+	pool := engineScratchPool(t, "mysql", "SPIRA_TEST_MYSQL_DSN")
+	if pool == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	steps := []migrate.Step{{
+		Name: "0001_partial_down",
+		Up:   "CREATE TABLE bk_partial (id BIGINT PRIMARY KEY, legacy BIGINT)",
+		Down: "ALTER TABLE bk_partial DROP COLUMN legacy; ALTER TABLE bk_partial DROP COLUMN never_created",
+	}}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("Apply: %v", err)
+		return
+	}
+	const columnsQuery = "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'bk_partial' ORDER BY column_name"
+	if got := engineBookkeepingColumn(ctx, t, pool, columnsQuery); !slices.Equal(got, []string{"id", "legacy"}) {
+		t.Fatalf("columns before rollback = %v, want [id legacy]", got)
+		return
+	}
+	err := migrate.Rollback(ctx, pool, steps, 1)
+	if !errors.Is(err, migrate.ErrPartialDDL) {
+		t.Fatalf("Rollback error = %v, want migrate.ErrPartialDDL", err)
+		return
+	}
+	cause, ok := errors.AsType[*mysql.MySQLError](err)
+	if !ok || cause.Number != 1091 {
+		t.Fatalf("Rollback error = %v, want MySQL error 1091 for dropping the missing column", err)
+		return
+	}
+	if got := engineBookkeepingColumn(ctx, t, pool, columnsQuery); !slices.Equal(got, []string{"id"}) {
+		t.Errorf("columns after rollback = %v, want [id] because the first ALTER committed", got)
+	}
+	if got := engineBookkeepingColumn(ctx, t, pool, engineAppliedNames); !slices.Equal(got, []string{"0001_partial_down"}) {
+		t.Errorf("bookkeeping names after rollback = %v, want [0001_partial_down]", got)
+	}
+}
+
+func requireEngineOrderMismatch(t *testing.T, err error, operation string) {
+	t.Helper()
+	if !errors.Is(err, migrate.ErrOrderMismatch) {
+		t.Fatalf("%s error = %v, want migrate.ErrOrderMismatch", operation, err)
+	}
+}
+
+func engineBookkeepingColumn(ctx context.Context, t *testing.T, pool *db.Pool, query string) []string {
+	t.Helper()
+	rows, err := pool.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("query %q: %v", query, err)
+		return nil
+	}
+	if rows == nil {
+		t.Fatalf("query %q returned no rows handle", query)
+		return nil
+	}
+	defer closeRows(t, rows)
+	var values []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			t.Fatalf("scan %q: %v", query, err)
+			return nil
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read %q: %v", query, err)
+		return nil
+	}
+	return values
+}
