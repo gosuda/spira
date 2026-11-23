@@ -73,6 +73,8 @@ func Fill[S any](ld *Loader, dst *S, prefix string)
 
 - `Loader.Set` MUST accept `string`, `bool`, `time.Duration`, `float64` and `[]string`.
 - `Loader.Set` MUST accept `int`, `int8`, `int16`, `int32`, `int64`, `uint`, `uint8`, `uint16`, `uint32` and `uint64`.
+- `Load` and `Fill` MUST accept defined integer types and defined types whose underlying type is `float64`.
+- `Load` and `Fill` MUST reject unsupported field types at compile time.
 - `Loader.Set` MUST parse an integer in base 10 and MUST refuse a value outside the range of the type.
 - `Loader.Set` MUST split a `[]string` value at each comma, trim each part and drop each empty part.
 - `Loader.Set` MUST report any other field type as an error at run time.
@@ -98,7 +100,8 @@ func Fill[S any](ld *Loader, dst *S, prefix string)
 - `TestLoadEveryTypeParses` proves each accepted field type.
 - `TestLoadMalformedValueNamesTheKey` and `TestLoadReportsEveryParseFailure` prove the parse failure report.
 - `TestLoaderErrPrefersParseOverMissing` proves that parse failures replace the report of missing keys.
-- `TestLoadUnsupportedFieldTypesAreRunTimeErrors` and `TestLoadRequiresAStruct` prove the two type errors.
+- `TestLoaderSetRejectsUnsupportedTypes`, `TestLoadRejectsUnsupportedFieldTypesAtCompileTime` and `TestLoadRequiresAStruct` prove the type errors.
+- `TestLoadNamedNumericTypes` and `TestLoadNamedNumericTypesReportParseErrors` prove the defined numeric types.
 - `TestFillKeepsFieldDefaultsThatNoSourceSets` proves that `Fill` keeps a value that no source sets.
 - `TestFileSourceReadsOneJSONObject`, `TestFileSourceRejectsBadDocuments`, `TestFileSourceRejectsArrayValue` and `TestFileSourceScalarsAndSkipsNulls` prove the file rules.
 - `TestFileSourceKeepsJSONNumbersExact` and `TestFileSourceExponentFormForIntMatchesEnv` prove that a number keeps its text.

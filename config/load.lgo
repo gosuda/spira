@@ -29,6 +29,10 @@ func (l *Loader) Set(dst any, key string, required bool) {
 		l.errs = append(l.errs, fmt.Errorf("config: %s: unsupported type", key))
 		return
 	}
+	l.ReadField(key, required, set)
+}
+
+func (l *Loader) ReadField(key string, required bool, set func(raw string) error) {
 	raw, found := l.lookup(key)
 	if !found {
 		if required {
@@ -78,12 +82,75 @@ func Load[T any](sources ...Source) (T, error) {
 func Fill[S any](ld *Loader, dst *S, prefix string) {
 	const for _, f := range comptime.Fields[S]() {
 		key := ld.Key(prefix, f.Name, f.Tag.Get("env"))
-		const if comptime.IsStruct[f.Type]() {
-			Fill[f.Type](ld, &dst.[f], key)
-		} else {
-			ld.Set(&dst.[f], key, f.Tag.Get("required") == "true")
+		FillField[f.Type](ld, &dst.[f], key, f.Tag.Get("required") == "true")
+	}
+}
+
+func FillField[F any](ld *Loader, dst *F, key string, required bool) {
+	const if comptime.IsStruct[F]() {
+		Fill[F](ld, dst, key)
+	} else {
+		const switch F {
+		case time.Duration:
+			ld.ReadField(key, required, func(raw string) error {
+				v := time.ParseDuration(raw)?
+				*dst = v
+				return nil
+			})
+		case string:
+			ld.ReadField(key, required, func(raw string) error {
+				*dst = raw
+				return nil
+			})
+		case bool:
+			ld.ReadField(key, required, func(raw string) error {
+				v := strconv.ParseBool(raw)?
+				*dst = v
+				return nil
+			})
+		case ~float64:
+			ld.ReadField(key, required, func(raw string) error {
+				return SetFloat64(dst, raw)
+			})
+		case []string:
+			ld.ReadField(key, required, func(raw string) error {
+				*dst = SplitList(raw)
+				return nil
+			})
+		case any:
+			ld.ReadField(key, required, func(raw string) error {
+				return ParseIntegerField[F](dst, raw)
+			})
 		}
 	}
+}
+
+func ParseIntegerField[F any](dst *F, raw string) error {
+	const switch F {
+	case ~int:
+		return SetSigned(dst, raw, strconv.IntSize)
+	case ~int8:
+		return SetSigned(dst, raw, 8)
+	case ~int16:
+		return SetSigned(dst, raw, 16)
+	case ~int32:
+		return SetSigned(dst, raw, 32)
+	case ~int64:
+		return SetSigned(dst, raw, 64)
+	case ~uint:
+		return SetUnsigned(dst, raw, strconv.IntSize)
+	case ~uint8:
+		return SetUnsigned(dst, raw, 8)
+	case ~uint16:
+		return SetUnsigned(dst, raw, 16)
+	case ~uint32:
+		return SetUnsigned(dst, raw, 32)
+	case ~uint64:
+		return SetUnsigned(dst, raw, 64)
+	case any:
+		comptime.Error("config: unsupported field type")
+	}
+	return nil
 }
 
 type setter func(raw string) error
@@ -97,7 +164,7 @@ func setterOf(dst any) setter {
 		}
 	case *[]string:
 		return func(raw string) error {
-			*d = splitList(raw)
+			*d = SplitList(raw)
 			return nil
 		}
 	case *bool:
@@ -105,9 +172,9 @@ func setterOf(dst any) setter {
 	case *time.Duration:
 		return parsed(d, time.ParseDuration)
 	case *float64:
-		return parsed(d, func(raw string) (float64, error) {
-			return strconv.ParseFloat(raw, 64)
-		})
+		return func(raw string) error {
+			return SetFloat64(d, raw)
+		}
 	}
 	return integerSetter(dst)
 }
@@ -115,25 +182,25 @@ func setterOf(dst any) setter {
 func integerSetter(dst any) setter {
 	switch d := dst.(type) {
 	case *int:
-		return parsed(d, signedOf[int](strconv.IntSize))
+		return signedSetter(d, strconv.IntSize)
 	case *int8:
-		return parsed(d, signedOf[int8](8))
+		return signedSetter(d, 8)
 	case *int16:
-		return parsed(d, signedOf[int16](16))
+		return signedSetter(d, 16)
 	case *int32:
-		return parsed(d, signedOf[int32](32))
+		return signedSetter(d, 32)
 	case *int64:
-		return parsed(d, signedOf[int64](64))
+		return signedSetter(d, 64)
 	case *uint:
-		return parsed(d, unsignedOf[uint](strconv.IntSize))
+		return unsignedSetter(d, strconv.IntSize)
 	case *uint8:
-		return parsed(d, unsignedOf[uint8](8))
+		return unsignedSetter(d, 8)
 	case *uint16:
-		return parsed(d, unsignedOf[uint16](16))
+		return unsignedSetter(d, 16)
 	case *uint32:
-		return parsed(d, unsignedOf[uint32](32))
+		return unsignedSetter(d, 32)
 	case *uint64:
-		return parsed(d, unsignedOf[uint64](64))
+		return unsignedSetter(d, 64)
 	}
 	return nil
 }
@@ -150,34 +217,44 @@ func parsed[V any](dst *V, parse func(raw string) (V, error)) setter {
 }
 
 type signed interface {
-	int | int8 | int16 | int32 | int64
+	~int | ~int8 | ~int16 | ~int32 | ~int64
 }
 
 type unsigned interface {
-	uint | uint8 | uint16 | uint32 | uint64
+	~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
 }
 
-func signedOf[E signed](bits int) func(raw string) (E, error) {
-	return func(raw string) (E, error) {
-		n, err := strconv.ParseInt(raw, 10, bits)
-		if err != nil {
-			return 0, err
-		}
-		return E(n), nil
+func signedSetter[E signed](dst *E, bits int) setter {
+	return func(raw string) error {
+		return SetSigned(dst, raw, bits)
 	}
 }
 
-func unsignedOf[E unsigned](bits int) func(raw string) (E, error) {
-	return func(raw string) (E, error) {
-		n, err := strconv.ParseUint(raw, 10, bits)
-		if err != nil {
-			return 0, err
-		}
-		return E(n), nil
+func unsignedSetter[E unsigned](dst *E, bits int) setter {
+	return func(raw string) error {
+		return SetUnsigned(dst, raw, bits)
 	}
 }
 
-func splitList(raw string) []string {
+func SetSigned[E signed](dst *E, raw string, bits int) error {
+	v := strconv.ParseInt(raw, 10, bits)?
+	*dst = E(v)
+	return nil
+}
+
+func SetUnsigned[E unsigned](dst *E, raw string, bits int) error {
+	v := strconv.ParseUint(raw, 10, bits)?
+	*dst = E(v)
+	return nil
+}
+
+func SetFloat64[F ~float64](dst *F, raw string) error {
+	v := strconv.ParseFloat(raw, 64)?
+	*dst = F(v)
+	return nil
+}
+
+func SplitList(raw string) []string {
 	var parts []string
 	for _, p := range strings.Split(raw, ",") {
 		if trimmed := strings.TrimSpace(p); trimmed != "" {
