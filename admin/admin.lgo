@@ -426,7 +426,22 @@ func (s *Server) publish(name string, status string) {
 
 func pageNode(rows []rowView) view.Node {
 	return view.Div(
+		view.Attr("data-live-region", "admin"),
+		view.Attr("hx-ext", "sse"),
+		view.Attr("sse-connect", "/admin/events"),
 		view.H1(view.T("Instances")),
+		view.Button(
+			view.Attr("type", "button"),
+			view.Flag("data-live-toggle"),
+			view.Attr("aria-pressed", "false"),
+			view.Flag("hidden"),
+			view.T("Pause updates"),
+		),
+		view.Span(
+			view.Attr("sse-swap", "instance"),
+			view.Attr("hx-swap", "none"),
+			view.Flag("hidden"),
+		),
 		view.Table(
 			view.Thead(view.Tr(view.Th(view.T("Name")), view.Th(view.T("Status")))),
 			view.Tbody(view.Each(rows, item => rowNode(item.name, item.status))),
@@ -435,7 +450,12 @@ func pageNode(rows []rowView) view.Node {
 }
 
 func rowNode(name string, status string) view.Node {
-	return view.Tr(view.Attr("id", "instance-"+name), view.Td(view.T(name)), view.Td(view.T(status)))
+	return view.Tr(
+		view.Attr("id", "instance-"+name),
+		view.Attr("hx-swap-oob", "outerHTML"),
+		view.Td(view.T(name)),
+		view.Td(view.T(status)),
+	)
 }
 
 func (c *Client) Start(ctx context.Context) error {

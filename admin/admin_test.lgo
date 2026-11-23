@@ -117,7 +117,7 @@ func getPage(t *testing.T, ts *httptest.Server, path string) (int, string) {
 
 func pageHolds(body string, wants []string) bool {
 	for _, w := range wants {
-		if !strings.Contains(body, w) {
+		if !strings.Contains(body, "<td>"+w+"</td>") {
 			return false
 		}
 	}
