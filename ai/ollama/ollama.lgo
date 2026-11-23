@@ -6,7 +6,6 @@
 package ollama
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json/jsontext"
@@ -19,14 +18,17 @@ import (
 	"strings"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/internal/bounded"
 	"github.com/gosuda/spira/resilience"
 )
 
 type Client struct {
-	BaseURL string
-	Model   string
-	HTTP    *http.Client
-	Policy  resilience.Policy
+	BaseURL   string
+	Model     string
+	HTTP      *http.Client
+	Policy    resilience.Policy
+	MaxLine   int
+	MaxStream int64
 }
 
 func (c *Client) http() *http.Client {
@@ -83,7 +85,7 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		yield ai.Chunk{}, failure(status, body)
 		return
 	}
-	for chunk, err := range streamLines(ctx, body) {
+	for chunk, err := range streamLines(ctx, bounded.NewLines(body, c.MaxLine, c.MaxStream)) {
 		yield chunk, err
 	}
 }
@@ -182,12 +184,15 @@ func (c *Client) do(ctx context.Context, path string, payload []byte) (int, io.R
 	return resp.StatusCode, resp.Body, nil
 }
 
-func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
-	reader := bufio.NewReader(body)
+func streamLines(ctx context.Context, lines *bounded.Lines) iter.Seq2[ai.Chunk, error] {
 	indexer := partIndexer{}
 	done := false
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := lines.Next()
+		if err != nil {
+			yield ai.Chunk{}, streamEnd(ctx, err)
+			return
+		}
 		if text := strings.TrimSpace(line); text != "" {
 			for chunk, cerr := range yieldLine(text, &indexer, &done) {
 				yield chunk, cerr
@@ -200,11 +205,17 @@ func streamLines(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error]
 			yield ai.Chunk{}, ErrProviderStreamCut.Wrap(ctx.Err())
 			return
 		}
-		if err != nil {
-			yield ai.Chunk{}, ErrProviderStreamCut.Err()
-			return
-		}
 	}
+}
+
+func streamEnd(ctx context.Context, err error) error {
+	if errors.Is(err, bounded.ErrTooLarge) {
+		return ErrProviderTooLarge.Wrap(fmt.Errorf("ai/ollama: %w", err))
+	}
+	if cause := ctx.Err(); cause != nil {
+		return ErrProviderStreamCut.Wrap(cause)
+	}
+	return ErrProviderStreamCut.Err()
 }
 
 func yieldLine(text string, indexer *partIndexer, done *bool) iter.Seq2[ai.Chunk, error] {

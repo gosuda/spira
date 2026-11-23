@@ -13,6 +13,8 @@ type Client struct {
 	HTTP      *http.Client
 	Policy    resilience.Policy
 	MaxTokens int
+	MaxLine   int
+	MaxStream int64
 }
 
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error)
@@ -28,7 +30,7 @@ var ErrTooManyRedirects = fault.New("anthropic.too_many_redirects", fault.Unavai
 func Faults() []*fault.Error
 ```
 
-`Key` is sent as the `x-api-key` header when it is not empty. `Policy` governs retries and the breaker. `MaxTokens` is the fallback for a request with no `MaxTokens`; the default is 4096. The provider requires `max_tokens`, so a fallback avoids a failing call, while the request value always wins.
+`Key` is sent as the `x-api-key` header when it is not empty. `Policy` governs retries and the breaker. `MaxTokens` is the fallback for a request with no `MaxTokens`; the default is 4096. The provider requires `max_tokens`, so a fallback avoids a failing call, while the request value always wins. A stream line longer than `MaxLine` bytes (1 MiB when zero) or a stream longer than `MaxStream` bytes (64 MiB when zero) ends the stream with `anthropic.provider_too_large`.
 
 ## Requirements
 

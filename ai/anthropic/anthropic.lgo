@@ -8,7 +8,6 @@
 package anthropic
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json/v2"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/internal/bounded"
 	"github.com/gosuda/spira/resilience"
 )
 
@@ -39,6 +39,8 @@ type Client struct {
 	HTTP      *http.Client
 	Policy    resilience.Policy
 	MaxTokens int
+	MaxLine   int
+	MaxStream int64
 }
 
 func (c *Client) http() *http.Client {
@@ -113,13 +115,17 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		if err := holdUntil(ctx, hold); err != nil {
 			return streamHead{}, ErrProviderError.Wrap(err)
 		}
-		status, header, body, derr := c.do(actx, payload)
+		streamCtx, stop := context.WithCancelCause(ctx)
+		detach := context.AfterFunc(actx, func() { stop(context.Cause(actx)) })
+		status, header, body, derr := c.do(streamCtx, payload)
 		if derr != nil {
+			stop(nil)
 			return streamHead{}, transportFault(derr)
 		}
-		if status >= 200 && status <= 299 {
-			return streamHead{body: body}, nil
+		if status >= 200 && status <= 299 && detach() {
+			return streamHead{body: body, stop: stop}, nil
 		}
+		defer stop(nil)
 		data, rerr := io.ReadAll(io.LimitReader(body, replyLimit))
 		failure := classifyStatus(status, statusDetailOf(status, data))
 		closeBody(body)
@@ -144,14 +150,16 @@ func (c *Client) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk,
 		yield ai.Chunk{}, err
 		return
 	}
+	defer head.stop(nil)
 	defer closeBody(head.body)
-	for chunk, cerr := range streamEvents(ctx, head.body) {
+	for chunk, cerr := range streamEvents(ctx, bounded.NewLines(head.body, c.MaxLine, c.MaxStream)) {
 		yield chunk, cerr
 	}
 }
 
 type streamHead struct {
 	body io.ReadCloser
+	stop context.CancelCauseFunc
 }
 
 func closeBody(body io.Closer) {
@@ -300,23 +308,20 @@ func deferredWait(err error) time.Duration {
 	return 0
 }
 
-func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error] {
-	reader := bufio.NewReader(body)
+func streamEvents(ctx context.Context, lines *bounded.Lines) iter.Seq2[ai.Chunk, error] {
 	state := &streamState{tools: map[int32]*toolBlock{}}
 	for {
-		line, rerr := reader.ReadString('\n')
-		for chunk, err := range state.line(strings.TrimRight(line, "\r\n"), rerr != nil) {
+		line, rerr := lines.Next()
+		if rerr != nil {
+			for chunk, err := range streamEnd(ctx, rerr, state) {
+				yield chunk, err
+			}
+			return
+		}
+		for chunk, err := range state.line(strings.TrimRight(line, "\r\n")) {
 			yield chunk, err
 		}
 		if state.ended {
-			return
-		}
-		if rerr != nil {
-			if err := ctx.Err(); err != nil {
-				yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
-				return
-			}
-			yield ai.Chunk{}, ErrProviderStreamCut.Err()
 			return
 		}
 		if err := ctx.Err(); err != nil {
@@ -324,6 +329,24 @@ func streamEvents(ctx context.Context, body io.Reader) iter.Seq2[ai.Chunk, error
 			return
 		}
 	}
+}
+
+func streamEnd(ctx context.Context, rerr error, state *streamState) iter.Seq2[ai.Chunk, error] {
+	if errors.Is(rerr, bounded.ErrTooLarge) {
+		yield ai.Chunk{}, ErrProviderTooLarge.Wrap(fmt.Errorf("ai/anthropic: %w", rerr))
+		return
+	}
+	for chunk, err := range state.line("") {
+		yield chunk, err
+	}
+	if state.ended {
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		yield ai.Chunk{}, ErrProviderStreamCut.Wrap(err)
+		return
+	}
+	yield ai.Chunk{}, ErrProviderStreamCut.Err()
 }
 
 type toolBlock struct {
@@ -346,7 +369,7 @@ type streamState struct {
 	tools    map[int32]*toolBlock
 }
 
-func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
+func (s *streamState) line(line string) iter.Seq2[ai.Chunk, error] {
 	if name, isEvent := strings.CutPrefix(line, "event:"); isEvent && strings.TrimSpace(name) == "message_stop" {
 		s.ended = true
 		yield s.final(), nil
@@ -356,7 +379,7 @@ func (s *streamState) line(line string, last bool) iter.Seq2[ai.Chunk, error] {
 		s.data.WriteString(value)
 		s.data.WriteByte('\n')
 	}
-	if line != "" && !last {
+	if line != "" {
 		return
 	}
 	data := s.data.String()

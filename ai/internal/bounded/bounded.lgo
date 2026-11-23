@@ -1,0 +1,104 @@
+package bounded
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+)
+
+const (
+	defaultLine   = 1 << 20
+	defaultStream = 64 << 20
+)
+
+var ErrTooLarge = errors.New("bounded: stream over its limit")
+
+type Lines struct {
+	reader  *bufio.Reader
+	maxLine int
+	tooLong error
+	pending error
+	line    []byte
+}
+
+func NewLines(r io.Reader, maxLine int, maxTotal int64) *Lines {
+	if maxLine <= 0 {
+		maxLine = defaultLine
+	}
+	if maxTotal <= 0 {
+		maxTotal = defaultStream
+	}
+	counted := &capped{source: r, left: maxTotal, over: &limitError{what: "stream", limit: maxTotal}}
+	return &Lines{
+		reader:  bufio.NewReader(counted),
+		maxLine: maxLine,
+		tooLong: &limitError{what: "stream line", limit: int64(maxLine)},
+	}
+}
+
+func (l *Lines) Next() (string, error) {
+	if l.pending != nil {
+		return "", l.pending
+	}
+	line := l.line[:0]
+	for {
+		chunk, err := l.reader.ReadSlice('\n')
+		if errors.Is(err, ErrTooLarge) {
+			l.pending = err
+			return "", err
+		}
+		size := len(line) + len(chunk)
+		if err == nil {
+			size--
+		}
+		if size > l.maxLine {
+			l.pending = l.tooLong
+			return "", l.tooLong
+		}
+		line = append(line, chunk...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		l.line = line
+		l.pending = err
+		if len(line) == 0 {
+			return "", err
+		}
+		return string(line), nil
+	}
+}
+
+type capped struct {
+	source io.Reader
+	left   int64
+	over   error
+}
+
+func (c *capped) Read(p []byte) (int, error) {
+	if c.left < 0 {
+		return 0, c.over
+	}
+	if room := c.left + 1; room > 0 && room < int64(len(p)) {
+		p = p[:room]
+	}
+	n, err := c.source.Read(p)
+	c.left -= int64(n)
+	if c.left < 0 {
+		return n - 1, c.over
+	}
+	return n, err
+}
+
+type limitError struct {
+	what  string
+	limit int64
+}
+
+func (e *limitError) Error() string {
+	return fmt.Sprintf("%s exceeds %d bytes", e.what, e.limit)
+}
+
+func (e *limitError) Unwrap() error {
+	return ErrTooLarge
+}

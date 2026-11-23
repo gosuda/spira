@@ -15,6 +15,8 @@ type Client struct {
 	RandomSeed int?
 	HTTP       *http.Client
 	Policy     resilience.Policy
+	MaxLine    int
+	MaxStream  int64
 }
 
 func (c *Client) Chat(ctx context.Context, req ai.Request) (ai.Reply, error)
@@ -30,7 +32,7 @@ var ErrInvalidRequest = fault.New("openai.invalid_request", fault.Invalid, "The 
 func Faults() []*fault.Error
 ```
 
-`Model` names the model for `Embed`, which takes no model argument. `Key` is sent as the bearer token when it is not empty. `SafePrompt` and `RandomSeed` are the Mistral options. They go out only when the caller sets them.
+`Model` names the model for `Embed`, which takes no model argument. `Key` is sent as the bearer token when it is not empty. `SafePrompt` and `RandomSeed` are the Mistral options. They go out only when the caller sets them. A stream line longer than `MaxLine` bytes (1 MiB when zero) or a stream longer than `MaxStream` bytes (64 MiB when zero) ends the stream with `openai.provider_too_large`.
 
 ## Requirements
 
@@ -117,6 +119,9 @@ func Faults() []*fault.Error
 - `TestStreamOfAStalledProviderEndsAtThePolicyTimeout` proves the error for a provider that stops sending.
 - `TestStreamKeepsAProviderWhoseEventsStayInsideTheTimeout` proves the idle bound resets on every line read and never fires.
 - `TestStreamKeepsReceivingToolFragments` proves tool-only fragments reset the idle bound and assemble into one call.
+- `TestStreamKeepAliveCommentsHoldTheIdleBoundPastTheTimeout` proves that comment lines keep a stream alive past the timeout and yield no chunk.
+- `TestStreamToolFragmentsSpanningBeyondTheTimeoutAssemble` proves that tool fragments paced across more than the timeout still assemble into one call.
+- `TestStreamIdleBoundRefreshesOnLinesThatYieldNothing` proves that the idle bound resets once for every line read, also for lines that yield no chunk.
 - `TestStreamResetsBeforeTheFirstChunk` proves resets precede the first yielded chunk.
 - `TestStreamCanceledBeforeHeadersKeepsThePackagePrefix` proves a canceled stream still names the package.
 - `TestStreamCancelBetweenChunksKeepsThePackagePrefix` proves a mid-stream cancel keeps the package prefix.
