@@ -201,14 +201,17 @@ func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // replayable decides whether a failed first upstream may be followed by a
-// second. A body of unknown length is never assumed empty: the first byte is
-// read under the relay timeout, and only an immediate end of stream proves
-// the body empty. A proved byte is pushed back so the stream, and the
-// trailers after it, stay intact.
+// second. The no-body proof runs for every method: a body of unknown length
+// is never assumed empty, the first byte is read under the relay timeout, and
+// only an immediate end of stream proves the body empty. A proved byte is
+// pushed back so the stream, and the trailers after it, stay intact. The
+// replay itself needs an idempotent method (GET, HEAD, OPTIONS, TRACE, PUT,
+// DELETE, RFC 9110 section 9.2.2): a bodyless POST or PATCH can still carry a
+// side effect the first upstream committed, so it stops after that upstream.
 
 func (rl *relay) replayable(req *http.Request) (bool, error?) {
 	if req.Body == nil || req.Body == http.NoBody {
-		return true, nil
+		return idempotentMethod(req.Method), nil
 	}
 	if req.ContentLength >= 0 {
 		return false, nil
@@ -220,9 +223,17 @@ func (rl *relay) replayable(req *http.Request) (bool, error?) {
 	req.Body = body
 	if empty {
 		req.ContentLength = 0
-		return true, nil
+		return idempotentMethod(req.Method), nil
 	}
 	return false, nil
+}
+
+func idempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
+		return true
+	}
+	return false
 }
 
 type pushedBody struct {

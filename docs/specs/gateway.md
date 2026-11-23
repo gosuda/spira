@@ -83,10 +83,10 @@ func Faults() []*fault.Error
 - Any other upstream status MUST pass through to the client.
 - A passed-through status MUST NOT open the breaker.
 - An open breaker MUST skip that upstream.
-- A request with no body MUST try the later upstreams after a failure.
+- A request with no body MUST try the later upstreams after a failure only when its method is idempotent: GET, HEAD, OPTIONS, TRACE, PUT or DELETE (RFC 9110 section 9.2.2). A bodyless POST or PATCH MUST stop after its first upstream, as a request with a body does.
 - A request whose body is nil or `http.NoBody` MUST count as a request with no body.
 - A request with a body MUST stop after its first upstream.
-- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`: end of stream counts as no body and retries, and a byte counts as a body that is pushed back and stops after the first upstream.
+- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`, whatever the method: end of stream counts as no body and the idempotent-method rule above decides whether it retries, and a byte counts as a body that is pushed back and stops after the first upstream.
 - A wait that yields no byte and no end of stream MUST answer 502 without trying an upstream.
 - When that wait ends without a byte, the gateway MUST end the blocked body read through `http.ResponseController.SetReadDeadline`, so that the 502 reaches the client while the client still holds the request body open.
 - When every tried upstream fails, the proxy MUST answer 502.
@@ -131,7 +131,7 @@ func Faults() []*fault.Error
 - `TestSettledStagesLetTheProxyAnswer` proves that `web.Recover` and `web.AccessLog` as route stages let the upstream answer.
 - `TestMountPanicsOnBadRoutes` proves the three registration panics.
 - `TestMountRefusesWildcardPrefixButStripsLiteralNeighbor` proves that a wildcard prefix is refused and a literal neighbor still strips.
-- `TestDeadUpstreamFailsOverForGetAndNeverReplaysPost` proves failover for a bodyless request and no second try for a body.
+- `TestDeadUpstreamFailsOverForGetAndNeverReplaysPost` proves failover for a bodyless GET and no second try for a request with a body.
 - `TestOpenBreakerSkipsItsUpstreamAndKeepsTheLiveOne` proves that an open breaker skips only its upstream.
 - `TestBreakerRecoversThroughProbeWithSharedClock` proves probe recovery from the copied `Now`.
 - `TestAllUpstreamsDeadAnswersProblemWithoutLeaking` proves the 502 problem and that the body names no upstream.
@@ -150,8 +150,9 @@ func Faults() []*fault.Error
 - `TestMountLeavesARetryPolicyUntouched` proves that a retrying policy does not retry a POST.
 - `TestClientForwardedHeaderNeverReachesTheUpstream` proves that a client `Forwarded` header does not ride along.
 - `TestNilBreakerPolicyAddsNoBreaker` proves that a nil breaker leaves the upstream unguarded.
-- `TestBodylessPostFailsOverLikeAGet` proves that a bodyless POST fails over.
-- `TestUnknownLengthEmptyBodyFailsOver` proves that an empty body of unknown length fails over.
+- `TestBodylessPostStopsAfterFirstUpstream` proves that a bodyless POST reaches exactly one upstream when that upstream fails.
+- `TestBodylessGetAndDeleteFailOver` proves that a bodyless GET and a bodyless DELETE still fail over.
+- `TestUnknownLengthEmptyBodyFailsOver` proves that an empty body of unknown length on a DELETE fails over.
 - `TestUnknownLengthNonemptyBodyIsPreserved` proves that a nonempty body of unknown length reaches the upstream whole.
 - `TestPeekEmptyFailsClosedOnStalledBody` proves that a stalled body of unknown length answers 502 without an upstream.
 - `TestStalledBodyPeekAnswersWhileTheBodyStaysOpen` proves that a chunked request with no body byte gets its 502 within three seconds while the connection stays open.
