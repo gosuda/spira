@@ -100,7 +100,9 @@ func (m recorderModel) Chat(ctx context.Context, req ai.Request) (ai.Reply, erro
 }
 
 func (m recorderModel) Stream(ctx context.Context, req ai.Request) iter.Seq2[ai.Chunk, error] {
-	return m.next.Stream(ctx, req)
+	for chunk, err := range m.next.Stream(ctx, req) {
+		yield chunk, err
+	}
 }
 
 func (s *Service) storeDirect(ctx context.Context, id string, reply ai.Reply, call ai.Message?) error {

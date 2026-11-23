@@ -362,21 +362,32 @@ func assistantOf(m ai.Message) (wireMessage, error) {
 	w := wireMessage{Role: "assistant"}
 	var thinking []string
 	for _, p := range m.Parts {
-		switch v := p.(type) {
-		case ai.Text:
-			w.Content += v.Text
-		case ai.Reasoning:
-			thinking = append(thinking, v.Text)
-		case ai.ToolCall:
-			call, err := toolCallOf(v)
-			if err != nil {
-				return w, err
-			}
-			w.ToolCalls = append(w.ToolCalls, call)
+		var err error
+		thinking, err = addAssistantPart(&w, thinking, p)
+		if err != nil {
+			return w, err
 		}
 	}
 	w.Thinking = strings.Join(thinking, "\n")
 	return w, nil
+}
+
+func addAssistantPart(w *wireMessage, thinking []string, p ai.Part) ([]string, error) {
+	switch v := p.(type) {
+	case ai.Text:
+		w.Content += v.Text
+	case ai.Reasoning:
+		thinking = append(thinking, v.Text)
+	case ai.ToolCall:
+		call, err := toolCallOf(v)
+		if err != nil {
+			return thinking, err
+		}
+		w.ToolCalls = append(w.ToolCalls, call)
+	case ai.ToolResult:
+	case nil:
+	}
+	return thinking, nil
 }
 
 func toolCallOf(call ai.ToolCall) (wireToolCall, error) {

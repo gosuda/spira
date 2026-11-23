@@ -397,6 +397,8 @@ func assistantOf(m ai.Message) wireMessage {
 				Type:     "function",
 				Function: wireReqCallFunc{Name: v.Name, Arguments: v.Arguments},
 			})
+		case ai.ToolResult:
+		case nil:
 		}
 	}
 	if text.Len() > 0 || len(w.ToolCalls) == 0 {

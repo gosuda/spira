@@ -271,6 +271,8 @@ func sqlPartEqual(a ai.Part, b ai.Part) bool {
 	case ai.ToolResult:
 		y, ok := b.(ai.ToolResult)
 		return ok && x.ID == y.ID && x.Name == y.Name && x.Content == y.Content && x.Skipped == y.Skipped
+	case nil:
+		return b == nil
 	}
 	return false
 }

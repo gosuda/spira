@@ -763,6 +763,9 @@ func partTexts(parts []ai.Part) (reasoning string, text string) {
 			reasoning += v.Text
 		case ai.Text:
 			text += v.Text
+		case ai.ToolCall:
+		case ai.ToolResult:
+		case nil:
 		}
 	}
 	return reasoning, text
