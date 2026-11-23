@@ -127,3 +127,71 @@ func versionOf(doc blobDoc?) int64 {
 	}
 	return doc.Version
 }
+type blobShape struct {
+	ID    int64  `col:"id"`
+	Shape string `col:"shape"`
+	Size  int64? `col:"size"`
+}
+
+func TestNullableEmptyBlobCopyPreservesEmptiness(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := exec(ctx, pool, "CREATE TABLE orm_blobs (id INTEGER PRIMARY KEY, data BLOB, version INTEGER NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec(ctx, pool, "INSERT INTO orm_blobs (id, data, version) VALUES (21, X'', 1), (22, NULL, 1)"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := db.Query[blobDoc](ctx, pool, "SELECT id, data, version FROM orm_blobs WHERE id = 21")
+	if err != nil {
+		t.Fatalf("load empty blob: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded %d empty-blob rows, want 1", len(loaded))
+	}
+	if loaded[0].Data == nil {
+		t.Fatalf("empty blob reads as absent, want present")
+	}
+	_, err = orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		clone := &blobDoc{Data: loaded[0].Data}
+		orm.Add[blobDoc, blobID](s, blobDocs, clone)
+		s.Flush(ctx)?
+		return 0, nil
+	})
+	if err != nil {
+		t.Fatalf("flush blob copy: %v", err)
+	}
+	shapes, err := db.Query[blobShape](ctx, pool, "SELECT id, typeof(data) AS shape, length(data) AS size FROM orm_blobs ORDER BY id")
+	if err != nil {
+		t.Fatalf("read blob shapes: %v", err)
+	}
+	if err := blobCopyShapes(shapes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func blobCopyShapes(shapes []blobShape) error {
+	blobs := 0
+	nulls := 0
+	for _, shape := range shapes {
+		if shape.ID == 22 {
+			if shape.Shape != "null" {
+				return fmt.Errorf("seed NULL row stores %q, want null", shape.Shape)
+			}
+			nulls++
+			continue
+		}
+		if shape.Shape != "blob" {
+			return fmt.Errorf("row %d stores %q, want blob", shape.ID, shape.Shape)
+		}
+		if size := shape.Size ?? -1; size != 0 {
+			return fmt.Errorf("row %d stores length %d, want 0", shape.ID, size)
+		}
+		blobs++
+	}
+	if blobs != 2 || nulls != 1 {
+		return fmt.Errorf("stored %d blobs and %d nulls, want 2 blobs and 1 null", blobs, nulls)
+	}
+	return nil
+}

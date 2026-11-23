@@ -164,7 +164,7 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `ScanField` MUST accept `float32` and `float64`.
 - `ScanField` MUST accept a named type whose underlying type is `bool`, `int`, `int8`, `int16`, `int32`, `int64`, `float32`, `float64` or `string`.
 - `ScanField` MUST accept `time.Time?`, `string?`, `bool?`, `int16?`, `int32?` and `int64?`.
-- `ScanField` MUST accept `float32?` and `float64?`.
+- `ScanField` MUST accept `float32?`, `float64?` and `[]byte?`.
 
 ### Constraint violations
 

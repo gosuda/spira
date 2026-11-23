@@ -354,6 +354,9 @@ func fieldValue[F any](address *F) any {
 	case *rt.Option[time.Time]:
 		return presentValue(p)
 	case *rt.Option[[]byte]:
+		if p.Present && p.Value == nil {
+			return []byte{}
+		}
 		return presentValue(p)
 	}
 	return *address
