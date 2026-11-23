@@ -1,0 +1,115 @@
+package http3
+
+import (
+	"fmt"
+	"io"
+
+	"github.com/quic-go/quic-go/quicvarint"
+)
+
+type h3FrameHeader struct {
+	kind   uint64
+	length uint64
+}
+
+const h3MaxSettingsPayload = 8192
+
+const (
+	h3SettingQpackMaxTableCapacity = 0x01
+	h3SettingQpackBlockedStreams   = 0x07
+	h3SettingMaxFieldSectionSize   = 0x06
+	h3SettingEnableConnectProtocol = 0x08
+	h3SettingEnableDatagram        = 0x33
+)
+
+var (
+	errH3SettingsMalformed = fmt.Errorf("http3: malformed SETTINGS frame")
+	errH3SettingsTooLarge  = fmt.Errorf("http3: SETTINGS payload exceeds %d bytes", h3MaxSettingsPayload)
+)
+
+func readH3FrameHeader(r io.ByteReader) (h3FrameHeader, error) {
+	kind, err := quicvarint.Read(r)
+	if err != nil {
+		return h3FrameHeader{}, fmt.Errorf("http3: read frame kind: %w", err)
+	}
+	length, err := quicvarint.Read(r)
+	if err != nil {
+		return h3FrameHeader{}, fmt.Errorf("http3: read frame length: %w", err)
+	}
+	return h3FrameHeader{kind: kind, length: length}, nil
+}
+
+func appendH3FrameHeader(dst []byte, kind, length uint64) []byte {
+	dst = quicvarint.Append(dst, kind)
+	return quicvarint.Append(dst, length)
+}
+
+const h3UnlimitedFieldSectionSize = ^uint64(0)
+
+type h3Settings struct {
+	maxFieldSectionSize   uint64
+	qpackMaxTableCapacity uint64
+	qpackBlockedStreams   uint64
+	enableConnectProtocol bool
+	enableDatagram        bool
+}
+
+func decodeH3Settings(payload []byte) (h3Settings, error) {
+	if len(payload) > h3MaxSettingsPayload {
+		return h3Settings{}, errH3SettingsTooLarge
+	}
+	s := h3Settings{maxFieldSectionSize: h3UnlimitedFieldSectionSize}
+	seen := make(map[uint64]bool, 8)
+	for len(payload) > 0 {
+		id, value, rest, err := parseH3Setting(payload)
+		if err != nil {
+			return h3Settings{}, err
+		}
+		payload = rest
+		if _, exists := seen[id]; exists {
+			return h3Settings{}, fmt.Errorf("http3: duplicate SETTINGS id %#x: %w", id, errH3SettingsMalformed)
+		}
+		seen[id] = true
+		if id >= 0x2 && id <= 0x5 {
+			return h3Settings{}, fmt.Errorf("http3: forbidden HTTP/2 SETTINGS id %#x: %w", id, errH3SettingsMalformed)
+		}
+		if err := applyH3Setting(&s, id, value); err != nil {
+			return h3Settings{}, err
+		}
+	}
+	return s, nil
+}
+
+func parseH3Setting(payload []byte) (uint64, uint64, []byte, error) {
+	id, idLen, err := quicvarint.Parse(payload)
+	if err != nil {
+		return 0, 0, nil, errH3SettingsMalformed
+	}
+	value, valueLen, err := quicvarint.Parse(payload[idLen:])
+	if err != nil {
+		return 0, 0, nil, errH3SettingsMalformed
+	}
+	return id, value, payload[idLen+valueLen:], nil
+}
+
+func applyH3Setting(s *h3Settings, id, value uint64) error {
+	switch id {
+	case h3SettingMaxFieldSectionSize:
+		s.maxFieldSectionSize = value
+	case h3SettingQpackMaxTableCapacity:
+		s.qpackMaxTableCapacity = value
+	case h3SettingQpackBlockedStreams:
+		s.qpackBlockedStreams = value
+	case h3SettingEnableConnectProtocol:
+		if value > 1 {
+			return fmt.Errorf("http3: invalid SETTINGS_ENABLE_CONNECT_PROTOCOL value %d: %w", value, errH3SettingsMalformed)
+		}
+		s.enableConnectProtocol = value == 1
+	case h3SettingEnableDatagram:
+		if value > 1 {
+			return fmt.Errorf("http3: invalid SETTINGS_H3_DATAGRAM value %d: %w", value, errH3SettingsMalformed)
+		}
+		s.enableDatagram = value == 1
+	}
+	return nil
+}

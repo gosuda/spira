@@ -1,0 +1,453 @@
+package http3
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/quic-go/qpack"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
+)
+
+type h3RequestStreamPair struct {
+	client     *quic.Conn
+	server     *quic.Conn
+	clientSide *quic.Stream
+	serverSide *quic.Stream
+	deadline   time.Time
+}
+
+func h3RequestStreamTestTLS() (*tls.Config?, *tls.Config?, error) {
+	public, private := ed25519.GenerateKey(rand.Reader)?
+	now := time.Now()
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(1), DNSNames: []string{"example.com"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der := x509.CreateCertificate(rand.Reader, cert, cert, public, private)?
+	leaf := x509.ParseCertificate(der)?
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	server := &tls.Config{NextProtos: []string{"h3"}, Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: private}}}
+	client := &tls.Config{NextProtos: []string{"h3"}, ServerName: "example.com", RootCAs: roots}
+	return server, client, nil
+}
+
+func openH3RequestStreamPair(t *testing.T, initial []byte) (*h3RequestStreamPair?, error) {
+	serverTLS, clientTLS := h3RequestStreamTestTLS()?
+	if serverTLS == nil {
+		return nil, errors.New("missing test server TLS config")
+	}
+	if clientTLS == nil {
+		return nil, errors.New("missing test client TLS config")
+	}
+	listener := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{})?
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, quic.ErrServerClosed) {
+			t.Errorf("close QUIC test listener: %T", err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	client := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, &quic.Config{})?
+	t.Cleanup(func() { closeH3RequestTestConn(t, client) })
+	server := listener.Accept(ctx)?
+	t.Cleanup(func() { closeH3RequestTestConn(t, server) })
+	clientSide := client.OpenStreamSync(ctx)?
+	clientSide.SetDeadline(deadline)?
+	clientSide.Write(initial)?
+	serverSide := server.AcceptStream(ctx)?
+	serverSide.SetDeadline(deadline)?
+	return &h3RequestStreamPair{client: client, server: server, clientSide: clientSide, serverSide: serverSide, deadline: deadline}, nil
+}
+
+func closeH3RequestTestConn(t *testing.T, conn *quic.Conn) {
+	t.Helper()
+	if err := conn.CloseWithError(0, ""); err != nil && conn.Context().Err() == nil {
+		t.Errorf("close QUIC test connection: %T", err)
+	}
+}
+
+func h3StreamTestHeaders(t *testing.T, fields []qpack.HeaderField) []byte {
+	t.Helper()
+	block := encodeH3TestFields(t, fields)
+	return append(appendH3FrameHeader(nil, 0x1, uint64(len(block))), block...)
+}
+
+func h3StreamTestResponse(t *testing.T, source io.Reader) *bytes.Reader {
+	t.Helper()
+	wire, err := io.ReadAll(source)
+	if err != nil {
+		t.Fatalf("read complete response: %v", err)
+	}
+	return bytes.NewReader(wire)
+}
+
+func TestH3RequestStreamDispatchesFullDuplex(t *testing.T) {
+	fields := []qpack.HeaderField{
+		{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: "websocket"},
+		{Name: ":scheme", Value: "https"}, {Name: ":authority", Value: "example.com"}, {Name: ":path", Value: "/socket"},
+	}
+	wire := append([]byte("\x21\x01x"), h3StreamTestHeaders(t, fields)...)
+	opened, err := openH3RequestStreamPair(t, wire)
+	if err != nil {
+		t.Fatalf("open QUIC request: %v", err)
+		return
+	}
+	if opened == nil {
+		t.Fatal("missing QUIC request stream pair")
+		return
+	}
+	var pair *h3RequestStreamPair = opened
+	response := bufio.NewReader(pair.clientSide)
+	var handlerCtx context.Context
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCtx = r.Context()
+		local, ok := handlerCtx.Value(http.LocalAddrContextKey).(net.Addr)
+		if !ok || local.String() != pair.server.LocalAddr().String() || r.RemoteAddr != pair.server.RemoteAddr().String() {
+			t.Errorf("wrong request addresses: local %v, remote %q", local, r.RemoteAddr)
+		}
+		tlsState := r.TLS
+		if tlsState == nil || tlsState.NegotiatedProtocol != "h3" || tlsState.Version != tls.VersionTLS13 {
+			t.Errorf("wrong TLS state: %v", tlsState)
+		}
+		if handlerCtx.Err() != nil || r.Proto != "HTTP/3.0" || r.Method != "CONNECT" || r.Header.Get(":protocol") != "websocket" || r.RequestURI != "/socket" {
+			t.Errorf("wrong extended CONNECT request: %s %s %s protocol %q, context %v", r.Method, r.Proto, r.RequestURI, r.Header.Get(":protocol"), handlerCtx.Err())
+		}
+		if err := exchangeH3TestTunnel(w, r, response, pair); err != nil {
+			t.Errorf("exchange full-duplex bytes: %v", err)
+		}
+	})
+	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	if handlerCtx == nil || !errors.Is(handlerCtx.Err(), context.Canceled) {
+		t.Fatal("handler context not canceled after return")
+	}
+	remaining := h3StreamTestResponse(t, response)
+	h3ExpectResponseData(t, remaining, "pong")
+	h3ExpectNoResponseFrames(t, remaining)
+}
+
+func exchangeH3TestTunnel(w http.ResponseWriter, r *http.Request, response *bufio.Reader, pair *h3RequestStreamPair) error {
+	controller := http.NewResponseController(w)
+	controller.EnableFullDuplex()?
+	controller.SetReadDeadline(pair.deadline)?
+	controller.SetWriteDeadline(pair.deadline)?
+	w.Header()["Date"] = nil
+	w.WriteHeader(http.StatusOK)
+	controller.Flush()?
+	kind := quicvarint.Read(response)?
+	length := quicvarint.Read(response)?
+	if kind != 1 || length > 64 {
+		return errors.New("missing flushed response HEADERS")
+	}
+	block := response.Peek(int(length))?
+	next := qpack.NewDecoder().Decode(block)
+	status := next()?
+	if status.Name != ":status" || status.Value != "200" {
+		return errors.New("expected CONNECT success before sending DATA")
+	}
+	response.Discard(int(length))?
+	pair.clientSide.Write([]byte("\x00\x04ping"))?
+	pair.clientSide.Close()?
+	data := io.ReadAll(r.Body)?
+	if string(data) != "ping" {
+		return errors.New("wrong inbound DATA")
+	}
+	_, err := w.Write([]byte("pong"))
+	return err
+}
+
+func TestH3RequestStreamPublishesUnannouncedTrailers(t *testing.T) {
+	wire := h3StreamTestHeaders(t, h3TestRequestFields())
+	wire = append(wire, h3BodyTestTrailerFrame(t, qpack.HeaderField{Name: "x-note", Value: "arrived"})...)
+	pair, err := openH3RequestStreamPair(t, wire)
+	if err != nil {
+		t.Fatalf("open QUIC request: %v", err)
+		return
+	}
+	if pair == nil {
+		t.Fatal("missing QUIC request stream pair")
+		return
+	}
+	if err := pair.clientSide.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Trailer.Get("X-Note") != "" {
+			t.Error("trailer visible before reading the body")
+		}
+		if _, err := io.ReadAll(r.Body); err != nil || r.Trailer.Get("X-Note") != "arrived" {
+			t.Errorf("read trailers = %v (%v)", r.Trailer, err)
+		}
+		w.Header()["Date"] = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
+	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	response := h3StreamTestResponse(t, pair.clientSide)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	h3ExpectNoResponseFrames(t, response)
+}
+
+func TestH3RequestStreamFinishesWithoutReadingRequest(t *testing.T) {
+	pair, err := openH3RequestStreamPair(t, h3StreamTestHeaders(t, h3TestRequestFields()))
+	if err != nil {
+		t.Fatalf("open QUIC request: %v", err)
+		return
+	}
+	if pair == nil {
+		t.Fatal("missing QUIC request stream pair")
+		return
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["Date"] = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
+	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	response := h3StreamTestResponse(t, pair.clientSide)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	h3ExpectNoResponseFrames(t, response)
+	h3ExpectRequestSendStop(t, pair, 0x100)
+}
+
+func TestH3RequestStreamBodyCloseKeepsResponse(t *testing.T) {
+	wire := append(h3StreamTestHeaders(t, h3TestRequestFields()), "\x00\x01x"...)
+	pair, err := openH3RequestStreamPair(t, wire)
+	if err != nil {
+		t.Fatalf("open QUIC request: %v", err)
+		return
+	}
+	if pair == nil {
+		t.Fatal("missing QUIC request stream pair")
+		return
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.Body.Close(); err != nil {
+			t.Errorf("close request body: %v", err)
+		}
+		var p [1]byte
+		if n, err := r.Body.Read(p[:]); n != 0 || !errors.Is(err, http.ErrBodyReadAfterClose) {
+			t.Errorf("read closed request body = (%d, %v)", n, err)
+		}
+		w.Header()["Date"] = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
+	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	response := h3StreamTestResponse(t, pair.clientSide)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	h3ExpectNoResponseFrames(t, response)
+	h3ExpectRequestSendStop(t, pair, 0x100)
+}
+
+func h3ExpectRequestSendStop(t *testing.T, pair *h3RequestStreamPair, want quic.StreamErrorCode) {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(t.Context(), pair.deadline)
+	defer cancel()
+	send := pair.clientSide.Context()
+	select {
+	case <-send.Done():
+		cause := context.Cause(send)
+		failure, ok := errors.AsType[*quic.StreamError](cause)
+		if !ok || !failure.Remote || failure.ErrorCode != want {
+			t.Errorf("request send stopped with %v; want remote stream code %#x", cause, want)
+		}
+	case <-ctx.Done():
+		t.Error("request send side not stopped")
+	}
+}
+
+func TestH3RequestStreamLimitsRejectWithoutDraining(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		wire  []byte
+		limit uint64
+	}{
+		{"compressed", []byte("\x01\xff\xff\xff\xff\xff\xff\xff\xff"), 1024},
+		{"decoded", h3StreamTestHeaders(t, h3TestRequestFields()), 16},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pair, err := openH3RequestStreamPair(t, tc.wire)
+			if err != nil {
+				t.Fatalf("open QUIC request: %v", err)
+				return
+			}
+			if pair == nil {
+				t.Fatal("missing QUIC request stream pair")
+				return
+			}
+			cfg := h3RequestStreamConfig{maxFieldSectionSize: tc.limit, handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				t.Error("oversized request reached the handler")
+			})}
+			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, cfg)
+			response := h3StreamTestResponse(t, pair.clientSide)
+			h3ExpectResponseFields(t, response, map[string][]string{":status": {"431"}})
+			h3ExpectNoResponseFrames(t, response)
+			h3ExpectRequestSendStop(t, pair, 0x107)
+		})
+	}
+}
+
+func TestH3RequestStreamClosesConnectionOnFrameErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wire string
+		code quic.ApplicationErrorCode
+	}{
+		{"DATA before HEADERS", "\x00\x00", 0x105},
+		{"partial frame length", "\x01\x40", 0x106},
+		{"partial field section", "\x01\x03\x00\x00", 0x106},
+		{"invalid QPACK field section", "\x01\x02\x01\x00", 0x200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pair, err := openH3RequestStreamPair(t, []byte(tc.wire))
+			if err != nil {
+				t.Fatalf("open QUIC request: %v", err)
+				return
+			}
+			if pair == nil {
+				t.Fatal("missing QUIC request stream pair")
+				return
+			}
+			if err := pair.clientSide.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cfg := h3RequestStreamConfig{handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				t.Error("invalid request reached the handler")
+			})}
+			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, cfg)
+			data, err := io.ReadAll(pair.clientSide)
+			failure, ok := errors.AsType[*quic.ApplicationError](err)
+			if len(data) != 0 || !ok || !failure.Remote || failure.ErrorCode != tc.code {
+				t.Errorf("response %x, error %v; want connection code %#x", data, err, tc.code)
+			}
+		})
+	}
+}
+
+func TestH3RequestStreamResetsRequestFailures(t *testing.T) {
+	fields := h3TestRequestFields()
+	valid := h3StreamTestHeaders(t, fields)
+	malformed := h3StreamTestHeaders(t, append(fields, qpack.HeaderField{Name: ":path", Value: "/attempt"}))
+	length := h3StreamTestHeaders(t, append(fields, qpack.HeaderField{Name: "content-length", Value: "1"}))
+	for _, tc := range []struct {
+		name    string
+		wire    []byte
+		handler func(*testing.T, http.ResponseWriter, *http.Request)
+		code    quic.StreamErrorCode
+	}{
+		{"no HEADERS before FIN", []byte("\x21\x00"), nil, 0x10d},
+		{"malformed header", malformed, nil, 0x10e},
+		{"short body", length, func(t *testing.T, _ http.ResponseWriter, r *http.Request) {
+			var p [1]byte
+			if _, err := r.Body.Read(p[:]); !errors.Is(err, errH3MalformedMessage) {
+				t.Errorf("read truncated request body: got %T, want malformed message", err)
+			}
+		}, 0x10e},
+		{"handler abort", valid, func(_ *testing.T, _ http.ResponseWriter, _ *http.Request) { panic(http.ErrAbortHandler) }, 0x102},
+		{"incomplete response", valid, func(_ *testing.T, w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusOK)
+		}, 0x10c},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pair, err := openH3RequestStreamPair(t, tc.wire)
+			if err != nil {
+				t.Fatalf("open QUIC request: %v", err)
+				return
+			}
+			if pair == nil {
+				t.Fatal("missing QUIC request stream pair")
+				return
+			}
+			if err := pair.clientSide.Close(); err != nil {
+				t.Fatal(err)
+			}
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.handler == nil {
+					t.Error("invalid request reached the handler")
+					return
+				}
+				tc.handler(t, w, r)
+			})
+			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+			_, err = io.ReadAll(pair.clientSide)
+			failure, ok := errors.AsType[*quic.StreamError](err)
+			if !ok || !failure.Remote || failure.ErrorCode != tc.code || pair.server.Context().Err() != nil {
+				t.Errorf("error %v; want stream reset code %#x with connection still open", err, tc.code)
+			}
+		})
+	}
+}
+
+func TestH3RequestStreamPropagatesPeerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		interrupt func(*h3RequestStreamPair, *http.Request) error
+	}{
+		{"STOP_SENDING", func(pair *h3RequestStreamPair, _ *http.Request) error {
+			pair.clientSide.CancelRead(0x10c)
+			return nil
+		}},
+		{"read observes RESET_STREAM", func(pair *h3RequestStreamPair, req *http.Request) error {
+			pair.clientSide.CancelWrite(0x10c)
+			var p [1]byte
+			_, err := req.Body.Read(p[:])
+			failure, ok := errors.AsType[*quic.StreamError](err)
+			if !ok || !failure.Remote || failure.ErrorCode != 0x10c {
+				return errors.New("expected remote request stream reset")
+			}
+			return nil
+		}},
+		{"connection closes", func(pair *h3RequestStreamPair, _ *http.Request) error {
+			if err := pair.client.CloseWithError(0x100, ""); err != nil && pair.client.Context().Err() == nil {
+				return errors.New("close QUIC test peer failed")
+			}
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opened, err := openH3RequestStreamPair(t, h3StreamTestHeaders(t, h3TestRequestFields()))
+			if err != nil {
+				t.Fatalf("open QUIC request: %v", err)
+				return
+			}
+			if opened == nil {
+				t.Fatal("missing QUIC request stream pair")
+				return
+			}
+			var pair *h3RequestStreamPair = opened
+			ctx, cancel := context.WithDeadline(t.Context(), pair.deadline)
+			defer cancel()
+			entered := false
+			handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				entered = true
+				if err := tc.interrupt(pair, r); err != nil {
+					t.Error(err)
+					return
+				}
+				select {
+				case <-r.Context().Done():
+				case <-ctx.Done():
+					t.Error("handler context stayed live after peer cancellation")
+				}
+			})
+			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+			if !entered {
+				t.Error("handler was not dispatched")
+			}
+		})
+	}
+}

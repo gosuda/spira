@@ -1,0 +1,374 @@
+package http3
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"io"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
+	"logos/sync"
+)
+
+const (
+	h3ControlUniControl      = 0x00
+	h3ControlUniPush         = 0x01
+	h3ControlUniQPACKEncoder = 0x02
+	h3ControlUniQPACKDecoder = 0x03
+
+	h3ControlFrameCancelPush    = 0x03
+	h3ControlFrameSettings      = 0x04
+	h3ControlFrameGoAway        = 0x07
+	h3ControlFrameMaxPushID     = 0x0d
+	h3ControlFramePriority      = 0xf0700
+	h3ControlFramePriorityPush  = 0xf0701
+	h3ControlMaxPriorityPayload = 4096
+)
+
+const (
+	h3ControlStreamCreationError   quic.ApplicationErrorCode = 0x103
+	h3ControlClosedCriticalStream quic.ApplicationErrorCode = 0x104
+	h3ControlFrameUnexpected      quic.ApplicationErrorCode = 0x105
+	h3ControlFrameError            quic.ApplicationErrorCode = 0x106
+	h3ControlIDError               quic.ApplicationErrorCode = 0x108
+	h3ControlSettingsError        quic.ApplicationErrorCode = 0x109
+	h3ControlMissingSettings      quic.ApplicationErrorCode = 0x10a
+)
+
+type h3Control struct {
+	conn          *quic.Conn
+	local         *quic.SendStream
+	peer          sync.Locked[h3ControlPeer]
+	settingsDone  chan struct{}
+	goAway        chan uint64
+}
+
+type h3ControlPeer struct {
+	streams       uint8
+	settings      h3Settings
+	settingsReady bool
+}
+
+func startH3Control(ctx context.Context, conn *quic.Conn, maxFieldSectionSize uint64) (*h3Control?, error) {
+	if maxFieldSectionSize > quicvarint.Max && maxFieldSectionSize != h3UnlimitedFieldSectionSize {
+		return nil, errors.New("http3: field section limit does not fit in SETTINGS")
+	}
+	stream := conn.OpenUniStreamSync(ctx)?
+	errdefer stream.CancelWrite(quic.StreamErrorCode(h3ControlClosedCriticalStream))
+
+	var settingBytes [16]byte
+	payload := quicvarint.Append(settingBytes[:0], h3SettingEnableConnectProtocol)
+	payload = quicvarint.Append(payload, 1)
+	if maxFieldSectionSize != h3UnlimitedFieldSectionSize {
+		payload = quicvarint.Append(payload, h3SettingMaxFieldSectionSize)
+		payload = quicvarint.Append(payload, maxFieldSectionSize)
+	}
+	var initialBytes [24]byte
+	initial := quicvarint.Append(initialBytes[:0], h3ControlUniControl)
+	initial = appendH3FrameHeader(initial, h3ControlFrameSettings, uint64(len(payload)))
+	if err := writeH3Control(ctx, stream, append(initial, payload...)); err != nil {
+		if _, reset := errors.AsType[*quic.StreamError](err); reset && ctx.Err() == nil && conn.Context().Err() == nil {
+			return nil, errors.Join(err, conn.CloseWithError(h3ControlClosedCriticalStream, ""))
+		}
+		return nil, err
+	}
+
+	goAway := make(chan uint64, 1)
+	goAway <- quicvarint.Max
+	return &h3Control{conn: conn, local: stream, settingsDone: make(chan struct{}), goAway: goAway}, nil
+}
+
+func (c *h3Control) peerSettings() (h3Settings, bool) {
+	settings := h3Settings{maxFieldSectionSize: h3UnlimitedFieldSectionSize}
+	ready := false
+	c.peer.WithLock(func(peer *h3ControlPeer) {
+		if peer.settingsReady {
+			settings = peer.settings
+			ready = true
+		}
+	})
+	return settings, ready
+}
+
+func (c *h3Control) awaitPeerSettings(ctx context.Context) (h3Settings, error) {
+	connCtx := c.conn.Context()
+	select {
+	case <-c.settingsDone:
+	case <-ctx.Done():
+	case <-connCtx.Done():
+	}
+	settings, ready := c.peerSettings()
+	if ready {
+		return settings, nil
+	}
+	if err := context.Cause(connCtx); err != nil {
+		return h3Settings{}, err
+	}
+	return h3Settings{}, context.Cause(ctx)
+}
+
+func (c *h3Control) sendGoAway(ctx context.Context, id quic.StreamID) error {
+	if id < 0 || id%4 != 0 || uint64(id) > quicvarint.Max {
+		return errors.New("http3: GOAWAY requires a client-initiated bidirectional stream ID")
+	}
+	var last uint64
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case last = <-c.goAway:
+	}
+	defer func() {
+		select {
+		case c.goAway <- last:
+		default:
+			panic("http3: GOAWAY token returned twice")
+		}
+	}()
+
+	next := uint64(id)
+	if next > last {
+		return errors.New("http3: GOAWAY stream ID increased")
+	}
+	var frame [24]byte
+	payload := appendH3FrameHeader(frame[:0], h3ControlFrameGoAway, uint64(quicvarint.Len(next)))
+	writeH3Control(ctx, c.local, quicvarint.Append(payload, next))?
+	last = next
+	return nil
+}
+
+func writeH3Control(ctx context.Context, stream *quic.SendStream, payload []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { stream.CancelWrite(quic.StreamErrorCode(h3ControlClosedCriticalStream)) })
+	n, err := stream.Write(payload)
+	if !stop() {
+		return ctx.Err()
+	}
+	if err != nil {
+		stream.CancelWrite(quic.StreamErrorCode(h3ControlClosedCriticalStream))
+		return err
+	}
+	if n != len(payload) {
+		stream.CancelWrite(quic.StreamErrorCode(h3ControlClosedCriticalStream))
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (c *h3Control) watchLocal(ctx context.Context) error {
+	streamCtx := c.local.Context()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-c.conn.Context().Done():
+		return nil
+	case <-streamCtx.Done():
+	}
+	cause := context.Cause(streamCtx)
+	if _, reset := errors.AsType[*quic.StreamError](cause); !reset && !errors.Is(cause, quic.ErrStreamClosed) {
+		return nil
+	}
+	return c.closeOnPeerError(ctx, h3ControlClosedCriticalStream)
+}
+
+func (c *h3Control) handlePeerUni(ctx context.Context, stream *quic.ReceiveStream) error {
+	defer stream.ReleaseStreamCredit()
+	stop := context.AfterFunc(ctx, func() { stream.CancelRead(quic.StreamErrorCode(h3ControlClosedCriticalStream)) })
+	defer stop()
+
+	kind, err := quicvarint.Read(quicvarint.NewReader(stream))
+	if err != nil {
+		return nil
+	}
+	switch kind {
+	case h3ControlUniControl, h3ControlUniQPACKEncoder, h3ControlUniQPACKDecoder:
+		if !c.claimPeerUni(kind) {
+			return c.closeOnPeerError(ctx, h3ControlStreamCreationError)
+		}
+	case h3ControlUniPush:
+		return c.closeOnPeerError(ctx, h3ControlStreamCreationError)
+	default:
+		stream.CancelRead(quic.StreamErrorCode(h3ControlStreamCreationError))
+		return nil
+	}
+	if kind == h3ControlUniControl {
+		return c.closeOnPeerError(ctx, c.readPeerControl(bufio.NewReader(stream)))
+	}
+	// Static QPACK has no instruction consumer, but these streams remain critical.
+	_, err = io.Copy(io.Discard, stream)
+	if err == nil {
+		return c.closeOnPeerError(ctx, h3ControlClosedCriticalStream)
+	}
+	if _, reset := errors.AsType[*quic.StreamError](err); reset {
+		return c.closeOnPeerError(ctx, h3ControlClosedCriticalStream)
+	}
+	return nil
+}
+
+func (c *h3Control) claimPeerUni(kind uint64) bool {
+	bit := uint8(1 << kind)
+	claimed := false
+	c.peer.WithLock(func(peer *h3ControlPeer) {
+		claimed = peer.streams&bit == 0
+		peer.streams |= bit
+	})
+	return claimed
+}
+
+func (c *h3Control) closeOnPeerError(ctx context.Context, code quic.ApplicationErrorCode) error {
+	if ctx.Err() != nil || c.conn.Context().Err() != nil {
+		return nil
+	}
+	return c.conn.CloseWithError(code, "")
+}
+
+func (c *h3Control) readPeerControl(r *bufio.Reader) quic.ApplicationErrorCode {
+	header, code := readH3ControlHeader(r)
+	if code != 0 {
+		return code
+	}
+	if header.kind != h3ControlFrameSettings {
+		return h3ControlMissingSettings
+	}
+	settings, code := readH3PeerSettings(r, header.length)
+	if code != 0 {
+		return code
+	}
+	c.peer.WithLock(func(peer *h3ControlPeer) {
+		peer.settings = settings
+		peer.settingsReady = true
+		close(c.settingsDone)
+	})
+	var ids h3ControlPeerIDs
+	for {
+		header, code := readH3ControlHeader(r)
+		if code != 0 {
+			return code
+		}
+		if code := ids.readFrame(r, header); code != 0 {
+			return code
+		}
+	}
+}
+
+func readH3ControlHeader(r *bufio.Reader) (h3FrameHeader, quic.ApplicationErrorCode) {
+	if _, err := r.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) {
+			return h3FrameHeader{}, h3ControlClosedCriticalStream
+		}
+		return h3FrameHeader{}, h3ControlPayloadError(err)
+	}
+	header, err := readH3FrameHeader(r)
+	if err != nil {
+		return h3FrameHeader{}, h3ControlPayloadError(err)
+	}
+	return header, 0
+}
+
+func h3ControlPayloadError(err error) quic.ApplicationErrorCode {
+	if err == nil {
+		return 0
+	}
+	if _, reset := errors.AsType[*quic.StreamError](err); reset {
+		return h3ControlClosedCriticalStream
+	}
+	return h3ControlFrameError
+}
+
+func readH3PeerSettings(r io.Reader, length uint64) (h3Settings, quic.ApplicationErrorCode) {
+	if length > h3MaxSettingsPayload {
+		return h3Settings{}, h3ControlFrameError
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return h3Settings{}, h3ControlPayloadError(err)
+	}
+	settings, err := decodeH3Settings(payload)
+	if err == nil {
+		return settings, 0
+	}
+	for len(payload) > 0 {
+		_, _, rest, err := parseH3Setting(payload)
+		if err != nil {
+			return h3Settings{}, h3ControlFrameError
+		}
+		payload = rest
+	}
+	return h3Settings{}, h3ControlSettingsError
+}
+
+type h3ControlPeerIDs struct {
+	goAway    uint64
+	maxPushID uint64
+	hasGoAway bool
+}
+
+func (ids *h3ControlPeerIDs) readFrame(r io.Reader, header h3FrameHeader) quic.ApplicationErrorCode {
+	switch header.kind {
+	case 0x00, 0x01, 0x02, h3ControlFrameSettings, 0x05, 0x06, 0x08, 0x09:
+		return h3ControlFrameUnexpected
+	case h3ControlFrameGoAway, h3ControlFrameMaxPushID, h3ControlFrameCancelPush:
+		id, code := readH3ControlID(r, header.length)
+		if code != 0 {
+			return code
+		}
+		return ids.record(header.kind, id)
+	case h3ControlFramePriority, h3ControlFramePriorityPush:
+		return readH3ControlPriority(r, header)
+	default:
+		_, err := io.CopyN(io.Discard, r, int64(header.length))
+		return h3ControlPayloadError(err)
+	}
+}
+
+func (ids *h3ControlPeerIDs) record(kind, id uint64) quic.ApplicationErrorCode {
+	switch kind {
+	case h3ControlFrameGoAway:
+		if ids.hasGoAway && id > ids.goAway {
+			return h3ControlIDError
+		}
+		ids.goAway = id
+		ids.hasGoAway = true
+	case h3ControlFrameMaxPushID:
+		if id < ids.maxPushID {
+			return h3ControlIDError
+		}
+		ids.maxPushID = id
+	}
+	return 0
+}
+
+func readH3ControlID(r io.Reader, length uint64) (uint64, quic.ApplicationErrorCode) {
+	if length == 0 || length > 8 {
+		return 0, h3ControlFrameError
+	}
+	var payload [8]byte
+	if _, err := io.ReadFull(r, payload[:length]); err != nil {
+		return 0, h3ControlPayloadError(err)
+	}
+	id, used, err := quicvarint.Parse(payload[:length])
+	if err != nil || uint64(used) != length {
+		return 0, h3ControlFrameError
+	}
+	return id, 0
+}
+
+func readH3ControlPriority(r io.Reader, header h3FrameHeader) quic.ApplicationErrorCode {
+	if header.length == 0 || header.length > h3ControlMaxPriorityPayload {
+		return h3ControlFrameError
+	}
+	payload := &io.LimitedReader{R: r, N: int64(header.length)}
+	id, err := quicvarint.Read(quicvarint.NewReader(payload))
+	if err != nil {
+		return h3ControlPayloadError(err)
+	}
+	if _, err := io.CopyN(io.Discard, payload, payload.N); err != nil {
+		return h3ControlPayloadError(err)
+	}
+	if header.kind == h3ControlFramePriorityPush || id%4 != 0 {
+		return h3ControlIDError
+	}
+	return 0
+}

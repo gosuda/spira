@@ -1,0 +1,294 @@
+package http3_test
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	stdsync "sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/web"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
+)
+
+type h3FaultProbe struct {
+	server *http3.Server
+	udp    net.PacketConn
+}
+
+func startH3FaultProbe(ctx context.Context, t *testing.T) *h3FaultProbe? {
+	t.Helper()
+	fixture := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(fixture.Close)
+	serverTLS := fixture.TLS
+	if serverTLS == nil {
+		t.Fatal("test server has no TLS configuration")
+		return nil
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen TCP: %v", err)
+		return nil
+	}
+	udp, err := net.ListenPacket("udp", listener.Addr().String())
+	if err != nil {
+		closeErr := listener.Close()
+		t.Fatalf("listen UDP: %v; close TCP: %v", err, closeErr)
+		return nil
+	}
+	server := &http3.Server{Router: web.NewRouter(), TLS: serverTLS, H3: true, ShutdownGrace: 20 * time.Millisecond}
+	if err := server.Serve(ctx, listener, udp); err != nil {
+		closeErr := errors.Join(listener.Close(), udp.Close())
+		t.Fatalf("serve: %v; close listeners: %v", err, closeErr)
+		return nil
+	}
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := server.Stop(stopCtx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
+	roots := x509.NewCertPool()
+	roots.AddCert(fixture.Certificate())
+	clientTLS := &tls.Config{RootCAs: roots, ServerName: "127.0.0.1", NextProtos: []string{"h3"}}
+	conn, err := quic.DialAddr(ctx, udp.LocalAddr().String(), clientTLS, &quic.Config{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		return nil
+	}
+	t.Cleanup(func() {
+		if conn.Context().Err() == nil {
+			if err := conn.CloseWithError(0, ""); err != nil {
+				t.Errorf("close connection: %v", err)
+			}
+		}
+	})
+	if err := waitH3FaultControl(ctx, conn); err != nil {
+		t.Fatalf("control stream: %v", err)
+		return nil
+	}
+	return &h3FaultProbe{server: server, udp: udp}
+}
+
+func waitH3FaultControl(ctx context.Context, conn *quic.Conn) error {
+	stream, err := conn.AcceptUniStream(ctx)
+	if err != nil {
+		return fmt.Errorf("accept: %w", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("control stream needs a deadline")
+	}
+	if err := stream.SetReadDeadline(deadline); err != nil {
+		return fmt.Errorf("set read deadline: %w", err)
+	}
+	kind, err := quicvarint.Read(quicvarint.NewReader(stream))
+	if err != nil {
+		return fmt.Errorf("read stream type: %w", err)
+	}
+	if kind != 0 {
+		return fmt.Errorf("stream type %d, want control stream", kind)
+	}
+	return nil
+}
+
+func TestH3ServeAndShutdownFaultsMap(t *testing.T) {
+	t.Run("UDP listen cause names address", testH3UDPListenFault)
+	t.Run("serve retains its cause", testH3ServeFault)
+	t.Run("shutdown retains its cause", testH3ShutdownFault)
+}
+
+func testH3UDPListenFault(t *testing.T) {
+	occupied, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy UDP: %v", err)
+		return
+	}
+	defer func() {
+		if err := occupied.Close(); err != nil {
+			t.Errorf("close occupied UDP: %v", err)
+		}
+	}()
+	addr := occupied.LocalAddr().String()
+	server := &http3.Server{Addr: addr, Router: web.NewRouter(), TLS: &tls.Config{}, H3: true, ShutdownGrace: time.Second}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = server.Start(ctx)
+	if err == nil {
+		if stopErr := server.Stop(ctx); stopErr != nil {
+			t.Errorf("stop unexpected server: %v", stopErr)
+		}
+		t.Fatal("start succeeded on occupied UDP port")
+		return
+	}
+	if !errors.Is(err, http3.ErrListenUDP) || !errors.Is(err, syscall.EADDRINUSE) || !strings.Contains(err.Error(), addr) {
+		t.Errorf("start error = %v, want UDP fault, address %s and address-in-use cause", err, addr)
+	}
+}
+
+func testH3ServeFault(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	probe := startH3FaultProbe(ctx, t)
+	if probe == nil {
+		return
+	}
+	if err := probe.udp.Close(); err != nil {
+		t.Fatalf("close UDP: %v", err)
+		return
+	}
+	serveErr := probe.server.WaitH3ServeForTest(ctx)
+	if !errors.Is(serveErr, http3.ErrH3Serve) || !errors.Is(serveErr, net.ErrClosed) {
+		t.Fatalf("serve error = %v, want H3 serve fault and closed socket cause", serveErr)
+		return
+	}
+	var readErr *net.OpError?
+	if !errors.As(serveErr, &readErr) {
+		t.Fatalf("serve error = %v, want socket read cause", serveErr)
+		return
+	}
+	cause := readErr
+	if cause == nil {
+		t.Fatal("serve read cause is nil")
+		return
+	}
+	if !errors.Is(cause, net.ErrClosed) {
+		t.Fatalf("serve read cause = %v, want closed socket", cause)
+		return
+	}
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer stopCancel()
+	stopErr := probe.server.Stop(stopCtx)
+	if !errors.Is(stopErr, http3.ErrH3Serve) || !errors.Is(stopErr, cause) {
+		t.Errorf("stop error = %v, want H3 serve fault and original read cause %v", stopErr, cause)
+	}
+}
+
+func testH3ShutdownFault(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	probe := startH3FaultProbe(ctx, t)
+	if probe == nil {
+		return
+	}
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer stopCancel()
+	stopErr := probe.server.Stop(stopCtx)
+	if !errors.Is(stopErr, http3.ErrH3Shutdown) || !errors.Is(stopErr, context.DeadlineExceeded) || stopCtx.Err() != nil {
+		t.Errorf("stop error = %v, outer context = %v, want H3 shutdown fault and grace deadline cause", stopErr, stopCtx.Err())
+	}
+}
+var errH3UDPSecondClose = errors.New("http3 test: injected second udp close fault")
+
+type h3SecondCloseUDP struct {
+	net.PacketConn
+	mu     stdsync.Mutex
+	closes int
+}
+
+func (c *h3SecondCloseUDP) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closes++
+	if c.closes > 1 {
+		return errH3UDPSecondClose
+	}
+	return c.PacketConn.Close()
+}
+
+func (c *h3SecondCloseUDP) closesSoFar() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closes
+}
+
+func startH3WrappedUDPProbe(ctx context.Context, t *testing.T, udp net.PacketConn) *http3.Server? {
+	t.Helper()
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return nil
+	}
+	listener, err := net.Listen("tcp", udp.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("listen TCP: %v", err)
+		return nil
+	}
+	server := &http3.Server{Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true, ShutdownGrace: 20 * time.Millisecond}
+	if serr := server.Serve(ctx, listener, udp); serr != nil {
+		closeErr := errors.Join(listener.Close(), udp.Close())
+		t.Fatalf("serve: %v; close listeners: %v", serr, closeErr)
+		return nil
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stopCancel()
+		if serr := server.Stop(stopCtx); serr != nil {
+			t.Errorf("cleanup stop: %v", serr)
+		}
+	})
+	clientTLS := &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}}
+	conn, derr := quic.DialAddr(ctx, udp.LocalAddr().String(), clientTLS, &quic.Config{})
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+		return nil
+	}
+	t.Cleanup(func() {
+		if conn.Context().Err() == nil {
+			if cerr := conn.CloseWithError(0, ""); cerr != nil {
+				t.Errorf("close connection: %v", cerr)
+			}
+		}
+	})
+	if cerr := waitH3FaultControl(ctx, conn); cerr != nil {
+		t.Fatalf("control stream: %v", cerr)
+		return nil
+	}
+	return server
+}
+
+func TestH3UDPSecondCloseSentinel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	real, lerr := net.ListenPacket("udp", "127.0.0.1:0")
+	if lerr != nil {
+		t.Fatalf("listen UDP: %v", lerr)
+		return
+	}
+	t.Cleanup(func() {
+		if cerr := real.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("cleanup UDP: %v", cerr)
+		}
+	})
+	wrapped := &h3SecondCloseUDP{PacketConn: real}
+	server := startH3WrappedUDPProbe(ctx, t, wrapped)
+	if server == nil {
+		return
+	}
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer stopCancel()
+	stopErr := server.Stop(stopCtx)
+	if !errors.Is(stopErr, errH3UDPSecondClose) || !errors.Is(stopErr, http3.ErrListenUDP) {
+		t.Errorf("stop error = %v, want the second-close sentinel %v retained under ErrListenUDP", stopErr, errH3UDPSecondClose)
+	}
+	if stopCtx.Err() != nil {
+		t.Errorf("stop context = %v, want stop to finish inside its budget", stopCtx.Err())
+	}
+	if closes := wrapped.closesSoFar(); closes < 2 {
+		t.Errorf("udp close calls = %d, want a transport close before the server's own close", closes)
+	}
+	if err := real.Close(); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("real udp close after stop = %v, want net.ErrClosed from a socket the wrapper closed", err)
+	}
+}

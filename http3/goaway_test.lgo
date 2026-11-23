@@ -1,0 +1,210 @@
+package http3_test
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/internal/http3peer"
+	"github.com/gosuda/spira/web"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
+)
+
+type h3GoAwayProbe struct {
+	server   *http3.Server
+	client   http.RoundTripper
+	conn     *quic.Conn
+	control  quicvarint.Reader
+	slow     *h3SlowProbe
+	finished chan struct{}
+	url      string
+}
+
+func h3ControlStream(ctx context.Context, conn *quic.Conn) (quicvarint.Reader, error) {
+	deadline, _ := ctx.Deadline()
+	for {
+		stream, err := conn.AcceptUniStream(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("accept control stream: %w", err)
+		}
+		if err := stream.SetReadDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("set control deadline: %w", err)
+		}
+		reader := quicvarint.NewReader(stream)
+		kind, err := quicvarint.Read(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read stream type: %w", err)
+		}
+		if kind != 0 {
+			continue
+		}
+		return reader, nil
+	}
+}
+
+func readH3Settings(reader quicvarint.Reader) (bool, error) {
+	frame, err := quicvarint.Read(reader)
+	if err != nil {
+		return false, fmt.Errorf("read SETTINGS frame type: %w", err)
+	}
+	if frame != 4 {
+		return false, fmt.Errorf("first control frame %d, want SETTINGS", frame)
+	}
+	size, err := quicvarint.Read(reader)
+	if err != nil {
+		return false, fmt.Errorf("read SETTINGS size: %w", err)
+	}
+	payload := &io.LimitedReader{R: reader, N: int64(size)}
+	settings := quicvarint.NewReader(payload)
+	hasDatagrams := false
+	for payload.N > 0 {
+		id, err := quicvarint.Read(settings)
+		if err != nil {
+			return false, fmt.Errorf("read SETTINGS id: %w", err)
+		}
+		if _, err := quicvarint.Read(settings); err != nil {
+			return false, fmt.Errorf("read SETTINGS value: %w", err)
+		}
+		hasDatagrams = hasDatagrams || id == 0x33
+	}
+	return hasDatagrams, nil
+}
+
+func fetchH3GoAway(ctx context.Context, p *h3GoAwayProbe) error {
+	defer close(p.finished)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	resp, err := p.client.RoundTrip(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	_, readErr := io.Copy(io.Discard, resp.Body)
+	closeErr := resp.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("response status %d, want 204", resp.StatusCode)
+	}
+	return p.conn.CloseWithError(0, "")
+}
+
+func stopH3ForGoAway(ctx context.Context, p *h3GoAwayProbe) error {
+	if err := waitH3Entered(ctx, p.slow.entered); err != nil {
+		return err
+	}
+	return p.server.Stop(ctx)
+}
+
+func observeH3GoAway(ctx context.Context, p *h3GoAwayProbe) error {
+	defer close(p.slow.release)
+	if err := waitH3Entered(ctx, p.slow.entered); err != nil {
+		return err
+	}
+	if err := readH3GoAway(p.control); err != nil {
+		return err
+	}
+	select {
+	case <-p.finished:
+		return errors.New("request finished before GOAWAY")
+	default:
+		return nil
+	}
+}
+
+func readH3GoAway(reader quicvarint.Reader) error {
+	for {
+		frame, err := quicvarint.Read(reader)
+		if err != nil {
+			return fmt.Errorf("read control frame: %w", err)
+		}
+		size, err := quicvarint.Read(reader)
+		if err != nil {
+			return fmt.Errorf("read control frame size: %w", err)
+		}
+		if frame == 7 {
+			return checkH3GoAway(reader, size)
+		}
+		if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
+			return fmt.Errorf("skip control frame: %w", err)
+		}
+	}
+}
+
+func checkH3GoAway(reader quicvarint.Reader, size uint64) error {
+	if size == 0 || size > 8 {
+		return fmt.Errorf("invalid GOAWAY size %d", size)
+	}
+	var payload [8]byte
+	if _, err := io.ReadFull(reader, payload[:size]); err != nil {
+		return fmt.Errorf("read GOAWAY payload: %w", err)
+	}
+	id, used, err := quicvarint.Parse(payload[:size])
+	if err != nil || uint64(used) != size || id%4 != 0 {
+		return fmt.Errorf("invalid GOAWAY stream ID %d", id)
+	}
+	return nil
+}
+
+func driveH3GoAway(ctx context.Context, p *h3GoAwayProbe) error {
+	go group (ctx) {
+		go fetchH3GoAway(ctx, p)
+		go stopH3ForGoAway(ctx, p)
+		go observeH3GoAway(ctx, p)
+	}
+	return nil
+}
+
+func TestH3StopSendsGOAWAYBeforeDrain(t *testing.T) {
+	router := web.NewRouter()
+	slow := &h3SlowProbe{entered: make(chan struct{}), release: make(chan struct{})}
+	router.Handle("GET", "/slow", h3SlowHandler(slow))
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	server := startH3Server(t, router, cert, 10*time.Second)
+	if server == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	addr := server.BoundUDPAddrForTest()
+	clientTLS := &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}}
+	conn, err := quic.DialAddr(ctx, addr, clientTLS, &quic.Config{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		return
+	}
+	defer func() {
+		if conn.Context().Err() == nil {
+			if err := conn.CloseWithError(0, ""); err != nil {
+				t.Errorf("close connection: %v", err)
+			}
+		}
+	}()
+	client := http3peer.NewRawClientConn(conn)
+	control, err := h3ControlStream(ctx, conn)
+	if err != nil {
+		t.Fatalf("control stream: %v", err)
+		return
+	}
+	if _, err := readH3Settings(control); err != nil {
+		t.Fatalf("SETTINGS: %v", err)
+		return
+	}
+	probe := &h3GoAwayProbe{server: server, client: client, conn: conn, control: control, slow: slow, finished: make(chan struct{}), url: "https://" + addr + "/slow"}
+	if err := driveH3GoAway(ctx, probe); err != nil {
+		t.Fatalf("GOAWAY before drain: %v", err)
+	}
+}

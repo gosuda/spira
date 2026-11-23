@@ -1,0 +1,538 @@
+package http3
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/quic-go/qpack"
+)
+
+type h3ResponseTestStream struct {
+	bytes.Buffer
+	writeLimit    int
+	readDeadline  time.Time
+	writeDeadline time.Time
+	deadlineError error
+}
+
+func (s *h3ResponseTestStream) Write(p []byte) (int, error) {
+	if s.writeLimit >= 0 && len(p) > s.writeLimit {
+		p = p[:s.writeLimit]
+	}
+	return s.Buffer.Write(p)
+}
+
+func (s *h3ResponseTestStream) SetReadDeadline(deadline time.Time) error {
+	s.readDeadline = deadline
+	return s.deadlineError
+}
+
+func (s *h3ResponseTestStream) SetWriteDeadline(deadline time.Time) error {
+	s.writeDeadline = deadline
+	return s.deadlineError
+}
+
+func h3ResponseFixture(method string, limit uint64) (*h3ResponseWriter, *h3ResponseTestStream) {
+	sink := &h3ResponseTestStream{writeLimit: -1}
+	w := newH3ResponseWriter(sink, method, limit)
+	w.Header()["Date"] = nil
+	return w, sink
+}
+
+func h3ReadResponseTestVarint(t *testing.T, wire *bytes.Reader) uint64 {
+	t.Helper()
+	first, err := wire.ReadByte()
+	if err != nil {
+		t.Fatalf("read frame varint: %v", err)
+	}
+	width := 1 << (first >> 6)
+	value := uint64(first & 63)
+	for range width - 1 {
+		b, err := wire.ReadByte()
+		if err != nil {
+			t.Fatalf("read frame varint continuation: %v", err)
+		}
+		value = value<<8 | uint64(b)
+	}
+	return value
+}
+
+func h3ReadResponseTestFrame(t *testing.T, wire *bytes.Reader, wantKind uint64) []byte {
+	t.Helper()
+	kind := h3ReadResponseTestVarint(t, wire)
+	if kind != wantKind {
+		t.Fatalf("frame kind = %#x, want %#x", kind, wantKind)
+	}
+	length := h3ReadResponseTestVarint(t, wire)
+	if length > uint64(wire.Len()) {
+		t.Fatalf("frame declares %d bytes, only %d left", length, wire.Len())
+	}
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(wire, payload); err != nil {
+		t.Fatalf("read frame payload: %v", err)
+	}
+	return payload
+}
+
+func h3ExpectResponseFields(t *testing.T, wire *bytes.Reader, want map[string][]string) {
+	t.Helper()
+	payload := h3ReadResponseTestFrame(t, wire, 0x1)
+	next := qpack.NewDecoder().Decode(payload)
+	got := make(map[string][]string)
+	for i := 0; ; i++ {
+		field, err := next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode QPACK: %v", err)
+			return
+		}
+		if _, status := want[":status"]; status && i == 0 && field.Name != ":status" {
+			t.Fatalf("first field = %q, want :status", field.Name)
+		}
+		values, _ := got[field.Name]
+		got[field.Name] = append(values, field.Value)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("QPACK fields = %v, want %v", got, want)
+	}
+	for key, values := range want {
+		actual, ok := got[key]
+		if !ok || !slices.Equal(actual, values) {
+			t.Fatalf("QPACK fields = %v, want %v", got, want)
+		}
+	}
+}
+
+func h3ExpectResponseData(t *testing.T, wire *bytes.Reader, want string) {
+	t.Helper()
+	if actual := string(h3ReadResponseTestFrame(t, wire, 0x0)); actual != want {
+		t.Fatalf("DATA = %q, want %q", actual, want)
+	}
+}
+
+func h3ExpectNoResponseFrames(t *testing.T, wire *bytes.Reader) {
+	t.Helper()
+	if wire.Len() != 0 {
+		t.Fatalf("%d unexpected wire bytes", wire.Len())
+	}
+}
+
+func h3WriteResponseTestBody(t *testing.T, w http.ResponseWriter, body string) {
+	t.Helper()
+	n, err := w.Write([]byte(body))
+	if err != nil || n != len(body) {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(body))
+	}
+}
+
+func h3FinishResponseTest(t *testing.T, w *h3ResponseWriter) {
+	t.Helper()
+	if err := w.finish(); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+}
+
+func TestH3ResponseWriterStreamsFinalAfterInformational(t *testing.T) {
+	w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+	h := w.Header()
+	h.Set("Link", "</style.css>; rel=preload")
+	w.WriteHeader(http.StatusEarlyHints)
+	h.Del("Link")
+	w.WriteHeader(http.StatusProcessing)
+	wire := bytes.NewReader(sink.Bytes())
+	h3ExpectResponseFields(t, wire, map[string][]string{":status": {"103"}, "link": {"</style.css>; rel=preload"}})
+	h3ExpectResponseFields(t, wire, map[string][]string{":status": {"102"}})
+	h3ExpectNoResponseFrames(t, wire)
+	sink.Reset()
+
+	h.Set("X-Frozen", "before")
+	w.WriteHeader(http.StatusCreated)
+	h.Set("X-Frozen", "after")
+	w.WriteHeader(http.StatusInternalServerError)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		t.Fatal(err)
+	}
+	wire = bytes.NewReader(sink.Bytes())
+	h3ExpectResponseFields(t, wire, map[string][]string{":status": {"201"}, "x-frozen": {"before"}})
+	h3ExpectNoResponseFrames(t, wire)
+	sink.Reset()
+
+	large := strings.Repeat("a", 80)
+	h3WriteResponseTestBody(t, w, large)
+	w.Flush()
+	h3WriteResponseTestBody(t, w, "next")
+	wire = bytes.NewReader(sink.Bytes())
+	h3ExpectResponseData(t, wire, large)
+	h3ExpectResponseData(t, wire, "next")
+	h3ExpectNoResponseFrames(t, wire)
+	sink.Reset()
+	h3FinishResponseTest(t, w)
+	h3FinishResponseTest(t, w)
+	if sink.Len() != 0 {
+		t.Fatalf("finish added %d bytes after all frames were sent", sink.Len())
+	}
+}
+
+func TestH3ResponseWriterContentType(t *testing.T) {
+	t.Run("sniff", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		h3WriteResponseTestBody(t, w, "<html>hello")
+		h3FinishResponseTest(t, w)
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "content-type": {"text/html; charset=utf-8"}})
+		h3ExpectResponseData(t, wire, "<html>hello")
+		h3ExpectNoResponseFrames(t, wire)
+	})
+	t.Run("encoding", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.Header().Set("Content-Encoding", "gzip")
+		h3WriteResponseTestBody(t, w, "encoded")
+		h3FinishResponseTest(t, w)
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "content-encoding": {"gzip"}})
+		h3ExpectResponseData(t, wire, "encoded")
+		h3ExpectNoResponseFrames(t, wire)
+	})
+}
+
+func TestH3ResponseWriterBodyRules(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		status int
+		want   map[string][]string
+	}{
+		{"HEAD", http.MethodHead, 200, map[string][]string{":status": {"200"}, "content-length": {"20"}}},
+		{"204", http.MethodGet, 204, map[string][]string{":status": {"204"}}},
+		{"304", http.MethodGet, 304, map[string][]string{":status": {"304"}, "content-length": {"20"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, sink := h3ResponseFixture(tc.method, ^uint64(0))
+			w.Header().Set("Content-Length", "20")
+			w.Header()["Content-Type"] = nil
+			w.Header().Set("Trailer", "X-Final")
+			w.WriteHeader(tc.status)
+			w.Header().Set("X-Final", "value")
+			if tc.method == http.MethodHead {
+				h3WriteResponseTestBody(t, w, "omitted")
+			} else {
+				var writer http.ResponseWriter = w
+				n, err := writer.Write([]byte("omitted"))
+				if n != 0 || !errors.Is(err, http.ErrBodyNotAllowed) {
+					t.Fatalf("body-forbidden Write = (%d, %v)", n, err)
+				}
+			}
+			h3FinishResponseTest(t, w)
+			wire := bytes.NewReader(sink.Bytes())
+			h3ExpectResponseFields(t, wire, tc.want)
+			h3ExpectNoResponseFrames(t, wire)
+		})
+	}
+}
+
+func TestH3ResponseWriterConnectWritesTunnelData(t *testing.T) {
+	w, sink := h3ResponseFixture(http.MethodConnect, ^uint64(0))
+	w.Header().Set("Content-Length", "0")
+	w.Header().Set("Trailer", "X-Final")
+	w.WriteHeader(http.StatusOK)
+	controller := http.NewResponseController(w)
+	if err := controller.EnableFullDuplex(); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	h3WriteResponseTestBody(t, w, "tunnel bytes")
+	h3FinishResponseTest(t, w)
+	wire := bytes.NewReader(sink.Bytes())
+	h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}})
+	h3ExpectResponseData(t, wire, "tunnel bytes")
+	h3ExpectNoResponseFrames(t, wire)
+}
+
+func TestH3ResponseWriterAcceptsUnregisteredFinalStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		wire   string
+	}{{600, "600"}, {999, "999"}} {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.WriteHeader(tc.status)
+		w.WriteHeader(http.StatusOK)
+		h3FinishResponseTest(t, w)
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {tc.wire}})
+		h3ExpectNoResponseFrames(t, wire)
+	}
+}
+
+func TestH3ResponseWriterRejectsInvalidStatus(t *testing.T) {
+	for _, status := range []int{99, 101, 1000} {
+		func() {
+			w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+			defer func() {
+				if recover() == nil || sink.Len() != 0 {
+					t.Errorf("invalid status %d did not panic before writing", status)
+				}
+			}()
+			w.WriteHeader(status)
+		}()
+	}
+}
+
+func TestH3ResponseWriterContentLength(t *testing.T) {
+	t.Run("bounds", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.Header().Add("Content-Length", "3, 03")
+		w.Header()["Content-Type"] = nil
+		var writer http.ResponseWriter = w
+		if n, err := writer.Write([]byte("long")); n != 0 || !errors.Is(err, http.ErrContentLength) {
+			t.Fatalf("over-limit Write = (%d, %v)", n, err)
+		}
+		h3WriteResponseTestBody(t, w, "abc")
+		h3FinishResponseTest(t, w)
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "content-length": {"3"}})
+		h3ExpectResponseData(t, wire, "abc")
+		h3ExpectNoResponseFrames(t, wire)
+	})
+	t.Run("explicit-zero", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.Header().Set("Content-Length", "0")
+		if _, err := w.Write([]byte("x")); !errors.Is(err, http.ErrContentLength) {
+			t.Fatalf("Write with zero Content-Length: %v", err)
+		}
+		h3FinishResponseTest(t, w)
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "content-length": {"0"}})
+		h3ExpectNoResponseFrames(t, wire)
+	})
+	t.Run("mismatch-after-data", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.Header().Set("Content-Length", "3")
+		w.Header()["Content-Type"] = nil
+		h3WriteResponseTestBody(t, w, "ab")
+		for range 2 {
+			if err := w.finish(); !errors.Is(err, http.ErrContentLength) {
+				t.Fatalf("finish with too little data: %v", err)
+			}
+		}
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "content-length": {"3"}})
+		h3ExpectResponseData(t, wire, "ab")
+		h3ExpectNoResponseFrames(t, wire)
+	})
+	t.Run("mismatch-before-output", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.Header().Set("Content-Length", "3")
+		if err := w.finish(); !errors.Is(err, http.ErrContentLength) || sink.Len() != 0 {
+			t.Fatalf("finish with a missing body = %v, wrote %d bytes", err, sink.Len())
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		for _, length := range []string{"-1", "1, 2", "9223372036854775808"} {
+			w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+			w.Header().Set("Content-Length", length)
+			if err := w.finish(); !errors.Is(err, http.ErrContentLength) || sink.Len() != 0 {
+				t.Errorf("Content-Length %q: finish = %v, wrote %d bytes", length, err, sink.Len())
+			}
+		}
+	})
+}
+
+func TestH3ResponseWriterTrailers(t *testing.T) {
+	w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+	h := w.Header()
+	h.Set("Trailer", "X-Final, X-Trace")
+	h.Set("X-Final", "initial placeholder")
+	h.Set("Content-Type", "text/plain")
+	h3WriteResponseTestBody(t, w, "body")
+	h.Set("X-Final", "done")
+	h.Add("X-Trace", "one")
+	h.Add("X-Trace", "two")
+	h.Set(http.TrailerPrefix+"X-Late", "late")
+	h3FinishResponseTest(t, w)
+	h3FinishResponseTest(t, w)
+	wire := bytes.NewReader(sink.Bytes())
+	h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "trailer": {"X-Final, X-Trace"}, "content-type": {"text/plain"}})
+	h3ExpectResponseData(t, wire, "body")
+	h3ExpectResponseFields(t, wire, map[string][]string{"x-final": {"done"}, "x-trace": {"one", "two"}, "x-late": {"late"}})
+	h3ExpectNoResponseFrames(t, wire)
+}
+
+func TestH3ResponseWriterWriteFailures(t *testing.T) {
+	t.Run("short-data", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		if err := w.FlushError(); err != nil {
+			t.Fatal(err)
+		}
+		sink.Reset()
+		sink.writeLimit = 2
+		var writer http.ResponseWriter = w
+		n, err := writer.Write([]byte("abcde"))
+		if n != 2 || !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("short DATA Write = (%d, %v)", n, err)
+		}
+		if err := w.FlushError(); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("FlushError did not retain short write: %v", err)
+		}
+		if err := w.finish(); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("finish did not retain short write: %v", err)
+		}
+		if !bytes.Equal(sink.Bytes(), []byte{0x0, 5, 'a', 'b'}) {
+			t.Fatalf("partial DATA wire = %x", sink.Bytes())
+		}
+	})
+	t.Run("informational-io", func(t *testing.T) {
+		local, peer := net.Pipe()
+		t.Cleanup(func() {
+			if err := local.Close(); err != nil {
+				t.Errorf("close local pipe: %v", err)
+			}
+		})
+		if err := peer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		w := newH3ResponseWriter(local, http.MethodGet, ^uint64(0))
+		w.WriteHeader(http.StatusEarlyHints)
+		var writer http.ResponseWriter = w
+		if n, err := writer.Write([]byte("body")); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("Write did not retain informational I/O error: (%d, %v)", n, err)
+		}
+		if err := w.finish(); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("finish did not retain informational I/O error: %v", err)
+		}
+	})
+}
+
+func TestH3ResponseWriterFlushRetainsWireError(t *testing.T) {
+	w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+	sink.writeLimit = 1
+	var flusher http.Flusher = w
+	flusher.Flush()
+	if err := w.finish(); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("finish after short Flush: %v", err)
+	}
+	if !bytes.Equal(sink.Bytes(), []byte{0x1}) {
+		t.Fatalf("partial HEADERS wire = %x", sink.Bytes())
+	}
+}
+
+func TestH3ResponseWriterDeadlineForwarding(t *testing.T) {
+	w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+	controller := http.NewResponseController(w)
+	read := time.Unix(100, 0)
+	if err := controller.SetReadDeadline(read); err != nil || !sink.readDeadline.Equal(read) {
+		t.Fatalf("read deadline = (%v, %v), want %v", sink.readDeadline, err, read)
+	}
+	write := time.Unix(200, 0)
+	sink.deadlineError = net.ErrClosed
+	if err := controller.SetWriteDeadline(write); !errors.Is(err, net.ErrClosed) || !sink.writeDeadline.Equal(write) {
+		t.Fatalf("write deadline = (%v, %v), want (%v, net.ErrClosed)", sink.writeDeadline, err, write)
+	}
+	sink.deadlineError = nil
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil || !sink.writeDeadline.IsZero() {
+		t.Fatalf("clearing write deadline = (%v, %v)", sink.writeDeadline, err)
+	}
+}
+
+func TestH3ResponseWriterFieldLimits(t *testing.T) {
+	t.Run("final-section", func(t *testing.T) {
+		const exact = 42 + 2*(1+1+32)
+		for _, limit := range []uint64{0, exact - 1, exact, ^uint64(0)} {
+			w, sink := h3ResponseFixture(http.MethodGet, limit)
+			w.Header().Add("X", "a")
+			w.Header().Add("X", "b")
+			err := w.finish()
+			if limit < exact {
+				if err == nil || !strings.Contains(err.Error(), "field section exceeds peer limit") || sink.Len() != 0 {
+					t.Errorf("limit %d: finish = %v, wrote %d bytes", limit, err, sink.Len())
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("limit %d: %v", limit, err)
+			}
+			wire := bytes.NewReader(sink.Bytes())
+			h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "x": {"a", "b"}})
+			h3ExpectNoResponseFrames(t, wire)
+		}
+	})
+	t.Run("sniffed-field", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, 42)
+		if _, err := w.Write([]byte("x")); err == nil || !strings.Contains(err.Error(), "field section exceeds peer limit") || sink.Len() != 0 {
+			t.Fatalf("sniff over limit: Write = %v, wrote %d bytes", err, sink.Len())
+		}
+	})
+	t.Run("trailer-section", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, 86)
+		w.Header().Set("Trailer", "X-End")
+		if err := w.FlushError(); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("X-End", strings.Repeat("x", 50))
+		if err := w.finish(); err == nil || !strings.Contains(err.Error(), "field section exceeds peer limit") {
+			t.Fatalf("trailer over limit: finish = %v", err)
+		}
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "trailer": {"X-End"}})
+		h3ExpectNoResponseFrames(t, wire)
+	})
+}
+
+func TestH3ResponseWriterValidatesAndFiltersFields(t *testing.T) {
+	t.Run("connection-fields", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		h := w.Header()
+		h["cOnNeCtIoN"] = []string{"X-Private, Keep-Alive"}
+		h.Set("X-Private", "private")
+		h.Set("Keep-Alive", "timeout=5")
+		h.Set("Proxy-Connection", "close")
+		h.Set("TE", "trailers")
+		h.Set("Transfer-Encoding", "chunked")
+		h.Set("Upgrade", "websocket")
+		h.Set("X-Public", "\t keep \t")
+		h3FinishResponseTest(t, w)
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "x-public": {"keep"}})
+		h3ExpectNoResponseFrames(t, wire)
+	})
+	t.Run("bad-initial-fields", func(t *testing.T) {
+		cases := []struct{ key, value, problem string }{
+			{"X-Bad Key", "value", "invalid response field name"},
+			{":status", "201", "invalid response field name"},
+			{"X-Bad", "value\r\nnot-a-field", "invalid response field value"},
+			{"Trailer", "Content-Length", "invalid response trailer name"},
+		}
+		for _, tc := range cases {
+			w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+			w.Header()[tc.key] = []string{tc.value}
+			if err := w.finish(); err == nil || !strings.Contains(err.Error(), tc.problem) || sink.Len() != 0 {
+				t.Errorf("invalid %q: finish = %v, wrote %d bytes", tc.key, err, sink.Len())
+			}
+		}
+	})
+	t.Run("bad-trailer-value", func(t *testing.T) {
+		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
+		w.Header().Set("Trailer", "X-End")
+		if err := w.FlushError(); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("X-End", "bad\x00byte")
+		if err := w.finish(); err == nil || !strings.Contains(err.Error(), "invalid response field value") {
+			t.Fatalf("invalid trailer: finish = %v", err)
+		}
+		wire := bytes.NewReader(sink.Bytes())
+		h3ExpectResponseFields(t, wire, map[string][]string{":status": {"200"}, "trailer": {"X-End"}})
+		h3ExpectNoResponseFrames(t, wire)
+	})
+}
