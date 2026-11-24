@@ -54,7 +54,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - For `mssql`, the test MUST read `SPIRA_TEST_MSSQL_DSN`.
 - The login handler MUST call `auth.VerifyAgainstDummy` when the user is missing.
 - A missing user and a wrong password MUST answer `auth.invalid_credentials`.
-- The account handlers MUST NOT call `web.Fail` with a literal problem.
+- The account handlers MUST return a declared fault.
 - A bad session user id MUST wrap the account fault.
 - `main.lgo` MUST seed the user `demo` only when `SPIRA_SEED_DEMO_PASSWORD` is set and not empty.
 - The seed MUST give the user `demo` the value of `SPIRA_SEED_DEMO_PASSWORD` as its password.
