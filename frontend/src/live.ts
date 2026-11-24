@@ -3,6 +3,26 @@ import htmx, { type HtmxSwapSpecification } from "htmx.org";
 const regionSelector = "[data-live-region]";
 const toggleSelector = "[data-live-region] button[data-live-toggle]";
 
+function soleOuterSwap(owner: Document, data: unknown): Element | null {
+	if (typeof data !== "string") {
+		return null;
+	}
+	const template = owner.createElement("template");
+	template.innerHTML = data;
+	const { content } = template;
+	const update = content.firstElementChild;
+	if (
+		content.childElementCount !== 1 ||
+		!update?.matches('[hx-swap-oob="outerHTML"]') ||
+		update.id === "" ||
+		content.textContent?.trim() !== update.textContent?.trim() ||
+		update.querySelector("[hx-swap-oob], [data-hx-swap-oob], template") !== null
+	) {
+		return null;
+	}
+	return update;
+}
+
 function isFilteredStockUpdate(event: Event, region: Element): boolean {
 	if (
 		region.getAttribute("data-live-region") !== "stock" ||
@@ -11,25 +31,11 @@ function isFilteredStockUpdate(event: Event, region: Element): boolean {
 		return false;
 	}
 	const { detail } = event;
-	if (
-		!(detail instanceof MessageEvent) ||
-		detail.type !== "stock" ||
-		typeof detail.data !== "string"
-	) {
+	if (!(detail instanceof MessageEvent) || detail.type !== "stock") {
 		return false;
 	}
-
-	const template = region.ownerDocument.createElement("template");
-	template.innerHTML = detail.data;
-	const { content } = template;
-	const update = content.firstElementChild;
-	if (
-		content.childElementCount !== 1 ||
-		!update?.matches('span[hx-swap-oob="outerHTML"]') ||
-		!/^stock-[0-9]+$/.test(update.id) ||
-		content.textContent?.trim() !== update.textContent?.trim() ||
-		update.querySelector("[hx-swap-oob], [data-hx-swap-oob], template") !== null
-	) {
+	const update = soleOuterSwap(region.ownerDocument, detail.data);
+	if (!update?.matches("span") || !/^stock-[0-9]+$/.test(update.id)) {
 		return false;
 	}
 	const target = region.ownerDocument.getElementById(update.id);
@@ -40,7 +46,7 @@ export function installLiveUpdates(): void {
 	const pausedRegions = new WeakSet<Element>();
 	const retainedUpdates = new WeakMap<
 		Element,
-		Array<{ target: Element; message: MessageEvent }>
+		Array<{ key: string | undefined; target: Element; message: MessageEvent }>
 	>();
 	const maxRetainedUpdates = 128;
 
@@ -50,7 +56,13 @@ export function installLiveUpdates(): void {
 		message: MessageEvent,
 	): void {
 		const kept = retainedUpdates.get(region) ?? [];
-		kept.push({ target, message });
+		const key = soleOuterSwap(region.ownerDocument, message.data)?.id;
+		const superseded =
+			key === undefined ? -1 : kept.findIndex((update) => update.key === key);
+		if (superseded !== -1) {
+			kept.splice(superseded, 1);
+		}
+		kept.push({ key, target, message });
 		if (kept.length > maxRetainedUpdates) {
 			kept.shift();
 		}

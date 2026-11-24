@@ -180,3 +180,28 @@ test("resume replays the bare dashboard row paused in the region", async () => {
 		swapSpy.mockRestore();
 	}
 });
+
+test("resume applies an instance update that a busier instance outlasts", () => {
+	const cart = document.createElement("span");
+	cart.id = "cart-status";
+	cart.textContent = "up";
+	fixtureElement("shop-status").after(cart);
+	const toggle = adminToggle();
+	toggle.click();
+	dispatchMessage(
+		"admin-sink",
+		"instance",
+		'<span id="shop-status" hx-swap-oob="outerHTML">down</span>',
+	);
+	for (let i = 0; i < 200; i++) {
+		const status = i % 2 === 0 ? "up" : "down";
+		dispatchMessage(
+			"admin-sink",
+			"instance",
+			`<span id="cart-status" hx-swap-oob="outerHTML">${status}</span>`,
+		);
+	}
+	toggle.click();
+	expect(fixtureElement("shop-status").textContent).toBe("down");
+	expect(fixtureElement("cart-status").textContent).toBe("down");
+});
