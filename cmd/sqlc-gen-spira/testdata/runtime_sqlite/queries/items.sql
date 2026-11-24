@@ -29,3 +29,11 @@ WHERE id >= sqlc.arg('anchor_id')
   AND name <> '?12' /* ?23 is not a bind */
   AND name <> sqlc.arg('omit_name')
 ORDER BY id DESC;
+
+-- name: FilterItemsAroundSlice :many
+SELECT id, name
+FROM items
+WHERE id >= ?
+  AND id IN (sqlc.slice('ids'))
+  AND name <> ?
+ORDER BY id DESC;
