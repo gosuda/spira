@@ -167,12 +167,15 @@ test("resume replays the bare dashboard row paused in the region", async () => {
 		swapSpy.mockClear();
 		toggle.click();
 		expect(toggle.getAttribute("aria-pressed")).toBe("false");
-		const calls = swapSpy.mock.calls.filter(
-			(call) =>
-				typeof call[1] === "string" &&
-				(call[1] as string).includes('id="instance-shop"'),
+		expect(swapSpy).toHaveBeenCalledExactlyOnceWith(
+			fixtureElement("admin-sink"),
+			down,
+			{
+				swapStyle: "none",
+				swapDelay: htmx.config.defaultSwapDelay,
+				settleDelay: htmx.config.defaultSettleDelay,
+			},
 		);
-		expect(calls.length).toBe(1);
 	} finally {
 		swapSpy.mockRestore();
 	}
