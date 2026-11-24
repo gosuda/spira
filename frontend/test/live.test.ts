@@ -205,3 +205,45 @@ test("resume applies an instance update that a busier instance outlasts", () => 
 	expect(fixtureElement("shop-status").textContent).toBe("down");
 	expect(fixtureElement("cart-status").textContent).toBe("down");
 });
+
+test("resume keeps the quiet dashboard row when a busier row outlasts it", async () => {
+	// The overflow case above sends spans, while rowNode in admin/admin.lgo
+	// emits bare tr elements. Retention keeps every message when
+	// soleOuterSwap returns null, so the one-row replay test passes even
+	// without row recognition. This overflow case fails without per-id
+	// coalescing and proves the row ids are recognized.
+	const { default: htmx } = await import("htmx.org");
+	const swapSpy = vi.spyOn(htmx, "swap");
+	try {
+		const toggle = adminToggle();
+		toggle.click();
+		expect(toggle.getAttribute("aria-pressed")).toBe("true");
+		const shopDown =
+			'<tr id="instance-shop" hx-swap-oob="outerHTML"><td>shop</td><td>down</td></tr>';
+		expect(dispatchMessage("admin-sink", "instance", shopDown)).toBe(false);
+		for (let i = 0; i < 200; i++) {
+			const status = i % 2 === 0 ? "up" : "down";
+			expect(
+				dispatchMessage(
+					"admin-sink",
+					"instance",
+					`<tr id="instance-cart" hx-swap-oob="outerHTML"><td>cart</td><td>${status}</td></tr>`,
+				),
+			).toBe(false);
+		}
+		swapSpy.mockClear();
+		toggle.click();
+		expect(toggle.getAttribute("aria-pressed")).toBe("false");
+		expect(swapSpy).toHaveBeenCalledTimes(2);
+		const payloads = swapSpy.mock.calls.map((call) => call[1]);
+		expect(payloads[0]).toBe(shopDown);
+		expect(payloads[1]).toBe(
+			'<tr id="instance-cart" hx-swap-oob="outerHTML"><td>cart</td><td>down</td></tr>',
+		);
+		for (const call of swapSpy.mock.calls) {
+			expect(call[0]).toBe(fixtureElement("admin-sink"));
+		}
+	} finally {
+		swapSpy.mockRestore();
+	}
+});
