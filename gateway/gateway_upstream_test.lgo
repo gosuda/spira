@@ -570,28 +570,77 @@ func TestBodylessPostStopsAfterFirstUpstream(t *testing.T) {
 }
 
 func TestBodylessGetAndDeleteFailOver(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			grd := newRequestGuard(t)
+			hc := grd.httpClient(t)
+			dead := deadUpstream(t)
+			var hits atomic.Int64
+			live := countingUpstream(t, grd, &hits)
+			gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{dead, live.URL}}}, plainPolicy())
+			req, err := http.NewRequest(method, gw.URL+"/shop/x", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := hc.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			readBody(t, resp)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s status=%d want 200 through the live upstream", method, resp.StatusCode)
+			}
+			if hits.Load() != 1 {
+				t.Fatalf("%s: the live upstream saw %d requests, want 1: a bodyless %s must fail over from the dead upstream\n%s", method, hits.Load(), method, grd.report())
+			}
+		})
+	}
+}
+
+func TestBodylessPostSkipsAnOpenBreaker(t *testing.T) {
 	grd := newRequestGuard(t)
 	hc := grd.httpClient(t)
-	dead := deadUpstream(t)
+	var sick atomic.Int64
+	sickUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !grd.admit(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		sick.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(sickUp.Close)
 	var hits atomic.Int64
 	live := countingUpstream(t, grd, &hits)
-	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{dead, live.URL}}}, plainPolicy())
-	for _, method := range []string{http.MethodGet, http.MethodDelete} {
-		req, err := http.NewRequest(method, gw.URL+"/shop/x", nil)
+	brk := resilience.Breaker{Window: 2, FailureRate: 0.5, OpenFor: time.Hour}
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{sickUp.URL, live.URL}}}, resilience.Policy{Timeout: 2 * time.Second, Breaker: &brk})
+	for i := range 4 {
+		resp, err := hc.Get(gw.URL + "/shop/x")
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("request %d: %v", i, err)
 		}
-		resp, err := hc.Do(req)
-		if err != nil {
-			t.Fatal(err)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status=%d want 200", i, resp.StatusCode)
 		}
 		readBody(t, resp)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("%s status=%d want 200 through the live upstream", method, resp.StatusCode)
-		}
 	}
-	if hits.Load() != 2 {
-		t.Fatalf("the live upstream saw %d requests, want 2: a bodyless GET and a bodyless DELETE each fail over\n%s", hits.Load(), grd.report())
+	if sick.Load() != 2 {
+		t.Fatalf("the failing upstream saw %d requests, want 2 before its own breaker opened\n%s", sick.Load(), grd.report())
+	}
+	before := hits.Load()
+	presp, err := hc.Post(gw.URL+"/shop/order", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody(t, presp)
+	if presp.StatusCode != http.StatusOK {
+		t.Fatalf("bodyless POST status=%d want 200 through the live upstream", presp.StatusCode)
+	}
+	if sick.Load() != 2 {
+		t.Fatalf("the failing upstream saw %d requests, want 2: an open breaker refuses without delivery\n%s", sick.Load(), grd.report())
+	}
+	if hits.Load() != before+1 {
+		t.Fatalf("the live upstream saw %d requests, want %d: a bodyless POST must skip the open breaker\n%s", hits.Load(), before+1, grd.report())
 	}
 }
 
