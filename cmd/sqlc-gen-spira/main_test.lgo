@@ -915,6 +915,38 @@ func TestQueryColumnNameThatBreaksTheStructTagIsRefused(t *testing.T) {
 	}
 }
 
+func TestPackageNameThatIsNotAGoIdentifierIsRefused(t *testing.T) {
+	const inject = "store\nfunc init() { panic(1) }"
+	cases := []struct {
+		pkg string
+		out string
+	}{
+		{pkg: inject, out: "gen"},
+		{pkg: "my-store", out: "gen"},
+		{pkg: "type", out: "gen"},
+		{pkg: "_", out: "gen"},
+		{out: "db/" + inject},
+		{out: "db/my-store"},
+	}
+	for _, tc := range cases {
+		req := loadRequest(t, "sqlite")
+		req.Settings.Codegen.Out = tc.out
+		if tc.pkg != "" {
+			req.PluginOptions = pluginOptions(t, map[string]any{"package": tc.pkg})
+		}
+		_, files, err := Generate(req)
+		if err == nil {
+			head, _, _ := strings.Cut(string(files[0].Contents), "\n\nimport")
+			t.Fatalf("Generate accepted package %q with out %q; models.sql.lgo begins %q", tc.pkg, tc.out, head)
+			return
+		}
+		if !strings.Contains(err.Error(), "is not a Go package name") {
+			t.Fatalf("error for package %q with out %q = %v, want substring %q", tc.pkg, tc.out, err, "is not a Go package name")
+			return
+		}
+	}
+}
+
 func sliceFixture(t *testing.T) *Request {
 	t.Helper()
 	req := loadRequest(t, "sqlite")
