@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"go/token"
 	"path"
 	"strconv"
 	"strings"
@@ -39,7 +40,7 @@ func packageName(req *Request, opts *PluginOptions) (string, error) {
 			return "models", nil
 		}
 	}
-	if name == "_" || !isGoIdent(name) {
+	if name == "_" || !token.IsIdentifier(name) {
 		return "", fmt.Errorf("sqlc-gen-spira: package %q is not a Go package name", name)
 	}
 	return name, nil

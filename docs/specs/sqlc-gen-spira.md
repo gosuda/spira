@@ -63,6 +63,12 @@ The plugin writes one JSON object to standard output. The object has one field `
 - `refs` MUST map a column path to a table name.
 - `overrides` MUST map a column type name to a LoGOs type from the scan list.
 - An `overrides` type MUST win over the type map.
+- The plugin MUST read `package` from the plugin options, or infer it from the output directory.
+- When the output directory is empty or root, the package MUST be `models`.
+- A package name of `_` MUST be an error.
+- Any other package name MUST be a Go identifier.
+- A Go identifier MUST follow `go/token.IsIdentifier`, which admits Unicode letters.
+- The error for a bad package name MUST name the rejected value.
 
 ### Type map
 
@@ -73,7 +79,8 @@ The plugin writes one JSON object to standard output. The object has one field `
 - An array column MUST be an error that names the table and the column.
 - An unmapped type MUST be an error that names the table and the column.
 - The plugin MUST NOT guess a type.
-- A column name with a backtick or a control character MUST be an error, because the generated `col` tag is a raw string.
+- A column name with a backtick or a control character MUST be an error.
+- The generated `col` tag MUST stay a raw string.
 - On MySQL, an unsigned integer column MUST be an error unless `overrides` names a type.
 
 All engines:
