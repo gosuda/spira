@@ -1,0 +1,37 @@
+package web
+
+import (
+	"context"
+	"errors"
+	"net/http"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func WebSocket(r *Router, pattern string, cfg websocket.Config, serve func(ctx context.Context, c *websocket.Conn) error) {
+	h := func(ctx *Context) (Reply, error) {
+		c, err := acceptWebSocket(ctx, cfg)
+		if err != nil {
+			return nil, nil
+		}
+		if c == nil {
+			return nil, nil
+		}
+		if serr := serve(ctx.Request.Context(), c); serr != nil {
+			if errors.Is(serr, websocket.ErrClosed) {
+				return nil, nil
+			}
+			return nil, serr
+		}
+		return nil, c.Close()
+	}
+	r.Handle(http.MethodGet, pattern, h)
+	r.Handle(http.MethodConnect, pattern, h)
+}
+
+func acceptWebSocket(ctx *Context, cfg websocket.Config) (*websocket.Conn?, error) {
+	if ctx.Request.Method == http.MethodConnect {
+		return websocket.ServeStream(ctx.writer, ctx.Request, cfg)
+	}
+	return websocket.Upgrade(ctx.writer, ctx.Request, cfg)
+}
