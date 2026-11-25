@@ -42,8 +42,18 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+const maxRedirects = 10
+
 func New(base string, policy resilience.Policy) *Client {
-	return &Client{Base: base, Policy: policy, HTTP: http.DefaultClient}
+	return &Client{Base: base, Policy: policy, HTTP: &http.Client{CheckRedirect: followSameOrigin}}
+}
+
+func followSameOrigin(req *http.Request, via []*http.Request) error {
+	first := via[0].URL
+	if len(via) >= maxRedirects || req.URL.Scheme != first.Scheme || !strings.EqualFold(req.URL.Host, first.Host) {
+		return http.ErrUseLastResponse
+	}
+	return nil
 }
 
 func Get[Out any](ctx context.Context, c *Client, path string) (Out, error) {
