@@ -1,0 +1,107 @@
+package web_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/web"
+)
+
+type BindPreparsedIn struct {
+	Username string `form:"username"`
+}
+
+type BindNarrowIn struct {
+	Small int8   `query:"small"`
+	Age   uint16 `query:"age"`
+}
+
+type BindEdgeIn struct {
+	Count  int32  `query:"count"`
+	Price  uint64 `query:"price"`
+	Ratio  float32 `query:"ratio"`
+	Limit  int64  `query:"limit"`
+}
+
+func TestBindKeepsPreParsedFormValues(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindPreparsedIn) (web.Reply, error) {
+		return web.Data{Value: in.Username}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("ignored=never"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	form := url.Values{}
+	form.Set("username", "ada")
+	req.PostForm = form
+	rec := call(t, r, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preparsed status %d want 200 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if !strings.Contains(rec.Body.String(), "ada") {
+		t.Fatalf("preparsed echo %q lacks the username the stage already parsed", rec.Body.String())
+		return
+	}
+}
+
+func TestBindNarrowIntOverflowIsRejected(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/narrow", func(ctx *web.Context, in BindNarrowIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := assertProblemJSON(t, call(t, r, httptest.NewRequest(http.MethodGet, "/narrow?small=130&age=70000", nil)), http.StatusBadRequest)
+	seen := map[string]string{}
+	for _, e := range doc.Errors {
+		seen[e.Field] = e.Rule
+	}
+	if (seen["Small"] ?? "") != "format" || (seen["Age"] ?? "") != "format" {
+		t.Fatalf("overflow errors %v want format on Small and Age", seen)
+		return
+	}
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/narrow?small=127&age=65535", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("boundary status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBindWrongTypesAndDuplicatesAreRejected(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/edge", func(ctx *web.Context, in BindEdgeIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := assertProblemJSON(t, call(t, r, httptest.NewRequest(http.MethodGet, "/edge?count=notanumber&price=1.5&ratio=notafloat&limit=99999999999999999999", nil)), http.StatusBadRequest)
+	seen := map[string]string{}
+	for _, e := range doc.Errors {
+		seen[e.Field] = e.Rule
+	}
+	for _, field := range []string{"Count", "Price", "Ratio", "Limit"} {
+		if (seen[field] ?? "") != "format" {
+			t.Fatalf("field %s rule %q want format", field, seen[field])
+			return
+		}
+	}
+	dup := call(t, r, httptest.NewRequest(http.MethodGet, "/edge?count=1&count=2&price=3&ratio=4.5&limit=6", nil))
+	if dup.Code != http.StatusNoContent {
+		t.Fatalf("duplicate query status %d want 204: the first value binds body %s", dup.Code, dup.Body.String())
+		return
+	}
+	rec := call(t, r, httptest.NewRequest(http.MethodGet, "/edge?count=7&price=3&ratio=4.5&limit=6", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("clean edge status %d want 204 body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFormBodyOverSmallMaxBodyIsRejected(t *testing.T) {
+	r := web.NewRouter()
+	r.MaxBody = 8
+	web.Route(r, "POST", "/login", func(ctx *web.Context, in BindPreparsedIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=ada-and-more"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	assertProblemJSON(t, call(t, r, req), http.StatusRequestEntityTooLarge)
+}
+
