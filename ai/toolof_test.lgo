@@ -1,0 +1,357 @@
+package ai_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/ai"
+)
+
+type lookupArgs struct {
+	Query string `json:"query"`
+	Limit int32? `json:"limit"`
+}
+
+func lookupTool(seen *lookupArgs, ran *bool, result string) ai.Tool {
+	return ai.ToolOf[lookupArgs]("lookup", "Look up the forecast.", func(ctx context.Context, in lookupArgs) (string, error) {
+		*seen = in
+		*ran = true
+		return result + in.Query, nil
+	})
+}
+
+func TestToolOfSchemaMatchesHandWrittenSchema(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	var got any
+	if err := json.Unmarshal([]byte(tool.Schema), &got); err != nil {
+		t.Fatalf("ToolOf schema is not JSON: %v", err)
+		return
+	}
+	const hand = `{"type":"object","additionalProperties":false,"required":["query"],` +
+		`"properties":{"limit":{"type":"integer"},"query":{"type":"string"}}}`
+	var want any
+	if err := json.Unmarshal([]byte(hand), &want); err != nil {
+		t.Fatalf("hand-written schema is not JSON: %v", err)
+		return
+	}
+	if !equalJSON(got, want) {
+		t.Fatalf("ToolOf schema = %s, want %s", tool.Schema, hand)
+	}
+}
+
+func TestToolOfLeavesOptionFieldsOutOfRequired(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(tool.Schema), &doc); err != nil {
+		t.Fatalf("ToolOf schema is not JSON: %v", err)
+		return
+	}
+	v, present := doc["required"]
+	if !present {
+		t.Fatalf("ToolOf schema has no required list: %s", tool.Schema)
+		return
+	}
+	raw, ok := v.([]any)
+	if !ok {
+		t.Fatalf("ToolOf schema has no required list: %s", tool.Schema)
+		return
+	}
+	var required []string
+	for _, item := range raw {
+		name, ok := item.(string)
+		if !ok {
+			t.Fatalf("ToolOf required holds a non-string: %s", tool.Schema)
+			return
+		}
+		required = append(required, name)
+	}
+	if !slices.Equal(required, []string{"query"}) {
+		t.Fatalf("ToolOf required = %q, want [query]", required)
+	}
+}
+
+func TestToolOfRejectsAWrongTypeWithoutRunningTheFunction(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	_, err := tool.Call(t.Context(), `{"query":42}`)
+	if err == nil {
+		t.Fatal("ToolOf wrong type: expected an error")
+		return
+	}
+	if !strings.Contains(err.Error(), "lookup") {
+		t.Fatalf("ToolOf wrong type error = %q, want it to name the tool", err.Error())
+	}
+	if ran {
+		t.Fatal("ToolOf wrong type: the function ran")
+	}
+}
+
+func TestToolOfRejectsAnUnknownMemberWithoutRunningTheFunction(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	_, err := tool.Call(t.Context(), `{"query":"rain","bogus":1}`)
+	if err == nil {
+		t.Fatal("ToolOf unknown member: expected an error")
+		return
+	}
+	if !strings.Contains(err.Error(), "lookup") {
+		t.Fatalf("ToolOf unknown member error = %q, want it to name the tool", err.Error())
+	}
+	if ran {
+		t.Fatal("ToolOf unknown member: the function ran")
+	}
+}
+
+func TestToolOfDecodesBlankArgumentsAsAnEmptyObject(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "ok ")
+	out, err := tool.Call(t.Context(), "   ")
+	if err != nil {
+		t.Fatalf("ToolOf blank arguments: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf blank arguments: the function did not run")
+		return
+	}
+	if seen.Query != "" {
+		t.Fatalf("ToolOf blank query = %q, want empty", seen.Query)
+	}
+	if seen.Limit != nil {
+		t.Fatalf("ToolOf blank limit is present, want none")
+	}
+	if out != "ok " {
+		t.Fatalf("ToolOf blank result = %q, want ok with empty query", out)
+	}
+}
+
+func TestToolOfRunsThroughRun(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	model := &scripted{replies: []ai.Reply{
+		asking(ai.ToolCall{ID: "c1", Name: "lookup", Arguments: `{"query":"rain","limit":2}`}),
+		saying("Rain likely."),
+	}}
+	reply, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: []ai.Tool{tool}}, ai.Limits{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("Run: the typed function did not run")
+		return
+	}
+	if seen.Query != "rain" {
+		t.Fatalf("tool saw query = %q, want rain", seen.Query)
+	}
+	if (seen.Limit ?? -1) != 2 {
+		t.Fatalf("tool saw limit present with a wrong value")
+	}
+	if text := textOf(reply.Message); text != "Rain likely." {
+		t.Fatalf("final text = %q, want Rain likely.", text)
+	}
+	requireStrings(t, "results sent to the model", resultsOf(model.seen[1].Messages[2]), "c1=found rain")
+}
+
+type searchFilter struct {
+	City string `json:"city"`
+	Zip  string? `json:"zip"`
+}
+
+type searchArgs struct {
+	Query string `json:"query"`
+	Limit int32? `json:"limit"`
+	Where searchFilter `json:"where"`
+}
+
+func nestedTool(seen *searchArgs) ai.Tool {
+	return ai.ToolOf[searchArgs]("search", "Search the catalog.", func(ctx context.Context, in searchArgs) (string, error) {
+		*seen = in
+		return "ok", nil
+	})
+}
+
+func TestToolOfNestedStructSchemaMatchesHandWritten(t *testing.T) {
+	var seen searchArgs
+	tool := nestedTool(&seen)
+	var got any
+	if err := json.Unmarshal([]byte(tool.Schema), &got); err != nil {
+		t.Fatalf("ToolOf nested schema is not JSON: %v", err)
+		return
+	}
+	const hand = `{"type":"object","additionalProperties":false,"required":["query","where"],` +
+		`"properties":{"limit":{"type":"integer"},"query":{"type":"string"},` +
+		`"where":{"type":"object","additionalProperties":false,"required":["city"],` +
+		`"properties":{"city":{"type":"string"},"zip":{"type":"string"}}}}}`
+	var want any
+	if err := json.Unmarshal([]byte(hand), &want); err != nil {
+		t.Fatalf("hand-written nested schema is not JSON: %v", err)
+		return
+	}
+	if !equalJSON(got, want) {
+		t.Fatalf("ToolOf nested schema = %s, want %s", tool.Schema, hand)
+	}
+}
+
+func TestToolOfNestedStructDecodesValues(t *testing.T) {
+	var seen searchArgs
+	tool := nestedTool(&seen)
+	out, err := tool.Call(t.Context(), `{"query":"rain","where":{"city":"Seoul"}}`)
+	if err != nil {
+		t.Fatalf("ToolOf nested decode: %v", err)
+		return
+	}
+	if out != "ok" {
+		t.Fatalf("ToolOf nested result = %q, want ok", out)
+	}
+	if seen.Query != "rain" {
+		t.Fatalf("ToolOf nested query = %q, want rain", seen.Query)
+	}
+	if seen.Where.City != "Seoul" {
+		t.Fatalf("ToolOf nested city = %q, want Seoul", seen.Where.City)
+	}
+	if seen.Where.Zip != nil {
+		t.Fatalf("ToolOf nested zip is present, want none")
+	}
+	out, err = tool.Call(t.Context(), `{"query":"rain","limit":2,"where":{"city":"Seoul","zip":"03187"}}`)
+	if err != nil {
+		t.Fatalf("ToolOf nested full decode: %v", err)
+		return
+	}
+	if out != "ok" {
+		t.Fatalf("ToolOf nested full result = %q, want ok", out)
+	}
+	if (seen.Limit ?? -1) != 2 {
+		t.Fatalf("ToolOf nested limit present with a wrong value")
+	}
+	if (seen.Where.Zip ?? "") != "03187" {
+		t.Fatalf("ToolOf nested zip = %q, want 03187", seen.Where.Zip ?? "")
+	}
+	if _, err := tool.Call(t.Context(), `{"query":"rain","where":null}`); err == nil {
+		t.Fatal("ToolOf null nested struct: expected an error")
+	}
+	if _, err := tool.Call(t.Context(), `{"query":"rain","where":{"city":"Seoul","bogus":1}}`); err == nil {
+		t.Fatal("ToolOf unknown nested member: expected an error")
+	} else if !strings.Contains(err.Error(), "where.bogus") {
+		t.Fatalf("ToolOf unknown nested member error = %q, want it to name where.bogus", err.Error())
+	}
+}
+
+type badToolArgs struct {
+	Query string `json:"query"`
+	Ch    chan int `json:"ch"`
+}
+
+func TestToolOfUnsupportedFieldPanicsAtDerivation(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("ToolOf accepted an unsupported field type")
+			return
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "unsupported type") || !strings.Contains(msg, "Ch") {
+			t.Fatalf("ToolOf panic = %v, want the schema unsupported-type error", r)
+			return
+		}
+	}()
+	ai.ToolOf[badToolArgs]("bad", "Bad tool.", func(ctx context.Context, in badToolArgs) (string, error) {
+		return "", nil
+	})
+}
+
+type bigArgs struct {
+	N int64 `json:"n"`
+}
+
+func TestToolOfPreservesLargeIntegers(t *testing.T) {
+	var seen bigArgs
+	tool := ai.ToolOf[bigArgs]("big", "Take a big integer.", func(ctx context.Context, in bigArgs) (string, error) {
+		seen = in
+		return "ok", nil
+	})
+	out, err := tool.Call(t.Context(), `{"n":9007199254740993}`)
+	if err != nil {
+		t.Fatalf("ToolOf big integer: %v", err)
+		return
+	}
+	if out != "ok" {
+		t.Fatalf("ToolOf big integer result = %q, want ok", out)
+	}
+	if seen.N != 9007199254740993 {
+		t.Fatalf("ToolOf big integer = %d, want 9007199254740993", seen.N)
+	}
+}
+
+func TestToolOfRejectsIntegerOverflow(t *testing.T) {
+	tool := ai.ToolOf[bigArgs]("big", "Take a big integer.", func(ctx context.Context, in bigArgs) (string, error) {
+		return "", nil
+	})
+	_, err := tool.Call(t.Context(), `{"n":9223372036854775808}`)
+	if err == nil {
+		t.Fatal("ToolOf integer overflow: expected an error")
+		return
+	}
+	if !strings.Contains(err.Error(), `"n"`) {
+		t.Fatalf("ToolOf integer overflow error = %q, want it to name the field", err.Error())
+	}
+}
+
+func equalJSON(a any, b any) bool {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		return ok && equalObjects(av, bv)
+	case []any:
+		bv, ok := b.([]any)
+		return ok && equalArrays(av, bv)
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case float64:
+		bv, ok := b.(float64)
+		return ok && av == bv
+	case bool:
+		bv, ok := b.(bool)
+		return ok && av == bv
+	case nil:
+		return b == nil
+	}
+	return false
+}
+
+func equalObjects(a map[string]any, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || !equalJSON(va, vb) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalArrays(a []any, b []any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !equalJSON(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
