@@ -1,4 +1,4 @@
-package main
+package main_test
 
 import (
 	"bytes"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/gosuda/spira/asset"
 	"github.com/gosuda/spira/config"
+	shopmain "github.com/gosuda/spira/example/shop"
 	"github.com/gosuda/spira/view"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
@@ -30,7 +31,7 @@ func TestAssembledShopRoutes(t *testing.T) {
 		return
 	}
 	assets := asset.Dev("http://localhost:5173")
-	router, _ := buildRouter(shopParts{pool: pool, assets: assets, tags: view.Group{}, dev: true})
+	router, _ := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
 	shop := scheduledStockServer(t, router)
 	shop.Client().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -298,7 +299,7 @@ func TestShopSettingsDefaultsAndOverrides(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := loadShopSettings(config.Map(tc.values))
+			got, err := shopmain.LoadShopSettingsForTest(config.Map(tc.values))
 			if err != nil {
 				t.Fatalf("load settings: %v", err)
 				return
