@@ -415,6 +415,7 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestHTTP2WebSocketReadDeadlineAndCancellation` checks read deadlines and cancellation on a live HTTP/2 stream.
 - `TestHTTP2WebSocketWriteDeadline` checks a write blocked by HTTP/2 flow control. The HTTP/2 connection stays open.
 - `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
+- `BenchmarkWebSocketEcho1KiBInMemory` reports allocations per message and the p50, p95, p99 and max latency of a 1 KiB binary echo through `ServeHijacked` over `net.Pipe`. Run it with `-benchtime=256x`; another iteration count above 1 skips it.
 
 ## Not in scope
 
