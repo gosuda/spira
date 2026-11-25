@@ -1,6 +1,10 @@
 package main
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 var initialisms = map[string]bool{
 	"api": true, "css": true, "db": true, "html": true, "http": true,
@@ -90,12 +94,15 @@ func isGoIdent(s string) bool {
 	if s == "" {
 		return false
 	}
-	if !isASCIILetter(s[0]) && s[0] != '_' {
+	first, size := utf8.DecodeRuneInString(s)
+	if size <= 1 && first == utf8.RuneError {
 		return false
 	}
-	for i := 1; i < len(s); i++ {
-		c := s[i]
-		if !isASCIILetter(c) && !isASCIIDigit(c) && c != '_' {
+	if first != '_' && !unicode.IsLetter(first) {
+		return false
+	}
+	for _, r := range s[size:] {
+		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
 			return false
 		}
 	}
