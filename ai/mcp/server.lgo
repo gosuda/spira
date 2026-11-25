@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 
@@ -68,7 +70,27 @@ func originAllowed(req *http.Request) bool {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return false
 	}
-	return strings.EqualFold(u.Host, req.Host)
+	if !strings.EqualFold(u.Host, req.Host) {
+		return false
+	}
+	return !arrivedOnLoopback(req) || loopbackName(u.Hostname())
+}
+
+func arrivedOnLoopback(req *http.Request) bool {
+	local, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok || local == nil {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(local.String())
+	return err == nil && ap.Addr().Unmap().IsLoopback()
+}
+
+func loopbackName(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
 }
 
 func dispatch(ctx context.Context, tools []ai.Tool, msg Envelope) (web.Reply, error) {

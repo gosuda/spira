@@ -95,7 +95,21 @@ func fetchH3GoAway(ctx context.Context, p *h3GoAwayProbe) error {
 	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("response status %d, want 204", resp.StatusCode)
 	}
-	return p.conn.CloseWithError(0, "")
+	return expectH3ServerNoErrorClose(ctx, p.conn)
+}
+
+func expectH3ServerNoErrorClose(ctx context.Context, conn *quic.Conn) error {
+	select {
+	case <-conn.Context().Done():
+	case <-ctx.Done():
+		return fmt.Errorf("wait server H3_NO_ERROR close: %w", ctx.Err())
+	}
+	cause := context.Cause(conn.Context())
+	got, ok := errors.AsType[*quic.ApplicationError](cause)
+	if !ok || got.ErrorCode != 0x100 || !got.Remote {
+		return fmt.Errorf("server close = %w, want remote H3_NO_ERROR 0x100", cause)
+	}
+	return nil
 }
 
 func stopH3ForGoAway(ctx context.Context, p *h3GoAwayProbe) error {

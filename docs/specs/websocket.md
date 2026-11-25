@@ -437,6 +437,7 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestStreamRejectsBadHandshakes` proves that a foreign or missing `:protocol` answers 501, a missing or wrong version answers 400, a foreign origin answers 403 and a wrong method answers 405, each with its fault.
 - `TestStreamRefusesHTTP1Connect` proves that a CONNECT over HTTP/1.1 answers 400.
 - `BenchmarkLoopbackEcho1KiB` reports allocations and latency percentiles per 1 KiB text echo over loopback TCP.
+- `BenchmarkWebSocketEcho1KiBInMemory` reports allocations per message and the p50, p95, p99 and max latency of a 1 KiB binary echo through `ServeHijacked` over `net.Pipe`. Run it with `-benchtime=256x`; another iteration count above 1 skips it.
 
 ## Not in scope
 

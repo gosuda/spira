@@ -48,9 +48,6 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - The UDP listener MUST use TLS 1.3 with no older version.
 - `ReadHeaderTimeout` MUST bound the TCP listener header reads only.
 - `ReadHeaderTimeout` MUST NOT be presented as bounding HTTP/3 header reads.
-- The LoGOs backend limits the encoded header block by size.
-- The LoGOs backend limits the decoded field section by size.
-- The LoGOs backend sets no separate deadline for reading HTTP/3 request headers.
 - The TCP listener MUST keep the ALPN list that [web](web.md) fixes.
 - Each HTTPS response MUST carry `Alt-Svc: h3=":<port>"; ma=2592000` while the UDP listener is open, with the actual UDP port.
 - A cleartext response MUST NOT carry that header.
@@ -62,6 +59,26 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - `Start` MUST NOT add the stage to the router itself.
 - When `H3` is false, `Start` MUST serve TCP only and open no UDP listener.
 
+### Limits and timeouts
+
+These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
+
+- The backend MUST use `http.DefaultMaxHeaderBytes` (1 MiB) because `http3.Server` sets no `MaxHeaderBytes`.
+- The backend MUST advertise this value in `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 section 7.2.4.1).
+- This value MUST limit the encoded request header block and the decoded field section separately. Each decoded field MUST count its name and value in bytes plus 32 bytes.
+- If either limit is exceeded, the backend MUST stop reading the stream with `H3_EXCESSIVE_LOAD` and MUST attempt status 431.
+- The backend MUST omit `SETTINGS_QPACK_MAX_TABLE_CAPACITY` and `SETTINGS_QPACK_BLOCKED_STREAMS`. Both MUST default to 0 (RFC 9204 section 5).
+- If a header block refers to the dynamic table, the backend MUST close the connection with `QPACK_DECOMPRESSION_FAILED`.
+- A client MUST keep at most 100 bidirectional streams and 100 unidirectional streams open per connection.
+- The initial QUIC receive window MUST be 1 MiB per stream and 1 MiB per connection (RFC 9000 section 4).
+- The QUIC send buffer MUST hold at most 1 MiB per stream. A write MUST wait for space if the buffer is full.
+- The backend MUST set the QUIC handshake timeout to 5 seconds.
+- After the QUIC handshake, the backend MUST wait up to 5 seconds for client SETTINGS. On timeout it MUST close the connection with `H3_MISSING_SETTINGS`.
+- The server MUST use a local idle timeout of 30 seconds. It MUST send no `max_idle_timeout` transport parameter or keep-alive packets.
+- If the client advertises a smaller nonzero idle timeout, the server MUST use that value. QUIC MUST set each handshake and idle timer to at least three times the probe timeout (RFC 9000 section 10.1).
+- The backend MUST set no separate request header deadline. A stream waiting for request headers MUST count against the bidirectional stream limit.
+- `Stop` MUST use a separate drain deadline. The QUIC idle timeout MUST remain in effect during the drain and MAY close an idle connection first.
+
 ### Shutdown
 
 - `Stop` MUST close the UDP listener before it returns, after the drain or the timeout ends it.
@@ -69,15 +86,26 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
 - `Stop` MUST close HTTP/3 connections when shutdown times out.
 - `Stop` of a server that is not started MUST return a nil error.
+- On each connection with an open HTTP/3 control stream, a graceful drain MUST send one GOAWAY frame.
+- The GOAWAY identifier MUST be the next client bidirectional stream ID after the highest admitted request stream. If the backend admitted no request stream, the identifier MUST be 0.
+- Once the drain starts, the backend MUST admit no new request streams. It MUST reject new request streams on open connections with `H3_REQUEST_REJECTED` so the client can retry the request.
+- The backend MUST reject request stream IDs at or above `2^62 - 4` so the GOAWAY identifier fits in a variable-length integer.
+- The control stream MUST reject an attempt to send a GOAWAY identifier greater than the previous one.
+- The backend MUST wait for admitted requests to finish and for QUIC to acknowledge GOAWAY. If both complete and the connection remains open, it MUST close the connection with `H3_NO_ERROR`.
+- A client GOAWAY frame MUST NOT stop requests. If a client GOAWAY identifier exceeds the previous one, the backend MUST close the connection with `H3_ID_ERROR`.
 
 ### Early data
 
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
+- When a client attempts TLS session resumption, the QUIC layer MUST clear the early data flag on the session. The server MUST accept no 0-RTT data and MUST keep no 0-RTT replay window.
+- The QUIC backend MUST issue no session tickets. The server MAY resume with a ticket from another issuer if the TLS configuration accepts it.
+- After a restart, the TLS configuration MUST retain a valid ticket key or recover the session state with `UnwrapSession`. `http3.Server` MUST NOT manage ticket key storage or rotation.
+- `SessionTicketsDisabled` on the effective TLS configuration MUST disable resumption.
 - Extended CONNECT over HTTP/3 MUST stay unbuilt in this server.
 - The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
-- `H3Server` sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`.
-- Peers can therefore attempt extended CONNECT.
-- The backend answers extended CONNECT with 501 and does not call the request handler.
+- `H3Server` MUST send `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`.
+- Peers MAY therefore attempt extended CONNECT.
+- The backend MUST answer extended CONNECT with 501 and MUST NOT call the request handler.
 
 ### Faults
 

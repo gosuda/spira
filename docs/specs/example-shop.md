@@ -97,7 +97,7 @@ func FS() fs.FS
 
 - `POST /orders` MUST create the order and its lines inside `orm.InSession`.
 - `POST /orders/{id}/cancel` MUST load the order with `orm.Get`.
-- When `Flush` returns `*orm.StaleError`, cancel MUST answer 409 through `web.Fail`.
+- When `Flush` returns `*orm.StaleError`, cancel MUST answer 409 with the `orders.stale_order` fault.
 - Two parallel cancels of one order MUST yield one 200 and one 409.
 - The 409 response MUST use content type `application/problem+json`.
 

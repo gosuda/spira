@@ -173,6 +173,7 @@ SQL Server:
 - Two parameters with one name MUST differ by the parameter number suffix.
 - Each slice marker in the query text MUST pair with the slice parameter of that name.
 - A slice parameter without a marker MUST pass as one argument.
+- On SQLite, sqlc numbers each bare `?` before it numbers a slice. A bare `?` MUST bind the next of those numbers, and a slice marker MUST NOT advance that count.
 
 ### Refusals
 

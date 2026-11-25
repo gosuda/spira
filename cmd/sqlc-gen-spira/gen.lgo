@@ -441,7 +441,7 @@ func planSliceCall(qd *QueryDef, engine string) (sliceCall, error) {
 		if err != nil {
 			return sliceCall{}, fmt.Errorf("sqlc-gen-spira: %s: %w", qd.Name, err)
 		}
-		if engine != "sqlite" || token == "?" || arg.marker != "" {
+		if engine != "sqlite" || token == "?" {
 			positional++
 		}
 		plan.rewriteBind(&arg, start, end)

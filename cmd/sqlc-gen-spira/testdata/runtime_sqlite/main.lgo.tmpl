@@ -55,6 +55,7 @@ func compareQueries(ctx context.Context) error {
 	id := compareInsertAndRename(ctx, pool, oracle)?
 	compareGetItem(ctx, pool, oracle, id)?
 	compareSliceItems(ctx, pool, oracle)?
+	compareAroundSliceItems(ctx, pool, oracle)?
 	store.DeleteItem(ctx, pool, id)?
 	oracle.ExecContext(ctx, "DELETE FROM items WHERE id = ?", id)?
 	compareGetItem(ctx, pool, oracle, id)?
@@ -137,6 +138,21 @@ func compareSliceItems(ctx context.Context, pool *db.Pool, oracle *sql.DB) error
 		if !slices.Equal(got, want) {
 			return fmt.Errorf("FilterItems(%v) = %+v, database/sql rows = %+v", c.ids, got, want)
 		}
+	}
+	return nil
+}
+
+func compareAroundSliceItems(ctx context.Context, pool *db.Pool, oracle *sql.DB) error {
+	const minID int64 = 2
+	const omitName = "third item"
+	ids := []int64{4, 1, 2, 3}
+	args := store.FilterItemsAroundSliceArgs{ID: minID, Ids: ids, Name: omitName}
+	got := store.FilterItemsAroundSlice(ctx, pool, args)?
+	want := readOracleItems(ctx, oracle,
+		"SELECT id, name FROM items WHERE id >= ? AND id IN (?, ?, ?, ?) AND name <> ? ORDER BY id DESC",
+		minID, ids[0], ids[1], ids[2], ids[3], omitName)?
+	if len(want) != 2 || !slices.Equal(got, want) {
+		return fmt.Errorf("FilterItemsAroundSlice(%v) = %+v, database/sql rows = %+v", ids, got, want)
 	}
 	return nil
 }
