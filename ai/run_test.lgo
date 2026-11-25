@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gosuda/spira/ai"
 	"github.com/gosuda/spira/fault"
@@ -479,9 +480,10 @@ func TestRunEndsWhenTheContextEndsDuringATool(t *testing.T) {
 }
 
 func TestRunReportsTimeoutWhenTheDeadlineEndsDuringATool(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 0)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	slow := ai.Tool{Name: "weather", Call: func(ctx context.Context, arguments string) (string, error) {
+		<-ctx.Done()
 		return "sunny", nil
 	}}
 	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather")), saying("never")}}
