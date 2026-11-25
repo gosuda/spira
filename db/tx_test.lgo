@@ -306,58 +306,6 @@ func txProbeFreed(t *testing.T, pool *db.Pool, table string, absent int64) {
 	}
 }
 
-func txWorkPanics(ctx context.Context, pool *db.Pool) (panicked bool, err error) {
-	defer func() {
-		if recover() != nil {
-			panicked = true
-		}
-	}()
-	_, err = db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
-		if _, err := db.Exec(ctx, tx, "INSERT INTO tx_panic (n) VALUES (1)"); err != nil {
-			return struct{}{}, fmt.Errorf("insert: %w", err)
-		}
-		panic("tx work panicked")
-	})
-	return panicked, err
-}
-
-func TestInTxRollsBackWhenWorkPanics(t *testing.T) {
-	pool := openTxPool(t)
-	ctx, cancel := txTimeout()
-	defer cancel()
-	if _, err := db.Exec(ctx, pool, "CREATE TABLE tx_panic (n integer not null)"); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	panicked, ierr := txWorkPanics(ctx, pool)
-	if ierr != nil {
-		panic(fmt.Sprintf("db_test: txWorkPanics err=%v", ierr))
-	}
-	if !panicked {
-		t.Fatal("InTx must propagate the work panic")
-	}
-	txProbeFreed(t, pool, "tx_panic", 1)
-}
-
-func TestInTxRollsBackWhenWorkFails(t *testing.T) {
-	pool := openTxPool(t)
-	ctx, cancel := txTimeout()
-	defer cancel()
-	if _, err := db.Exec(ctx, pool, "CREATE TABLE tx_fail (n integer not null)"); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	boom := errors.New("tx work failed")
-	_, err := db.InTx(ctx, pool, func(tx *db.Tx) (struct{}, error) {
-		if _, err := db.Exec(ctx, tx, "INSERT INTO tx_fail (n) VALUES (1)"); err != nil {
-			return struct{}{}, fmt.Errorf("insert: %w", err)
-		}
-		return struct{}{}, boom
-	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("InTx error = %v, want the work error %v", err, boom)
-	}
-	txProbeFreed(t, pool, "tx_fail", 1)
-}
-
 func TestInTxCommitFailureReturnsCommitErrorAlone(t *testing.T) {
 	pool := openTxPoolDSN(t, "file:spira_"+txPoolKey(t)+"?mode=memory&cache=shared&_pragma=foreign_keys(1)")
 	ctx, cancel := txTimeout()

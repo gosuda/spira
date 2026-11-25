@@ -311,6 +311,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - A form body that does not parse MUST fail the bind even when the query parses.
 - `Bind` MUST apply `MaxBody` to a form body and answer 413 past the limit.
 - A present value that does not decode MUST fail with rule `format`.
+- `Bind` MUST keep the form values a stage has already parsed into `Request.PostForm` and MUST NOT read the body again for them.
 - `Bind` MUST leave untagged fields alone.
 - `Bind` MUST decode one `body:"json"` field under `MaxBody`.
 - `Bind` MUST reject an unknown JSON member in the body.
@@ -559,6 +560,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestBindKeepsTheFormAStageParsed` proves that a `PostForm` parsed by an earlier stage survives the bind.
 - `TestJSONRouteSkipsFormParsing` proves that a JSON-only route leaves a form-labeled body unread.
 - `TestFormBodyOverMaxBodyIsRejected` proves the 413 answer for an oversized form body.
+- `TestBindKeepsPreParsedFormValues` proves that form values a stage already parsed bind without a second body read.
 - `TestMalformedOptionQueryValueIsAFieldError` proves that a malformed query value fails with rule `format` instead of absence.
 - `TestRouteInfoCarriesSchemaAndDoc` proves the stored `Wire`, the stored `Source` and the attached `Doc`.
 - `TestRouteSchemaKeepsBoundFieldsThatJSONHides` proves that a header field with `json:"-"` stays in the route schema with its source.

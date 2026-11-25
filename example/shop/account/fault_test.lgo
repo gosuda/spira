@@ -1,0 +1,30 @@
+package account_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/example/shop/account"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestAccountFailedStaysClientSafe(t *testing.T) {
+	const secret = "SECRET-ACCOUNT-44710"
+	err := account.ErrAccountFailed.Wrap(errors.New(secret))
+	if !errors.Is(err, account.ErrAccountFailed) {
+		t.Fatalf("error %v is not the account fault", err)
+		return
+	}
+	raw := faulttest.PublicJSON(t, err)
+	faulttest.RefuseLeak(t, raw, secret)
+	faulttest.RefuseLeak(t, raw, "account.failed", "The account request could not be completed.")
+	if !strings.Contains(string(raw), `"internal"`) {
+		t.Fatalf("public view %s lacks the fixed internal code", raw)
+		return
+	}
+	if !strings.Contains(string(raw), "internal error") {
+		t.Fatalf("public view %s lacks the fixed internal message", raw)
+		return
+	}
+}

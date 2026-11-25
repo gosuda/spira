@@ -1,6 +1,8 @@
 package ai
 
 import (
+	"fmt"
+
 	"github.com/gosuda/spira/fault"
 )
 
@@ -14,16 +16,26 @@ var ErrUnknownTool = fault.New("ai.unknown_tool", fault.Invalid, "The tool is un
 
 var ErrModelFailed = fault.New("ai.model_failed", fault.Unavailable, "The model request failed.")
 
+var ErrToolCanceled = fault.New("ai.tool_canceled", fault.Canceled, "The tool call was canceled.")
+
+var ErrToolTimeout = fault.New("ai.tool_timeout", fault.Timeout, "The tool call timed out.")
+
 var ErrInvalidToolArguments = fault.New("ai.invalid_tool_arguments", fault.Invalid, "The tool arguments are invalid.")
 
 var ErrEmptyAnswer = fault.New("ai.empty_answer", fault.Unprocessable, "The answer is empty.")
 
 var ErrAnswerTooLarge = fault.New("ai.answer_too_large", fault.TooLarge, "The answer is too large.")
-
 var ErrUnterminatedFence = fault.New("ai.unterminated_fence", fault.Unprocessable, "The answer format is invalid.")
 
 var ErrInvalidAnswer = fault.New("ai.invalid_answer", fault.Unprocessable, "The answer is not valid JSON.")
 
 func Faults() []*fault.Error {
-	return []*fault.Error{ErrConfirmationRequired, ErrToolLimitExceeded, ErrInvalidDecision, ErrUnknownTool, ErrModelFailed, ErrInvalidToolArguments, ErrEmptyAnswer, ErrAnswerTooLarge, ErrUnterminatedFence, ErrInvalidAnswer}
+	return []*fault.Error{ErrConfirmationRequired, ErrToolLimitExceeded, ErrInvalidDecision, ErrUnknownTool, ErrModelFailed, ErrToolCanceled, ErrToolTimeout, ErrInvalidToolArguments, ErrEmptyAnswer, ErrAnswerTooLarge, ErrUnterminatedFence, ErrInvalidAnswer}
+}
+
+func modelFault(op string, err error) error {
+	if fault.Of(err) != nil {
+		return fmt.Errorf("ai: %s: %w", op, err)
+	}
+	return ErrModelFailed.Wrap(fmt.Errorf("ai: %s: %w", op, err))
 }

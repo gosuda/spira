@@ -167,6 +167,8 @@ var ErrToolLimitExceeded = fault.New("ai.tool_limit_exceeded", fault.Unprocessab
 var ErrInvalidDecision = fault.New("ai.invalid_decision", fault.Unprocessable, "The tool call decision is invalid.")
 var ErrUnknownTool = fault.New("ai.unknown_tool", fault.Invalid, "The tool is unknown.")
 var ErrModelFailed = fault.New("ai.model_failed", fault.Unavailable, "The model request failed.")
+var ErrToolCanceled = fault.New("ai.tool_canceled", fault.Canceled, "The tool call was canceled.")
+var ErrToolTimeout = fault.New("ai.tool_timeout", fault.Timeout, "The tool call timed out.")
 var ErrInvalidToolArguments = fault.New("ai.invalid_tool_arguments", fault.Invalid, "The tool arguments are invalid.")
 var ErrEmptyAnswer = fault.New("ai.empty_answer", fault.Unprocessable, "The answer is empty.")
 var ErrAnswerTooLarge = fault.New("ai.answer_too_large", fault.TooLarge, "The answer is too large.")
@@ -215,7 +217,7 @@ func Structured[T any](text string) (T, error)
 - `Collect` MUST keep the last id and model whose trimmed text is not empty.
 - `Collect` MUST use other when no chunk carries a finish.
 - `Collect` MUST set the reply role to assistant.
-- `Collect` MUST wrap a stream failure in `ai.model_failed`.
+- `Collect` MUST keep a declared stream fault and wrap only an undeclared stream failure in `ai.model_failed`.
 
 ### Run
 
@@ -229,7 +231,9 @@ func Structured[T any](text string) (T, error)
 - `Run` MUST use the public message for a tool error that holds a fault.
 - `Run` MUST turn blank tool error text into `tool <name> failed`.
 - `Run` MUST return the context error when the context ends during a tool call.
-- `Run` MUST wrap a model error in `ai.model_failed`.
+- `Run` MUST report `ai.tool_canceled` when the context is canceled during a tool call.
+- `Run` MUST report `ai.tool_timeout` when the deadline ends during a tool call.
+- `Run` MUST keep a declared model fault and wrap only an undeclared model error in `ai.model_failed`.
 - `Run` MUST count only the tool results after the last user message.
 - `Run` MUST set `Skipped` on the result of a call that a denial or a limit kept from running.
 - `Run` MUST NOT count a `Skipped` result toward a limit.
@@ -336,7 +340,9 @@ func Structured[T any](text string) (T, error)
 | `ai.invalid_decision` | unprocessable | The tool call decision is invalid. |
 | `ai.invalid_tool_arguments` | invalid | The tool arguments are invalid. |
 | `ai.model_failed` | unavailable | The model request failed. |
+| `ai.tool_canceled` | canceled | The tool call was canceled. |
 | `ai.tool_limit_exceeded` | unprocessable | The tool call limit was exceeded. |
+| `ai.tool_timeout` | timeout | The tool call timed out. |
 | `ai.unknown_tool` | invalid | The tool is unknown. |
 | `ai.unterminated_fence` | unprocessable | The answer format is invalid. |
 
@@ -344,11 +350,8 @@ func Structured[T any](text string) (T, error)
 
 - `ai: collect: %w` when the chunk stream fails.
 - `ai: run: %w` when the model call fails.
-- `ai: run: no tool named %q` when the request has no tool with that name.
-- `ai: run: tool %s: %w` when the context ends during a tool call.
 - `ai: run: no tool call has the key '%s'; the reply's tool call keys: %v` for an unknown decision key.
 - `ai: run: two decisions name the tool call '%s'` for a duplicate decision key.
-- `ai: run: the request does not carry the tool '%s' of the allowed call '%s'` for an allowed call with no tool.
 - `ai: run: every tool call of the reply needs a decision; missing: %v` for missing decisions.
 - `ai: search tools: arguments: %w` when the search arguments are not JSON.
 - `ai: search tools: result: %w` when the search result cannot be encoded.
@@ -384,6 +387,7 @@ func Structured[T any](text string) (T, error)
 - `TestCollectKeepsTheLastPositiveUsageAndTheLastNamedIDAndModel` proves usage, id and model retention.
 - `TestCollectReportsOtherWhenNoChunkCarriesAFinish` proves the default finish.
 - `TestCollectEndsWithTheStreamError` proves the stream error wrap.
+- `TestCollectKeepsADeclaredStreamFault` proves a declared stream fault survives `Collect`.
 - `TestCollectReturnsTheSameTextForEverySplit` is the property test that any split returns the same text.
 - The `DefaultToolCallingManagerTest` and `DefaultToolCallingManagerDecisionsTests` cases prove the tool loop.
 - `TestRunExecutesACallThatNeedsNoConfirmationAndReturnsTheFinalReply` proves the plain run.
@@ -403,7 +407,9 @@ func Structured[T any](text string) (T, error)
 - `TestRunFailsOnAToolTheRequestDoesNotCarry` proves unknown tools.
 - `TestRunGivesBlankArgumentsToTheToolAsAnEmptyObject` proves blank arguments.
 - `TestRunTurnsAToolErrorIntoTheResultOfThatCall` proves tool error text.
-- `TestRunEndsWhenTheContextEndsDuringATool` proves context end.
+- `TestRunEndsWhenTheContextEndsDuringATool` proves context end and its canceled report.
+- `TestRunReportsTimeoutWhenTheDeadlineEndsDuringATool` proves the timeout report.
+- `TestRunKeepsADeclaredModelFault` proves a declared model fault survives `Run`.
 - `TestRunWrapsTheModelError` proves model error wrap.
 - `TestRunNeverCallsAToolWhenTheContextEndedBeforeTheBatch` proves the pre-batch context check.
 - `TestRunCarriesUsageAndReplyStateAcrossAConfirmation` proves the paused reply state.

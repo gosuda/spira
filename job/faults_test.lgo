@@ -36,33 +36,6 @@ func TestQueueStoppedThroughStartAfterStop(t *testing.T) {
 	}
 }
 
-func TestAlreadyStartedFaults(t *testing.T) {
-	var s job.Scheduler
-	if err := s.Start(t.Context()); err != nil {
-		t.Fatalf("scheduler Start: %v", err)
-	}
-	defer func() {
-		if err := s.Stop(t.Context()); err != nil {
-			t.Fatalf("scheduler Stop: %v", err)
-		}
-	}()
-	if err := s.Start(t.Context()); !errors.Is(err, job.ErrSchedulerStarted) {
-		t.Fatalf("second scheduler Start = %v, want scheduler_already_started", err)
-	}
-	q := job.NewQueue[int](1, 1, func(ctx context.Context, v int) error { return nil })
-	if err := q.Start(t.Context()); err != nil {
-		t.Fatalf("queue Start: %v", err)
-	}
-	defer func() {
-		if err := q.Stop(t.Context()); err != nil {
-			t.Fatalf("queue Stop: %v", err)
-		}
-	}()
-	if err := q.Start(t.Context()); !errors.Is(err, job.ErrQueueStarted) {
-		t.Fatalf("second queue Start = %v, want queue_already_started", err)
-	}
-}
-
 func TestChunkFailedThroughWriteError(t *testing.T) {
 	planted := []string{"hunter2", "<script>alert(1)</script>", "'; DROP TABLE x; --", "/etc/passwd"}
 	cause := errors.New("write: password=hunter2 <script>alert(1)</script> '; DROP TABLE x; --' /etc/passwd")

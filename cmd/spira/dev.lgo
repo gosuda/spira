@@ -164,7 +164,7 @@ func notifyStart(ctx context.Context, cfg Loop, s Start) error {
 	}
 	select {
 	case cfg.Started <- s:
-	case <-ctx.Done():
+	default:
 	}
 	return nil
 }

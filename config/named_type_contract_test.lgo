@@ -26,7 +26,7 @@ type builtinNumericConfig struct {
 func TestLoadNamedNumericTypes(t *testing.T) {
 	t.Parallel()
 	src := config.Map(map[string]string{"OFFSET": "-17", "RATIO": "2.75"})
-	control, err := config.Load[builtinNumericConfig](src)
+	control, err := config.Load[builtinNumericConfig](builtinNumericConfig{}, src)
 	if err != nil {
 		t.Fatalf("Load with builtin numeric fields: %v", err)
 		return
@@ -35,7 +35,7 @@ func TestLoadNamedNumericTypes(t *testing.T) {
 		t.Fatalf("Load with builtin numeric fields = %+v, want Offset=-17 Ratio=2.75", control)
 	}
 
-	got, err := config.Load[namedNumericConfig](src)
+	got, err := config.Load[namedNumericConfig](namedNumericConfig{}, src)
 	if err != nil {
 		t.Fatalf("Load with named numeric fields: %v", err)
 		return
@@ -57,7 +57,7 @@ func TestLoadNamedNumericTypesReportParseErrors(t *testing.T) {
 	for _, c := range cases {
 		values := map[string]string{"OFFSET": "-17", "RATIO": "2.75"}
 		values[c.key] = c.value
-		_, err := config.Load[namedNumericConfig](config.Map(values))
+		_, err := config.Load[namedNumericConfig](namedNumericConfig{}, config.Map(values))
 		if err == nil || !errors.Is(err, strconv.ErrSyntax) || !strings.HasPrefix(err.Error(), "config: "+c.key+": ") {
 			t.Errorf("Load with %s=%q error = %v, want syntax error wrapped for %s", c.key, c.value, err, c.key)
 		}

@@ -87,8 +87,8 @@ func Faults() []*fault.Error
 - A request with no body MUST try the later upstreams after a failure only when its method is idempotent: GET, HEAD, OPTIONS, TRACE, PUT or DELETE (RFC 9110 section 9.2.2). A bodyless POST or PATCH MUST stop after its first upstream, as a request with a body does.
 - A request whose body is nil or `http.NoBody` MUST count as a request with no body.
 - A request with a body MUST stop after its first upstream.
-- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`, whatever the method: end of stream counts as no body and the idempotent-method rule above decides whether it retries, and a byte counts as a body that is pushed back and stops after the first upstream.
-- A wait that yields no byte and no end of stream MUST answer 502 without trying an upstream.
+- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`, whatever the method: end of stream counts as no body and the idempotent-method rule above decides whether it retries, a byte counts as a body that is pushed back and stops after the first upstream, and any other read failure ends the wait.
+- A wait that yields no byte and no end of stream, or whose first read fails, MUST answer 502 without trying an upstream and without sending request headers to any upstream.
 - When that wait ends without a byte, the gateway MUST end the blocked body read through `http.ResponseController.SetReadDeadline`, so that the 502 reaches the client while the client still holds the request body open.
 - When every tried upstream fails, the proxy MUST answer 502.
 - That answer MUST use the content type `application/problem+json`.
@@ -159,6 +159,9 @@ func Faults() []*fault.Error
 - `TestPeekEmptyFailsClosedOnStalledBody` proves that a stalled body of unknown length answers 502 without an upstream.
 - `TestStalledBodyPeekAnswersWhileTheBodyStaysOpen` proves that a chunked request with no body byte gets its 502 within three seconds while the connection stays open.
 - `TestPeekEmptyPushesBackReadyByte` proves that the empty-proof read hands the byte back.
+- `TestUnknownLengthReadErrorNeverReachesUpstream` proves that a body whose first read fails answers 502 with zero upstream hits.
+- `TestPartialBodyNeverFailsOverToSecondUpstream` proves that an upload cut mid-body never reaches the second upstream.
+- `TestStalledUploadGetsATimelyRefusal` proves that a stalled chunked upload receives its 502 while the upload is still open.
 - `TestCutEscapedSuffixKeepsOneLeadingSlash` proves that a stripped remainder starting with a slash keeps one leading slash.
 - `TestBadGatewayThroughDeadUpstream` proves the fault match for a refused route and that the 502 answer names no upstream address.
 - `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.

@@ -1,0 +1,58 @@
+package openapi_test
+
+import (
+	"encoding/json/v2"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/openapi"
+	"github.com/gosuda/spira/web"
+)
+
+func customInfo() *json.Marshalers {
+	return json.MarshalFunc[openapi.DocInfo](func(openapi.DocInfo) ([]byte, error) {
+		return []byte(`{"title":"replaced","version":"replaced"}`), nil
+	})
+}
+
+func TestDocumentKeepsCallerMarshalOptions(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/tags", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	doc := openapi.Document(r, openapi.Info{Title: "Shop", Version: "1.0"})
+	raw, err := json.Marshal(doc, json.WithMarshalers(customInfo()))
+	if err != nil {
+		t.Fatalf("marshal with caller marshalers: %v", err)
+		return
+	}
+	if !strings.Contains(string(raw), `"title":"replaced"`) {
+		t.Fatalf("document %s ignored the caller marshaler for its info", raw)
+		return
+	}
+	if strings.Contains(string(raw), `"title":"Shop"`) {
+		t.Fatalf("document %s encodes the info with its own encoder", raw)
+		return
+	}
+}
+
+func TestDocumentBytesStayStableWithCallerOptions(t *testing.T) {
+	r := web.NewRouter()
+	openapi.Mount(r, fixtureInfo())
+	first, err := json.Marshal(openapi.Document(r, fixtureInfo()), json.Deterministic(true))
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+		return
+	}
+	for i := 0; i < 20; i++ {
+		next, merr := json.Marshal(openapi.Document(r, fixtureInfo()), json.Deterministic(true))
+		if merr != nil {
+			t.Fatalf("marshal at repetition %d: %v", i, merr)
+			return
+		}
+		if string(next) != string(first) {
+			t.Fatalf("document bytes with caller options differ at repetition %d:\n%s\n%s", i, first, next)
+			return
+		}
+	}
+}

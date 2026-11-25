@@ -64,19 +64,18 @@ func (l *Loader) lookup(key string) (string, bool) {
 	return "", false
 }
 
-func Load[T any](sources ...Source) (T, error) {
-	var out T
+func Load[T any](seed T, sources ...Source) (T, error) {
 	const if comptime.IsStruct[T]() {
+		out := seed
 		ld := NewLoader(sources)
 		Fill[T](ld, &out, "")
 		if err := ld.Err(); err != nil {
-			var zero T
-			return zero, err
+			return out, err
 		}
+		return out, nil
 	} else {
-		return out, errors.New("config: Load needs a struct")
+		return seed, errors.New("config: Load needs a struct")
 	}
-	return out, nil
 }
 
 func Fill[S any](ld *Loader, dst *S, prefix string) {

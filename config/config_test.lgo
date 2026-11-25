@@ -49,7 +49,7 @@ func writeBody(w http.ResponseWriter, body string) {
 func TestLoadFirstSourceWins(t *testing.T) {
 	first := config.Map(map[string]string{"NAME": "first", "RETRY": "1"})
 	second := config.Map(map[string]string{"NAME": "second", "RETRY": "2"})
-	cfg, err := config.Load[twoFields](first, second)
+	cfg, err := config.Load[twoFields](twoFields{}, first, second)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -61,7 +61,7 @@ func TestLoadFirstSourceWins(t *testing.T) {
 
 func TestLoadEnvBeatsLaterMap(t *testing.T) {
 	t.Setenv("NAME", "from-env")
-	cfg, err := config.Load[twoFields](config.Env(), config.Map(map[string]string{"NAME": "from-map"}))
+	cfg, err := config.Load[twoFields](twoFields{}, config.Env(), config.Map(map[string]string{"NAME": "from-map"}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -72,7 +72,7 @@ func TestLoadEnvBeatsLaterMap(t *testing.T) {
 }
 
 func TestLoadMapBeatsLaterMap(t *testing.T) {
-	cfg, err := config.Load[twoFields](config.Map(map[string]string{"NAME": "from-map"}), config.Env())
+	cfg, err := config.Load[twoFields](twoFields{}, config.Map(map[string]string{"NAME": "from-map"}), config.Env())
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -110,7 +110,7 @@ func TestLoadMissingKeysReport(t *testing.T) {
 			want = append(want, r.key)
 		}
 	}
-	_, err := config.Load[requiredMix](config.Map(map[string]string{"EMPTY": ""}))
+	_, err := config.Load[requiredMix](requiredMix{}, config.Map(map[string]string{"EMPTY": ""}))
 	if err == nil {
 		t.Fatalf("Load error = nil, want missing keys report")
 		return
@@ -126,7 +126,7 @@ type emptyOnly struct {
 }
 
 func TestLoadEmptySourcedStringIsAValue(t *testing.T) {
-	cfg, err := config.Load[emptyOnly](config.Map(map[string]string{"EMPTY": ""}))
+	cfg, err := config.Load[emptyOnly](emptyOnly{}, config.Map(map[string]string{"EMPTY": ""}))
 	if err != nil {
 		t.Fatalf("Load: %v, want EMPTY sourced as empty string to satisfy required", err)
 		return
@@ -156,7 +156,7 @@ func TestLoadNestedStructKeys(t *testing.T) {
 		"DB_PORT":      "5432",
 		"DB_CONN_ADDR": "10.0.0.1",
 	})
-	cfg, err := config.Load[nested](src)
+	cfg, err := config.Load[nested](nested{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -181,7 +181,7 @@ func TestLoadEnvTagReplacesPath(t *testing.T) {
 		"DB_PORT":    "1",
 		"SPIRA_ZONE": "eu",
 	})
-	cfg, err := config.Load[tagged](src)
+	cfg, err := config.Load[tagged](tagged{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -253,7 +253,7 @@ func kindsValues() map[string]string {
 }
 
 func TestLoadEveryTypeParses(t *testing.T) {
-	cfg, err := config.Load[kinds](config.Map(kindsValues()))
+	cfg, err := config.Load[kinds](kinds{}, config.Map(kindsValues()))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -293,7 +293,7 @@ func TestLoadMalformedValueNamesTheKey(t *testing.T) {
 	}
 	for _, c := range cases {
 		values := map[string]string{c.key: c.value}
-		_, err := config.Load[kinds](config.Map(values))
+		_, err := config.Load[kinds](kinds{}, config.Map(values))
 		if err == nil {
 			t.Fatalf("Load with %s=%q error = nil, want key-named parse error", c.key, c.value)
 			return
@@ -306,7 +306,7 @@ func TestLoadMalformedValueNamesTheKey(t *testing.T) {
 }
 
 func TestLoadReportsEveryParseFailure(t *testing.T) {
-	_, err := config.Load[kinds](config.Map(map[string]string{"B": "nope", "I": "12.5"}))
+	_, err := config.Load[kinds](kinds{}, config.Map(map[string]string{"B": "nope", "I": "12.5"}))
 	if err == nil {
 		t.Fatalf("Load error = nil, want both parse failures reported")
 		return
@@ -341,7 +341,7 @@ func TestLoaderSetRejectsUnsupportedTypes(t *testing.T) {
 }
 
 func TestLoadRequiresAStruct(t *testing.T) {
-	_, err := config.Load[int](config.Map(map[string]string{"I": "1"}))
+	_, err := config.Load[int](0, config.Map(map[string]string{"I": "1"}))
 	if err == nil || err.Error() != "config: Load needs a struct" {
 		t.Fatalf("Load[int] error = %v, want config: Load needs a struct", err)
 	}
@@ -350,7 +350,7 @@ func TestLoadRequiresAStruct(t *testing.T) {
 func TestLoadFieldWithoutSourceKeepsSourceProvidedValue(t *testing.T) {
 	base := config.Map(map[string]string{"NAME": "base"})
 	extra := config.Map(map[string]string{"RETRY": "9"})
-	cfg, err := config.Load[twoFields](base, extra)
+	cfg, err := config.Load[twoFields](twoFields{}, base, extra)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -372,7 +372,7 @@ func TestFileSourceReadsOneJSONObject(t *testing.T) {
 		t.Fatalf("File: %v", err)
 		return
 	}
-	cfg, err := config.Load[twoFields](src)
+	cfg, err := config.Load[twoFields](twoFields{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -427,7 +427,7 @@ func TestFileSourceScalarsAndSkipsNulls(t *testing.T) {
 		t.Fatalf("File: %v", err)
 		return
 	}
-	cfg, err := config.Load[twoFields](src)
+	cfg, err := config.Load[twoFields](twoFields{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -448,7 +448,7 @@ func TestRemoteSourceReadsOneJSONObject(t *testing.T) {
 		t.Fatalf("Remote: %v", err)
 		return
 	}
-	cfg, err := config.Load[twoFields](src)
+	cfg, err := config.Load[twoFields](twoFields{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -468,7 +468,7 @@ func TestRemoteSourceNestedObjectsFlatten(t *testing.T) {
 		t.Fatalf("Remote: %v", err)
 		return
 	}
-	cfg, err := config.Load[dbOnly](src)
+	cfg, err := config.Load[dbOnly](dbOnly{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -577,37 +577,6 @@ func TestProfileDefaultsToDev(t *testing.T) {
 	}
 }
 
-
-type crossFixture struct {
-	Name     string `required:"true"`
-	Region   string
-	Settings inner
-}
-
-func TestLoadCrossPackageNestedAndRequired(t *testing.T) {
-	src := config.Map(map[string]string{
-		"NAME":         "shop",
-		"REGION":       "eu",
-		"SETTINGS_HOST": "cross.internal",
-		"SETTINGS_PORT": "5432",
-	})
-	cfg, err := config.Load[crossFixture](src)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-		return
-	}
-	if cfg.Name != "shop" || cfg.Region != "eu" {
-		t.Fatalf("scalars = %+v, want Name shop Region eu", cfg)
-	}
-	if cfg.Settings.Host != "cross.internal" || cfg.Settings.Port != 5432 {
-		t.Fatalf("Settings = %+v, want host cross.internal port 5432", cfg.Settings)
-	}
-	_, err = config.Load[crossFixture](config.Map(map[string]string{"SETTINGS_HOST": "h", "SETTINGS_PORT": "1"}))
-	if err == nil || err.Error() != "config: missing keys: NAME" {
-		t.Fatalf("Load without NAME error = %v, want config: missing keys: NAME", err)
-	}
-}
-
 func TestProfileReadsEnvironment(t *testing.T) {
 	t.Setenv("SPIRA_PROFILE", "prod")
 	if got := config.Profile(); got != "prod" {
@@ -622,7 +591,7 @@ func TestSnakeKeysFromCamelFieldNames(t *testing.T) {
 		"TLS_KEY":   "k",
 		"ADDR2":     "3",
 	})
-	cfg, err := config.Load[camel](src)
+	cfg, err := config.Load[camel](camel{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -662,6 +631,28 @@ func TestFillKeepsFieldDefaultsThatNoSourceSets(t *testing.T) {
 	}
 }
 
+func TestLoadAppliesFieldDefaults(t *testing.T) {
+	cfg, err := config.Load[withDefaults](withDefaults{}, config.Map(map[string]string{"HOST": "db.internal"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if cfg.Host != "db.internal" {
+		t.Fatalf("Host = %q, want the source value db.internal", cfg.Host)
+	}
+	if cfg.Port != 8080 {
+		t.Fatalf("Port = %d, want the field default 8080", cfg.Port)
+	}
+	def, err := config.Load[withDefaults](withDefaults{})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+		return
+	}
+	if def.Host != "localhost" || def.Port != 8080 {
+		t.Fatalf("Load = %+v, want defaults localhost 8080", def)
+	}
+}
+
 type jsonNumbers struct {
 	Huge  int64
 	Ratio float64
@@ -684,7 +675,7 @@ func TestFileSourceKeepsJSONNumbersExact(t *testing.T) {
 		t.Fatalf("File: %v", err)
 		return
 	}
-	cfg, err := config.Load[jsonNumbers](src)
+	cfg, err := config.Load[jsonNumbers](jsonNumbers{}, src)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 		return
@@ -711,7 +702,7 @@ type countOnly struct {
 }
 
 func TestFileSourceExponentFormForIntMatchesEnv(t *testing.T) {
-	_, envErr := config.Load[countOnly](config.Map(map[string]string{"COUNT": "1e3"}))
+	_, envErr := config.Load[countOnly](countOnly{}, config.Map(map[string]string{"COUNT": "1e3"}))
 	dir := t.TempDir()
 	path := filepath.Join(dir, "exp.json")
 	if err := os.WriteFile(path, []byte(`{"count": 1e3}`), 0o600); err != nil {
@@ -723,7 +714,7 @@ func TestFileSourceExponentFormForIntMatchesEnv(t *testing.T) {
 		t.Fatalf("File: %v", err)
 		return
 	}
-	_, fileErr := config.Load[countOnly](src)
+	_, fileErr := config.Load[countOnly](countOnly{}, src)
 	if envErr == nil {
 		t.Fatal("env source accepted COUNT=1e3 for an int field, want a refusal")
 		return

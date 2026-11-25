@@ -1,0 +1,148 @@
+package websocket_test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/websocket"
+)
+
+func loopbackFrame(payload []byte) []byte {
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	frame := []byte{0x81, 0xfe, 0x04, 0x00, key[0], key[1], key[2], key[3]}
+	for i := range payload {
+		frame = append(frame, payload[i]^key[i%4])
+	}
+	return frame
+}
+
+type loopbackEcho struct {
+	frame  []byte
+	client net.Conn
+	conn   *websocket.Conn
+	reader *bufio.Reader
+	ctx    context.Context
+}
+
+func openLoopbackEcho(b *testing.B, payload []byte) (*loopbackEcho?, error) {
+	b.Helper()
+	frame := loopbackFrame(payload)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	server, err := ln.Accept()
+	if err != nil {
+		return nil, fmt.Errorf("accept: %w", err)
+	}
+	if err := ln.Close(); err != nil {
+		return nil, fmt.Errorf("listener close: %w", err)
+	}
+	b.Cleanup(func() {
+		if cerr := client.Close(); cerr != nil {
+			b.Errorf("client close: %v", cerr)
+		}
+	})
+	rw := bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server))
+	c := websocket.ServeHijacked(server, rw, "", 1<<20)
+	b.Cleanup(func() {
+		if cerr := c.Close(); cerr != nil {
+			b.Errorf("conn close: %v", cerr)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	b.Cleanup(cancel)
+	return &loopbackEcho{frame: frame, client: client, conn: c, reader: bufio.NewReader(client), ctx: ctx}, nil
+}
+
+func (e *loopbackEcho) round() ([]byte, error) {
+	if _, werr := e.client.Write(e.frame); werr != nil {
+		return nil, werr
+	}
+	k, echo, nerr := e.conn.Next(e.ctx)
+	if nerr != nil {
+		return nil, nerr
+	}
+	if k != websocket.Text {
+		return nil, fmt.Errorf("echo kind = %d, want text", uint8(k))
+	}
+	if werr := e.conn.WriteText(e.ctx, echo); werr != nil {
+		return nil, werr
+	}
+	op, got, rerr := readServerBytes(e.reader)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if op != 0x1 {
+		return nil, fmt.Errorf("echo opcode = %d, want 1", op)
+	}
+	return got, nil
+}
+
+func reportLatencies(b *testing.B, lat []time.Duration) {
+	b.Helper()
+	if len(lat) == 0 {
+		b.Fatal("no samples collected")
+		return
+	}
+	slices.Sort(lat)
+	n := len(lat)
+	b.ReportMetric(float64(lat[n/2].Nanoseconds()), "p50-ns/op")
+	b.ReportMetric(float64(lat[n*95/100].Nanoseconds()), "p95-ns/op")
+	b.ReportMetric(float64(lat[n*99/100].Nanoseconds()), "p99-ns/op")
+	b.ReportMetric(float64(lat[n-1].Nanoseconds()), "max-ns/op")
+}
+func BenchmarkLoopbackEcho1KiB(b *testing.B) {
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = 'a' + byte(i%26)
+	}
+	e, err := openLoopbackEcho(b, payload)
+	if err != nil {
+		b.Fatalf("open: %v", err)
+		return
+	}
+	if e == nil {
+		b.Fatal("open gave no connection")
+		return
+	}
+	for i := 0; i < 5; i++ {
+		got, werr := e.round()
+		if werr != nil {
+			b.Fatalf("warm-up: %v", werr)
+			return
+		}
+		if !bytes.Equal(got, payload) {
+			b.Fatal("warm-up echo mismatch")
+			return
+		}
+	}
+	lat := make([]time.Duration, 0, 1<<17)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		start := time.Now()
+		got, werr := e.round()
+		if werr != nil {
+			b.Fatalf("echo: %v", werr)
+			return
+		}
+		if !bytes.Equal(got, payload) {
+			b.Fatal("echo mismatch")
+			return
+		}
+		lat = append(lat, time.Since(start))
+	}
+	b.StopTimer()
+	reportLatencies(b, lat)
+}

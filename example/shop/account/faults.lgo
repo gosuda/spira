@@ -1,0 +1,11 @@
+package account
+
+import (
+	"github.com/gosuda/spira/fault"
+)
+
+var ErrAccountFailed = fault.New("account.failed", fault.Internal, "The account request could not be completed.")
+
+func Faults() []*fault.Error {
+	return []*fault.Error{ErrAccountFailed}
+}

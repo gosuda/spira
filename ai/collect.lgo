@@ -7,7 +7,6 @@ package ai
 
 import (
 	"cmp"
-	"fmt"
 	"iter"
 	"slices"
 	"strings"
@@ -49,7 +48,7 @@ func Collect(chunks iter.Seq2[Chunk, error]) (Reply, error) {
 	var c collector
 	for chunk, err := range chunks {
 		if err != nil {
-			return Reply{}, ErrModelFailed.Wrap(fmt.Errorf("ai: collect: %w", err))
+			return Reply{}, modelFault("collect", err)
 		}
 		c.note(chunk)
 		c.add(chunk)

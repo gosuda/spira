@@ -29,7 +29,7 @@ type Settings struct {
 }
 
 func Load() (Settings, error) {
-	return config.Load[Settings]()
+	return config.Load[Settings](Settings{})
 }
 `
 

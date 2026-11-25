@@ -23,7 +23,7 @@ func NewLoader(sources []Source) *Loader
 func (l *Loader) Key(prefix string, name string, tag string) string
 func (l *Loader) Set(dst any, key string, required bool)
 func (l *Loader) Err() error
-func Load[T any](sources ...Source) (T, error)
+func Load[T any](seed T, sources ...Source) (T, error)
 func Fill[S any](ld *Loader, dst *S, prefix string)
 ```
 
@@ -61,13 +61,13 @@ func Fill[S any](ld *Loader, dst *S, prefix string)
 - `Load` MUST return the error `config: Load needs a struct` when `T` is not a struct.
 - `Load` MUST take the value of a key from the first source that has the key.
 - A source that holds an empty string for a key MUST count as a source that has the key.
-- `Load` MUST leave a field at its zero value when no source has its key.
+- `Load` MUST start from the seed value, keeping each field default the seed holds.
 - `Fill` MUST keep the value that `dst` holds for a field when no source has its key.
 - A field with the tag `required:"true"` and no value MUST be reported as a missing key.
 - `Loader.Err` MUST report all missing keys in one error.
 - `Loader.Err` MUST report every parse failure, joined with `errors.Join`.
 - `Loader.Err` MUST report the parse failures and not the missing keys when both exist.
-- `Load` MUST return the zero value of `T` together with an error.
+- `Load` MUST return the partially filled value together with an error.
 
 ### Field types
 

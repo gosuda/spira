@@ -4,6 +4,7 @@ import (
 	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -496,5 +497,72 @@ func TestDocEndpointExclusionKeepsUnrelatedRoutes(t *testing.T) {
 	if reports.Get == nil {
 		t.Fatalf("document drops GET /reports/openapi.json")
 		return
+	}
+}
+
+func filesSingle(ctx *web.Context) (web.Reply, error) {
+	return web.Data{Value: "single"}, nil
+}
+
+func filesMulti(ctx *web.Context) (web.Reply, error) {
+	return web.Data{Value: "multi"}, nil
+}
+
+func TestDocEndpointExcludedUnderGroupPrefix(t *testing.T) {
+	r := web.NewRouter()
+	r.Group("/api", func(g *web.Router) {
+		openapi.Mount(g, fixtureInfo())
+	})
+	doc := openapi.Document(r, fixtureInfo())
+	if _, bad := doc.Paths["/api/openapi.json"]; bad {
+		t.Fatalf("document lists its own endpoint under a group prefix")
+		return
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/openapi.json", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("group mount status %d want 200", rec.Code)
+		return
+	}
+	var served openapi.Doc
+	if err := json.Unmarshal(rec.Body.Bytes(), &served); err != nil {
+		t.Fatalf("decode served document: %v", err)
+		return
+	}
+	if _, bad := served.Paths["/api/openapi.json"]; bad {
+		t.Fatalf("served document lists its own endpoint under a group prefix")
+		return
+	}
+}
+
+func TestCollapsedWildcardKeepsTheMuxServedOperation(t *testing.T) {
+	for i := range 2 {
+		r := web.NewRouter()
+		if i == 0 {
+			r.Handle("GET", "/files/{rest}", filesSingle)
+			r.Handle("GET", "/files/{rest...}", filesMulti)
+		} else {
+			r.Handle("GET", "/files/{rest...}", filesMulti)
+			r.Handle("GET", "/files/{rest}", filesSingle)
+		}
+		r.Describe("GET", "/files/{rest}", web.Doc{Summary: "single"})
+		r.Describe("GET", "/files/{rest...}", web.Doc{Summary: "multi"})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/a", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("order %d status %d want 200", i, rec.Code)
+			return
+		}
+		if !strings.Contains(rec.Body.String(), "single") {
+			t.Fatalf("order %d serves %q want the single-segment route", i, rec.Body.String())
+			return
+		}
+		doc := openapi.Document(r, fixtureInfo())
+		got := doc.Paths["/files/{rest}"] ?? openapi.PathItem{}
+		op := got.Get ?? &openapi.Operation{}
+		if op.Summary != "single" {
+			t.Fatalf("order %d documents %q want single", i, op.Summary)
+			return
+		}
 	}
 }

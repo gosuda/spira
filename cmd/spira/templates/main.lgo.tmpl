@@ -57,6 +57,7 @@ func run(ctx context.Context) error {
 	for _, stage := range web.Defaults() {
 		r.Use(stage)
 	}
+	r.Use(auth.CrossOrigin())
 	sessions := &auth.Sessions{Store: &account.DBStore{DB: pool}, Cookie: "__Host-demo", TTL: 12 * time.Hour}
 	r.Use(auth.Authenticate(sessions.Authenticator()))
 	r.Layout = func(ctx *web.Context, p web.Page) view.Node {
