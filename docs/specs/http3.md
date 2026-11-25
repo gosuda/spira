@@ -70,6 +70,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - The backend MUST omit `SETTINGS_QPACK_MAX_TABLE_CAPACITY` and `SETTINGS_QPACK_BLOCKED_STREAMS`. Both MUST default to 0 (RFC 9204 section 5).
 - If a header block refers to the dynamic table, the backend MUST close the connection with `QPACK_DECOMPRESSION_FAILED`.
 - A client MUST keep at most 100 bidirectional streams and 100 unidirectional streams open per connection.
+- The backend MUST cap incoming streams at 100 bidirectional and 100 unidirectional per connection.
 - The initial QUIC receive window MUST be 1 MiB per stream and 1 MiB per connection (RFC 9000 section 4).
 - The QUIC send buffer MUST hold at most 1 MiB per stream. A write MUST wait for space if the buffer is full.
 - The backend MUST set the QUIC handshake timeout to 5 seconds.
@@ -89,7 +90,8 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - On each connection with an open HTTP/3 control stream, a graceful drain MUST send one GOAWAY frame.
 - The GOAWAY identifier MUST be the next client bidirectional stream ID after the highest admitted request stream. If the backend admitted no request stream, the identifier MUST be 0.
 - Once the drain starts, the backend MUST admit no new request streams. It MUST reject new request streams on open connections with `H3_REQUEST_REJECTED` so the client can retry the request.
-- The backend MUST reject request stream IDs at or above `2^62 - 4` so the GOAWAY identifier fits in a variable-length integer.
+- The backend MUST reject request stream IDs at or above `2^62 - 4`.
+- The cap MUST leave room for the GOAWAY identifier in a variable-length integer.
 - The control stream MUST reject an attempt to send a GOAWAY identifier greater than the previous one.
 - The backend MUST wait for admitted requests to finish and for QUIC to acknowledge GOAWAY. If both complete and the connection remains open, it MUST close the connection with `H3_NO_ERROR`.
 - A client GOAWAY frame MUST NOT stop requests. If a client GOAWAY identifier exceeds the previous one, the backend MUST close the connection with `H3_ID_ERROR`.
@@ -99,7 +101,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - When a client attempts TLS session resumption, the QUIC layer MUST clear the early data flag on the session. The server MUST accept no 0-RTT data and MUST keep no 0-RTT replay window.
 - The QUIC backend MUST issue no session tickets. The server MAY resume with a ticket from another issuer if the TLS configuration accepts it.
-- After a restart, the TLS configuration MUST retain a valid ticket key or recover the session state with `UnwrapSession`. `http3.Server` MUST NOT manage ticket key storage or rotation.
+- A restart MUST NOT drop the ability to resume a session established before the restart.
+- The TLS configuration MUST retain a valid ticket key for such a session, or recover its state with `UnwrapSession`.
+- `http3.Server` MUST NOT manage ticket key storage or rotation.
 - `SessionTicketsDisabled` on the effective TLS configuration MUST disable resumption.
 - Extended CONNECT over HTTP/3 MUST stay unbuilt in this server.
 - The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
