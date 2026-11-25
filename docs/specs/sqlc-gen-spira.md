@@ -140,12 +140,8 @@ SQL Server:
 - For each PostgreSQL enum, the plugin MUST emit a named string type, its constants, and `Valid() bool`.
 - For each table with `key`, the plugin MUST emit `var <Type>Table = orm.Table[<Type>, <key_type>]` with `Name`, `Key` and `Version`.
 - The plugin MUST emit `func PrepareAll(ctx context.Context, p *db.Pool) error`.
-- `PrepareAll` MUST prepare every generated statement.
-- `PrepareAll` MUST return the first failure with the query name.
-- `PrepareAll` MUST call one `prepare<Topic>` helper for each query file.
-- `<Topic>` MUST be the file stem in Pascal-case.
-- Each helper MUST prepare the statements of its file in query order.
-- Each helper MUST return the first failure with the sqlc query name in the message.
+- `PrepareAll` MUST prepare every generated statement through one shared query table in query order.
+- `PrepareAll` MUST return the first failure with the sqlc query name in the message.
 - The failure MUST wrap the engine error with `%w`.
 - The wrapped error MUST satisfy `errors.Is` and `errors.As` to the `db` prepare error.
 - Every emitted call MUST pass a query constant and bound arguments.
@@ -225,9 +221,8 @@ SQL Server:
 - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
-- `TestGeneratedStoreBuilds` generates a two-query store and compiles it with `logos build`.
-- The same test runs the generated PrepareAll over one valid and one rejected statement against SQLite.
-- The run MUST report the rejected query name and satisfy `errors.Is` to `db.ErrStatementFailed`.
+- `TestSQLcSQLiteIntegration` builds the plugin, generates the runtime fixture store, and compiles and runs it with `logos`.
+- The run calls the generated PrepareAll before the items table exists, which MUST report the rejected query name and satisfy `errors.Is` to `db.ErrStatementFailed`.
 - The raw-query rule is proved on a scratch copy with a planted call and on the clean tree.
 - The shop lane adds `sql-check` to `gate` after it publishes `example/shop/sqlc.yaml`.
 - The end-to-end proof that runs generated functions against `database/sql` is not in this package.

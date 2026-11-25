@@ -103,3 +103,11 @@ This product includes github.com/quic-go/quic-go
 (https://github.com/quic-go/quic-go), version v0.65.0.
 Copyright (c) 2016 the quic-go authors and Google, Inc.
 Licensed under the MIT License.
+
+The HPACK Huffman tables in web/ws_h2_test.lgo and
+websocket/stream_test.lgo are transcribed from golang.org/x/net/http2/hpack
+(https://github.com/golang/net), file hpack/huffman.go, as vendored in the
+LoGOs toolchain at version v0.55.1-0.20260731170536-c1d18010be90. The code
+lengths and values come from RFC 7541 Appendix B (IETF).
+Copyright 2014 The Go Authors.
+Licensed under the BSD-3-Clause license.
