@@ -426,7 +426,6 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestCloseWithCodeEndsConnection` proves that `CloseWithCode` sends 1000 and ends the connection.
 - `TestUpgradeAnswers101WithRFCVector` proves that the RFC 6455 section 1.3 sample key answers 101 with its accept value.
 - `TestUpgradeOriginPolicy` proves that foreign origins get 403 while same, absent and listed origins get 101.
-// refused_by: merge_ladder_exhausted · collision: none (1 contested hunk(s), neither side deleted the other's lines)
 - `TestUpgradeSelectsSubprotocolInServerOrder` proves that the first supported offered subprotocol wins.
 - `TestHTTP2WebSocketEchoAndClose` exercises a masked text echo, subprotocol selection and a close handshake over HTTP/2. It then uses the same connection for another request.
 - `TestHTTP2WebSocketRejectsInvalidHandshake` checks the protocol, legacy key, version, subprotocol offer and origin rejections.

@@ -56,8 +56,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - A missing user and a wrong password MUST answer `auth.invalid_credentials`.
 - The account handlers MUST NOT call `web.Fail` with a literal problem.
 - A bad session user id MUST wrap the account fault.
-// refused_by: statement_fold · collision: none (no common ancestor text)
-// refused_by: statement_fold · collision: none (no common ancestor text)
+- Each failed account request MUST return a declared fault as the handler's error; a successful request MUST return no fault.
 - `main.lgo` MUST seed the user `demo` only when `SPIRA_SEED_DEMO_PASSWORD` is set and not empty.
 - The seed MUST give the user `demo` the value of `SPIRA_SEED_DEMO_PASSWORD` as its password.
 - When the user `demo` exists, the seed MUST replace its password with that value.
