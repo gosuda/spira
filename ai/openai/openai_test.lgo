@@ -432,6 +432,8 @@ func TestCutStreamYieldsErrorChunkAndNoReply(t *testing.T) {
 		Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "Say hello"}}}},
 	})); cerr == nil {
 		t.Fatal("collect over a cut stream returned no error")
+	} else if got := fault.Public(cerr).Code; got != openai.ErrProviderStreamCut.Code {
+		t.Fatalf("collect public code = %s, want the stream cut fault instead of ai.model_failed", got)
 	}
 }
 

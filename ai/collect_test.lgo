@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
 )
 
 func streamOf(chunks ...ai.Chunk) iter.Seq2[ai.Chunk, error] {
@@ -263,6 +264,29 @@ func TestCollectEndsWithTheStreamError(t *testing.T) {
 	}
 	if !errors.Is(err, ai.ErrModelFailed) {
 		t.Fatalf("error %q lacks the ai.model_failed fault", err.Error())
+	}
+}
+
+var errDeclaredCut = fault.New("collecttest.declared_cut", fault.Unavailable, "the test stream was cut")
+
+func TestCollectKeepsADeclaredStreamFault(t *testing.T) {
+	cut := func(yield func(ai.Chunk, error) bool) {
+		if !yield(loose(ai.Text{Text: "partial answer"}), nil) {
+			return
+		}
+		yield(ai.Chunk{}, errDeclaredCut.Wrap(errors.New("cut")))
+	}
+	_, err := ai.Collect(cut)
+	if !errors.Is(err, errDeclaredCut) {
+		t.Fatalf("error = %v, want the declared stream fault", err)
+		return
+	}
+	if errors.Is(err, ai.ErrModelFailed) {
+		t.Fatalf("error = %v, want the declared fault without the ai.model_failed wrap", err)
+		return
+	}
+	if got := fault.Public(err).Code; got != errDeclaredCut.Code {
+		t.Fatalf("public code = %s, want %s", got, errDeclaredCut.Code)
 	}
 }
 
