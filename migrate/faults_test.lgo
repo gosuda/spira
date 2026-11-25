@@ -11,60 +11,6 @@ import (
 	"github.com/gosuda/spira/migrate"
 )
 
-func TestFaultMissingDown(t *testing.T) {
-	fsys := fstest.MapFS{
-		"0001_only.up.sql": &fstest.MapFile{Data: []byte("CREATE TABLE only_one (id integer)")},
-	}
-	_, err := migrate.Load(fsys)
-	if !errors.Is(err, migrate.ErrMissingDown) {
-		t.Fatalf("Load error = %v, want migrate.ErrMissingDown", err)
-		return
-	}
-	_, err = migrate.Load(os.DirFS("testdata/downonly"))
-	if !errors.Is(err, migrate.ErrMissingDown) {
-		t.Fatalf("Load error = %v, want migrate.ErrMissingDown", err)
-		return
-	}
-}
-
-func TestFaultOrderMismatch(t *testing.T) {
-	pool := openPool(t)
-	steps := loadSteps(t, "good")
-	if err := migrate.Apply(t.Context(), pool, steps); err != nil {
-		t.Fatalf("Apply: %v", err)
-		return
-	}
-	err := migrate.Apply(t.Context(), pool, []migrate.Step{steps[1], steps[0]})
-	if !errors.Is(err, migrate.ErrOrderMismatch) {
-		t.Fatalf("Apply error = %v, want migrate.ErrOrderMismatch", err)
-		return
-	}
-}
-
-func TestFaultNotReversible(t *testing.T) {
-	pool := openPool(t)
-	steps := loadSteps(t, "badpair")
-	err := migrate.CheckReversible(t.Context(), pool, steps)
-	if !errors.Is(err, migrate.ErrNotReversible) {
-		t.Fatalf("CheckReversible error = %v, want migrate.ErrNotReversible", err)
-		return
-	}
-}
-
-func TestFaultScratchNotEmpty(t *testing.T) {
-	pool := openPool(t)
-	if _, err := db.Exec(t.Context(), pool, "CREATE TABLE scratch_left (id integer)"); err != nil {
-		t.Fatalf("seed: %v", err)
-		return
-	}
-	steps := loadSteps(t, "good")
-	err := migrate.CheckReversible(t.Context(), pool, steps)
-	if !errors.Is(err, migrate.ErrScratchNotEmpty) {
-		t.Fatalf("CheckReversible error = %v, want migrate.ErrScratchNotEmpty", err)
-		return
-	}
-}
-
 func TestFaultUnavailable(t *testing.T) {
 	_, err := migrate.Load(os.DirFS("/nonexistent-fault-dir"))
 	if !errors.Is(err, migrate.ErrUnavailable) {

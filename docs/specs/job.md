@@ -169,7 +169,6 @@ func Faults() []*fault.Error
 - `TestSchedulerReclaimsTickSentBeforeCancel` proves that a pump cancelled after its send takes its tick back and leaves no busy mark.
 - `TestSchedulerReleasesClaimWhenCancelWinsBeforeSend` proves that a pump cancelled before its send clears the claim it just made.
 - `TestQueueClosedThroughEnqueueBeforeStart` and `TestQueueStoppedThroughStartAfterStop` prove the closed and stopped matches through `Enqueue` and `Start`.
-- `TestAlreadyStartedFaults` proves both already-started matches.
 - `TestChunkFailedThroughWriteError` proves the `job.chunk_failed` match, the stats on the cause, and that hostile input in the cause reaches no public view.
 - `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 

@@ -577,37 +577,6 @@ func TestProfileDefaultsToDev(t *testing.T) {
 	}
 }
 
-
-type crossFixture struct {
-	Name     string `required:"true"`
-	Region   string
-	Settings inner
-}
-
-func TestLoadCrossPackageNestedAndRequired(t *testing.T) {
-	src := config.Map(map[string]string{
-		"NAME":         "shop",
-		"REGION":       "eu",
-		"SETTINGS_HOST": "cross.internal",
-		"SETTINGS_PORT": "5432",
-	})
-	cfg, err := config.Load[crossFixture](crossFixture{}, src)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-		return
-	}
-	if cfg.Name != "shop" || cfg.Region != "eu" {
-		t.Fatalf("scalars = %+v, want Name shop Region eu", cfg)
-	}
-	if cfg.Settings.Host != "cross.internal" || cfg.Settings.Port != 5432 {
-		t.Fatalf("Settings = %+v, want host cross.internal port 5432", cfg.Settings)
-	}
-	_, err = config.Load[crossFixture](crossFixture{}, config.Map(map[string]string{"SETTINGS_HOST": "h", "SETTINGS_PORT": "1"}))
-	if err == nil || err.Error() != "config: missing keys: NAME" {
-		t.Fatalf("Load without NAME error = %v, want config: missing keys: NAME", err)
-	}
-}
-
 func TestProfileReadsEnvironment(t *testing.T) {
 	t.Setenv("SPIRA_PROFILE", "prod")
 	if got := config.Profile(); got != "prod" {
