@@ -586,6 +586,42 @@ func TestPercentEncodedPathArrivesEncoded(t *testing.T) {
 	}
 }
 
+func TestDotSegmentsAreRefusedBeforeAnyUpstream(t *testing.T) {
+	grd := newRequestGuard(t)
+	hc := grd.httpClient(t)
+	var hits atomic.Int64
+	up := countingUpstream(t, grd, &hits)
+	gw := serveGateway(t, []gateway.Route{
+		{PathPrefix: "/api", StripPrefix: true, To: []string{up.URL + "/base"}},
+		{PathPrefix: "/keep", To: []string{up.URL}},
+	}, plainPolicy())
+	for _, path := range []string{
+		"/api/%2e%2e/admin",
+		"/api/%2E%2E/admin",
+		"/api/.%2e/admin",
+		"/api/%2e./admin",
+		"/api/%2e/admin",
+		"/api/..%2Fadmin",
+		"/api/x%2F..%2Fadmin",
+		"/keep/%2e%2e/admin",
+	} {
+		resp, err := hc.Get(gw.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status %d want 400 (body %s)\n%s", path, resp.StatusCode, body, grd.report())
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+			t.Fatalf("%s: content type %q want application/problem+json", path, ct)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("the upstream saw %d requests with dot segments, want 0\n%s", hits.Load(), grd.report())
+	}
+}
+
 func TestUpstreamQueryLeadsTheRequestQuery(t *testing.T) {
 	grd := newRequestGuard(t)
 	hc := grd.httpClient(t)
