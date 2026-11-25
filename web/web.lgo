@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json/v2"
-	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -219,11 +218,6 @@ func (r *Router) answerReply(c *Context, reply Reply) {
 func (r *Router) answerError(c *Context, err error) {
 	if c.writer.wrote {
 		slog.Error("web: error after the response was written", "method", c.Request.Method, "path", c.Request.URL.Path, "error", err)
-		return
-	}
-	pe := &ProblemError{}
-	if errors.As(err, &pe) {
-		r.answerProblem(c, pe.Problem)
 		return
 	}
 	if f := fault.Of(err); f != nil {

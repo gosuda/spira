@@ -221,13 +221,6 @@ func RequestID() Stage
 func AccessLog(log *slog.Logger) Stage
 func CacheControl(directive string) Stage
 
-type ProblemError struct {
-	Problem Problem
-}
-
-func (e *ProblemError) Error() string
-func Fail(p Problem) error
-
 type Server struct {
 	Addr                 string = ":8080"
 	Router               *Router
@@ -388,15 +381,14 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - The internal problem MUST NOT include the panic text or the error text.
 - An unknown error MUST be logged as `web: handler failed`.
 - A fault that answers 500 or above MUST be logged as `web: handler failed`.
-- `Fail` MUST be written as its problem, including a wrapped or joined error.
-- `ProblemError.Error` MUST return `web: ` plus `Problem.Title`.
-- The answer status MUST be 400 for `invalid`, 422 for `unprocessable` and 401 for `unauthenticated`.
-- The answer status MUST be 403 for `forbidden`, 404 for `not_found` and 409 for `conflict`.
-- The answer status MUST be 413 for `too_large`, 429 for `rate_limited` and 499 for `canceled`.
-- The answer status MUST be 504 for `timeout`, 503 for `unavailable` and 500 for `internal`.
+- An error that carries a fault MUST be answered with the public view of its outermost fault.
+- The answer status MUST follow the kind:
+- The kind `invalid` MUST map to status 400, `unprocessable` to 422, `unauthenticated` to 401, `forbidden` to 403.
+- The kind `not_found` MUST map to status 404, `conflict` to 409, `too_large` to 413, `rate_limited` to 429.
+- The kind `canceled` MUST map to status 499, `timeout` to 504, `unavailable` to 503, `internal` to 500.
 - A fault wrapped under `fmt.Errorf` and a fault joined under `errors.Join` MUST map by the outermost fault in the chain.
 - The public view MUST carry the fault code and the constant message.
-- The public view MUST NOT carry cause text, driver text or a submitted value.
+- The public view MUST NOT carry wrapped cause text, driver text or submitted values.
 - The body of a fault answer MUST use content type `application/problem+json`.
 - `RequestID` MUST keep an inbound `X-Request-Id` of 1 to 64 allowed bytes.
 - An allowed byte MUST be a letter, a digit, `.`, `_` or `-`.
@@ -496,7 +488,6 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestRedirectRefusesScriptSchemes` and `TestRedirectKeepsOrdinaryTargets` prove the redirect scheme rule.
 - `TestFailWritesProblemMembers` and `TestJoinedProblemErrorsKeepTheProblem` prove problem members and a wrapped or joined fault.
 - `TestInternalFaultIsLoggedOnce` proves that a 500 fault is logged once while a 409 fault stays quiet.
-- `TestWrappedLegacyProblemKeepsTheProblem` proves that a wrapped `Fail` keeps its problem.
 - `TestUnknownErrorAndPanicStayHidden` proves that an unknown error answers the fixed internal view and that both omit their text.
 - `TestErrAbortHandlerAbortsACutStream` proves that a cut stream ends in a body read error.
 - `TestAccessLogRecordsAnAbortedStream` proves the log record for an aborted stream.

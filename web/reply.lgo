@@ -299,15 +299,3 @@ func (fw *flushWriter) Write(b []byte) (int, error) {
 	}
 	return n, err
 }
-
-type ProblemError struct {
-	Problem Problem
-}
-
-func (e *ProblemError) Error() string {
-	return "web: " + e.Problem.Title
-}
-
-func Fail(p Problem) error {
-	return &ProblemError{Problem: p}
-}
