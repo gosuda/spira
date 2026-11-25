@@ -1,4 +1,4 @@
-package http3
+package http3_test
 
 import (
 	"bufio"
@@ -10,6 +10,7 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/gosuda/spira/http3"
 	"github.com/quic-go/qpack"
 )
 
@@ -17,7 +18,7 @@ func TestH3RequestBodyStreamsData(t *testing.T) {
 	wire := []byte("\x00\x03abc\x21\x04skip\x00\x00\x00\x02de\x00\x00")
 	source := bytes.NewReader(wire)
 	stream := bufio.NewReaderSize(iotest.OneByteReader(source), 16)
-	var body io.Reader = newH3RequestBodyReader(stream, nil, h3RequestBodyLimits{contentLength: 5})
+	var body io.Reader = http3.NewH3RequestBodyReaderForTest(stream, nil, http3.H3RequestBodyLimitsForTest{ContentLength: 5})
 	if n, err := body.Read(nil); n != 0 || err != nil || source.Len() != len(wire) {
 		t.Fatalf("zero-length Read = (%d, %v); remaining wire bytes = %d, want %d", n, err, source.Len(), len(wire))
 	}
@@ -46,18 +47,18 @@ func TestH3RequestBodyContentLength(t *testing.T) {
 		{"omitted", "\x00\x02ab\x00\x03cde", -1, "abcde", nil},
 		{"short", "\x00\x02ab", 3, "ab", io.ErrUnexpectedEOF},
 		{"missing", "", 1, "", io.ErrUnexpectedEOF},
-		{"excess within frame", "\x00\x02ab\x00\x03cde", 4, "abcd", errH3MalformedMessage},
-		{"excess in next frame", "\x00\x02ab\x00\x02cd", 2, "ab", errH3MalformedMessage},
-		{"excess over zero", "\x00\x01a", 0, "", errH3MalformedMessage},
+		{"excess within frame", "\x00\x02ab\x00\x03cde", 4, "abcd", http3.ErrH3MalformedMessageForTest()},
+		{"excess in next frame", "\x00\x02ab\x00\x02cd", 2, "ab", http3.ErrH3MalformedMessageForTest()},
+		{"excess over zero", "\x00\x01a", 0, "", http3.ErrH3MalformedMessageForTest()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stream := bufio.NewReader(bytes.NewReader([]byte(tc.wire)))
-			body := newH3RequestBodyReader(stream, nil, h3RequestBodyLimits{contentLength: tc.length})
+			body := http3.NewH3RequestBodyReaderForTest(stream, nil, http3.H3RequestBodyLimitsForTest{ContentLength: tc.length})
 			got, err := io.ReadAll(body)
 			if string(got) != tc.want || !errors.Is(err, tc.wantErr) {
 				t.Fatalf("ReadAll = (%q, %v), want (%q, %v)", got, err, tc.want, tc.wantErr)
 			}
-			if tc.wantErr != nil && !errors.Is(err, errH3MalformedMessage) {
+			if tc.wantErr != nil && !errors.Is(err, http3.ErrH3MalformedMessageForTest()) {
 				t.Fatalf("length error = %v, want malformed message", err)
 			}
 		})
@@ -85,8 +86,8 @@ func TestH3RequestBodyFrameEOF(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stream := bufio.NewReader(bytes.NewReader([]byte(tc.wire)))
-			limits := h3RequestBodyLimits{contentLength: -1, maxTrailerBytes: 64}
-			var body io.Reader = newH3RequestBodyReader(stream, nil, limits)
+			limits := http3.H3RequestBodyLimitsForTest{ContentLength: -1, MaxTrailerBytes: 64}
+			var body io.Reader = http3.NewH3RequestBodyReaderForTest(stream, nil, limits)
 			got, err := io.ReadAll(body)
 			if tc.wantErr == io.EOF {
 				if len(got) != 0 || err != nil {
@@ -101,7 +102,7 @@ func TestH3RequestBodyFrameEOF(t *testing.T) {
 			if string(got) != tc.want || !errors.Is(err, tc.wantErr) {
 				t.Fatalf("body = %q, terminal error = %v; want %q, %v", got, err, tc.want, tc.wantErr)
 			}
-			if tc.wantErr == io.ErrUnexpectedEOF && (!errors.Is(err, errH3FrameTruncated) || errors.Is(err, io.EOF)) {
+			if tc.wantErr == io.ErrUnexpectedEOF && (!errors.Is(err, http3.ErrH3FrameTruncatedForTest()) || errors.Is(err, io.EOF)) {
 				t.Fatalf("error = %v, want a truncated frame, not clean EOF", err)
 			}
 		})
@@ -117,13 +118,13 @@ func TestH3RequestBodyEOFWithData(t *testing.T) {
 		wantErr error
 	}{
 		{"finished frame", "\x00\x20", 32, nil},
-		{"truncated frame", "\x00\x21", -1, errH3FrameTruncated},
-		{"short content length", "\x00\x20", 33, errH3MalformedMessage},
+		{"truncated frame", "\x00\x21", -1, http3.ErrH3FrameTruncatedForTest()},
+		{"short content length", "\x00\x20", 33, http3.ErrH3MalformedMessageForTest()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wire := append([]byte(tc.header), payload...)
 			stream := bufio.NewReaderSize(iotest.DataErrReader(bytes.NewReader(wire)), 16)
-			body := newH3RequestBodyReader(stream, nil, h3RequestBodyLimits{contentLength: tc.length})
+			body := http3.NewH3RequestBodyReaderForTest(stream, nil, http3.H3RequestBodyLimitsForTest{ContentLength: tc.length})
 			got, err := io.ReadAll(body)
 			if !bytes.Equal(got, payload) || !errors.Is(err, tc.wantErr) {
 				t.Fatalf("ReadAll = (%q, %v), want (%q, %v)", got, err, payload, tc.wantErr)
@@ -151,8 +152,8 @@ func TestH3RequestBodyPreservesReadError(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			source := io.MultiReader(bytes.NewReader([]byte(tc.wire)), iotest.ErrReader(cause))
-			limits := h3RequestBodyLimits{contentLength: -1, maxTrailerBytes: 64}
-			body := newH3RequestBodyReader(bufio.NewReader(source), nil, limits)
+			limits := http3.H3RequestBodyLimitsForTest{ContentLength: -1, MaxTrailerBytes: 64}
+			body := http3.NewH3RequestBodyReaderForTest(bufio.NewReader(source), nil, limits)
 			got, err := io.ReadAll(body)
 			if string(got) != tc.want || !errors.Is(err, cause) {
 				t.Fatalf("ReadAll = (%q, %v), want (%q, %v)", got, err, tc.want, cause)
@@ -180,8 +181,8 @@ func TestH3RequestBodyRejectsForbiddenFrames(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stream := bufio.NewReader(bytes.NewReader([]byte(tc.wire)))
-			body := newH3RequestBodyReader(stream, nil, h3RequestBodyLimits{contentLength: -1})
-			if _, err := io.ReadAll(body); !errors.Is(err, errH3FrameUnexpected) {
+			body := http3.NewH3RequestBodyReaderForTest(stream, nil, http3.H3RequestBodyLimitsForTest{ContentLength: -1})
+			if _, err := io.ReadAll(body); !errors.Is(err, http3.ErrH3FrameUnexpectedForTest()) {
 				t.Fatalf("ReadAll error = %v, want unexpected frame", err)
 			}
 		})
@@ -198,8 +199,8 @@ func TestH3RequestBodyPublishesTrailers(t *testing.T) {
 	wire = append(wire, "\x21\x01x"...)
 	trailers := http.Header{"X-Checksum": nil, "X-Absent": nil}
 	stream := bufio.NewReaderSize(bytes.NewReader(wire), 16)
-	limits := h3RequestBodyLimits{contentLength: 3, maxTrailerBytes: 64, maxFieldSectionSize: 256}
-	var body io.Reader = newH3RequestBodyReader(stream, trailers, limits)
+	limits := http3.H3RequestBodyLimitsForTest{ContentLength: 3, MaxTrailerBytes: 64, MaxFieldSectionSize: 256}
+	var body io.Reader = http3.NewH3RequestBodyReaderForTest(stream, trailers, limits)
 	var p [3]byte
 	if n, err := io.ReadFull(body, p[:]); n != len(p) || string(p[:]) != "hey" || err != nil {
 		t.Fatalf("DATA = (%q, %v), want (hey, nil)", p[:n], err)
@@ -230,18 +231,18 @@ func TestH3RequestBodyRejectsBadTrailers(t *testing.T) {
 		wire    string
 		wantErr error
 	}{
-		{"invalid QPACK", "\x01\x01\x00", errH3QPACK},
-		{"prohibited field after valid field", string(prohibited), errH3MalformedMessage},
-		{"DATA after trailers", frame + "\x00\x01a", errH3FrameUnexpected},
-		{"empty DATA after trailers", frame + "\x00\x00", errH3FrameUnexpected},
-		{"second trailer section", frame + frame, errH3FrameUnexpected},
-		{"second trailer after empty section", "\x01\x02\x00\x00" + frame, errH3FrameUnexpected},
+		{"invalid QPACK", "\x01\x01\x00", http3.ErrH3QPACKForTest()},
+		{"prohibited field after valid field", string(prohibited), http3.ErrH3MalformedMessageForTest()},
+		{"DATA after trailers", frame + "\x00\x01a", http3.ErrH3FrameUnexpectedForTest()},
+		{"empty DATA after trailers", frame + "\x00\x00", http3.ErrH3FrameUnexpectedForTest()},
+		{"second trailer section", frame + frame, http3.ErrH3FrameUnexpectedForTest()},
+		{"second trailer after empty section", "\x01\x02\x00\x00" + frame, http3.ErrH3FrameUnexpectedForTest()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			trailers := http.Header{"X-Checksum": nil}
 			stream := bufio.NewReader(bytes.NewReader([]byte(tc.wire)))
-			limits := h3RequestBodyLimits{contentLength: 0, maxTrailerBytes: 64, maxFieldSectionSize: 256}
-			body := newH3RequestBodyReader(stream, trailers, limits)
+			limits := http3.H3RequestBodyLimitsForTest{ContentLength: 0, MaxTrailerBytes: 64, MaxFieldSectionSize: 256}
+			body := http3.NewH3RequestBodyReaderForTest(stream, trailers, limits)
 			if _, err := io.ReadAll(body); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("ReadAll error = %v, want %v", err, tc.wantErr)
 			}
@@ -262,17 +263,17 @@ func TestH3RequestBodyTrailerLimits(t *testing.T) {
 		decoded    uint64
 		wantErr    error
 	}{
-		{"compressed below", frame, compressed - 1, 40, errH3FieldSectionTooLarge},
-		{"decoded below", frame, compressed, 39, errH3FieldSectionTooLarge},
+		{"compressed below", frame, compressed - 1, 40, http3.ErrH3FieldSectionTooLargeForTest()},
+		{"decoded below", frame, compressed, 39, http3.ErrH3FieldSectionTooLargeForTest()},
 		{"both exact", frame, compressed, 40, nil},
 		{"both above", frame, compressed + 1, 41, nil},
-		{"oversized without payload", []byte("\x01\xff\xff\xff\xff\xff\xff\xff\xff"), compressed, 40, errH3FieldSectionTooLarge},
+		{"oversized without payload", []byte("\x01\xff\xff\xff\xff\xff\xff\xff\xff"), compressed, 40, http3.ErrH3FieldSectionTooLargeForTest()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			trailers := make(http.Header)
 			stream := bufio.NewReader(bytes.NewReader(tc.wire))
-			limits := h3RequestBodyLimits{contentLength: -1, maxTrailerBytes: tc.compressed, maxFieldSectionSize: tc.decoded}
-			body := newH3RequestBodyReader(stream, trailers, limits)
+			limits := http3.H3RequestBodyLimitsForTest{ContentLength: -1, MaxTrailerBytes: tc.compressed, MaxFieldSectionSize: tc.decoded}
+			body := http3.NewH3RequestBodyReaderForTest(stream, trailers, limits)
 			if _, err := io.ReadAll(body); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("ReadAll error = %v, want %v", err, tc.wantErr)
 			}

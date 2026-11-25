@@ -1,10 +1,12 @@
-package http3
+package http3_test
 
 import (
 	"bytes"
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/gosuda/spira/http3"
 )
 
 func encV(v uint64) []byte {
@@ -43,13 +45,13 @@ func TestReadH3FrameHeaderWidthBoundaries(t *testing.T) {
 			payload := []byte("payload-bytes")
 			wire := append(append(append([]byte{}, c.kind...), c.length...), payload...)
 			r := bytes.NewReader(wire)
-			h, err := readH3FrameHeader(r)
+			kind, length, err := http3.ReadH3FrameHeaderForTest(r)
 			if err != nil {
 				t.Fatalf("readH3FrameHeader: %v", err)
 				return
 			}
-			if h.kind != c.kindV || h.length != c.lenV {
-				t.Fatalf("header = {kind %d, length %d}, want {kind %d, length %d}", h.kind, h.length, c.kindV, c.lenV)
+			if kind != c.kindV || length != c.lenV {
+				t.Fatalf("header = {kind %d, length %d}, want {kind %d, length %d}", kind, length, c.kindV, c.lenV)
 			}
 			rest, err := io.ReadAll(r)
 			if err != nil {
@@ -68,7 +70,7 @@ func TestReadH3FrameHeaderTruncated(t *testing.T) {
 	header := append(kind, length...)
 	for cut := 0; cut < len(header); cut++ {
 		r := bytes.NewReader(header[:cut])
-		if _, err := readH3FrameHeader(r); err == nil {
+		if _, _, err := http3.ReadH3FrameHeaderForTest(r); err == nil {
 			t.Fatalf("cut %d: expected error, got nil", cut)
 		}
 	}
@@ -92,7 +94,7 @@ func TestAppendH3FrameHeaderWireBytes(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := appendH3FrameHeader([]byte("pre-"), c.kind, c.len)
+			got := http3.AppendH3FrameHeaderForTest([]byte("pre-"), c.kind, c.len)
 			if !bytes.HasPrefix(got, []byte("pre-")) {
 				t.Fatalf("prefix lost: %q", got)
 			}
@@ -100,13 +102,13 @@ func TestAppendH3FrameHeaderWireBytes(t *testing.T) {
 				t.Fatalf("wire = % x, want % x", got[4:], c.want)
 			}
 			r := bytes.NewReader(got[4:])
-			h, err := readH3FrameHeader(r)
+			kind, length, err := http3.ReadH3FrameHeaderForTest(r)
 			if err != nil {
 				t.Fatalf("roundtrip: %v", err)
 				return
 			}
-			if h.kind != c.kind || h.length != c.len {
-				t.Fatalf("roundtrip = {%d, %d}, want {%d, %d}", h.kind, h.length, c.kind, c.len)
+			if kind != c.kind || length != c.len {
+				t.Fatalf("roundtrip = {%d, %d}, want {%d, %d}", kind, length, c.kind, c.len)
 			}
 			if r.Len() != 0 {
 				t.Fatalf("roundtrip left %d bytes", r.Len())
@@ -122,34 +124,34 @@ func TestDecodeH3SettingsAllFields(t *testing.T) {
 		encSetting(0x07, 100)...),
 		encSetting(0x08, 1)...),
 		encSetting(0x33, 1)...)
-	s, err := decodeH3Settings(payload)
+	s, err := http3.DecodeH3SettingsForTest(payload)
 	if err != nil {
 		t.Fatalf("decodeH3Settings: %v", err)
 		return
 	}
-	if s.maxFieldSectionSize != 9000 || s.qpackMaxTableCapacity != 4096 || s.qpackBlockedStreams != 100 {
-		t.Fatalf("numeric settings = {%d %d %d}, want {9000 4096 100}", s.maxFieldSectionSize, s.qpackMaxTableCapacity, s.qpackBlockedStreams)
+	if s.MaxFieldSectionSize != 9000 || s.QpackMaxTableCapacity != 4096 || s.QpackBlockedStreams != 100 {
+		t.Fatalf("numeric settings = {%d %d %d}, want {9000 4096 100}", s.MaxFieldSectionSize, s.QpackMaxTableCapacity, s.QpackBlockedStreams)
 	}
-	if !s.enableConnectProtocol || !s.enableDatagram {
-		t.Fatalf("boolean settings = {connect %v, datagram %v}, want true true", s.enableConnectProtocol, s.enableDatagram)
+	if !s.EnableConnectProtocol || !s.EnableDatagram {
+		t.Fatalf("boolean settings = {connect %v, datagram %v}, want true true", s.EnableConnectProtocol, s.EnableDatagram)
 	}
 }
 
 func TestDecodeH3SettingsDefaultsAndEmpty(t *testing.T) {
-	s, err := decodeH3Settings(nil)
+	s, err := http3.DecodeH3SettingsForTest(nil)
 	if err != nil {
 		t.Fatalf("empty payload: %v", err)
 		return
 	}
-	if s.maxFieldSectionSize != h3UnlimitedFieldSectionSize || s.qpackMaxTableCapacity != 0 || s.qpackBlockedStreams != 0 || s.enableConnectProtocol || s.enableDatagram {
+	if s.MaxFieldSectionSize != http3.H3UnlimitedFieldSectionSizeForTest() || s.QpackMaxTableCapacity != 0 || s.QpackBlockedStreams != 0 || s.EnableConnectProtocol || s.EnableDatagram {
 		t.Fatalf("empty payload settings = %+v, want all defaults", s)
 	}
-	s, err = decodeH3Settings(append(append([]byte{}, encSetting(0x33, 0)...), encSetting(0x08, 0)...))
+	s, err = http3.DecodeH3SettingsForTest(append(append([]byte{}, encSetting(0x33, 0)...), encSetting(0x08, 0)...))
 	if err != nil {
 		t.Fatalf("explicit zeros: %v", err)
 		return
 	}
-	if s.enableConnectProtocol || s.enableDatagram {
+	if s.EnableConnectProtocol || s.EnableDatagram {
 		t.Fatalf("explicit zero booleans set true: %+v", s)
 	}
 }
@@ -159,80 +161,80 @@ func TestDecodeH3SettingsUnknownIDsIgnored(t *testing.T) {
 		encSetting(0x21, 7)...),
 		encSetting(0x46, 5)...),
 		encSetting(0x27FF+64, 1)...)
-	s, err := decodeH3Settings(payload)
+	s, err := http3.DecodeH3SettingsForTest(payload)
 	if err != nil {
 		t.Fatalf("unknown ids: %v", err)
 		return
 	}
-	if s.maxFieldSectionSize != h3UnlimitedFieldSectionSize || s.enableDatagram {
+	if s.MaxFieldSectionSize != http3.H3UnlimitedFieldSectionSizeForTest() || s.EnableDatagram {
 		t.Fatalf("unknown ids leaked into known fields: %+v", s)
 	}
 }
 
 func TestDecodeH3SettingsFieldSectionSizeOmittedVersusZero(t *testing.T) {
-	omitted, err := decodeH3Settings(encSetting(0x33, 1))
+	omitted, err := http3.DecodeH3SettingsForTest(encSetting(0x33, 1))
 	if err != nil {
 		t.Fatalf("omitted size: %v", err)
 		return
 	}
-	if omitted.maxFieldSectionSize != h3UnlimitedFieldSectionSize {
-		t.Fatalf("omitted size = %d, want h3UnlimitedFieldSectionSize (%d)", omitted.maxFieldSectionSize, uint64(h3UnlimitedFieldSectionSize))
+	if omitted.MaxFieldSectionSize != http3.H3UnlimitedFieldSectionSizeForTest() {
+		t.Fatalf("omitted size = %d, want h3UnlimitedFieldSectionSize (%d)", omitted.MaxFieldSectionSize, uint64(http3.H3UnlimitedFieldSectionSizeForTest()))
 	}
-	explicitZero, err := decodeH3Settings(append(append([]byte{}, encSetting(0x06, 0)...), encSetting(0x33, 1)...))
+	explicitZero, err := http3.DecodeH3SettingsForTest(append(append([]byte{}, encSetting(0x06, 0)...), encSetting(0x33, 1)...))
 	if err != nil {
 		t.Fatalf("explicit zero size: %v", err)
 		return
 	}
-	if explicitZero.maxFieldSectionSize != 0 {
-		t.Fatalf("explicit zero size = %d, want 0", explicitZero.maxFieldSectionSize)
+	if explicitZero.MaxFieldSectionSize != 0 {
+		t.Fatalf("explicit zero size = %d, want 0", explicitZero.MaxFieldSectionSize)
 	}
-	if explicitZero.maxFieldSectionSize == h3UnlimitedFieldSectionSize {
+	if explicitZero.MaxFieldSectionSize == http3.H3UnlimitedFieldSectionSizeForTest() {
 		t.Fatal("explicit zero size indistinguishable from omitted")
 	}
 }
 
 func TestDecodeH3SettingsDuplicateRejected(t *testing.T) {
 	known := append(append([]byte{}, encSetting(0x06, 1)...), encSetting(0x06, 2)...)
-	_, err := decodeH3Settings(known)
-	if !errors.Is(err, errH3SettingsMalformed) {
+	_, err := http3.DecodeH3SettingsForTest(known)
+	if !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("duplicate known id: err %v, want errH3SettingsMalformed", err)
 	}
 	unknown := append(append([]byte{}, encSetting(0x99, 1)...), encSetting(0x99, 2)...)
-	_, err = decodeH3Settings(unknown)
-	if !errors.Is(err, errH3SettingsMalformed) {
+	_, err = http3.DecodeH3SettingsForTest(unknown)
+	if !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("duplicate unknown id: err %v, want errH3SettingsMalformed", err)
 	}
 }
 
 func TestDecodeH3SettingsForbiddenHTTP2IDs(t *testing.T) {
 	for _, id := range []uint64{0x2, 0x3, 0x4, 0x5} {
-		_, err := decodeH3Settings(encSetting(id, 1))
-		if !errors.Is(err, errH3SettingsMalformed) {
+		_, err := http3.DecodeH3SettingsForTest(encSetting(id, 1))
+		if !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 			t.Fatalf("id %#x: err %v, want errH3SettingsMalformed", id, err)
 		}
 	}
 }
 
 func TestDecodeH3SettingsInvalidBooleans(t *testing.T) {
-	if _, err := decodeH3Settings(encSetting(0x08, 2)); !errors.Is(err, errH3SettingsMalformed) {
+	if _, err := http3.DecodeH3SettingsForTest(encSetting(0x08, 2)); !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("connect protocol value 2: err %v", err)
 	}
-	if _, err := decodeH3Settings(encSetting(0x33, 2)); !errors.Is(err, errH3SettingsMalformed) {
+	if _, err := http3.DecodeH3SettingsForTest(encSetting(0x33, 2)); !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("datagram value 2: err %v", err)
 	}
-	if _, err := decodeH3Settings(encSetting(0x08, 7)); !errors.Is(err, errH3SettingsMalformed) {
+	if _, err := http3.DecodeH3SettingsForTest(encSetting(0x08, 7)); !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("connect protocol value 7: err %v", err)
 	}
 }
 
 func TestDecodeH3SettingsTruncated(t *testing.T) {
-	if _, err := decodeH3Settings([]byte{0xBF}); !errors.Is(err, errH3SettingsMalformed) {
+	if _, err := http3.DecodeH3SettingsForTest([]byte{0xBF}); !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("lone 4-byte id prefix: err %v", err)
 	}
-	if _, err := decodeH3Settings([]byte{0x06}); !errors.Is(err, errH3SettingsMalformed) {
+	if _, err := http3.DecodeH3SettingsForTest([]byte{0x06}); !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("id without value: err %v", err)
 	}
-	if _, err := decodeH3Settings([]byte{0x06, 0xC7, 0xFF}); !errors.Is(err, errH3SettingsMalformed) {
+	if _, err := http3.DecodeH3SettingsForTest([]byte{0x06, 0xC7, 0xFF}); !errors.Is(err, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatalf("value cut mid-varint: err %v", err)
 	}
 }
@@ -245,27 +247,27 @@ func TestDecodeH3SettingsSizeBound(t *testing.T) {
 		payload = append(payload, encV(v)...)
 	}
 	payload = payload[:8192]
-	s, err := decodeH3Settings(payload)
+	s, err := http3.DecodeH3SettingsForTest(payload)
 	if err != nil {
 		t.Fatalf("exactly 8192 bytes: %v", err)
 		return
 	}
-	if s.maxFieldSectionSize != h3UnlimitedFieldSectionSize {
+	if s.MaxFieldSectionSize != http3.H3UnlimitedFieldSectionSizeForTest() {
 		t.Fatalf("8192-byte unknown settings leaked: %+v", s)
 	}
-	_, err = decodeH3Settings(append(payload, 0x00))
-	if !errors.Is(err, errH3SettingsTooLarge) {
+	_, err = http3.DecodeH3SettingsForTest(append(payload, 0x00))
+	if !errors.Is(err, http3.ErrH3SettingsTooLargeForTest()) {
 		t.Fatalf("8193 bytes: err %v, want errH3SettingsTooLarge", err)
 	}
 }
 
 func TestDecodeH3SettingsErrorSentinelsDistinct(t *testing.T) {
-	_, dupErr := decodeH3Settings(append(append([]byte{}, encSetting(0x06, 1)...), encSetting(0x06, 2)...))
-	_, bigErr := decodeH3Settings(bytes.Repeat([]byte{0x00}, 8193))
-	if errors.Is(dupErr, errH3SettingsTooLarge) {
+	_, dupErr := http3.DecodeH3SettingsForTest(append(append([]byte{}, encSetting(0x06, 1)...), encSetting(0x06, 2)...))
+	_, bigErr := http3.DecodeH3SettingsForTest(bytes.Repeat([]byte{0x00}, 8193))
+	if errors.Is(dupErr, http3.ErrH3SettingsTooLargeForTest()) {
 		t.Fatal("malformed error matches too-large sentinel")
 	}
-	if errors.Is(bigErr, errH3SettingsMalformed) {
+	if errors.Is(bigErr, http3.ErrH3SettingsMalformedForTest()) {
 		t.Fatal("too-large error matches malformed sentinel")
 	}
 }

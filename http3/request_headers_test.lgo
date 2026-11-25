@@ -1,4 +1,4 @@
-package http3
+package http3_test
 
 import (
 	"bufio"
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gosuda/spira/http3"
 	"github.com/quic-go/qpack"
 )
 
@@ -52,7 +53,7 @@ func TestDecodeH3RequestMatchesNetHTTP(t *testing.T) {
 		{Name: "x-multi", Value: "first"},
 		{Name: "x-multi", Value: "second"},
 	}
-	got, err := decodeH3Request(encodeH3TestFields(t, fields), 1024)
+	got, err := http3.DecodeH3RequestForTest(encodeH3TestFields(t, fields), 1024)
 	if err != nil {
 		t.Fatalf("decode request: %v", err)
 		return
@@ -121,7 +122,7 @@ func TestDecodeH3RequestTargetForms(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := decodeH3Request(encodeH3TestFields(t, tc.fields), 1024)
+			req, err := http3.DecodeH3RequestForTest(encodeH3TestFields(t, tc.fields), 1024)
 			if err != nil {
 				t.Fatalf("decode request: %v", err)
 				return
@@ -147,8 +148,8 @@ func TestDecodeH3RequestTargetForms(t *testing.T) {
 
 func expectMalformedH3Request(t *testing.T, fields []qpack.HeaderField, detail string) {
 	t.Helper()
-	_, err := decodeH3Request(encodeH3TestFields(t, fields), 1024)
-	if !errors.Is(err, errH3MalformedMessage) || !strings.Contains(err.Error(), detail) {
+	_, err := http3.DecodeH3RequestForTest(encodeH3TestFields(t, fields), 1024)
+	if !errors.Is(err, http3.ErrH3MalformedMessageForTest()) || !strings.Contains(err.Error(), detail) {
 		t.Fatalf("want malformed message containing %q; got %v", detail, err)
 	}
 }
@@ -287,7 +288,7 @@ func TestDecodeH3AnnouncedTrailers(t *testing.T) {
 		qpack.HeaderField{Name: "trailer", Value: "X-Checksum, X-Warning"},
 		qpack.HeaderField{Name: "trailer", Value: "x-checksum,x-extra"},
 	)
-	req, err := decodeH3Request(encodeH3TestFields(t, fields), 1024)
+	req, err := http3.DecodeH3RequestForTest(encodeH3TestFields(t, fields), 1024)
 	if err != nil {
 		t.Fatalf("decode request: %v", err)
 		return
@@ -308,7 +309,7 @@ func TestDecodeH3AnnouncedTrailers(t *testing.T) {
 
 func TestDecodeH3Trailers(t *testing.T) {
 	fields := []qpack.HeaderField{{Name: "x-proof", Value: "first"}, {Name: "x-proof", Value: "second"}}
-	got, err := decodeH3Trailers(encodeH3TestFields(t, fields), 1024)
+	got, err := http3.DecodeH3TrailersForTest(encodeH3TestFields(t, fields), 1024)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -336,8 +337,8 @@ func TestDecodeH3RejectsInvalidTrailers(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			block := encodeH3TestFields(t, []qpack.HeaderField{{Name: tc.name, Value: tc.value}})
-			_, err := decodeH3Trailers(block, 1024)
-			if !errors.Is(err, errH3MalformedMessage) || !strings.Contains(err.Error(), tc.detail) {
+			_, err := http3.DecodeH3TrailersForTest(block, 1024)
+			if !errors.Is(err, http3.ErrH3MalformedMessageForTest()) || !strings.Contains(err.Error(), tc.detail) {
 				t.Fatalf("want malformed message containing %q; got %v", tc.detail, err)
 			}
 		})
@@ -364,14 +365,14 @@ func TestDecodeH3ClassifiesQPACKFailures(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, reqErr := decodeH3Request(tc.block, 1024)
-			_, trailerErr := decodeH3Trailers(tc.block, 1024)
-			if !errors.Is(reqErr, errH3QPACK) || !errors.Is(trailerErr, errH3QPACK) {
+			_, reqErr := http3.DecodeH3RequestForTest(tc.block, 1024)
+			_, trailerErr := http3.DecodeH3TrailersForTest(tc.block, 1024)
+			if !errors.Is(reqErr, http3.ErrH3QPACKForTest()) || !errors.Is(trailerErr, http3.ErrH3QPACKForTest()) {
 				t.Errorf("request error %v, trailer error %v; want QPACK errors", reqErr, trailerErr)
 			}
 		})
 	}
-	_, err := decodeH3Request([]byte{0, 0, 0x50}, 1024)
+	_, err := http3.DecodeH3RequestForTest([]byte{0, 0, 0x50}, 1024)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Errorf("QPACK error did not preserve unexpected EOF: %v", err)
 	}
@@ -384,23 +385,23 @@ func TestDecodeH3FieldSectionSize(t *testing.T) {
 	const requestSize = 42 + 44 + 53 + 38 + 34 + 34
 	const trailerSize = 32 + 7 + 2
 	for _, limit := range []uint64{requestSize, requestSize + 1, ^uint64(0)} {
-		if _, err := decodeH3Request(request, limit); err != nil {
+		if _, err := http3.DecodeH3RequestForTest(request, limit); err != nil {
 			t.Errorf("request under limit %d: %v", limit, err)
 		}
 	}
-	if _, err := decodeH3Request(request, requestSize-1); !errors.Is(err, errH3FieldSectionTooLarge) {
+	if _, err := http3.DecodeH3RequestForTest(request, requestSize-1); !errors.Is(err, http3.ErrH3FieldSectionTooLargeForTest()) {
 		t.Errorf("request exceeds size by one: %v", err)
 	}
-	if _, err := decodeH3Trailers(trailer, trailerSize); err != nil {
+	if _, err := http3.DecodeH3TrailersForTest(trailer, trailerSize); err != nil {
 		t.Errorf("trailer at exact limit: %v", err)
 	}
-	if _, err := decodeH3Trailers(trailer, trailerSize-1); !errors.Is(err, errH3FieldSectionTooLarge) {
+	if _, err := http3.DecodeH3TrailersForTest(trailer, trailerSize-1); !errors.Is(err, http3.ErrH3FieldSectionTooLargeForTest()) {
 		t.Errorf("trailer exceeds size by one: %v", err)
 	}
-	if _, err := decodeH3Trailers(trailer, 0); !errors.Is(err, errH3FieldSectionTooLarge) {
+	if _, err := http3.DecodeH3TrailersForTest(trailer, 0); !errors.Is(err, http3.ErrH3FieldSectionTooLargeForTest()) {
 		t.Errorf("nonempty trailer with zero budget: %v", err)
 	}
-	got, err := decodeH3Trailers([]byte{0, 0}, 0)
+	got, err := http3.DecodeH3TrailersForTest([]byte{0, 0}, 0)
 	if err != nil {
 		t.Fatalf("decode empty QPACK trailer section: %v", err)
 		return
@@ -408,7 +409,7 @@ func TestDecodeH3FieldSectionSize(t *testing.T) {
 	if len(got) != 0 {
 		t.Errorf("empty QPACK trailer section decoded as %v", got)
 	}
-	if _, err := decodeH3Request([]byte{0, 0}, 0); !errors.Is(err, errH3MalformedMessage) {
+	if _, err := http3.DecodeH3RequestForTest([]byte{0, 0}, 0); !errors.Is(err, http3.ErrH3MalformedMessageForTest()) {
 		t.Errorf("empty QPACK request section should fail HTTP validation: %v", err)
 	}
 }

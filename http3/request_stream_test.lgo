@@ -1,4 +1,4 @@
-package http3
+package http3_test
 
 import (
 	"bufio"
@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/http3"
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
@@ -85,7 +86,7 @@ func closeH3RequestTestConn(t *testing.T, conn *quic.Conn) {
 func h3StreamTestHeaders(t *testing.T, fields []qpack.HeaderField) []byte {
 	t.Helper()
 	block := encodeH3TestFields(t, fields)
-	return append(appendH3FrameHeader(nil, 0x1, uint64(len(block))), block...)
+	return append(http3.AppendH3FrameHeaderForTest(nil, 0x1, uint64(len(block))), block...)
 }
 
 func h3StreamTestResponse(t *testing.T, source io.Reader) *bytes.Reader {
@@ -132,7 +133,7 @@ func TestH3RequestStreamDispatchesFullDuplex(t *testing.T) {
 			t.Errorf("exchange full-duplex bytes: %v", err)
 		}
 	})
-	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler, MaxFieldSectionSize: http.DefaultMaxHeaderBytes})
 	if handlerCtx == nil || !errors.Is(handlerCtx.Err(), context.Canceled) {
 		t.Fatal("handler context not canceled after return")
 	}
@@ -196,7 +197,7 @@ func TestH3RequestStreamPublishesUnannouncedTrailers(t *testing.T) {
 		w.Header()["Date"] = nil
 		w.WriteHeader(http.StatusNoContent)
 	})
-	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler, MaxFieldSectionSize: http.DefaultMaxHeaderBytes})
 	response := h3StreamTestResponse(t, pair.clientSide)
 	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
 	h3ExpectNoResponseFrames(t, response)
@@ -216,7 +217,7 @@ func TestH3RequestStreamFinishesWithoutReadingRequest(t *testing.T) {
 		w.Header()["Date"] = nil
 		w.WriteHeader(http.StatusNoContent)
 	})
-	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler, MaxFieldSectionSize: http.DefaultMaxHeaderBytes})
 	response := h3StreamTestResponse(t, pair.clientSide)
 	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
 	h3ExpectNoResponseFrames(t, response)
@@ -245,7 +246,7 @@ func TestH3RequestStreamBodyCloseKeepsResponse(t *testing.T) {
 		w.Header()["Date"] = nil
 		w.WriteHeader(http.StatusNoContent)
 	})
-	serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+	http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler, MaxFieldSectionSize: http.DefaultMaxHeaderBytes})
 	response := h3StreamTestResponse(t, pair.clientSide)
 	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
 	h3ExpectNoResponseFrames(t, response)
@@ -288,10 +289,10 @@ func TestH3RequestStreamLimitsRejectWithoutDraining(t *testing.T) {
 				t.Fatal("missing QUIC request stream pair")
 				return
 			}
-			cfg := h3RequestStreamConfig{maxFieldSectionSize: tc.limit, handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			cfg := http3.H3RequestStreamConfigForTest{MaxFieldSectionSize: tc.limit, Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 				t.Error("oversized request reached the handler")
 			})}
-			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, cfg)
+			http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, cfg)
 			response := h3StreamTestResponse(t, pair.clientSide)
 			h3ExpectResponseFields(t, response, map[string][]string{":status": {"431"}})
 			h3ExpectNoResponseFrames(t, response)
@@ -324,10 +325,10 @@ func TestH3RequestStreamClosesConnectionOnFrameErrors(t *testing.T) {
 			if err := pair.clientSide.Close(); err != nil {
 				t.Fatal(err)
 			}
-			cfg := h3RequestStreamConfig{handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			cfg := http3.H3RequestStreamConfigForTest{Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 				t.Error("invalid request reached the handler")
 			})}
-			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, cfg)
+			http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, cfg)
 			data, err := io.ReadAll(pair.clientSide)
 			failure, ok := errors.AsType[*quic.ApplicationError](err)
 			if len(data) != 0 || !ok || !failure.Remote || failure.ErrorCode != tc.code {
@@ -352,7 +353,7 @@ func TestH3RequestStreamResetsRequestFailures(t *testing.T) {
 		{"malformed header", malformed, nil, 0x10e},
 		{"short body", length, func(t *testing.T, _ http.ResponseWriter, r *http.Request) {
 			var p [1]byte
-			if _, err := r.Body.Read(p[:]); !errors.Is(err, errH3MalformedMessage) {
+			if _, err := r.Body.Read(p[:]); !errors.Is(err, http3.ErrH3MalformedMessageForTest()) {
 				t.Errorf("read truncated request body: got %T, want malformed message", err)
 			}
 		}, 0x10e},
@@ -382,7 +383,7 @@ func TestH3RequestStreamResetsRequestFailures(t *testing.T) {
 				}
 				tc.handler(t, w, r)
 			})
-			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+			http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler, MaxFieldSectionSize: http.DefaultMaxHeaderBytes})
 			_, err = io.ReadAll(pair.clientSide)
 			failure, ok := errors.AsType[*quic.StreamError](err)
 			if !ok || !failure.Remote || failure.ErrorCode != tc.code || pair.server.Context().Err() != nil {
@@ -444,7 +445,7 @@ func TestH3RequestStreamPropagatesPeerCancellation(t *testing.T) {
 					t.Error("handler context stayed live after peer cancellation")
 				}
 			})
-			serveH3RequestStream(pair.server.Context(), pair.server, pair.serverSide, h3RequestStreamConfig{handler: handler})
+			http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler, MaxFieldSectionSize: http.DefaultMaxHeaderBytes})
 			if !entered {
 				t.Error("handler was not dispatched")
 			}
