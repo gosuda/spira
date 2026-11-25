@@ -242,9 +242,12 @@ type peekOutcome struct {
 
 // peekEmpty reads the first byte of an unknown-length body. It returns the
 // body with that byte pushed back, so the attempt that follows sees the whole
-// stream. A timeout or a cancelled request ends the wait: the body may hold a
+// stream, and the trailers after it stay intact.
+// A timeout or a cancelled request ends the wait: the body may hold a
 // late byte that no one owns afterward, so the caller must not reuse the body
-// and answers without trying an upstream.
+// and answers without trying an upstream. A read error that yields no byte
+// ends the wait the same way: the body is already broken, so the caller
+// answers 502 without sending anything upstream.
 func peekEmpty(req *http.Request, wait time.Duration) (bool, io.ReadCloser, error?) {
 	seen := make(chan peekOutcome, 1)
 	g, _ := rt.NewGroup(req.Context(), 0)
@@ -272,7 +275,7 @@ func peekEmpty(req *http.Request, wait time.Duration) (bool, io.ReadCloser, erro
 		if errors.Is(got.err, io.EOF) {
 			return true, http.NoBody, nil
 		}
-		return false, req.Body, nil
+		return false, nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: read body of unknown length: %w", got.err))
 	case <-timer.C:
 		interruptBodyRead(req.Context())
 		return false, nil, ErrBadGateway.Wrap(fmt.Errorf("gateway: body of unknown length yielded nothing in %s", wait))
