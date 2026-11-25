@@ -1,6 +1,8 @@
 package account
 
 import (
+	"fmt"
+
 	"github.com/gosuda/spira/auth"
 	"github.com/gosuda/spira/db"
 	"github.com/gosuda/spira/validate"
@@ -42,9 +44,11 @@ func (f LoginForm) Check() validate.Errors {
 	errs.Require(f.Password != "", "password", "required", "Enter your password.")
 	return errs
 }
-
 func (f *Account) login(ctx *web.Context, in LoginForm) (web.Reply, error) {
-	found := store.GetUserByName(ctx.Ctx(), f.DB, in.Username)?
+	found, err := store.GetUserByName(ctx.Ctx(), f.DB, in.Username)
+	if err != nil {
+		return nil, ErrAccountFailed.Wrap(fmt.Errorf("account: lookup user: %w", err))
+	}
 	if found == nil {
 		auth.VerifyAgainstDummy(in.Password)
 		return nil, auth.ErrInvalidCredentials.Err()
