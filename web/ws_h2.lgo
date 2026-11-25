@@ -17,16 +17,22 @@ func WebSocket(r *Router, pattern string, cfg websocket.Config, serve func(ctx c
 		if c == nil {
 			return nil, nil
 		}
-		if serr := serve(ctx.Request.Context(), c); serr != nil {
-			if errors.Is(serr, websocket.ErrClosed) {
-				return nil, nil
-			}
-			return nil, serr
-		}
-		return nil, c.Close()
+		return nil, runWebSocketSession(ctx.Request.Context(), c, serve)
 	}
 	r.Handle(http.MethodGet, pattern, h)
 	r.Handle(http.MethodConnect, pattern, h)
+}
+
+func runWebSocketSession(ctx context.Context, c *websocket.Conn, serve func(ctx context.Context, c *websocket.Conn) error) (err error) {
+	defer func() {
+		if cerr := c.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
+	if serr := serve(ctx, c); serr != nil && !errors.Is(serr, websocket.ErrClosed) {
+		return serr
+	}
+	return nil
 }
 
 func acceptWebSocket(ctx *Context, cfg websocket.Config) (*websocket.Conn?, error) {

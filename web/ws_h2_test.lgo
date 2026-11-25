@@ -855,8 +855,10 @@ func TestWebSocketEchoOverHTTP1ThroughRouter(t *testing.T) {
 		return
 	}
 }
-// Huffman table: symbol properties from RFC 7541 Appendix B,
-// transcribed from the toolchain's hpack tables for test decoding.
+// Huffman table: code lengths and values from RFC 7541 Appendix B,
+// transcribed from golang.org/x/net/http2/hpack (huffman.go) as vendored
+// in the LoGOs toolchain for test decoding.
+// Copyright 2014 The Go Authors. Licensed under the BSD-3-Clause license.
 var huffCode = [256]uint32{
 	0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3,
 	0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
@@ -995,4 +997,42 @@ var hpackStaticValue = [61]string{
 	"", "", "", "",
 	"", "", "", "",
 	"",
+}
+
+func TestWebSocketFailedCallbackClosesConnection(t *testing.T) {
+	r := web.NewRouter()
+	web.WebSocket(r, "/chat", websocket.Config{}, func(ctx context.Context, c *websocket.Conn) error {
+		return errors.New("session failed")
+	})
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			t.Errorf("peer close: %v", cerr)
+		}
+	}()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+		return
+	}
+	reader := bufio.NewReader(conn)
+	req := "GET /chat HTTP/1.1\r\nHost: " + addr + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write upgrade: %v", err)
+		return
+	}
+	if status := readH1Status(t, reader); status != "HTTP/1.1 101 Switching Protocols\r\n" {
+		t.Fatalf("status = %q, want 101", status)
+		return
+	}
+	skipH1Headers(t, reader)
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after failed callback = %v, want EOF", err)
+	}
 }

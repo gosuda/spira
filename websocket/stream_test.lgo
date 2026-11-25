@@ -780,6 +780,22 @@ func streamRejectCases() []streamRejectCase {
 		{name: "missing version", fields: rejectFields("websocket", "", ""), want: http.StatusBadRequest, fault: websocket.ErrHandshakeFailed},
 		{name: "foreign origin", fields: rejectFields("websocket", "13", "https://evil.example"), want: http.StatusForbidden, fault: websocket.ErrForbiddenOrigin},
 		{name: "wrong method", fields: getFields, want: http.StatusMethodNotAllowed, fault: websocket.ErrHandshakeFailed},
+		{name: "malformed subprotocol", fields: subprotocolFields("not a token"), want: http.StatusBadRequest, fault: websocket.ErrHandshakeFailed},
+		{name: "repeated subprotocol", fields: subprotocolFields("chat, chat"), want: http.StatusBadRequest, fault: websocket.ErrHandshakeFailed},
+	}
+}
+
+func subprotocolFields(offer string) func(string) []h2field {
+	return func(addr string) []h2field {
+		return []h2field{
+			{name: ":method", value: "CONNECT"},
+			{name: ":protocol", value: "websocket"},
+			{name: ":scheme", value: "https"},
+			{name: ":path", value: "/chat"},
+			{name: ":authority", value: addr},
+			{name: "sec-websocket-version", value: "13"},
+			{name: "sec-websocket-protocol", value: offer},
+		}
 	}
 }
 
@@ -870,8 +886,10 @@ func TestStreamRefusesHTTP1Connect(t *testing.T) {
 		return
 	}
 }
-// Huffman table: symbol properties from RFC 7541 Appendix B,
-// transcribed from the toolchain's hpack tables for test decoding.
+// Huffman table: code lengths and values from RFC 7541 Appendix B,
+// transcribed from golang.org/x/net/http2/hpack (huffman.go) as vendored
+// in the LoGOs toolchain for test decoding.
+// Copyright 2014 The Go Authors. Licensed under the BSD-3-Clause license.
 var huffCode = [256]uint32{
 	0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3,
 	0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
@@ -1010,4 +1028,63 @@ var hpackStaticValue = [61]string{
 	"", "", "", "",
 	"", "", "", "",
 	"",
+}
+
+func TestStreamCancelUnblocksPendingNext(t *testing.T) {
+	pending := make(chan context.CancelFunc, 1)
+	done := make(chan error, 1)
+	srv := serveStreamTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.ServeStream(w, r, websocket.Config{})
+		if err != nil {
+			reportStream(r, done, err)
+			return
+		}
+		if c == nil {
+			reportStream(r, done, errors.New("serve stream gave no connection"))
+			return
+		}
+		defer func() {
+			if cerr := c.Close(); cerr != nil && !errors.Is(cerr, websocket.ErrClosed) {
+				t.Errorf("stream close: %v", cerr)
+			}
+		}()
+		ctx, cancel := context.WithCancel(r.Context())
+		select {
+		case pending <- cancel:
+		case <-r.Context().Done():
+			reportStream(r, done, r.Context().Err())
+			return
+		}
+		_, _, err = c.Next(ctx)
+		reportStream(r, done, err)
+	}))
+	h := openH2TLS(t, srv)
+	requireExtendedConnect(t, h)
+	addr := srv.Listener.Addr().String()
+	id := h.nextID
+	h.sendHeaders(t, id, streamConnectFields(addr, ""), false)
+	if status, _ := h.readResponseHeaders(t, id); status != http.StatusOK {
+		t.Fatalf("extended CONNECT status = %d, want 200", status)
+		return
+	}
+	var cancel context.CancelFunc
+	select {
+	case cancel = <-pending:
+	case <-time.After(10 * time.Second):
+		t.Fatal("session did not reach Next")
+		return
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Next after cancel returned no error")
+			return
+		}
+		if !errors.Is(err, websocket.ErrClosed) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Next after cancel = %v, want ErrClosed or context canceled", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Next did not return after cancel")
+	}
 }
