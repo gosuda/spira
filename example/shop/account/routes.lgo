@@ -55,7 +55,7 @@ func (f *Feature) login(wctx *web.Context) (web.Reply, error) {
 	secret := wctx.Request.PostFormValue("password")
 	user, err := store.GetUserByName(call, f.DB, name)
 	if err != nil {
-		return nil, fmt.Errorf("account: lookup user: %w", err)
+		return nil, ErrAccountFailed.Wrap(fmt.Errorf("account: lookup user: %w", err))
 	}
 	if user == nil {
 		auth.VerifyAgainstDummy(secret)
@@ -73,7 +73,7 @@ func (f *Feature) login(wctx *web.Context) (web.Reply, error) {
 		return nil, fmt.Errorf("account: login: %w", err)
 	}
 	if cookie == nil {
-		return nil, fmt.Errorf("account: login issued no cookie")
+		return nil, ErrAccountFailed.Wrap(fmt.Errorf("account: login issued no cookie"))
 	}
 	wctx.ResponseHeader().Add("Set-Cookie", cookie.String())
 	return web.Redirect{To: "/account"}, nil
@@ -85,7 +85,7 @@ func (f *Feature) logout(wctx *web.Context) (web.Reply, error) {
 		return nil, fmt.Errorf("account: logout: %w", err)
 	}
 	if cookie == nil {
-		return nil, fmt.Errorf("account: logout issued no cookie")
+		return nil, ErrAccountFailed.Wrap(fmt.Errorf("account: logout issued no cookie"))
 	}
 	wctx.ResponseHeader().Add("Set-Cookie", cookie.String())
 	return web.Redirect{To: "/account/login"}, nil

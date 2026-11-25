@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -314,6 +315,54 @@ func TestMountOrigin(t *testing.T) {
 		if status != tc.want {
 			t.Errorf("origin %q: status %d, want %d (body %s)", tc.origin, status, tc.want, raw)
 		}
+	}
+}
+
+func TestMountRefusesRebindingOnLoopback(t *testing.T) {
+	var calls int
+	ts := mountServer(t, testTools(t, &calls), (&countingGuard{}).stage())
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(ts.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split %s: %v", ts.URL, err)
+		return
+	}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_weather","arguments":{}}}`
+	for _, tc := range []struct {
+		host string
+		want int
+	}{
+		{"rebind.example:" + port, http.StatusForbidden},
+		{"192.0.2.7:" + port, http.StatusForbidden},
+		{"localhost:" + port, http.StatusOK},
+		{"127.0.0.1:" + port, http.StatusOK},
+	} {
+		req, nerr := http.NewRequest("POST", ts.URL+"/mcp", strings.NewReader(body))
+		if nerr != nil {
+			t.Fatalf("new request: %v", nerr)
+			return
+		}
+		req.Host = tc.host
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://"+tc.host)
+		resp, derr := ts.Client().Do(req)
+		if derr != nil {
+			t.Fatalf("post: %v", derr)
+			return
+		}
+		raw, rerr := io.ReadAll(resp.Body)
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Errorf("close body: %v", cerr)
+		}
+		if rerr != nil {
+			t.Fatalf("read body: %v", rerr)
+			return
+		}
+		if resp.StatusCode != tc.want {
+			t.Errorf("host %q: status %d, want %d (body %s)", tc.host, resp.StatusCode, tc.want, raw)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("the tool ran %d times, want 2: only the loopback names may reach it", calls)
 	}
 }
 

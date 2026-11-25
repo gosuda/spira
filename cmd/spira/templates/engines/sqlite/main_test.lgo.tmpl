@@ -1,18 +1,25 @@
 package main_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gosuda/spira/auth"
 	"github.com/gosuda/spira/db"
 	"github.com/gosuda/spira/migrate"
+	"github.com/gosuda/spira/web"
 
 	app "{{MODULE}}"
 	appdb "{{MODULE}}/db"
 	"{{MODULE}}/db/store"
-
+	"{{MODULE}}/features/account"
 	_ "modernc.org/sqlite"
 )
 
@@ -100,4 +107,53 @@ func withMigratedPool(t *testing.T, ctx context.Context, dsn string, run func(po
 		return
 	}
 	run(pool)
+}
+
+func TestLoginLookupFailureCarriesAccountFault(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := db.Open("sqlite", "file:bare-login-fault?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatalf("open left no pool")
+		return
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if serr := pool.Stop(stopCtx); serr != nil {
+			t.Errorf("stop: %v", serr)
+		}
+	}()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(prev)
+	r := web.NewRouter()
+	sessions := &auth.Sessions{Store: &account.DBStore{DB: pool}}
+	(&account.Account{DB: pool, Sessions: sessions}).Mount(r)
+	form := url.Values{"username": []string{"demo"}, "password": []string{"secret"}}
+	req := httptest.NewRequest(http.MethodPost, "/account/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d want 500 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if !strings.Contains(buf.String(), "account.failed") {
+		t.Fatalf("handler log %q lacks the account fault", buf.String())
+		return
+	}
+	if strings.Contains(rec.Body.String(), "no such table") {
+		t.Fatalf("body %q leaks the driver error", rec.Body.String())
+		return
+	}
 }

@@ -1,0 +1,143 @@
+package gateway_test
+
+import (
+	"bufio"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/gateway"
+	"github.com/gosuda/spira/resilience"
+	"github.com/gosuda/spira/web"
+)
+
+func failFirstReadError() error {
+	return errors.New("gateway-test: upload chunk lost")
+}
+
+type failFirstRead struct {
+	err error
+}
+
+func (b *failFirstRead) Read(_ []byte) (int, error) {
+	return 0, b.err
+}
+
+func (b *failFirstRead) Close() error {
+	return nil
+}
+
+type midReadBody struct {
+	rest []byte
+	err  error
+}
+
+func (b *midReadBody) Read(p []byte) (int, error) {
+	if len(b.rest) == 0 {
+		return 0, b.err
+	}
+	p[0] = b.rest[0]
+	b.rest = b.rest[1:]
+	return 1, nil
+}
+
+func (b *midReadBody) Close() error {
+	return nil
+}
+
+func replayRouter(t *testing.T, routes []gateway.Route, policy resilience.Policy) *web.Router {
+	t.Helper()
+	r := web.NewRouter()
+	gateway.Mount(r, routes, policy)
+	return r
+}
+
+func TestUnknownLengthReadErrorNeverReachesUpstream(t *testing.T) {
+	grd := newRequestGuard(t)
+	var hits atomic.Int64
+	up := countingUpstream(t, grd, &hits)
+	r := replayRouter(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: 2 * time.Second})
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/shop/order", nil)
+	req.Header.Set("X-Spira-Test", t.Name())
+	req.Body = &failFirstRead{err: failFirstReadError()}
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502 for a body that fails its first read", rec.Code)
+		return
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("the upstream saw %d requests, want 0: a body the gateway could not read must never leave\n%s", hits.Load(), grd.report())
+		return
+	}
+}
+
+func TestPartialBodyNeverFailsOverToSecondUpstream(t *testing.T) {
+	dead := deadUpstream(t)
+	grd := newRequestGuard(t)
+	var liveHits atomic.Int64
+	live := countingUpstream(t, grd, &liveHits)
+	r := replayRouter(t, []gateway.Route{{PathPrefix: "/shop", To: []string{dead, live.URL}}}, resilience.Policy{Timeout: 2 * time.Second})
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/shop/order", nil)
+	req.Header.Set("X-Spira-Test", t.Name())
+	req.Body = &midReadBody{rest: []byte("x"), err: failFirstReadError()}
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502 for an upload cut mid-body", rec.Code)
+		return
+	}
+	if liveHits.Load() != 0 {
+		t.Fatalf("the live upstream saw %d requests, want 0: a partly consumed body must never fail over\n%s", liveHits.Load(), grd.report())
+		return
+	}
+}
+
+func TestStalledUploadGetsATimelyRefusal(t *testing.T) {
+	grd := newRequestGuard(t)
+	var hits atomic.Int64
+	up := countingUpstream(t, grd, &hits)
+	gw := serveGateway(t, []gateway.Route{{PathPrefix: "/shop", To: []string{up.URL}}}, resilience.Policy{Timeout: 300 * time.Millisecond})
+	addr := strings.TrimPrefix(gw.URL, "http://")
+	conn, derr := net.Dial("tcp", addr)
+	if derr != nil {
+		t.Fatal(derr)
+		return
+	}
+	t.Cleanup(func() {
+		if cerr := conn.Close(); cerr != nil {
+			t.Errorf("stalled close: %v", cerr)
+		}
+	})
+	head := "POST /shop/order HTTP/1.1\r\nHost: " + addr + "\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\nX-Spira-Test: " + t.Name() + "\r\nConnection: close\r\n\r\n"
+	if _, werr := conn.Write([]byte(head)); werr != nil {
+		t.Fatal(werr)
+		return
+	}
+	start := time.Now()
+	if derr := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); derr != nil {
+		t.Fatal(derr)
+		return
+	}
+	got, rerr := bufio.NewReader(conn).ReadString('\n')
+	wait := time.Since(start)
+	if rerr != nil {
+		t.Fatalf("stalled upload saw no response after %v: %v", wait, rerr)
+		return
+	}
+	if !strings.HasPrefix(got, "HTTP/1.1 502") {
+		t.Fatalf("stalled upload status %q want 502 after %v", strings.TrimSpace(got), wait)
+		return
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("the upstream saw %d requests, want 0: a stalled upload must never leave\n%s", hits.Load(), grd.report())
+		return
+	}
+}

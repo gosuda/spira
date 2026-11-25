@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/fault"
 )
 
 type scripted struct {
@@ -278,8 +279,16 @@ func TestRunRefusesAnAllowedCallWhoseToolTheRequestDoesNotCarry(t *testing.T) {
 	conversation := append(question(), asking(call("c1", "book_flight")).Message)
 	model := &scripted{replies: []ai.Reply{saying("Done.")}}
 	_, err := ai.Run(t.Context(), model, ai.Request{Messages: conversation, Decisions: []ai.Decision{{Call: "c1"}}}, ai.Limits{})
-	if err == nil || !strings.Contains(err.Error(), "'book_flight'") {
+	if err == nil || !strings.Contains(err.Error(), "book_flight") {
 		t.Fatalf("error = %v, want one that names the tool", err)
+		return
+	}
+	if !errors.Is(err, ai.ErrUnknownTool) {
+		t.Fatalf("error = %v, want the ai.unknown_tool fault instead of ai.invalid_decision", err)
+		return
+	}
+	if errors.Is(err, ai.ErrInvalidDecision) {
+		t.Fatalf("error = %v, names the tool but keeps the ai.invalid_decision wrap", err)
 		return
 	}
 	_, derr := ai.Run(t.Context(), model, ai.Request{Messages: conversation, Decisions: []ai.Decision{{Call: "c1", Deny: ""}}}, ai.Limits{})
@@ -458,13 +467,55 @@ func TestRunEndsWhenTheContextEndsDuringATool(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want the context error", err)
 	}
+	if errors.Is(err, ai.ErrModelFailed) {
+		t.Fatalf("error = %v, want the canceled fault instead of ai.model_failed", err)
+	}
+	if got := fault.Public(err).Code; got != ai.ErrToolCanceled.Code {
+		t.Fatalf("public code = %s, want %s", got, ai.ErrToolCanceled.Code)
+	}
 	if len(model.seen) != 1 {
 		t.Fatalf("the model was called %d times after the context ended", len(model.seen))
 	}
 }
 
+func TestRunReportsTimeoutWhenTheDeadlineEndsDuringATool(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 0)
+	defer cancel()
+	slow := ai.Tool{Name: "weather", Call: func(ctx context.Context, arguments string) (string, error) {
+		return "sunny", nil
+	}}
+	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather")), saying("never")}}
+	_, err := ai.Run(ctx, model, ai.Request{Messages: question(), Tools: []ai.Tool{slow}}, ai.Limits{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want the deadline error", err)
+	}
+	if errors.Is(err, ai.ErrModelFailed) {
+		t.Fatalf("error = %v, want the timeout fault instead of ai.model_failed", err)
+	}
+	if got := fault.Public(err).Code; got != ai.ErrToolTimeout.Code {
+		t.Fatalf("public code = %s, want %s", got, ai.ErrToolTimeout.Code)
+	}
+}
+
 var errModelDown = errors.New("run test: model down")
 
+var errDeclaredModel = fault.New("runtest.declared_model", fault.RateLimited, "the test model rate limited the request")
+
+func TestRunKeepsADeclaredModelFault(t *testing.T) {
+	model := &scripted{fail: errDeclaredModel.Wrap(errors.New("slow down"))}
+	_, err := ai.Run(t.Context(), model, ai.Request{Messages: question()}, ai.Limits{})
+	if !errors.Is(err, errDeclaredModel) {
+		t.Fatalf("error = %v, want the declared model fault", err)
+		return
+	}
+	if errors.Is(err, ai.ErrModelFailed) {
+		t.Fatalf("error = %v, want the declared fault without the ai.model_failed wrap", err)
+		return
+	}
+	if got := fault.Public(err).Code; got != errDeclaredModel.Code {
+		t.Fatalf("public code = %s, want %s", got, errDeclaredModel.Code)
+	}
+}
 func TestRunNeverCallsAToolWhenTheContextEndedBeforeTheBatch(t *testing.T) {
 	log := &toolLog{}
 	model := &scripted{replies: []ai.Reply{asking(call("c1", "weather"))}}

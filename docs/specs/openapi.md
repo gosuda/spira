@@ -77,8 +77,8 @@ func Mount(r *web.Router, info Info)
 - `Document` MUST build one path item per distinct path of `Routes`.
 - `Document` MUST skip a route whose method has no item field.
 - `Document` MUST strip a host prefix from the pattern before it builds the path.
-- `Document` MUST skip the `GET /openapi.json` route that `Mount` serves and keep every other method and path.
-- `Document` MUST rewrite a `{name...}` segment to `{name}` and drop a trailing `{$}` segment, keeping the slash, before it builds the path.
+- `Document` MUST skip the route that `Mount` serves, under whatever prefix the router carries, and keep every other method and path.
+- `Document` MUST rewrite a `{name...}` segment to `{name}` and drop a trailing `{$}` segment, keeping the slash, before it builds the path. When two routes collapse to one path, `Document` MUST document the operation the mux serves: host patterns over hostless ones, fewer `...` wildcards first, and exact paths over subtree paths; a later registration that is no more specific MUST NOT replace the kept operation.
 - `Document` MUST take each path parameter from a `{name}` segment of the path.
 - `Document` MUST mark every path parameter as required.
 - `Document` MUST refine a path parameter with the input field whose source is path and whose wire name matches.
@@ -103,6 +103,7 @@ func Mount(r *web.Router, info Info)
 - An `Object` schema MUST set `type` to `object` with each field under its wire name.
 - An object MUST list each field with a non-optional schema as required.
 - A marshalled document MUST be byte-identical across calls.
+- A marshalled document MUST apply the marshal options of the caller, including caller-registered marshalers for nested types, and MUST stay byte-identical across calls under the same options.
 - `Mount` MUST serve the document of its router at `GET /openapi.json`.
 - `Mount` MUST write the document as JSON.
 
@@ -116,6 +117,10 @@ func Mount(r *web.Router, info Info)
 - `TestDocumentRoundTripsThroughJSON` proves the byte-identical round trip through `encoding/json/v2`.
 - `TestMountServesJSON` proves the JSON content type, the self-exclusion and the equality with `Document`.
 - `TestDocumentBytesAreIdenticalAcrossCalls` proves the byte-identical encoding across direct and served calls.
+- `TestDocumentKeepsCallerMarshalOptions` proves that a caller marshaler for `DocInfo` reaches the document.
+- `TestDocumentBytesStayStableWithCallerOptions` proves byte equality across calls under caller options.
+- `TestDocEndpointExcludedUnderGroupPrefix` proves that the served endpoint stays out of the document under a group prefix.
+- `TestCollapsedWildcardKeepsTheMuxServedOperation` proves that the document follows the mux for a `{name}` and `{name...}` pair in both registration orders.
 
 ## Not in scope
 

@@ -2,6 +2,8 @@
 
 Package `resilience` runs one call under a timeout, an optional retry and an optional breaker. The caller handles the error. The breaker follows the run shape of Spring Cloud Circuit Breaker and has no fallback.
 
+`Do`, `Policy`, `Retry` and `Breaker` follow four references. They are Spring Cloud Commons at 5535a2bf79b7605b5e934ee850e560cb013bd0e9 and Spring Cloud Circuit Breaker at 1f34fb9ed185c89967f44c45fae96ac4888854bd. They are also the retry package of Spring Framework at 4cb62d893e09e23791d661e8d9b35aedee7006d0 and the backoff of Reactor Core at b35a253039a539d1c710d4fb759244a37d429b82. Spira keeps one call run under a policy, a timeout for each attempt and a bounded number of attempts. Spira keeps a doubling backoff ceiling with a maximum, and an end to the retry on an error that says nothing about the dependency. Spira keeps the closed, open and half-open breaker states, with one probe in half-open. Spira copies no code. Spira drops the fallback function, the registries, the factories, the customizers and the configuration builders. Spira drops the bulkhead with its executor, and the listeners and observations. One `Ignored` wrapper replaces the lists of exception classes to include or exclude. Spira drops a breaker that opens on the first failure and closes after a quiet period. Here a full window at the failure rate opens the breaker. Spira drops jitter around the delay. Here the wait is a uniform duration below the ceiling.
+
 ## Interface
 
 ```lgo

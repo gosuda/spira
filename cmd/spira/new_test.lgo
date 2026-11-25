@@ -63,6 +63,7 @@ func checkEngineApp(t *testing.T, c newEngineCase) {
 	assertContains(t, dir, "features/account/store.lgo", "store.SessionID(id)")
 	assertContains(t, dir, "features/account/account.lgo", "auth.ErrInvalidCredentials.Err()")
 	assertContains(t, dir, "features/account/account.lgo", "auth.VerifyAgainstDummy(in.Password)")
+	assertContains(t, dir, "features/account/account.lgo", "ErrAccountFailed.Wrap(fmt.Errorf(\"account: lookup user:")
 	assertContains(t, dir, "features/account/faults.lgo", "account.failed")
 	assertContains(t, dir, "features/account/store.lgo", "ErrAccountFailed.Wrap")
 	assertContains(t, dir, "features/home/views.lgo", "features/home/islands/greet.svelte")

@@ -12,11 +12,14 @@ func Generate(req *Request) (Model, []File, error) {
 	if err != nil {
 		return Model{}, nil, fmt.Errorf("sqlc-gen-spira: options: %w", err)
 	}
+	pkg, err := packageName(req, &opts)
+	if err != nil {
+		return Model{}, nil, err
+	}
 	model, err := buildModel(req, &opts)
 	if err != nil {
 		return Model{}, nil, err
 	}
-	pkg := packageName(req, &opts)
 	files := []File{{Name: "models.sql.lgo", Contents: []byte(emitModels(model, pkg))}}
 	for _, group := range groupQueryFiles(model) {
 		src, err := emitQueryFile(pkg, model.Engine, group)
@@ -28,16 +31,18 @@ func Generate(req *Request) (Model, []File, error) {
 	return model, files, nil
 }
 
-func packageName(req *Request, opts *PluginOptions) string {
-	if opts.Package != "" {
-		return opts.Package
-	}
-	if out := req.Settings.Codegen.Out; out != "" {
-		if base := path.Base(out); base != "." && base != "/" {
-			return base
+func packageName(req *Request, opts *PluginOptions) (string, error) {
+	name := opts.Package
+	if name == "" {
+		name = path.Base(req.Settings.Codegen.Out)
+		if name == "." || name == "/" {
+			return "models", nil
 		}
 	}
-	return "models"
+	if name == "_" || !isGoIdent(name) {
+		return "", fmt.Errorf("sqlc-gen-spira: package %q is not a Go package name", name)
+	}
+	return name, nil
 }
 
 func emitModels(m Model, pkg string) string {
@@ -436,7 +441,7 @@ func planSliceCall(qd *QueryDef, engine string) (sliceCall, error) {
 		if err != nil {
 			return sliceCall{}, fmt.Errorf("sqlc-gen-spira: %s: %w", qd.Name, err)
 		}
-		if engine != "sqlite" || token == "?" || arg.marker != "" {
+		if engine != "sqlite" || token == "?" {
 			positional++
 		}
 		plan.rewriteBind(&arg, start, end)

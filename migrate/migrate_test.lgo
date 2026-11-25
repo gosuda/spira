@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/gosuda/spira/db"
 	"github.com/gosuda/spira/migrate"
@@ -391,3 +392,79 @@ func TestCheckReversibleRefusesNonEmpty(t *testing.T) {
 	}
 }
 
+
+type scratchStack struct {
+	admin    *db.Pool?
+	pool     *db.Pool?
+	teardown []string
+}
+
+func (s *scratchStack) cleanup(t *testing.T) {
+	t.Helper()
+	cctx, ccancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer ccancel()
+	pool := s.pool
+	if pool != nil {
+		if serr := pool.Stop(cctx); serr != nil {
+			t.Errorf("stop: %v", serr)
+		}
+	}
+	admin := s.admin
+	if admin != nil {
+		for _, q := range s.teardown {
+			if _, err := db.Exec(cctx, admin, q); err != nil {
+				t.Errorf("teardown %q: %v", q, err)
+			}
+		}
+		if serr := admin.Stop(cctx); serr != nil {
+			t.Errorf("stop admin: %v", serr)
+		}
+	}
+}
+
+func TestScratchStackRunsTeardownWhenRegisteredFirst(t *testing.T) {
+	dsn := dsnFor(t)
+	observer, err := db.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open observer: %v", err)
+		return
+	}
+	if observer == nil {
+		t.Fatal("open returned no pool")
+		return
+	}
+	if serr := observer.Start(t.Context()); serr != nil {
+		t.Fatalf("start observer: %v", serr)
+		return
+	}
+	t.Cleanup(func() {
+		if serr := observer.Stop(context.Background()); serr != nil {
+			t.Errorf("stop observer: %v", serr)
+		}
+	})
+	t.Cleanup(func() {
+		if _, err := db.Exec(context.Background(), observer, "SELECT count(*) FROM scratch_sentinel"); err == nil {
+			t.Errorf("scratch stack teardown did not run; scratch_sentinel still exists")
+		}
+	})
+	stack := &scratchStack{teardown: []string{"DROP TABLE IF EXISTS scratch_sentinel"}}
+	t.Cleanup(func() { stack.cleanup(t) })
+	admin, err := db.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open admin: %v", err)
+		return
+	}
+	if admin == nil {
+		t.Fatal("open returned no admin pool")
+		return
+	}
+	stack.admin = admin
+	if serr := admin.Start(t.Context()); serr != nil {
+		t.Fatalf("start admin: %v", serr)
+		return
+	}
+	if _, err := db.Exec(t.Context(), admin, "CREATE TABLE IF NOT EXISTS scratch_sentinel (n integer not null)"); err != nil {
+		t.Fatalf("create sentinel: %v", err)
+		return
+	}
+}

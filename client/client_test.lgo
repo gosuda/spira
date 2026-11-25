@@ -887,6 +887,101 @@ func TestFaultPublicHidesSecret(t *testing.T) {
 	faulttest.RefuseLeak(t, []byte(err.Error()), secret, hostile, "/etc/passwd", "DROP TABLE")
 }
 
+func TestCrossOriginRedirectIsNotFollowed(t *testing.T) {
+	var otherHits atomic.Int64
+	var otherKey sync.Locked[string]
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits.Add(1)
+		otherKey.WithLock(func(k *string) {
+			*k = r.Header.Get("X-Api-Key")
+		})
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"ok":true}`); err != nil {
+			t.Errorf("other write: %v", err)
+		}
+	}))
+	defer other.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/collect", http.StatusFound)
+	}))
+	defer first.Close()
+	c := client.New(first.URL, resilience.Policy{Timeout: 5 * time.Second})
+	_, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{
+		Method: http.MethodGet,
+		Path:   "/start",
+		Header: http.Header{"X-Api-Key": []string{"key-for-first-only"}},
+	})
+	if otherHits.Load() != 0 {
+		var key string
+		otherKey.WithLock(func(k *string) {
+			key = *k
+		})
+		t.Fatalf("the other host saw %d requests carrying X-Api-Key %q, want none", otherHits.Load(), key)
+	}
+	se := &client.StatusError{}
+	if !errors.As(err, &se) {
+		t.Fatalf("err=%v (%T), want *client.StatusError for the unfollowed redirect", err, err)
+	}
+	if se.Status != http.StatusFound {
+		t.Fatalf("status=%d, want 302", se.Status)
+	}
+}
+
+func TestSameOriginRedirectIsFollowed(t *testing.T) {
+	var finalKey sync.Locked[string]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusFound)
+			return
+		}
+		finalKey.WithLock(func(k *string) {
+			*k = r.Header.Get("X-Api-Key")
+		})
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"ok":true}`); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: 5 * time.Second})
+	out, err := client.Send[nothing, probe](t.Context(), c, client.Request[nothing]{
+		Method: http.MethodGet,
+		Path:   "/start",
+		Header: http.Header{"X-Api-Key": []string{"same-origin-key"}},
+	})
+	if err != nil {
+		t.Fatalf("same-origin redirect failed: %v", err)
+	}
+	if !out.Ok {
+		t.Fatalf("out=%+v, want the final answer", out)
+	}
+	var key string
+	finalKey.WithLock(func(k *string) {
+		key = *k
+	})
+	if key != "same-origin-key" {
+		t.Fatalf("final X-Api-Key=%q, want the caller header", key)
+	}
+}
+
+func TestRedirectLoopStopsAfterTenRequests(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		http.Redirect(w, r, fmt.Sprintf("/loop/%d", n), http.StatusFound)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, resilience.Policy{Timeout: 5 * time.Second})
+	_, err := client.Get[probe](t.Context(), c, "/loop/0")
+	se := &client.StatusError{}
+	if !errors.As(err, &se) || se.Status != http.StatusFound {
+		t.Fatalf("err=%v (%T), want a *client.StatusError with status 302", err, err)
+	}
+	if hits.Load() != 10 {
+		t.Fatalf("the server saw %d requests, want 10", hits.Load())
+	}
+}
+
 func TestFaultsMatchCodeTable(t *testing.T) {
 	faulttest.CheckTable(t, "../docs/specs/client.md", client.Faults())
 }

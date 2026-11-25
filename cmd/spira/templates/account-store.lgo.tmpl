@@ -29,7 +29,17 @@ func (s *DBStore) Load(ctx context.Context, id string) (auth.Principal?, error) 
 func (s *DBStore) Save(ctx context.Context, id string, p auth.Principal, ttl time.Duration) error {
 	uid := parseUserID(p.ID)?
 	args := store.SaveSessionArgs{IDHash: store.SessionID(id), UserID: store.UserID(uid), Roles: strings.Join(p.Roles, ","), ExpiresAt: time.Now().Add(ttl)}
-	return store.SaveSession(ctx, s.DB, args)
+	if err := store.SaveSession(ctx, s.DB, args); err != nil {
+		return ErrAccountFailed.Wrap(fmt.Errorf("account: save session: %w", err))
+	}
+	return s.DeleteExpired(ctx)
+}
+
+func (s *DBStore) DeleteExpired(ctx context.Context) error {
+	if err := store.DeleteExpiredSessions(ctx, s.DB, time.Now()); err != nil {
+		return ErrAccountFailed.Wrap(fmt.Errorf("account: delete expired sessions: %w", err))
+	}
+	return nil
 }
 
 func (s *DBStore) Delete(ctx context.Context, id string) error {

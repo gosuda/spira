@@ -1,10 +1,12 @@
 # websocket
 
 Package `websocket` speaks RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 on `net/http` types.
-It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
+Package `websocket` speaks RFC 6455 over HTTP/1.1 and over HTTP/2 extended CONNECT (RFC 8441) on `net/http` types. It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
 
 The package owns the handshake answer, the frame loop and the close handshake. It holds no global session state.
 `Conn` is the public transport for a hijacked HTTP/1.1 socket or one HTTP/2 stream.
+
+The package follows RFC 6455 and RFC 8441 section 5. The unexported blocks are the frame codec, the opening-handshake checks, the origin check, the close-code rules and the message-assembly engine. `Conn` is the only public transport; the extended-CONNECT accept path adapts the HTTP/2 stream to that transport and runs the same frame loop.
 
 ## Interface
 
@@ -148,6 +150,7 @@ func Faults() []*fault.Error
 
 func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error)
 func Serve(w http.ResponseWriter, r *http.Request, cfg Config, session func(*Conn) error) error
+func ServeStream(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, error)
 func ServeHijacked(conn net.Conn, rw *bufio.ReadWriter, subprotocol string, limit int64) *Conn
 func (c *Conn) NetConn() net.Conn
 func (c *Conn) Subprotocol() string
@@ -159,8 +162,7 @@ func (c *Conn) Ping(ctx context.Context, payload []byte) error
 func (c *Conn) CloseWithCode(ctx context.Context, code uint16, reason string) error
 func (c *Conn) Close() error
 ```
-
-The frame codec and message engine are shared by HTTP/1.1 and HTTP/2. `Conn` answers pings, echoes one close and ends.
+`header` moves no payload bytes and opens no connection. `readHeader` reads 2 to 14 header bytes and never reads payload bytes. `acceptKey`, `checkUpgrade`, `upgradeStatus`, `handshakeFailureHeaders`, `upgradeHeaders`, `pickSubprotocol`, `checkOrigin` and `sameOrigin` are pure header checks. `checkStreamRequest` and `streamStatus` are pure header checks. `serveStreamConn` wraps the HTTP/2 stream in a `streamConn` that implements `net.Conn` over the request body and the response writer, so `ServeStream` reuses `ServeHijacked` and the one frame loop. `streamConn` deadlines reach the stream through `http.ResponseController`. `parseClose`, `validCloseCode` and `appendClose` move no frame bytes. `engine` reads frames from a `*bufio.Reader` and assembles messages; it opens no connection and starts no goroutine. `Conn` owns one hijacked connection, answers pings, echoes one close and ends.
 Each detection site wraps its unexported cause in the declared fault for that class. The frame, engine and close codecs surface `ErrProtocolError` or `ErrTooLarge` through the `Exposed` probes in `export_test.lgo` and `close_export_test.lgo`. The handshake checks keep their unexported causes for the status map and surface them through `handshake_export_test.lgo`.
 
 ## Requirements
@@ -259,6 +261,21 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `Upgrade` MUST return `ErrHandshakeFailed` for a check failure and `ErrForbiddenOrigin` for a foreign origin.
 - `Upgrade` MUST send no body text with a failure status.
 - Each close frame the server sends on a protocol fault MUST carry the code only and no reason text.
+
+### Extended CONNECT (RFC 8441 sections 3, 4, 5)
+
+- The `:scheme`, `:path` and `:authority` checks stay with the HTTP/2 server: it resets a malformed stream with `PROTOCOL_ERROR` before the handler runs. The server sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` only when the process runs with `GODEBUG=http2xconnect=1`, the one opt-in the toolchain offers.
+- `ServeStream` MUST require the CONNECT method and HTTP/2, else answer 405 and 400.
+- `ServeStream` MUST require `:protocol` `websocket`, else answer 501. A CONNECT without `:protocol` is a tunnel the package does not proxy, and answers 501 too.
+- `ServeStream` MUST require exactly one non-blank `Sec-WebSocket-Version` value of `13`, else answer 400.
+- `ServeStream` MUST NOT process `Sec-WebSocket-Key` and MUST send no `Sec-WebSocket-Accept`, as RFC 8441 section 5 replaces them with `:protocol`.
+- `ServeStream` MUST apply the same origin check and size limit as `Upgrade`: a foreign origin answers 403 with `ErrForbiddenOrigin`.
+- `ServeStream` MUST pick the subprotocol with `pickSubprotocol` and answer it in `Sec-WebSocket-Protocol`.
+- `ServeStream` MUST answer 200 and flush the headers before the first read, so the client starts sending frames.
+- `ServeStream` MUST return `ErrHandshakeFailed` for a check failure and `ErrForbiddenOrigin` for a foreign origin.
+- `ServeStream` MUST run the same frame loop as the HTTP/1.1 path: text echoes, a peer close is echoed once, and the second `Next` returns `ErrClosed`.
+- A stream reset or END_STREAM ends the read side; the connection then follows the same failed-or-closed path as a dropped TCP connection, with no goroutine left behind.
+- `ServeStream` MUST send no body text with a failure status.
 
 ### Close payload and codes (RFC 6455 sections 5.5.1, 7.1.5, 7.1.6, 7.4)
 
@@ -404,9 +421,16 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestHTTP2WebSocketReadDeadlineAndCancellation` checks read deadlines and cancellation on a live HTTP/2 stream.
 - `TestHTTP2WebSocketWriteDeadline` checks a write blocked by HTTP/2 flow control. The HTTP/2 connection stays open.
 - `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
+- `TestStreamEchoOverTLS` proves that an HTTP/2 client with `:protocol` `websocket` gets 200, the picked subprotocol and its text message back.
+- `TestStreamCloseRoundTrip` proves that a peer close over the stream is echoed once and the handler then ends.
+- `TestStreamRejectsBadHandshakes` proves that a foreign or missing `:protocol` answers 501, a missing or wrong version answers 400, a foreign origin answers 403 and a wrong method answers 405, each with its fault.
+- `TestStreamRefusesHTTP1Connect` proves that a CONNECT over HTTP/1.1 answers 400.
+- `BenchmarkLoopbackEcho1KiB` reports allocations and latency percentiles per 1 KiB text echo over loopback TCP.
+- `BenchmarkWebSocketEcho1KiBInMemory` reports allocations per message and the p50, p95, p99 and max latency of a 1 KiB binary echo through `ServeHijacked` over `net.Pipe`. Run it with `-benchtime=256x`; another iteration count above 1 skips it.
 
 ## Not in scope
 
 - Extensions such as permessage-deflate. No requirement names them.
 - A client handshake builder. The code checks requests only.
 - A background keep-alive loop. The application sends `Ping` itself.
+- HTTP/3 (RFC 9220). No requirement names it; `web.Server` offers the `h2` and `http/1.1` ALPN protocols only, and never advertises HTTP/3.

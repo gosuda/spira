@@ -57,6 +57,72 @@ func TestWatchRestartsServerOnlyOnLgoChange(t *testing.T) {
 	}
 }
 
+func TestWatchRestartsOnSizeOnlyChange(t *testing.T) {
+	dir := t.TempDir()
+	fix := newStandins(dir)
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := spira.Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return fix.count() == 1 }); err != nil {
+			return err
+		}
+		if err := growKeepingModTime(seed); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart after size-only change", backstop(t), func() bool { return fix.count() == 2 }); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+}
+
+func growKeepingModTime(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	mtime := info.ModTime()
+	if err := os.WriteFile(path, []byte("package main\n// grow the file without touching the clock\n"), 0o644); err != nil {
+		return err
+	}
+	return os.Chtimes(path, mtime, mtime)
+}
+
+func TestWatchRestartsWithUnreceivedStartReports(t *testing.T) {
+	dir := t.TempDir()
+	fix := newStandins(dir)
+	seed := filepath.Join(dir, "shop.lgo")
+	if err := os.WriteFile(seed, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := spira.Loop{ServerCmd: fix.serverCmd, FrontendCmd: fix.frontendCmd, Root: dir, Interval: 20 * time.Millisecond, Started: make(chan spira.Start)}
+	ctx, cancel := context.WithCancel(context.Background())
+	scenario := func(sctx context.Context) error {
+		if err := await(sctx, "first server start", backstop(t), func() bool { return fix.count() == 1 }); err != nil {
+			return err
+		}
+		if err := touchLater(seed); err != nil {
+			return err
+		}
+		if err := await(sctx, "restart with unreceived reports", backstop(t), func() bool { return fix.count() == 2 }); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	if err := driveWatch(ctx, cfg, scenario); err != nil {
+		t.Fatalf("watch loop: %v", err)
+	}
+}
+
 func TestWatchCancelEndsLoopAndKillsStandinGroups(t *testing.T) {
 	dir := t.TempDir()
 	fix := newStandins(dir)
@@ -307,11 +373,11 @@ func TestWatchServerSelfExitLogsOneWarningWithRealStatus(t *testing.T) {
 		if err := await(sctx, "first server start", backstop(t), func() bool { return lineCount(counter) == 1 }); err != nil {
 			return err
 		}
-		if err := await(sctx, "exit warning", backstop(t), func() bool { return strings.Contains(warnText(warnPath), "server exited") }); err != nil {
+		if err := await(sctx, "exit warning", backstop(t), func() bool { return strings.Contains(fileText(warnPath), "server exited") }); err != nil {
 			return err
 		}
 		if err := settle(sctx, "exactly one exit warning", 250*time.Millisecond, func() bool {
-			return strings.Count(warnText(warnPath), "server exited") != 1
+			return strings.Count(fileText(warnPath), "server exited") != 1
 		}); err != nil {
 			return err
 		}
@@ -321,7 +387,7 @@ func TestWatchServerSelfExitLogsOneWarningWithRealStatus(t *testing.T) {
 	if err := driveWatch(ctx, cfg, scenario); err != nil {
 		t.Fatalf("watch loop: %v", err)
 	}
-	text := warnText(warnPath)
+	text := fileText(warnPath)
 	if n := strings.Count(text, "server exited"); n != 1 {
 		t.Fatalf("server exited warnings = %d, want 1:\n%s", n, text)
 	}
@@ -445,7 +511,7 @@ func TestWatchRejectsRootThatIsNotADirectory(t *testing.T) {
 	}
 }
 
-func warnText(path string) string {
+func fileText(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -504,9 +570,11 @@ func assertNoChildren(t *testing.T) {
 func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	t.Setenv("SPIRA_VITE_ORIGIN", "inherited")
 	dir := t.TempDir()
+	envFile := filepath.Join(dir, "vite.env")
 	started := make(chan spira.Start, 4)
+	serverScript := fmt.Sprintf("printenv SPIRA_VITE_ORIGIN > '%[1]s'\nsleep 300\n", envFile)
 	cfg := spira.Loop{
-		ServerCmd:   []string{"sh", "-c", "sleep 300"},
+		ServerCmd:   []string{"sh", "-c", serverScript},
 		FrontendCmd: []string{"sh", "-c", "sleep 300"},
 		Root:        dir,
 		Interval:    20 * time.Millisecond,
@@ -514,52 +582,46 @@ func TestWatchGivesTheViteOriginToTheServer(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	scenario := func(sctx context.Context) error {
-		serverEnv, err := waitForStarts(sctx, started, backstop(t))
+		if err := await(sctx, "server env file", backstop(t), func() bool { return strings.TrimSpace(fileText(envFile)) == "http://localhost:5173" }); err != nil {
+			return err
+		}
+		report, err := waitForServerStart(sctx, started, backstop(t))
 		if err != nil {
 			return err
 		}
-		if lastViteOrigin(serverEnv) != "SPIRA_VITE_ORIGIN=http://localhost:5173" {
-			return fmt.Errorf("cmd/spira test: server SPIRA_VITE_ORIGIN = %q, want http://localhost:5173", lastViteOrigin(serverEnv))
+		if lastViteOrigin(report.Env) != "SPIRA_VITE_ORIGIN=http://localhost:5173" {
+			return fmt.Errorf("cmd/spira test: reported SPIRA_VITE_ORIGIN = %q, want http://localhost:5173", lastViteOrigin(report.Env))
 		}
 		cancel()
 		return nil
 	}
 	if err := driveWatch(ctx, cfg, scenario); err != nil {
 		t.Fatalf("watch loop: %v", err)
-		return
 	}
 }
 
-func waitForStarts(ctx context.Context, started <-chan spira.Start, budget time.Duration) ([]string, error) {
-	sawServer := false
-	sawFrontend := false
-	serverEnv := []string{}
+func waitForServerStart(ctx context.Context, started <-chan spira.Start, budget time.Duration) (spira.Start, error) {
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
-	for !sawServer || !sawFrontend {
+	for {
 		select {
 		case ev := <-started:
 			if ev.Role == "server" {
-				sawServer = true
-				serverEnv = ev.Env
-			}
-			if ev.Role == "frontend" {
-				sawFrontend = true
+				return ev, nil
 			}
 		case <-ctx.Done():
-			return nil, fmt.Errorf("cmd/spira test: cancelled while waiting for server and frontend start")
+			return spira.Start{}, fmt.Errorf("cmd/spira test: cancelled while waiting for the server report")
 		case <-timer.C:
-			return nil, fmt.Errorf("cmd/spira test: backstop expired waiting for server and frontend start")
+			return spira.Start{}, fmt.Errorf("cmd/spira test: backstop expired waiting for the server report")
 		}
 	}
-	return serverEnv, nil
 }
 
 func lastViteOrigin(env []string) string {
 	last := ""
-	for _, e := range env {
-		if strings.HasPrefix(e, "SPIRA_VITE_ORIGIN=") {
-			last = e
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "SPIRA_VITE_ORIGIN=") {
+			last = entry
 		}
 	}
 	return last
@@ -650,6 +712,31 @@ func nextServerEnv(ctx context.Context, started <-chan spira.Start, budget time.
 			return nil, fmt.Errorf("cmd/spira test: backstop expired waiting for the server restart")
 		}
 	}
+}
+
+func waitForStarts(ctx context.Context, started <-chan spira.Start, budget time.Duration) ([]string, error) {
+	sawServer := false
+	sawFrontend := false
+	serverEnv := []string{}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	for !sawServer || !sawFrontend {
+		select {
+		case ev := <-started:
+			if ev.Role == "server" {
+				sawServer = true
+				serverEnv = ev.Env
+			}
+			if ev.Role == "frontend" {
+				sawFrontend = true
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("cmd/spira test: cancelled while waiting for server and frontend start")
+		case <-timer.C:
+			return nil, fmt.Errorf("cmd/spira test: backstop expired waiting for server and frontend start")
+		}
+	}
+	return serverEnv, nil
 }
 
 func envValue(env []string, key string) string {

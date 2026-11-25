@@ -1,7 +1,8 @@
 package openapi
 
 import (
-	"encoding/json/v2"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"net/http"
 	"slices"
 	"strconv"
@@ -21,9 +22,10 @@ type Doc struct {
 	Info DocInfo `json:"info"`
 	Paths map[string]PathItem `json:"paths"`
 }
-func (d Doc) MarshalJSON() ([]byte, error) {
+
+func (d Doc) MarshalJSONTo(out *jsontext.Encoder) error {
 	type rawDoc Doc
-	return json.Marshal(rawDoc(d), json.Deterministic(true))
+	return json.MarshalEncode(out, rawDoc(d), json.Deterministic(true))
 }
 
 type DocInfo struct {
@@ -72,8 +74,9 @@ type MediaType struct {
 
 func Document(r *web.Router, info Info) Doc {
 	paths := map[string]PathItem{}
+	origins := map[string]string{}
 	for _, ri := range r.Routes() {
-		addRoute(paths, ri)
+		addRoute(paths, origins, ri)
 	}
 	return Doc{OpenAPI: "3.1.0", Info: DocInfo{Title: info.Title, Version: info.Version}, Paths: paths}
 }
@@ -82,18 +85,56 @@ func Mount(r *web.Router, info Info) {
 	r.Handle("GET", "/openapi.json", func(ctx *web.Context) (web.Reply, error) {
 		return web.Data{Value: Document(r, info)}, nil
 	})
+	r.Describe("GET", "/openapi.json", web.Doc{Summary: mountSummary})
 }
 
-func addRoute(paths map[string]PathItem, ri web.RouteInfo) {
+const mountSummary = "Serves this router's OpenAPI 3.1 document"
+
+func isMountRoute(ri web.RouteInfo) bool {
+	if strings.ToUpper(ri.Method) != http.MethodGet {
+		return false
+	}
+	doc := ri.Doc
+	if doc == nil {
+		return false
+	}
+	return doc.Summary == mountSummary
+}
+
+func addRoute(paths map[string]PathItem, origins map[string]string, ri web.RouteInfo) {
 	path := openapiPath(ri.Pattern)
-	if path == "/openapi.json" && strings.ToUpper(ri.Method) == http.MethodGet {
+	if isMountRoute(ri) {
 		return
 	}
 	item := paths[path] ?? PathItem{}
-	if !setSlot(&item, strings.ToLower(ri.Method), operationOf(ri)) {
+	method := strings.ToLower(ri.Method)
+	if kept, ok := origins[method+" "+path]; ok && !displaces(ri.Pattern, kept) {
+		return
+	}
+	if !setSlot(&item, method, operationOf(ri)) {
 		return
 	}
 	paths[path] = item
+	origins[method+" "+path] = ri.Pattern
+}
+
+func displaces(later string, kept string) bool {
+	laterHost := !strings.HasPrefix(later, "/")
+	keptHost := !strings.HasPrefix(kept, "/")
+	if laterHost != keptHost {
+		return laterHost
+	}
+	laterMultis := strings.Count(later, "...}")
+	keptMultis := strings.Count(kept, "...}")
+	if laterMultis != keptMultis {
+		return laterMultis < keptMultis
+	}
+	laterExact := !strings.HasSuffix(later, "/")
+	keptExact := !strings.HasSuffix(kept, "/")
+	if laterExact != keptExact {
+		return laterExact
+	}
+	return true
 }
 
 func setSlot(item *PathItem, method string, op Operation) bool {

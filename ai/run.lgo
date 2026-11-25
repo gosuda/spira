@@ -9,6 +9,7 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -75,7 +76,7 @@ func Run(ctx context.Context, m Model, req Request, limits Limits) (Reply, error
 			round.Decisions = nil
 			reply, err := m.Chat(ctx, round)
 			if err != nil {
-				return Reply{}, ErrModelFailed.Wrap(fmt.Errorf("ai: run: %w", err))
+				return Reply{}, modelFault("run", err)
 			}
 			usage = usage.plus(reply.Usage)
 			last = reply
@@ -210,7 +211,7 @@ func (b *batch) one(ctx context.Context, call ToolCall, key string) error {
 
 func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
 	if cerr := ctx.Err(); cerr != nil {
-		return "", ErrModelFailed.Wrap(fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr))
+		return "", toolContextFault(call.Name, cerr)
 	}
 	arguments := call.Arguments
 	if strings.TrimSpace(arguments) == "" {
@@ -218,7 +219,7 @@ func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
 	}
 	content, err := tool.Call(ctx, arguments)
 	if cerr := ctx.Err(); cerr != nil {
-		return "", ErrModelFailed.Wrap(fmt.Errorf("ai: run: tool %s: %w", call.Name, cerr))
+		return "", toolContextFault(call.Name, cerr)
 	}
 	if err == nil {
 		return content, nil
@@ -227,6 +228,14 @@ func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
 		return text, nil
 	}
 	return "tool " + call.Name + " failed", nil
+}
+
+func toolContextFault(name string, cerr error) error {
+	cause := fmt.Errorf("ai: run: tool %s: %w", name, cerr)
+	if errors.Is(cerr, context.DeadlineExceeded) {
+		return ErrToolTimeout.Wrap(cause)
+	}
+	return ErrToolCanceled.Wrap(cause)
 }
 
 func toolErrorText(err error) string {
@@ -339,14 +348,9 @@ func (b *batch) checkDecisions(keys []string) error {
 		decided[decision.Call] = true
 	}
 	var missing []string
-	for i, key := range keys {
+	for _, key := range keys {
 		if !(decided[key] ?? false) {
 			missing = append(missing, key)
-			continue
-		}
-		name := b.calls[i].Name
-		if b.denial(key) == nil && toolNamed(b.tools, name) == nil {
-			return fmt.Errorf("ai: run: the request does not carry the tool '%s' of the allowed call '%s'", name, key)
 		}
 	}
 	if len(missing) > 0 {

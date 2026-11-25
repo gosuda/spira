@@ -170,7 +170,7 @@ func Faults() []*fault.Error
 - Statements MUST use `?` on SQLite and MySQL, `$n` on Postgres and `@pn` on MSSQL.
 - Reads MUST use `LIMIT` on SQLite, Postgres and MySQL.
 - Reads on MSSQL MUST use `FETCH`.
-- Each engine case MUST skip when its DSN variable is not set.
+- Each engine case MUST fail naming its DSN variable when it is not set.
 - `Find` MUST return none after `Delete`.
 - `Version` MUST return zero after `Delete`.
 - `Ensure` MUST reject a blank id.

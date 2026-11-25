@@ -1,8 +1,10 @@
 package account_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -277,6 +279,47 @@ func TestLoginRejectsUnknownUser(t *testing.T) {
 	testRouter(pool).ServeHTTP(rec, loginRequest("bob", "s3cret"))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status %d want 401 body %s", rec.Code, rec.Body.String())
+		return
+	}
+}
+
+func TestLoginLookupFailureCarriesAccountFault(t *testing.T) {
+	pool, err := db.Open("sqlite", dsnFor(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatalf("open: no pool and no error")
+		return
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	if err := pool.Start(bounded(t)); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	rec := httptest.NewRecorder()
+	testRouter(pool).ServeHTTP(rec, loginRequest("ada", "s3cret"))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d want 500 body %s", rec.Code, rec.Body.String())
+		return
+	}
+	if !strings.Contains(buf.String(), "account.failed") {
+		t.Fatalf("handler log %q lacks the account fault", buf.String())
+		return
+	}
+	if strings.Contains(rec.Body.String(), "no such table") {
+		t.Fatalf("body %q leaks the driver error", rec.Body.String())
 		return
 	}
 }
