@@ -142,6 +142,14 @@ SQL Server:
 - The plugin MUST emit `func PrepareAll(ctx context.Context, p *db.Pool) error`.
 - `PrepareAll` MUST prepare every generated statement.
 - `PrepareAll` MUST return the first failure with the query name.
+- `PrepareAll` MUST call one `prepare<Topic>` helper for each query file.
+- `<Topic>` MUST be the file stem in Pascal-case.
+- Each helper MUST prepare the statements of its file in query order.
+- Each helper MUST return the first failure with the sqlc query name in the message.
+- The failure MUST wrap the engine error with `%w`.
+- The wrapped error MUST satisfy `errors.Is` and `errors.As` to the `db` prepare error.
+- Every emitted call MUST pass a query constant and bound arguments.
+- The plugin MUST NOT build SQL from values.
 
 ### Queries
 
@@ -175,6 +183,19 @@ SQL Server:
 - Two queries with one name MUST be the error `duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
+### Gate
+
+- `just sql` MUST read the sqlc config path from `sql_config`.
+- `sql_config` MUST default to `example/shop/sqlc.yaml`.
+- `just sql` MUST fail with a message that names the path when the file does not exist.
+- `just sql` MUST NOT create output when the file does not exist.
+- `just sql-check` MUST run `just sql` first.
+- `just sql-check` MUST fail when generated `*.sql.lgo` files differ from the SQL.
+- `just sql-check` MUST run `sqlc vet` on the same config.
+- `just sql-check` MUST fail when `db.Query`, `db.One` or `db.Exec` appears outside the data packages.
+- The raw-query check MUST skip `_test.lgo` files, generated `*.sql.lgo` files, the generator, and the packages `db`, `orm`, `migrate`, `ai/session` and `ai/rag`.
+- Tests MAY call the runtime directly.
+
 ## Errors
 
 - `<Name>: command <cmd> is not supported` for `:execresult`, `:copyfrom` and batch commands.
@@ -201,10 +222,14 @@ SQL Server:
 - Each negative case requires the named message.
 - The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
 - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
-- `TestGenerateJSONRoundTrip` proves one request decodes from JSON and encodes to a two-file response.
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
-- The parent compiles the generated text and runs the end-to-end proof against `database/sql`: that proof is not in this package.
+- `TestGeneratedStoreBuilds` generates a two-query store and compiles it with `logos build`.
+- The same test runs the generated PrepareAll over one valid and one rejected statement against SQLite.
+- The run MUST report the rejected query name and satisfy `errors.Is` to `db.ErrStatementFailed`.
+- The raw-query rule is proved on a scratch copy with a planted call and on the clean tree.
+- The shop lane adds `sql-check` to `gate` after it publishes `example/shop/sqlc.yaml`.
+- The end-to-end proof that runs generated functions against `database/sql` is not in this package.
 
 ## Not in scope
 
