@@ -108,6 +108,9 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `Mount` MUST validate `Origin`: an absent `Origin` is allowed.
 - A present `Origin` MUST parse as `http` or `https`.
 - A present `Origin` MUST match the request `Host`; anything else answers 403 with a no-id JSON-RPC error.
+- On a loopback connection, a present `Origin` MUST name `localhost` or a loopback IP.
+- Any other `Origin` on a loopback connection MUST answer the same 403. A DNS rebinding page makes `Origin` and `Host` both name its own domain. That domain then resolves to the loopback address. The match with `Host` alone does not stop such a page.
+- The loopback rule MUST apply only to a request with an `Origin`. Only a browser can be rebound, and a browser sends `Origin` on every `POST`. The rule follows the localhost protection in `mcp/streamable.go` of the MCP Go SDK (`modelcontextprotocol/go-sdk`). It also follows the local server guidance in the security best practices of the specification.
 - `Mount` MUST answer 400 for a present `MCP-Protocol-Version` other than `2025-11-25`.
 - `Mount` MUST answer 400 for a body that is not one JSON-RPC envelope, with error `-32700`.
 - `Mount` MUST take a guard as `ops` and `admin` do.
@@ -199,6 +202,8 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 - `TestMountOrigin`, `TestMountProtocolVersion` and `TestMountGuard` pin a 403 for a foreign `Origin`.
 - They also pin a 400 for an unsupported version.
 - They also pin that the guard runs and a refused request never reaches a tool.
+- `TestMountRefusesRebindingOnLoopback` proves that a loopback request whose `Origin` and `Host` both name another domain answers 403.
+- It also proves that such a request never reaches the tool, and that `localhost` and `127.0.0.1` still pass.
 - `TestMountCallToolError`, `TestMountUnknownTool`, `TestMountMalformed`, `TestMountUnknownMethod` and `TestMountNotification` pin the error results and the protocol error codes.
 - They also pin the 400 for an unparseable body and the 202 for a notification.
 - `TestMountClientServer` runs the client of this package against `Mount` over `net/http/httptest`.
