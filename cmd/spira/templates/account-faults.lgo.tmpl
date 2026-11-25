@@ -6,6 +6,8 @@ import (
 
 var ErrAccountFailed = fault.New("account.failed", fault.Internal, "The account request could not be completed.")
 
+var ErrAccountUnavailable = fault.New("account.unavailable", fault.Unavailable, "The account service is temporarily unavailable.")
+
 func Faults() []*fault.Error {
-	return []*fault.Error{ErrAccountFailed}
+	return []*fault.Error{ErrAccountFailed, ErrAccountUnavailable}
 }

@@ -2,6 +2,7 @@ package account
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -55,6 +56,9 @@ func (f *Feature) login(wctx *web.Context) (web.Reply, error) {
 	secret := wctx.Request.PostFormValue("password")
 	user, err := store.GetUserByName(call, f.DB, name)
 	if err != nil {
+		if errors.Is(err, db.ErrUnavailable) {
+			return nil, ErrAccountUnavailable.Wrap(fmt.Errorf("account: lookup user: %w", err))
+		}
 		return nil, ErrAccountFailed.Wrap(fmt.Errorf("account: lookup user: %w", err))
 	}
 	if user == nil {
