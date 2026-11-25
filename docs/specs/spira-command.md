@@ -56,11 +56,15 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - A missing user and a wrong password MUST answer `auth.invalid_credentials`.
 - The account handlers MUST NOT call `web.Fail` with a literal problem.
 - A bad session user id MUST wrap the account fault.
+// refused_by: statement_fold · collision: none (no common ancestor text)
+// refused_by: statement_fold · collision: none (no common ancestor text)
 - `main.lgo` MUST seed the user `demo` only when `SPIRA_SEED_DEMO_PASSWORD` is set and not empty.
 - The seed MUST give the user `demo` the value of `SPIRA_SEED_DEMO_PASSWORD` as its password.
 - When the user `demo` exists, the seed MUST replace its password with that value.
 - The templates MUST NOT hold a password for the user `demo`.
 - For `sqlite`, `spira new` MUST write `main_test.lgo` and `export_test.lgo`, which test the seed.
+- The generated session store MUST delete the expired session rows when it saves a session.
+- The generated router MUST install `auth.CrossOrigin()` before `auth.Authenticate`.
 - `spira new` MUST refuse a non-empty `<dir>`.
 - `spira new` MUST accept only `sqlite`, `postgresql`, `mysql` and `mssql` for `-engine`.
 - With `-spira-dir <path>`, the generated `go.mod` MUST hold a `replace github.com/gosuda/spira => <path>` line.
@@ -88,7 +92,7 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - The loop MUST report each frontend start on `Started` with role `frontend`.
 - A report MUST carry the command and the process environment.
 - The loop MUST NOT block when `Started` is nil.
-- A blocked report MUST end when the context ends.
+- A report MUST NOT delay supervision: when `Started` has no ready receiver the report is dropped.
 
 ### Restart
 
@@ -139,6 +143,8 @@ The subcommand `spira new` writes a minimal application into `<dir>` from files 
 - Generation plus `just sql`, `logos build ./...` and `logos test ./...` MUST pass for every engine.
 - The three server engines MUST run with their DSN exported.
 - `TestWatchRestartsServerOnlyOnLgoChange` proves a restart on an `.lgo` change, and no restart for a `.txt` file or for `node_modules`.
+- `TestWatchRestartsOnSizeOnlyChange` proves a restart when only the size of an `.lgo` file changes.
+- `TestWatchRestartsWithUnreceivedStartReports` proves a restart even when no receiver drains `Started`.
 - `TestWatchCancelEndsLoopAndKillsStandinGroups` proves that cancel stops the server group and the frontend group.
 - `TestWatchServerSelfExitWaitsForChange` proves that a server exit waits for an `.lgo` change.
 - `TestWatchServerSelfExitLogsOneWarningWithRealStatus` proves one warning with the real exit error.
