@@ -2,7 +2,7 @@
 
 `http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-`H3Server` runs over the `golang.org/x/net/quic` transport in the LoGOs toolchain. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
+The native `H3Server` uses `golang.org/x/net/quic` in the LoGOs toolchain. Ejected code uses `github.com/quic-go/quic-go`. Both clone the TLS configuration for UDP, require TLS 1.3, and set ALPN to `h3`.
 
 ## Interface
 
@@ -11,6 +11,8 @@ type Server struct {
 	Addr              string = ":8080"
 	Router            *web.Router
 	ReadHeaderTimeout time.Duration = 5 * time.Second
+	ReadTimeout       time.Duration = 30 * time.Second
+	IdleTimeout       time.Duration = 120 * time.Second
 	ShutdownGrace     time.Duration = 20 * time.Second
 	TLS               *tls.Config?
 	H2C               bool
@@ -30,7 +32,7 @@ var ErrH3Shutdown = fault.New("http3.h3_shutdown", fault.Internal, "The HTTP/3 s
 func Faults() []*fault.Error
 ```
 
-The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on.
+The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on. `ReadTimeout` and `IdleTimeout` reach the TCP listener through the inner `web.Server`.
 
 ## Requirements
 
@@ -59,6 +61,16 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - `Start` MUST NOT add the stage to the router itself.
 - When `H3` is false, `Start` MUST serve TCP only and open no UDP listener.
 
+### Timeouts
+
+- `ReadTimeout` MUST bound TCP request-body reads.
+- `ReadTimeout` MUST NOT promise a handler deadline or force TCP closure.
+- An idle TCP keep-alive connection MUST close within `IdleTimeout`.
+- The zero and negative rules of [web](web.md) MUST apply to both timeouts.
+- Missing client SETTINGS MUST trigger `H3_MISSING_SETTINGS` after the backend SETTINGS deadline.
+- QUIC idle expiry MUST use the negotiated timeout and the backend probe-timeout floor.
+- TCP `IdleTimeout` MUST NOT be described as a QUIC request-body deadline.
+
 ### Limits and timeouts
 
 These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
@@ -85,6 +97,11 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `Stop` MUST close the UDP listener before it returns, after the drain or the timeout ends it.
 - `Stop` MUST send GOAWAY on HTTP/3 connections, then wait for open requests until `ShutdownGrace` ends (RFC 9114).
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
+- When caller cancellation ends `Stop`, it MUST close the UDP listener.
+- That return MUST join the caller error with any listener close error.
+- That return MUST NOT wait for background cleanup or include its result.
+- If cleanup and caller cancellation are both ready, `Stop` MAY select either path.
+- A completed cleanup result MAY include the shutdown fault after the caller deadline.
 - `Stop` MUST close HTTP/3 connections when shutdown times out.
 - `Stop` of a server that is not started MUST return a nil error.
 - On each connection with an open HTTP/3 control stream, a graceful drain MUST send one GOAWAY frame.
@@ -117,6 +134,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - A UDP listen failure MUST map to `http3.listen_udp` with the address in the cause.
 - An HTTP/3 serve failure MUST map to `http3.h3_serve` with the cause.
 - An HTTP/3 shutdown failure MUST map to `http3.h3_shutdown` with the cause.
+- After HTTP/3 shutdown fails, background cleanup MUST close the backend.
+- Cleanup MUST join any backend close error with `http3.h3_shutdown`.
+- If `Stop` observes cleanup completion, it MUST include the joined errors.
 
 ### Code table
 
@@ -126,14 +146,6 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 | `http3.listen_udp` | internal | "The UDP listener failed to open." |
 | `http3.h3_serve` | internal | "The HTTP/3 server failed." |
 | `http3.h3_shutdown` | internal | "The HTTP/3 shutdown failed." |
-
-## Errors
-
-- A nil `TLS` with `H3` MUST map to `http3.h3_needs_tls`.
-- A UDP listen failure MUST map to `http3.listen_udp` with the address in the cause.
-- An HTTP/3 serve failure MUST map to `http3.h3_serve` with the cause.
-- An HTTP/3 shutdown failure MUST map to `http3.h3_shutdown` with the cause. `Stop` then closes the HTTP/3 server and joins that error.
-- Public views MUST NOT carry addresses, ports or transport details.
 
 ## Proof
 
@@ -147,16 +159,26 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3StopShutsTCPWhileH3Drains` proves that TCP stops accepting while an HTTP/3 request drains.
 - `TestH3RefusesExtendedConnect` proves that an extended CONNECT request answers 501 without reaching the router while plain H3 traffic still passes.
 - `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
+- `TestH3StopCallerDeadlineClosesUDPWithCallerError` proves that a caller-deadline `Stop` returns promptly with the deadline cause and closes the UDP listener, whether or not completed cleanup also contributes a shutdown fault.
+- `TestH3StopReturnsWhileTransportCleanupBlocked` proves that caller cancellation returns while a real UDP reader holds transport cleanup.
 - `TestH3RefusesEarlyData` sends QUIC 0-RTT data and checks that the server resumes the TLS session without accepting that data.
 - `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
+- `TestH3TCPClosesSlowBodyWithinReadTimeout` proves that a stalled body read fails and its test handler returns before the client deadline.
+- `TestH3TCPClosesIdleConnectionAfterIdleTimeout` proves that the TCP listener closes an idle keep-alive connection within `IdleTimeout`.
+- `TestH3ServeTimesOutSlowBodyRead` proves that `Serve` applies `ReadTimeout` to the TCP listener when `H3` is on.
+- `TestH3QUICClosesIdleConnectionAfterSettings` observes an idle timeout after sending SETTINGS; it does not identify which endpoint's idle timer fires.
+- `TestH3QUICMissingSettingsReportsProtocolCode` requires remote `H3_MISSING_SETTINGS` within five seconds plus one second of observation tolerance.
 - `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
 - `TestH3PublicCapsIncomingUniStreamsAt100` opens 100 peer-visible streams, blocks the 101st, and repeats after three release-and-renew cycles.
 - `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
 - `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
-- `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` releases both sockets and retries a bounded number of times until a transient UDP conflict clears.
+- `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` succeeds after a transient UDP conflict clears.
+- `TestH3StartPersistentUDPConflictExhaustsRetries` proves that persistent contention exhausts the 70ms retry budget before the caller deadline.
+- `TestH3StartRetriesAtEveryInterval` uses held TCP and timed UDP releases to prove the initial bind and each 10ms retry.
+- `TestH3StartReleasesUDPAfterTCPConflict` requires TCP listen `EADDRINUSE` and proves the acquired UDP socket was released.
 - `TestH3RunsStagesAndRepliesLikeTCP` proves that one router runs the same stages and writes the same data, page, and problem replies over UDP and TCP.
 - `TestH3AltSvcEdgeCases` proves that `Start` installs no stage, that disabled `H3` binds no UDP, and that a stopped server advertises nothing.
 - `TestH3StopSendsGOAWAYBeforeDrain` proves that `Stop` sends one GOAWAY frame on the control stream before the in-flight request drains.

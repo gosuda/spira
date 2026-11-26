@@ -1106,6 +1106,41 @@ func TestDescribeInsideAGroupAttachesTheDoc(t *testing.T) {
 	}
 }
 
+func TestHideMarksRouteHidden(t *testing.T) {
+	r := web.NewRouter()
+	web.Route(r, "GET", "/internal", func(ctx *web.Context, in BindSearchIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Group("/api", func(g *web.Router) {
+		web.Route(g, "GET", "/items", func(ctx *web.Context, in BindSearchIn) (web.Reply, error) {
+			return web.Empty{}, nil
+		})
+		g.Hide("GET", "/items")
+	})
+	r.Hide("GET", "/internal")
+	infos := r.Routes()
+	if len(infos) != 2 {
+		t.Fatalf("routes hold %d entries, want 2", len(infos))
+		return
+	}
+	for _, info := range infos {
+		if !info.Hidden {
+			t.Fatalf("route %s %s is not hidden", info.Method, info.Pattern)
+		}
+	}
+}
+
+func TestHideUnknownRoutePanics(t *testing.T) {
+	r := web.NewRouter()
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("Hide of an unknown route did not panic")
+		}
+	}()
+	r.Hide("GET", "/missing")
+}
+
 func TestRoutesDeepCopiesDocReturns(t *testing.T) {
 	r := web.NewRouter()
 	web.Route(r, "GET", "/search", func(ctx *web.Context, in BindSearchIn) (web.Reply, error) {

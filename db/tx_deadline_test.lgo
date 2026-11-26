@@ -28,3 +28,20 @@ func TestInTxHonorsCallerCancellationBeforeCommit(t *testing.T) {
 		t.Fatalf("rows after canceled transaction = %d, want 0", n)
 	}
 }
+
+func TestInTxReturnsBareContextErrorOnCancel(t *testing.T) {
+	pool := openPool(t)
+	createThings(t, pool)
+	ctx, cancel := context.WithCancel(t.Context())
+	_, err := db.InTx[int](ctx, pool, func(tx *db.Tx) (int, error) {
+		insertThingRow(t, tx)
+		cancel()
+		return 7, nil
+	})
+	if err != context.Canceled {
+		t.Fatalf("InTx error = %#v, want the bare context.Canceled value without a rollback join", err)
+	}
+	if n := countThings(t, pool); n != 0 {
+		t.Fatalf("rows after canceled transaction = %d, want 0", n)
+	}
+}

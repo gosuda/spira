@@ -1,0 +1,176 @@
+package db_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+)
+
+func openRawPool(t *testing.T, dsn string, opts ...db.PoolOptions) *db.Pool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := db.Open("sqlite", dsn, opts...)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: open %s: %v", dsn, err))
+	}
+	if pool == nil {
+		panic("db_test: open left no pool")
+	}
+	if serr := pool.Start(ctx); serr != nil {
+		panic(fmt.Sprintf("db_test: start %s: %v", dsn, serr))
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if serr := pool.Stop(stopCtx); serr != nil {
+			t.Errorf("stop: %v", serr)
+		}
+	})
+	return pool
+}
+
+func execKeep(t *testing.T, q db.Querier, query string, args ...any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := db.Exec(ctx, q, query, args...); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+}
+func countKeepRows(t *testing.T, ctx context.Context, pool *db.Pool) int {
+	t.Helper()
+	got, err := db.Query[int](ctx, pool, "SELECT COUNT(*) FROM keep")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+		return 0
+	}
+	if len(got) != 1 {
+		t.Fatalf("count rows = %d, want 1", len(got))
+		return 0
+	}
+	return got[0]
+}
+
+func TestPlainFilenameMemoryQueryKeepsExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plain.db")
+	pool := openRawPool(t, path+"?mode=memory",
+		db.PoolOptions{ConnMaxLifetime: time.Nanosecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("file-backed rows = %d, want 1", n)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("plain filename did not open a real file: %v", err)
+	}
+	if pool.Stats().MaxLifetimeClosed == 0 {
+		t.Fatal("plain filename query disabled connection expiry")
+	}
+}
+
+func TestMemoryURIFragmentKeepsRows(t *testing.T) {
+	pool := openRawPool(t, "file:spira_keep_fragment?cache=shared&mode=memory#shop",
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Nanosecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("fragmented memory URI lost rows: %d", n)
+	}
+	if pool.Stats().MaxLifetimeClosed != 0 {
+		t.Fatal("fragmented memory URI allowed connection expiry")
+	}
+}
+
+// TestInMemorySharedPoolSurvivesExpiry proves that pool expiry never deletes
+// the shop's shared in-memory database: with tiny lifetimes the old code let
+// the last connection close, and the next query found no tables.
+func TestInMemorySharedPoolSurvivesExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openRawPool(t, "file:spira_keep_shared?mode=memory&cache=shared",
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Millisecond, ConnMaxIdleTime: time.Millisecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	time.Sleep(200 * time.Millisecond)
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("rows after expiry = %d, want 1: expiry deleted the in-memory database", n)
+	}
+}
+
+// TestInMemoryPlainPoolSurvivesExpiry covers the plain :memory: DSN form with
+// the same guarantee: no eviction may close its only connection.
+func TestInMemoryPlainPoolSurvivesExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openRawPool(t, ":memory:",
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Millisecond, ConnMaxIdleTime: time.Millisecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	time.Sleep(200 * time.Millisecond)
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("rows after expiry = %d, want 1: expiry deleted the in-memory database", n)
+	}
+}
+
+// TestFilePoolNeverDeletesDatabase locks the security property for
+// file-backed shop databases: expiry must neither delete nor replace the
+// underlying file, and its rows must survive.
+func TestFilePoolNeverDeletesDatabase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "shop.db")
+	pool := openRawPool(t, path,
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Millisecond, ConnMaxIdleTime: time.Millisecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	time.Sleep(200 * time.Millisecond)
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("rows after expiry = %d, want 1", n)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("database file missing after expiry: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("database file is empty after expiry")
+	}
+}
+
+func TestMemoryPoolCapsIdleAtOpenLimit(t *testing.T) {
+	pool := openRawPool(t, "file:idle_open_cap?mode=memory&cache=shared",
+		db.PoolOptions{MaxOpenConns: 1, MaxIdleConns: 8})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	held, err := pool.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("hold connection: %v", err)
+		return
+	}
+	wait, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+	extra, err := pool.QueryContext(wait, "SELECT 1")
+	stop()
+	closeRows(t, held)
+	if err == nil {
+		closeRows(t, extra)
+		t.Fatal("idle limit overrode the smaller open-connection cap")
+		return
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second connection = %v, want the open-cap deadline", err)
+		return
+	}
+	if stats := pool.Stats(); stats.MaxOpenConnections != 1 || stats.OpenConnections != 1 || stats.Idle != 1 {
+		t.Fatalf("released memory pool = %+v, want one open and idle connection", stats)
+	}
+}

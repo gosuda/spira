@@ -18,7 +18,9 @@ import (
 
 func faultExec(t *testing.T, pool *db.Pool, statement string) {
 	t.Helper()
-	if _, err := db.Exec(t.Context(), pool, statement); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := db.Exec(ctx, pool, statement); err != nil {
 		t.Fatalf("faultExec %q: %v", statement, err)
 		return
 	}
@@ -30,16 +32,23 @@ type faultUniq struct {
 
 func TestFaultConstraintViolation(t *testing.T) {
 	pool := openPool(t)
-	faultExec(t, pool, "CREATE TABLE fault_uniq (n INTEGER NOT NULL UNIQUE)")
-	faultExec(t, pool, "INSERT INTO fault_uniq (n) VALUES (7)")
-	_, err := db.Exec(t.Context(), pool, "INSERT INTO fault_uniq (n) VALUES (7)")
-	if !errors.Is(err, db.ErrConstraintViolation) {
-		t.Fatalf("Exec error = %v, want db.ErrConstraintViolation", err)
-		return
-	}
-	if errors.Is(err, db.ErrUnavailable) {
-		t.Fatalf("Exec error = %v, must not be db.ErrUnavailable", err)
-		return
+	for _, table := range []string{"fault_uniq", "fault_uniq_retry"} {
+		withConstraintProbe(t, t.Context(), pool, constraintProbe{
+			table: table,
+			mark:  "?",
+			check: func(dupErr error) {
+				if !errors.Is(dupErr, db.ErrConstraintViolation) {
+					t.Fatalf("Exec error = %v, want db.ErrConstraintViolation", dupErr)
+					return
+				}
+				if errors.Is(dupErr, db.ErrUnavailable) {
+					t.Fatalf("Exec error = %v, must not be db.ErrUnavailable", dupErr)
+					return
+				}
+			},
+		})
+		faultExec(t, pool, "CREATE TABLE "+table+" (n INTEGER NOT NULL UNIQUE)")
+		faultExec(t, pool, "DROP TABLE "+table)
 	}
 }
 
@@ -174,12 +183,16 @@ type constraintProbe struct {
 
 func withConstraintProbe(t *testing.T, ctx context.Context, pool *db.Pool, p constraintProbe) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	if _, err := db.Exec(ctx, pool, "CREATE TABLE "+p.table+" (n integer not null unique)"); err != nil {
 		t.Fatalf("create %s: %v", p.table, err)
 		return
 	}
 	defer func() {
-		if _, derr := db.Exec(context.Background(), pool, "DROP TABLE "+p.table); derr != nil {
+		cleanup, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if _, derr := db.Exec(cleanup, pool, "DROP TABLE "+p.table); derr != nil {
 			t.Errorf("drop %s: %v", p.table, derr)
 		}
 	}()
@@ -193,4 +206,23 @@ func withConstraintProbe(t *testing.T, ctx context.Context, pool *db.Pool, p con
 		return
 	}
 	p.check(dupErr)
+}
+
+func TestConstraintProbeDropsAfterContextCancellation(t *testing.T) {
+	pool := openPool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	withConstraintProbe(t, ctx, pool, constraintProbe{
+		table: "fault_uniq_cancel",
+		mark:  "?",
+		check: func(err error) {
+			if !errors.Is(err, db.ErrConstraintViolation) {
+				t.Fatalf("duplicate insert = %v, want constraint violation", err)
+				return
+			}
+			cancel()
+		},
+	})
+	faultExec(t, pool, "CREATE TABLE fault_uniq_cancel (n INTEGER NOT NULL UNIQUE)")
+	faultExec(t, pool, "DROP TABLE fault_uniq_cancel")
 }

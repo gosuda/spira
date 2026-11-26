@@ -63,6 +63,7 @@ func serveStreamTLS(t *testing.T, handler http.Handler) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(handler)
 	srv.EnableHTTP2 = true
+	srv.Config.EnableHTTP2ExtendedConnect()
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	return srv
@@ -141,7 +142,7 @@ func hasConnectSetting(payload []byte) bool {
 func requireExtendedConnect(t *testing.T, h *h2client) {
 	t.Helper()
 	if !h.advertised {
-		t.Skip("server did not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL; rerun with GODEBUG=http2xconnect=1")
+		t.Fatal("server did not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL")
 	}
 }
 
@@ -810,7 +811,6 @@ func noProtocolFields(addr string) []h2field {
 func getFields(addr string) []h2field {
 	return []h2field{
 		{name: ":method", value: "GET"},
-		{name: ":protocol", value: "websocket"},
 		{name: ":scheme", value: "https"},
 		{name: ":path", value: "/chat"},
 		{name: ":authority", value: addr},
@@ -1030,17 +1030,48 @@ var hpackStaticValue = [61]string{
 	"",
 }
 
+type readEntryBody struct {
+	io.ReadCloser
+	entered chan<- struct{}
+}
+
+func (b *readEntryBody) Read(p []byte) (int, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	return b.ReadCloser.Read(p)
+}
+
+type streamCancelResult struct {
+	read     error
+	followup error
+}
+
+func reportStreamCancellation(t *testing.T, done chan<- streamCancelResult, result streamCancelResult) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	select {
+	case done <- result:
+	case <-ctx.Done():
+		t.Errorf("stream result was not received: %v", ctx.Err())
+	}
+}
+
 func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 	pending := make(chan context.CancelFunc, 1)
-	done := make(chan error, 1)
+	reading := make(chan struct{}, 1)
+	done := make(chan streamCancelResult, 1)
 	srv := serveStreamTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = &readEntryBody{ReadCloser: r.Body, entered: reading}
 		c, err := websocket.ServeStream(w, r, websocket.Config{})
 		if err != nil {
-			reportStream(r, done, err)
+			reportStreamCancellation(t, done, streamCancelResult{read: err})
 			return
 		}
 		if c == nil {
-			reportStream(r, done, errors.New("serve stream gave no connection"))
+			reportStreamCancellation(t, done, streamCancelResult{read: errors.New("serve stream gave no connection")})
 			return
 		}
 		defer func() {
@@ -1049,17 +1080,24 @@ func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 			}
 		}()
 		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
 		select {
 		case pending <- cancel:
 		case <-r.Context().Done():
-			reportStream(r, done, r.Context().Err())
+			reportStreamCancellation(t, done, streamCancelResult{read: r.Context().Err()})
 			return
 		}
 		_, _, err = c.Next(ctx)
-		reportStream(r, done, err)
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer probeCancel()
+		_, _, perr := c.Next(probeCtx)
+		reportStreamCancellation(t, done, streamCancelResult{read: err, followup: perr})
 	}))
 	h := openH2TLS(t, srv)
-	requireExtendedConnect(t, h)
+	if !h.advertised {
+		t.Fatal("cancellation probe requires SETTINGS_ENABLE_CONNECT_PROTOCOL")
+		return
+	}
 	addr := srv.Listener.Addr().String()
 	id := h.nextID
 	h.sendHeaders(t, id, streamConnectFields(addr, ""), false)
@@ -1067,24 +1105,34 @@ func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 		t.Fatalf("extended CONNECT status = %d, want 200", status)
 		return
 	}
-	var cancel context.CancelFunc
+	cancelAfterStreamRead(t, pending, reading)
 	select {
-	case cancel = <-pending:
-	case <-time.After(10 * time.Second):
-		t.Fatal("session did not reach Next")
-		return
-	}
-	cancel()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("Next after cancel returned no error")
-			return
+	case result := <-done:
+		if !errors.Is(result.read, context.Canceled) {
+			t.Fatalf("pending Next after cancel = %v, want context canceled", result.read)
 		}
-		if !errors.Is(err, websocket.ErrClosed) && !errors.Is(err, context.Canceled) {
-			t.Fatalf("Next after cancel = %v, want ErrClosed or context canceled", err)
+		if !errors.Is(result.followup, websocket.ErrClosed) {
+			t.Fatalf("follow-up Next = %v, want ErrClosed", result.followup)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("Next did not return after cancel")
 	}
+}
+
+func cancelAfterStreamRead(t *testing.T, pending <-chan context.CancelFunc, reading <-chan struct{}) {
+	t.Helper()
+	var cancel context.CancelFunc
+	select {
+	case cancel = <-pending:
+	case <-time.After(10 * time.Second):
+		t.Fatal("session did not provide its cancel function")
+		return
+	}
+	select {
+	case <-reading:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Next did not enter the request body read")
+		return
+	}
+	cancel()
 }

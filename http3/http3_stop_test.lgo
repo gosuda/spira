@@ -3,6 +3,7 @@ package http3_test
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -293,6 +294,73 @@ func TestH3StopMeetsCallerDeadline(t *testing.T) {
 		t.Fatalf("Stop blocked %v past the 300ms caller deadline", dur)
 		return
 	}
+}
+
+func TestH3StopCallerDeadlineClosesUDPWithCallerError(t *testing.T) {
+	entered := make(chan struct{})
+	r := web.NewRouter()
+	r.Handle("GET", "/sync", syncHandler(entered))
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 5*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
+	defer closeH3Transport(t, tr)
+	p := &deadlineProbe{entered: entered, tr: tr, url: "https://" + udpAddr + "/sync", srv: s}
+	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bcancel()
+	fetchCtx, endFetch := context.WithCancel(bctx)
+	defer endFetch()
+	if err := func() error {
+		go group (bctx) {
+			go fetchSyncDeadline(fetchCtx, p)
+			go stopCallerDeadlineAndRebind(bctx, p, endFetch)
+		}
+		return nil
+	}(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func stopCallerDeadlineAndRebind(ctx context.Context, p *deadlineProbe, endFetch context.CancelFunc) error {
+	defer endFetch()
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		return fmt.Errorf("http3: wait for caller-deadline request: %w", err)
+	}
+	addr := p.srv.BoundUDPAddrForTest()
+	stopCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := p.srv.Stop(stopCtx)
+	elapsed := time.Since(started)
+	if err == nil {
+		return errors.New("http3: Stop past the caller deadline reported success")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("http3: Stop did not retain the caller deadline: %w", err)
+	}
+	if elapsed > 1500*time.Millisecond {
+		return fmt.Errorf("http3: Stop blocked %v past the 300ms caller deadline", elapsed)
+	}
+	rebound, berr := net.ListenPacket("udp", addr)
+	if berr != nil {
+		return fmt.Errorf("http3: UDP port %s stayed bound after caller-deadline Stop: %w", addr, berr)
+	}
+	if cerr := rebound.Close(); cerr != nil {
+		return fmt.Errorf("http3: close rebound UDP port: %w", cerr)
+	}
+	return nil
 }
 
 type h3GraceProbe struct {

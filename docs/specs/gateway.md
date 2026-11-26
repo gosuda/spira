@@ -98,7 +98,7 @@ func Faults() []*fault.Error
 - A byte MUST count as a body, and the gateway MUST push it back.
 - A wait that yields no byte and no end of stream MUST answer 502 without trying an upstream.
 - A first read failure MUST answer the same way.
-- Neither case MUST send request headers to any upstream.
+- Neither case MUST contact any upstream.
 - When that wait ends without a byte, the gateway MUST end the blocked body read.
 - It MUST end that read through `http.ResponseController.SetReadDeadline`.
 - That end MUST let the 502 reach the client while the client still holds the request body open.
@@ -179,6 +179,7 @@ func Faults() []*fault.Error
 - `TestBadGatewayRefusalHidesUpstreamSecrets` proves that an upstream error body with secrets and hostile input reaches neither the refusal nor the public view.
 - `TestFaultsMatchSpecCodeTable` proves that `Faults` holds no duplicate and equals the code table.
 - `TestDotSegmentsAreRefusedBeforeAnyUpstream` proves the 400 problem for encoded dot segments in every spelling, with and without `StripPrefix`, and that no upstream receives them.
+- `TestGatewayClientDeadlineFailsFast` proves that a stalled server fails the shared test client within its deadline.
 
 ## Not in scope
 

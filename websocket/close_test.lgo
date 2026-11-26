@@ -132,4 +132,3 @@ func TestAppendCloseRefusesBadCode(t *testing.T) {
 		}
 	}
 }
-
