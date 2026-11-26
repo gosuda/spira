@@ -149,6 +149,17 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
+- `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
+- `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
+- `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
+- `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` releases both sockets and retries a bounded number of times until a transient UDP conflict clears.
+- `TestH3RunsStagesAndRepliesLikeTCP` proves that one router runs the same stages and writes the same data, page, and problem replies over UDP and TCP.
+- `TestH3AltSvcEdgeCases` proves that `Start` installs no stage, that disabled `H3` binds no UDP, and that a stopped server advertises nothing.
+- `TestH3StopSendsGOAWAYBeforeDrain` proves that `Stop` sends one GOAWAY frame on the control stream before the in-flight request drains.
+- `TestH3StopClosesClientConnectionOnTimeout` proves that a timed-out `Stop` maps to `http3.h3_shutdown` with the deadline cause and that the client connection closes.
+- `TestH3StopBeforeStartReturnsNil` proves that `Stop` before `Start` returns nil.
+- `TestH3ServeAndShutdownFaultsMap` proves that serve failures map to `http3.h3_serve` and shutdown failures to `http3.h3_shutdown`, each keeping its cause, and that the UDP cause names the address.
+- `TestH3DatagramsStayDisabled` proves that a datagram-offering client sees no QUIC datagram support and no HTTP/3 datagram setting from the server.
 
 ## Not in scope
 
