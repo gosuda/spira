@@ -1,4 +1,4 @@
-package main
+package main_test
 
 import (
 	"bufio"
@@ -13,6 +13,7 @@ import (
 	"github.com/gosuda/spira/asset"
 	"github.com/gosuda/spira/db"
 	shopdb "github.com/gosuda/spira/example/shop/db"
+	shopmain "github.com/gosuda/spira/example/shop"
 	"github.com/gosuda/spira/migrate"
 	"github.com/gosuda/spira/view"
 )
@@ -23,7 +24,7 @@ func TestScheduledStockReachesEventsStream(t *testing.T) {
 		return
 	}
 	assets := asset.Dev("http://localhost:5173")
-	router, scheduler := buildRouter(shopParts{pool: pool, assets: assets, tags: view.Group{}, dev: true})
+	router, scheduler := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
 	server := scheduledStockServer(t, router)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)

@@ -35,17 +35,7 @@ func startH3FaultProbe(ctx context.Context, t *testing.T) *h3FaultProbe? {
 		t.Fatal("test server has no TLS configuration")
 		return nil
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen TCP: %v", err)
-		return nil
-	}
-	udp, err := net.ListenPacket("udp", listener.Addr().String())
-	if err != nil {
-		closeErr := listener.Close()
-		t.Fatalf("listen UDP: %v; close TCP: %v", err, closeErr)
-		return nil
-	}
+	listener, udp := bindH3CallerSockets(t)
 	server := &http3.Server{Router: web.NewRouter(), TLS: serverTLS, H3: true, ShutdownGrace: 20 * time.Millisecond}
 	if err := server.Serve(ctx, listener, udp); err != nil {
 		closeErr := errors.Join(listener.Close(), udp.Close())

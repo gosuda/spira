@@ -22,9 +22,16 @@ type Loader struct {
 func NewLoader(sources []Source) *Loader
 func (l *Loader) Key(prefix string, name string, tag string) string
 func (l *Loader) Set(dst any, key string, required bool)
+func (l *Loader) ReadField(key string, required bool, set func(raw string) error)
 func (l *Loader) Err() error
 func Load[T any](seed T, sources ...Source) (T, error)
 func Fill[S any](ld *Loader, dst *S, prefix string)
+func FillField[F any](ld *Loader, dst *F, key string, required bool)
+func ParseIntegerField[F any](dst *F, raw string) error
+func SetSigned[E signed](dst *E, raw string, bits int) error
+func SetUnsigned[E unsigned](dst *E, raw string, bits int) error
+func SetFloat64[F ~float64](dst *F, raw string) error
+func SplitList(raw string) []string
 ```
 
 ## Requirements

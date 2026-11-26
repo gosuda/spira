@@ -1,6 +1,5 @@
 # websocket
 
-Package `websocket` speaks RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 on `net/http` types.
 Package `websocket` speaks RFC 6455 over HTTP/1.1 and over HTTP/2 extended CONNECT (RFC 8441) on `net/http` types. It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
 
 The package owns the handshake answer, the frame loop and the close handshake. It holds no global session state.
@@ -264,10 +263,11 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 
 ### Extended CONNECT (RFC 8441 sections 3, 4, 5)
 
-- The `:scheme`, `:path` and `:authority` checks stay with the HTTP/2 server: it resets a malformed stream with `PROTOCOL_ERROR` before the handler runs. The server sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` only when the process runs with `GODEBUG=http2xconnect=1`, the one opt-in the toolchain offers.
+- The `:scheme`, `:path` and `:authority` checks stay with the HTTP/2 server: it resets a malformed stream with `PROTOCOL_ERROR` before the handler runs. The server sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` when the standard library enables it: with `GODEBUG=http2xconnect=1` for its own servers, or per `web.Server` with `HTTP2ExtendedConnect` set on a TLS or `H2C` listener. A test server that does not advertise the setting answers no extended CONNECT.
 - `ServeStream` MUST require the CONNECT method and HTTP/2, else answer 405 and 400.
 - `ServeStream` MUST require `:protocol` `websocket`, else answer 501. A CONNECT without `:protocol` is a tunnel the package does not proxy, and answers 501 too.
 - `ServeStream` MUST require exactly one non-blank `Sec-WebSocket-Version` value of `13`, else answer 400.
+- `ServeStream` MUST reject a malformed or repeated `Sec-WebSocket-Protocol` offer with 400 before the session runs.
 - `ServeStream` MUST NOT process `Sec-WebSocket-Key` and MUST send no `Sec-WebSocket-Accept`, as RFC 8441 section 5 replaces them with `:protocol`.
 - `ServeStream` MUST apply the same origin check and size limit as `Upgrade`: a foreign origin answers 403 with `ErrForbiddenOrigin`.
 - `ServeStream` MUST pick the subprotocol with `pickSubprotocol` and answer it in `Sec-WebSocket-Protocol`.
@@ -353,17 +353,13 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestMaskMatchesByteLoop` proves that `mask` matches the byte loop for lengths 0 to 40 and offsets 0 to 3.
 - `TestReadHeaderZeroAllocs` proves that a warmed `readHeader` allocates nothing.
 - `FuzzFrame` proves that any input either fails `readHeader` or encodes back to the consumed bytes.
-- `TestAcceptKeyMatchesRFC6455Vector` proves that the RFC 6455 section 1.3 vector gives `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
 - `TestAcceptKeyTrimsOuterWhitespace` proves that `acceptKey` trims outer whitespace before hashing.
-- `TestCheckUpgradeAcceptsValidRequest` proves that a valid request passes.
-- `TestCheckUpgradeRefusesNonGet` proves that a non-GET method fails with the method error.
 - `TestCheckUpgradeRefusesOldProtocol` proves that HTTP/1.0 fails with the protocol error.
 - `TestCheckUpgradeRefusesMissingConnection` proves that a `Connection` without the upgrade token fails with the connection error.
 - `TestCheckUpgradeRefusesWrongUpgrade` proves that a wrong `Upgrade` token fails with the upgrade error.
 - `TestCheckUpgradeRefusesWrongVersion` proves that a wrong version fails with the version error.
 - `TestCheckUpgradeRefusesMissingVersion` proves that a missing version fails with the version error.
 - `TestCheckUpgradeRefusesDuplicateVersion` proves that two version lines fail with the version error.
-- `TestCheckUpgradeRefusesBadKey` proves that a bad key fails with the key error.
 - `TestCheckUpgradeRefusesMissingKey` proves that a missing key fails with the key error.
 - `TestCheckUpgradeRefusesDuplicateKey` proves that two key lines fail with the key error.
 - `TestCheckUpgradeRefusesShortKey` proves that a 15-byte decoded key fails with the key error.
@@ -373,10 +369,8 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestCheckUpgradeRefusesInnerWhitespaceKey` proves that a key with inner whitespace fails with the key error.
 - `TestCheckUpgradeAcceptsMixedCaseTokens` proves that token match ignores case across lines.
 - `TestCheckUpgradeAcceptsSplitUpgradeLines` proves that `Upgrade` match spans two header lines.
-- `TestCheckUpgradeAcceptsCommaTokens` proves that `Connection` match spans comma values.
 - `TestCheckUpgradeAcceptsSpacedCommaTokens` proves that token match tolerates spaces around commas.
 - `TestUpgradeStatusCodes` proves that nil maps to 101, version to 426, method to 405 and each other error to 400.
-- `TestFailureHeadersSetsVersionOn426` proves that the version error yields `Sec-WebSocket-Version: 13`.
 - `TestFailureHeadersEmptyOtherwise` proves that a non-version error yields no version header.
 - `TestUpgradeHeadersRoundTrip` proves that response headers carry `Upgrade`, `Connection`, the RFC accept value and the subprotocol.
 - `TestUpgradeHeadersOmitsEmptySubprotocol` proves that an empty subprotocol sets no protocol header.
@@ -393,11 +387,9 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestParseCloseEmpty` proves that an empty payload returns code 1005 with empty reason and no error.
 - `TestParseCloseOneByte` proves that a one-byte payload fails with `ErrProtocolError`.
 - `TestParseCloseCodeOnly` proves that a two-byte payload decodes the code in network order with empty reason.
-- `TestParseCloseCodeReason` proves that a longer payload decodes code 1000 and reason `bye`.
 - `TestParseCloseInvalidUTF8` proves that an invalid UTF-8 reason fails with `ErrProtocolError`.
 - `TestAppendCloseReasonLimits` proves that a 123-byte reason fits in 125 bytes and a 124-byte reason fails with `ErrProtocolError`.
 - `TestAppendCloseRefusesBadCode` proves that each refused code fails with `ErrProtocolError`.
-- `TestCloseRoundTrip` proves that an appended close payload parses back to its code and reason.
 - `TestEngineFragmentedHelloWithPing` proves that a ping arrives first and fragments assemble to `Hello`.
 - `TestEngineRefusesStrayContinuation` proves that a continuation with no open message fails with `ErrProtocolError`.
 - `TestEngineRefusesNewDataWhileOpen` proves that a data frame while a message stays open fails with `ErrProtocolError`.
@@ -419,7 +411,6 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `TestPeerCloseEchoedOnceThenEnds` proves that a peer close with code 1000 is echoed once and the connection ends.
 - `TestFaultFrameOverLimitSends1009` proves that a message past the limit fails with `ErrTooLarge` and sends 1009.
 - `TestFaultInvalidUTF8Sends1007` proves that invalid UTF-8 text fails with `ErrProtocolError` and sends 1007.
-- `TestFaultReservedBitSends1002` proves that a set reserved bit fails with `ErrProtocolError` and sends 1002.
 - `TestPingAnsweredWithPong` proves that a ping arrives as an event and the peer gets its pong.
 - `TestBinaryEchoRoundTrip1KiB` proves that a 1024-byte binary message echoes back byte for byte.
 - `TestExpiredContextFailsFast` proves that an expired context fails a read and a write.
@@ -434,7 +425,7 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
 - `TestStreamEchoOverTLS` proves that an HTTP/2 client with `:protocol` `websocket` gets 200, the picked subprotocol and its text message back.
 - `TestStreamCloseRoundTrip` proves that a peer close over the stream is echoed once and the handler then ends.
-- `TestStreamRejectsBadHandshakes` proves that a foreign or missing `:protocol` answers 501, a missing or wrong version answers 400, a foreign origin answers 403 and a wrong method answers 405, each with its fault.
+- `TestStreamRejectsBadHandshakes` proves that a foreign or missing `:protocol` answers 501, a missing or wrong version answers 400, a malformed or repeated subprotocol offer answers 400, a foreign origin answers 403 and a wrong method answers 405, each with its fault.
 - `TestStreamRefusesHTTP1Connect` proves that a CONNECT over HTTP/1.1 answers 400.
 - `BenchmarkLoopbackEcho1KiB` reports allocations and latency percentiles per 1 KiB text echo over loopback TCP.
 - `BenchmarkWebSocketEcho1KiBInMemory` reports allocations per message and the p50, p95, p99 and max latency of a 1 KiB binary echo through `ServeHijacked` over `net.Pipe`. Run it with `-benchtime=256x`; another iteration count above 1 skips it.

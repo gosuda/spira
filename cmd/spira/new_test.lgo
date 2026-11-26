@@ -15,7 +15,6 @@ type newEngineCase struct {
 	sqlcEngine   string
 	driverImport string
 	driverName   string
-	driverMod    string
 	dialect      string
 	userQuery    string
 	createMarker string
@@ -25,10 +24,10 @@ type newEngineCase struct {
 
 func newEngineCases() []newEngineCase {
 	return []newEngineCase{
-		{"sqlite", "", "sqlite", "modernc.org/sqlite", "sqlite", "modernc.org/sqlite v1.62.0", "INTEGER PRIMARY KEY", "RETURNING id", "got ?? store.UserID(0)", "", false},
-		{"postgresql", "postgresql", "postgresql", "github.com/jackc/pgx/v5/stdlib", "pgx", "github.com/jackc/pgx/v5 v5.13.0", "BIGSERIAL PRIMARY KEY", "RETURNING id", "got ?? store.UserID(0)", "SPIRA_TEST_POSTGRES_DSN", true},
-		{"mysql", "mysql", "mysql", "github.com/go-sql-driver/mysql", "mysql", "github.com/go-sql-driver/mysql v1.10.2", "AUTO_INCREMENT", ":execlastid", "store.UserID(id)", "SPIRA_TEST_MYSQL_DSN", true},
-		{"mssql", "mssql", "mssql", "github.com/microsoft/go-mssqldb", "sqlserver", "github.com/microsoft/go-mssqldb v1.12.0", "IDENTITY(1,1)", "OUTPUT INSERTED.id", "got ?? store.UserID(0)", "SPIRA_TEST_MSSQL_DSN", true},
+		{"sqlite", "", "sqlite", "modernc.org/sqlite", "sqlite", "INTEGER PRIMARY KEY", "RETURNING id", "got ?? store.UserID(0)", "", false},
+		{"postgresql", "postgresql", "postgresql", "github.com/jackc/pgx/v5/stdlib", "pgx", "BIGSERIAL PRIMARY KEY", "RETURNING id", "got ?? store.UserID(0)", "SPIRA_TEST_POSTGRES_DSN", true},
+		{"mysql", "mysql", "mysql", "github.com/go-sql-driver/mysql", "mysql", "AUTO_INCREMENT", ":execlastid", "store.UserID(id)", "SPIRA_TEST_MYSQL_DSN", true},
+		{"mssql", "mssql", "mssql", "github.com/microsoft/go-mssqldb", "sqlserver", "IDENTITY(1,1)", "OUTPUT INSERTED.id", "got ?? store.UserID(0)", "SPIRA_TEST_MSSQL_DSN", true},
 	}
 }
 
@@ -65,6 +64,9 @@ func checkEngineApp(t *testing.T, c newEngineCase) {
 	assertContains(t, dir, "features/account/account.lgo", "auth.ErrInvalidCredentials.Err()")
 	assertContains(t, dir, "features/account/account.lgo", "auth.VerifyAgainstDummy(in.Password)")
 	assertContains(t, dir, "features/account/account.lgo", "ErrAccountFailed.Wrap(fmt.Errorf(\"account: lookup user:")
+	assertContains(t, dir, "features/account/account.lgo", "db.ErrUnavailable")
+	assertContains(t, dir, "features/account/account.lgo", "ErrAccountUnavailable.Wrap(fmt.Errorf(\"account: lookup user:")
+	assertContains(t, dir, "features/account/faults.lgo", "account.unavailable")
 	assertContains(t, dir, "features/account/faults.lgo", "account.failed")
 	assertContains(t, dir, "features/account/store.lgo", "ErrAccountFailed.Wrap")
 	assertContains(t, dir, "features/home/views.lgo", "features/home/islands/greet.svelte")

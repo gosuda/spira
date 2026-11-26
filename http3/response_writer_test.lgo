@@ -1,4 +1,4 @@
-package http3
+package http3_test
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/http3"
 	"github.com/quic-go/qpack"
 )
 
@@ -39,9 +40,9 @@ func (s *h3ResponseTestStream) SetWriteDeadline(deadline time.Time) error {
 	return s.deadlineError
 }
 
-func h3ResponseFixture(method string, limit uint64) (*h3ResponseWriter, *h3ResponseTestStream) {
+func h3ResponseFixture(method string, limit uint64) (http3.H3ResponseWriterForTest, *h3ResponseTestStream) {
 	sink := &h3ResponseTestStream{writeLimit: -1}
-	w := newH3ResponseWriter(sink, method, limit)
+	w := http3.NewH3ResponseWriterForTest(sink, method, limit)
 	w.Header()["Date"] = nil
 	return w, sink
 }
@@ -134,9 +135,9 @@ func h3WriteResponseTestBody(t *testing.T, w http.ResponseWriter, body string) {
 	}
 }
 
-func h3FinishResponseTest(t *testing.T, w *h3ResponseWriter) {
+func h3FinishResponseTest(t *testing.T, w http.ResponseWriter) {
 	t.Helper()
-	if err := w.finish(); err != nil {
+	if err := http3.FinishH3ResponseForTest(w); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 }
@@ -322,7 +323,7 @@ func TestH3ResponseWriterContentLength(t *testing.T) {
 		w.Header()["Content-Type"] = nil
 		h3WriteResponseTestBody(t, w, "ab")
 		for range 2 {
-			if err := w.finish(); !errors.Is(err, http.ErrContentLength) {
+			if err := http3.FinishH3ResponseForTest(w); !errors.Is(err, http.ErrContentLength) {
 				t.Fatalf("finish with too little data: %v", err)
 			}
 		}
@@ -334,7 +335,7 @@ func TestH3ResponseWriterContentLength(t *testing.T) {
 	t.Run("mismatch-before-output", func(t *testing.T) {
 		w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
 		w.Header().Set("Content-Length", "3")
-		if err := w.finish(); !errors.Is(err, http.ErrContentLength) || sink.Len() != 0 {
+		if err := http3.FinishH3ResponseForTest(w); !errors.Is(err, http.ErrContentLength) || sink.Len() != 0 {
 			t.Fatalf("finish with a missing body = %v, wrote %d bytes", err, sink.Len())
 		}
 	})
@@ -342,7 +343,7 @@ func TestH3ResponseWriterContentLength(t *testing.T) {
 		for _, length := range []string{"-1", "1, 2", "9223372036854775808"} {
 			w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
 			w.Header().Set("Content-Length", length)
-			if err := w.finish(); !errors.Is(err, http.ErrContentLength) || sink.Len() != 0 {
+			if err := http3.FinishH3ResponseForTest(w); !errors.Is(err, http.ErrContentLength) || sink.Len() != 0 {
 				t.Errorf("Content-Length %q: finish = %v, wrote %d bytes", length, err, sink.Len())
 			}
 		}
@@ -385,7 +386,7 @@ func TestH3ResponseWriterWriteFailures(t *testing.T) {
 		if err := w.FlushError(); !errors.Is(err, io.ErrShortWrite) {
 			t.Fatalf("FlushError did not retain short write: %v", err)
 		}
-		if err := w.finish(); !errors.Is(err, io.ErrShortWrite) {
+		if err := http3.FinishH3ResponseForTest(w); !errors.Is(err, io.ErrShortWrite) {
 			t.Fatalf("finish did not retain short write: %v", err)
 		}
 		if !bytes.Equal(sink.Bytes(), []byte{0x0, 5, 'a', 'b'}) {
@@ -402,13 +403,13 @@ func TestH3ResponseWriterWriteFailures(t *testing.T) {
 		if err := peer.Close(); err != nil {
 			t.Fatal(err)
 		}
-		w := newH3ResponseWriter(local, http.MethodGet, ^uint64(0))
+		w := http3.NewH3ResponseWriterForTest(local, http.MethodGet, ^uint64(0))
 		w.WriteHeader(http.StatusEarlyHints)
 		var writer http.ResponseWriter = w
 		if n, err := writer.Write([]byte("body")); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("Write did not retain informational I/O error: (%d, %v)", n, err)
 		}
-		if err := w.finish(); !errors.Is(err, io.ErrClosedPipe) {
+		if err := http3.FinishH3ResponseForTest(w); !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("finish did not retain informational I/O error: %v", err)
 		}
 	})
@@ -419,7 +420,7 @@ func TestH3ResponseWriterFlushRetainsWireError(t *testing.T) {
 	sink.writeLimit = 1
 	var flusher http.Flusher = w
 	flusher.Flush()
-	if err := w.finish(); !errors.Is(err, io.ErrShortWrite) {
+	if err := http3.FinishH3ResponseForTest(w); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("finish after short Flush: %v", err)
 	}
 	if !bytes.Equal(sink.Bytes(), []byte{0x1}) {
@@ -452,7 +453,7 @@ func TestH3ResponseWriterFieldLimits(t *testing.T) {
 			w, sink := h3ResponseFixture(http.MethodGet, limit)
 			w.Header().Add("X", "a")
 			w.Header().Add("X", "b")
-			err := w.finish()
+			err := http3.FinishH3ResponseForTest(w)
 			if limit < exact {
 				if err == nil || !strings.Contains(err.Error(), "field section exceeds peer limit") || sink.Len() != 0 {
 					t.Errorf("limit %d: finish = %v, wrote %d bytes", limit, err, sink.Len())
@@ -480,7 +481,7 @@ func TestH3ResponseWriterFieldLimits(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.Header().Set("X-End", strings.Repeat("x", 50))
-		if err := w.finish(); err == nil || !strings.Contains(err.Error(), "field section exceeds peer limit") {
+		if err := http3.FinishH3ResponseForTest(w); err == nil || !strings.Contains(err.Error(), "field section exceeds peer limit") {
 			t.Fatalf("trailer over limit: finish = %v", err)
 		}
 		wire := bytes.NewReader(sink.Bytes())
@@ -516,7 +517,7 @@ func TestH3ResponseWriterValidatesAndFiltersFields(t *testing.T) {
 		for _, tc := range cases {
 			w, sink := h3ResponseFixture(http.MethodGet, ^uint64(0))
 			w.Header()[tc.key] = []string{tc.value}
-			if err := w.finish(); err == nil || !strings.Contains(err.Error(), tc.problem) || sink.Len() != 0 {
+			if err := http3.FinishH3ResponseForTest(w); err == nil || !strings.Contains(err.Error(), tc.problem) || sink.Len() != 0 {
 				t.Errorf("invalid %q: finish = %v, wrote %d bytes", tc.key, err, sink.Len())
 			}
 		}
@@ -528,7 +529,7 @@ func TestH3ResponseWriterValidatesAndFiltersFields(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.Header().Set("X-End", "bad\x00byte")
-		if err := w.finish(); err == nil || !strings.Contains(err.Error(), "invalid response field value") {
+		if err := http3.FinishH3ResponseForTest(w); err == nil || !strings.Contains(err.Error(), "invalid response field value") {
 			t.Fatalf("invalid trailer: finish = %v", err)
 		}
 		wire := bytes.NewReader(sink.Bytes())

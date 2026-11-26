@@ -65,7 +65,10 @@ func Faults() []*fault.Error
 - Each route stage boundary MUST be settled as in [web](web.md).
 - A route stage MUST read the upstream status from `ctx.Status()` after `next`.
 - The proxy MUST NOT forward a client `Forwarded` header.
-- The proxy MUST refuse a request whose escaped path holds a segment that decodes to `.` or `..`, alone or between encoded slashes, with the `gateway.dot_segment` fault (400), before any upstream sees it. RFC 3986 makes `%2e` equal to `.`, so an upstream that decodes and then removes dot segments would otherwise resolve such a path outside the mounted prefix or the upstream base path. A segment that does not decode MUST be refused the same way.
+- The proxy MUST refuse a request whose escaped path holds a segment that decodes to `.` or `..`. RFC 3986 makes `%2e` equal to `.`, so a decoding upstream could otherwise leave the mounted prefix.
+- The rule MUST cover a bare segment and one between encoded slashes.
+- The refusal MUST use the `gateway.dot_segment` fault (400) before any upstream sees it.
+- A segment that does not decode MUST be refused the same way.
 
 ### Failure
 
@@ -84,12 +87,21 @@ func Faults() []*fault.Error
 - Any other upstream status MUST pass through to the client.
 - A passed-through status MUST NOT open the breaker.
 - An open breaker MUST skip that upstream.
-- A request with no body MUST try the later upstreams after a failure only when its method is idempotent: GET, HEAD, OPTIONS, TRACE, PUT or DELETE (RFC 9110 section 9.2.2). A bodyless POST or PATCH MUST stop after its first upstream, as a request with a body does.
+- A request with no body MUST try the later upstreams after a delivery failure only when its method is idempotent.
+- Idempotent methods are GET, HEAD, OPTIONS, TRACE, PUT and DELETE (RFC 9110 section 9.2.2).
+- A breaker refusal MUST NOT count as a delivery attempt: the proxy MUST skip that upstream and try the next.
+- A bodyless POST or PATCH MUST stop after its first delivery attempt, as a request with a body does.
 - A request whose body is nil or `http.NoBody` MUST count as a request with no body.
-- A request with a body MUST stop after its first upstream.
-- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`, whatever the method: end of stream counts as no body and the idempotent-method rule above decides whether it retries, a byte counts as a body that is pushed back and stops after the first upstream, and any other read failure ends the wait.
-- A wait that yields no byte and no end of stream, or whose first read fails, MUST answer 502 without trying an upstream and without sending request headers to any upstream.
-- When that wait ends without a byte, the gateway MUST end the blocked body read through `http.ResponseController.SetReadDeadline`, so that the 502 reaches the client while the client still holds the request body open.
+- A request with a body MUST stop after its first delivery attempt.
+- A request whose body length is unknown MUST prove empty with one read under `Policy.Timeout`, whatever the method.
+- End of stream MUST count as no body: the idempotent-method rule above decides whether it retries.
+- A byte MUST count as a body, and the gateway MUST push it back.
+- A wait that yields no byte and no end of stream MUST answer 502 without trying an upstream.
+- A first read failure MUST answer the same way.
+- Neither case MUST send request headers to any upstream.
+- When that wait ends without a byte, the gateway MUST end the blocked body read.
+- It MUST end that read through `http.ResponseController.SetReadDeadline`.
+- That end MUST let the 502 reach the client while the client still holds the request body open.
 - When every tried upstream fails, the proxy MUST answer 502.
 - That answer MUST use the content type `application/problem+json`.
 - The body MUST be the JSON encoding of a [web](web.md) problem with title `Bad Gateway` and status 502.

@@ -9,9 +9,15 @@ import (
 	"strings"
 	"time"
 
+	"logos/sync"
+
 	"github.com/gosuda/spira/db"
 	"github.com/gosuda/spira/fault"
 )
+
+// applyMu serializes Apply and Rollback in this process. It does not
+// coordinate migrators on other hosts; run one migrator per database.
+var applyMu sync.Locked[struct{}]
 
 type Step struct {
 	Name string
@@ -157,6 +163,14 @@ func prefixError(applied []string, steps const []Step) error {
 }
 
 func Apply(ctx context.Context, p *db.Pool, steps const []Step) error {
+	var result error
+	applyMu.WithLock(func(_ *struct{}) {
+		result = applyLocked(ctx, p, steps)
+	})
+	return result
+}
+
+func applyLocked(ctx context.Context, p *db.Pool, steps const []Step) error {
 	if err := ensureTable(ctx, p); err != nil {
 		return err
 	}
@@ -221,6 +235,14 @@ func isMySQLDialect(d db.Dialect) bool {
 }
 
 func Rollback(ctx context.Context, p *db.Pool, steps const []Step, count int) error {
+	var result error
+	applyMu.WithLock(func(_ *struct{}) {
+		result = rollbackLocked(ctx, p, steps, count)
+	})
+	return result
+}
+
+func rollbackLocked(ctx context.Context, p *db.Pool, steps const []Step, count int) error {
 	if count == 0 {
 		return nil
 	}

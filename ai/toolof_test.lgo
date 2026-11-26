@@ -355,3 +355,77 @@ func equalArrays(a []any, b []any) bool {
 	}
 	return true
 }
+
+func TestToolOfKeepsTheLastRepeatedKey(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	out, err := tool.Call(t.Context(), `{"query":"snow","query":"rain"}`)
+	if err != nil {
+		t.Fatalf("ToolOf repeated key: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf repeated key: the function did not run")
+	}
+	if seen.Query != "rain" {
+		t.Fatalf("ToolOf repeated query = %q, want the last value rain", seen.Query)
+	}
+	if out != "found rain" {
+		t.Fatalf("ToolOf repeated result = %q, want found rain", out)
+	}
+}
+
+func TestToolOfKeepsTheLastRepeatedKeyWithAWrongTypeFirst(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := lookupTool(&seen, &ran, "found ")
+	out, err := tool.Call(t.Context(), `{"query":42,"query":"rain"}`)
+	if err != nil {
+		t.Fatalf("ToolOf repeated key with wrong type first: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf repeated key with wrong type first: the function did not run")
+	}
+	if seen.Query != "rain" {
+		t.Fatalf("ToolOf repeated query = %q, want rain", seen.Query)
+	}
+	if out != "found rain" {
+		t.Fatalf("ToolOf repeated result = %q, want found rain", out)
+	}
+}
+
+func TestToolOfKeepsTheLastRepeatedNestedKey(t *testing.T) {
+	var seen searchArgs
+	tool := nestedTool(&seen)
+	_, err := tool.Call(t.Context(), `{"query":"rain","where":{"city":"Dawn","city":"Seoul"}}`)
+	if err != nil {
+		t.Fatalf("ToolOf repeated nested key: %v", err)
+		return
+	}
+	if seen.Where.City != "Seoul" {
+		t.Fatalf("ToolOf repeated nested city = %q, want the last value Seoul", seen.Where.City)
+	}
+}
+
+func TestToolOfTopLevelBytesKeepTheLiteralString(t *testing.T) {
+	var seen []byte
+	var ran bool
+	tool := ai.ToolOf[[]byte]("blob", "Take the literal text.", func(ctx context.Context, in []byte) (string, error) {
+		seen = in
+		ran = true
+		return "ok", nil
+	})
+	_, err := tool.Call(t.Context(), `"YWJj"`)
+	if err != nil {
+		t.Fatalf("ToolOf top-level bytes: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf top-level bytes: the function did not run")
+	}
+	if string(seen) != "YWJj" {
+		t.Fatalf("ToolOf top-level bytes = %q, want the four literal characters", string(seen))
+	}
+}

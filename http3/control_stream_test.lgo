@@ -1,4 +1,4 @@
-package http3
+package http3_test
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/http3"
 	"github.com/quic-go/quic-go"
 )
 
@@ -20,7 +21,7 @@ type h3ControlTestPair struct {
 	ctx     context.Context
 	server  *quic.Conn
 	client  *quic.Conn
-	control *h3Control
+	control *http3.H3ControlForTest
 }
 
 func h3ControlTestTLS() (*tls.Config, *tls.Config, error) {
@@ -61,7 +62,7 @@ func openH3ControlTestPair(ctx context.Context, t *testing.T) (*h3ControlTestPai
 			t.Error(err)
 		}
 	})
-	control := startH3Control(ctx, server, 1024)?
+	control := http3.StartH3ControlForTest(ctx, server, 1024)?
 	if control == nil {
 		return nil, errors.New("missing server control stream")
 	}
@@ -104,10 +105,10 @@ func (p *h3ControlTestPair) expectClose(t *testing.T, want quic.ApplicationError
 	}
 }
 
-func sendH3ControlConcurrentGoAway(ctx context.Context, control *h3Control) error {
+func sendH3ControlConcurrentGoAway(ctx context.Context, control *http3.H3ControlForTest) error {
 	go group (ctx) {
-		go control.sendGoAway(ctx, 64)
-		go control.sendGoAway(ctx, 64)
+		go control.SendGoAwayForTest(ctx, 64)
+		go control.SendGoAwayForTest(ctx, 64)
 	}
 	return nil
 }
@@ -117,7 +118,7 @@ func TestH3ControlOrderedWrites(t *testing.T) {
 	if p == nil {
 		return
 	}
-	if cause := context.Cause(p.control.local.Context()); cause != nil {
+	if cause := context.Cause(p.control.LocalContextForTest()); cause != nil {
 		t.Fatalf("Local control stream closed during setup: %v", cause)
 		return
 	}
@@ -125,11 +126,11 @@ func TestH3ControlOrderedWrites(t *testing.T) {
 		t.Fatalf("Concurrent GOAWAY writes: %v", err)
 		return
 	}
-	if err := p.control.sendGoAway(p.ctx, 0); err != nil {
+	if err := p.control.SendGoAwayForTest(p.ctx, 0); err != nil {
 		t.Fatalf("Decreasing GOAWAY: %v", err)
 		return
 	}
-	if err := p.control.sendGoAway(p.ctx, 4); err == nil {
+	if err := p.control.SendGoAwayForTest(p.ctx, 4); err == nil {
 		t.Fatal("Accepted increasing GOAWAY")
 		return
 	}
@@ -212,7 +213,7 @@ func checkH3ControlWireError(t *testing.T, c h3ControlWireCase) {
 			return
 		}
 	}
-	if err := p.control.handlePeerUni(p.ctx, receive); err != nil {
+	if err := p.control.HandlePeerUniForTest(p.ctx, receive); err != nil {
 		t.Fatalf("Handle peer stream: %v", err)
 		return
 	}
@@ -224,8 +225,8 @@ func TestH3ControlPublishesSettingsAndSkipsUnknownFrame(t *testing.T) {
 	if p == nil {
 		return
 	}
-	settings, ready := p.control.peerSettings()
-	if ready || settings.maxFieldSectionSize != ^uint64(0) {
+	settings, ready := p.control.PeerSettingsForTest()
+	if ready || settings.MaxFieldSectionSize != ^uint64(0) {
 		t.Fatalf("Before peer SETTINGS: %+v, ready %t", settings, ready)
 	}
 	if err := driveH3ControlDelayedSettings(p); err != nil {
@@ -233,13 +234,13 @@ func TestH3ControlPublishesSettingsAndSkipsUnknownFrame(t *testing.T) {
 		return
 	}
 	p.expectClose(t, 0x105)
-	settings, ready = p.control.peerSettings()
-	if !ready || settings.maxFieldSectionSize != 512 || settings.qpackBlockedStreams != 2 {
+	settings, ready = p.control.PeerSettingsForTest()
+	if !ready || settings.MaxFieldSectionSize != 512 || settings.QpackBlockedStreams != 2 {
 		t.Fatalf("After peer SETTINGS: %+v, ready %t", settings, ready)
 	}
 	ctx, cancel := context.WithCancel(p.ctx)
 	cancel()
-	got, err := p.control.awaitPeerSettings(ctx)
+	got, err := p.control.AwaitPeerSettingsForTest(ctx)
 	if err != nil {
 		t.Fatalf("Await published SETTINGS after duplicate and cancellation: %v", err)
 		return
@@ -280,9 +281,9 @@ func driveH3ControlAwait(ctx, waitCtx context.Context, check func(context.Contex
 	return nil
 }
 
-func checkH3ControlDelayedSettings(ctx context.Context, control *h3Control) error {
-	settings := control.awaitPeerSettings(ctx)?
-	if settings.maxFieldSectionSize != 512 || settings.qpackBlockedStreams != 2 {
+func checkH3ControlDelayedSettings(ctx context.Context, control *http3.H3ControlForTest) error {
+	settings := control.AwaitPeerSettingsForTest(ctx)?
+	if settings.MaxFieldSectionSize != 512 || settings.QpackBlockedStreams != 2 {
 		return fmt.Errorf("awaited peer SETTINGS = %+v", settings)
 	}
 	return nil
@@ -300,7 +301,7 @@ func resolveH3ControlAwait(ctx context.Context, waiting <-chan struct{}, resolve
 func sendH3ControlDelayedSettings(p *h3ControlTestPair) error {
 	const wire = "\x00\x04\x05\x06\x42\x00\x07\x02\x21\x03\x07\x00\x00\x04\x00"
 	_, receive := p.openPeer(wire)?
-	return p.control.handlePeerUni(p.ctx, receive)
+	return p.control.HandlePeerUniForTest(p.ctx, receive)
 }
 
 func TestH3ControlAwaitPeerSettingsCallerCancellation(t *testing.T) {
@@ -312,7 +313,7 @@ func TestH3ControlAwaitPeerSettingsCallerCancellation(t *testing.T) {
 	want := errors.New("stop waiting for peer SETTINGS")
 	defer cancel(want)
 	err := driveH3ControlAwait(p.ctx, ctx, func(waitCtx context.Context) error {
-		_, err := p.control.awaitPeerSettings(waitCtx)
+		_, err := p.control.AwaitPeerSettingsForTest(waitCtx)
 		if err == nil {
 			return errors.New("await before SETTINGS succeeded after caller cancellation")
 		}
@@ -335,7 +336,7 @@ func TestH3ControlAwaitPeerSettingsConnectionClose(t *testing.T) {
 		return
 	}
 	err := driveH3ControlAwait(p.ctx, p.ctx, func(ctx context.Context) error {
-		_, err := p.control.awaitPeerSettings(ctx)
+		_, err := p.control.AwaitPeerSettingsForTest(ctx)
 		if err == nil {
 			return errors.New("await before SETTINGS succeeded after peer connection closed")
 		}
@@ -357,8 +358,8 @@ func driveDuplicateH3Control(p *h3ControlTestPair, wire string) error {
 	_, second := p.openPeer(wire)?
 	ctx := p.ctx
 	go group (ctx) {
-		go p.control.handlePeerUni(ctx, first)
-		go p.control.handlePeerUni(ctx, second)
+		go p.control.HandlePeerUniForTest(ctx, first)
+		go p.control.HandlePeerUniForTest(ctx, second)
 	}
 	return nil
 }
@@ -389,7 +390,7 @@ func TestH3ControlUnknownUniStreamStopsOnlyThatStream(t *testing.T) {
 		t.Fatalf("Open unknown peer stream: %v", err)
 		return
 	}
-	if err := p.control.handlePeerUni(p.ctx, receive); err != nil {
+	if err := p.control.HandlePeerUniForTest(p.ctx, receive); err != nil {
 		t.Fatalf("Handle unknown peer stream: %v", err)
 		return
 	}
@@ -408,7 +409,7 @@ func TestH3ControlOwnerCancellationStopsReader(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(p.ctx)
 	cancel()
-	if err := p.control.handlePeerUni(ctx, receive); err != nil {
+	if err := p.control.HandlePeerUniForTest(ctx, receive); err != nil {
 		t.Fatalf("Handle canceled stream: %v", err)
 		return
 	}
@@ -443,7 +444,7 @@ func TestH3ControlLocalStopSending(t *testing.T) {
 		return
 	}
 	receive.CancelRead(0x100)
-	if err := p.control.watchLocal(p.ctx); err != nil {
+	if err := p.control.WatchLocalForTest(p.ctx); err != nil {
 		t.Fatalf("Watch server control stream: %v", err)
 		return
 	}

@@ -85,7 +85,7 @@ func Faults() []*fault.Error
 - A nonempty `Format` MUST go out as `output_config.format` with `type` `json_schema`.
 - A `Format` that is not a JSON object MUST fail as `anthropic.invalid_request` before any request.
 - A bad tool schema MUST fail as `anthropic.invalid_request` before any request.
-- Tool arguments and schemas MUST reach the wire byte for byte as written.
+- Tool arguments and schemas MUST reach the wire as written, except that leading and trailing whitespace is trimmed.
 - A body over 1 MiB cut by a read error MUST still end as the size limit error.
 - Too many redirects MUST surface as `anthropic.too_many_redirects`.
 

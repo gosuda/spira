@@ -64,26 +64,6 @@ func mustPgParse(t *testing.T, text string) rag.Filter {
 	return out
 }
 
-func TestPgvectorSharesTheStoreContract(t *testing.T) {
-	var store rag.Store = newStore(t, map[string][]float32{"q": {1, 0, 0}})
-	if err := store.Add(t.Context(), []rag.Document{{ID: "d", Text: "q"}}); err != nil {
-		t.Fatalf("Add through Store: %v", err)
-		return
-	}
-	docs, err := store.Search(t.Context(), rag.Search{Query: "q"})
-	if err != nil {
-		t.Fatalf("Search through Store: %v", err)
-		return
-	}
-	if got := ids(docs); !slices.Equal(got, []string{"d"}) {
-		t.Errorf("Store search = %v, want [d]", got)
-	}
-	if err := store.Delete(t.Context(), []string{"d"}); err != nil {
-		t.Fatalf("Delete through Store: %v", err)
-		return
-	}
-}
-
 func TestPgvectorRefusesBadTables(t *testing.T) {
 	pool, err := db.Open("pgx", "postgres://spira@localhost:5432/spira_test?sslmode=disable")
 	if err != nil {

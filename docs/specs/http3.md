@@ -2,7 +2,7 @@
 
 `http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-`H3Server` uses the vendored `golang.org/x/net/quic` transport. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
+`H3Server` runs over the `golang.org/x/net/quic` transport in the LoGOs toolchain. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
 
 ## Interface
 
@@ -63,12 +63,13 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 
 ### Timeouts
 
-- A stalled TCP body MUST close within `ReadTimeout`.
+- `ReadTimeout` MUST bound TCP request-body reads.
+- `ReadTimeout` MUST NOT promise a handler deadline or force TCP closure.
 - An idle TCP keep-alive connection MUST close within `IdleTimeout`.
 - The zero and negative rules of [web](web.md) MUST apply to both timeouts.
-- A QUIC connection that sends nothing after the handshake MUST close within 5 seconds.
-- A QUIC connection idle for 30 seconds MUST close on the backend idle bound.
-- The idle bound MUST stay within the default `IdleTimeout` of 120 seconds.
+- Missing client SETTINGS MUST trigger `H3_MISSING_SETTINGS` after the backend SETTINGS deadline.
+- QUIC idle expiry MUST use the negotiated timeout and the backend probe-timeout floor.
+- TCP `IdleTimeout` MUST NOT be described as a QUIC request-body deadline.
 
 ### Limits and timeouts
 
@@ -81,6 +82,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - The backend MUST omit `SETTINGS_QPACK_MAX_TABLE_CAPACITY` and `SETTINGS_QPACK_BLOCKED_STREAMS`. Both MUST default to 0 (RFC 9204 section 5).
 - If a header block refers to the dynamic table, the backend MUST close the connection with `QPACK_DECOMPRESSION_FAILED`.
 - A client MUST keep at most 100 bidirectional streams and 100 unidirectional streams open per connection.
+- The backend MUST cap incoming streams at 100 bidirectional and 100 unidirectional per connection.
 - The initial QUIC receive window MUST be 1 MiB per stream and 1 MiB per connection (RFC 9000 section 4).
 - The QUIC send buffer MUST hold at most 1 MiB per stream. A write MUST wait for space if the buffer is full.
 - The backend MUST set the QUIC handshake timeout to 5 seconds.
@@ -100,7 +102,8 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - On each connection with an open HTTP/3 control stream, a graceful drain MUST send one GOAWAY frame.
 - The GOAWAY identifier MUST be the next client bidirectional stream ID after the highest admitted request stream. If the backend admitted no request stream, the identifier MUST be 0.
 - Once the drain starts, the backend MUST admit no new request streams. It MUST reject new request streams on open connections with `H3_REQUEST_REJECTED` so the client can retry the request.
-- The backend MUST reject request stream IDs at or above `2^62 - 4` so the GOAWAY identifier fits in a variable-length integer.
+- The backend MUST reject request stream IDs at or above `2^62 - 4`.
+- The cap MUST leave room for the GOAWAY identifier in a variable-length integer.
 - The control stream MUST reject an attempt to send a GOAWAY identifier greater than the previous one.
 - The backend MUST wait for admitted requests to finish and for QUIC to acknowledge GOAWAY. If both complete and the connection remains open, it MUST close the connection with `H3_NO_ERROR`.
 - A client GOAWAY frame MUST NOT stop requests. If a client GOAWAY identifier exceeds the previous one, the backend MUST close the connection with `H3_ID_ERROR`.
@@ -110,7 +113,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - When a client attempts TLS session resumption, the QUIC layer MUST clear the early data flag on the session. The server MUST accept no 0-RTT data and MUST keep no 0-RTT replay window.
 - The QUIC backend MUST issue no session tickets. The server MAY resume with a ticket from another issuer if the TLS configuration accepts it.
-- After a restart, the TLS configuration MUST retain a valid ticket key or recover the session state with `UnwrapSession`. `http3.Server` MUST NOT manage ticket key storage or rotation.
+- A restart MUST NOT drop the ability to resume a session established before the restart.
+- The TLS configuration MUST retain a valid ticket key for such a session, or recover its state with `UnwrapSession`.
+- `http3.Server` MUST NOT manage ticket key storage or rotation.
 - `SessionTicketsDisabled` on the effective TLS configuration MUST disable resumption.
 - Extended CONNECT over HTTP/3 MUST stay unbuilt in this server.
 - The server MUST answer an extended CONNECT request with 501 and MUST NOT pass it to the router.
@@ -137,7 +142,6 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 ## Proof
 
 - `TestH3NeedsTLSFailsStart` proves that H3 without TLS fails to start and opens no listener.
-- `TestH3ServesHTTP3OverUDP` proves that a request over UDP gets the router answer with ALPN `h3`.
 - `TestH3SharesRouterWithTCP` proves that the same route answers over both listeners.
 - `TestH3AltSvcOnHTTPSOnly` proves the header value on HTTPS and its absence on cleartext and when `H3` is false.
 - `TestH3AltSvcIgnoresRegistrationOrder` proves that discovery works whether the stage is added before or after route registration.
@@ -152,10 +156,22 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
-- `TestH3TCPClosesSlowBodyWithinReadTimeout` proves that the TCP listener closes a stalled body within `ReadTimeout`.
+- `TestH3TCPClosesSlowBodyWithinReadTimeout` proves that a stalled body read fails and its test handler returns before the client deadline.
 - `TestH3TCPClosesIdleConnectionAfterIdleTimeout` proves that the TCP listener closes an idle keep-alive connection within `IdleTimeout`.
 - `TestH3ServeClosesSlowBodyWithinReadTimeout` proves that `Serve` applies `ReadTimeout` to the TCP listener when `H3` is on.
-- `TestH3QUICClosesIdleConnectionAfterSettings` proves that a QUIC connection that sends `SETTINGS` closes on the backend idle bound.
+- `TestH3QUICClosesIdleConnectionAfterSettings` observes an idle timeout after sending SETTINGS; it does not identify which endpoint's idle timer fires.
+- `TestH3QUICMissingSettingsReportsProtocolCode` requires the remote `H3_MISSING_SETTINGS` code, excluding transport failures and client timeouts.
+- `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
+- `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
+- `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
+- `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` releases both sockets and retries a bounded number of times until a transient UDP conflict clears.
+- `TestH3RunsStagesAndRepliesLikeTCP` proves that one router runs the same stages and writes the same data, page, and problem replies over UDP and TCP.
+- `TestH3AltSvcEdgeCases` proves that `Start` installs no stage, that disabled `H3` binds no UDP, and that a stopped server advertises nothing.
+- `TestH3StopSendsGOAWAYBeforeDrain` proves that `Stop` sends one GOAWAY frame on the control stream before the in-flight request drains.
+- `TestH3StopClosesClientConnectionOnTimeout` proves that a timed-out `Stop` maps to `http3.h3_shutdown` with the deadline cause and that the client connection closes.
+- `TestH3StopBeforeStartReturnsNil` proves that `Stop` before `Start` returns nil.
+- `TestH3ServeAndShutdownFaultsMap` proves that serve failures map to `http3.h3_serve` and shutdown failures to `http3.h3_shutdown`, each keeping its cause, and that the UDP cause names the address.
+- `TestH3DatagramsStayDisabled` proves that a datagram-offering client sees no QUIC datagram support and no HTTP/3 datagram setting from the server.
 
 ## Not in scope
 

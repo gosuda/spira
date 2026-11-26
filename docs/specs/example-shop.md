@@ -110,6 +110,15 @@ func FS() fs.FS
 - That cookie MUST include `Secure`, `HttpOnly` and `SameSite=Lax`.
 - `GET /account` with that cookie MUST return 200.
 - The account feature MUST provide logout.
+- Each failed account request MUST return a declared fault as the handler's error.
+- A failed account lookup during a database outage MUST answer 503 with `account.unavailable`.
+
+### Code table
+
+| Code | Kind | Message |
+|---|---|---|
+| `account.failed` | internal | The account request could not be completed. |
+| `account.unavailable` | unavailable | The account service is temporarily unavailable. |
 
 ### Stock and operations
 

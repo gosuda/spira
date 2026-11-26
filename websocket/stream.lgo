@@ -4,11 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"time"
-
-	"logos/sync"
 )
 
 var errStreamMethod = errors.New("websocket: extended CONNECT requires CONNECT method")
@@ -33,14 +29,7 @@ func ServeStream(w http.ResponseWriter, r *http.Request, cfg Config) (*Conn?, er
 		writeStreamError(w, err)
 		return nil, ErrHandshakeFailed.Wrap(err)
 	}
-	if sub != "" {
-		w.Header().Set("Sec-WebSocket-Protocol", sub)
-	}
-	w.WriteHeader(http.StatusOK)
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		return nil, fmt.Errorf("websocket: flush upgrade: %w", err)
-	}
-	return serveStreamConn(w, r, sub, limitOf(cfg)), nil
+	return serveStreamConn(w, r, sub, limitOf(cfg))
 }
 func checkStreamRequest(r *http.Request) error {
 	if r.Method != http.MethodConnect {
@@ -59,7 +48,7 @@ func checkStreamRequest(r *http.Request) error {
 	if version != "13" {
 		return errStreamVersion
 	}
-	return nil
+	return checkOfferedSubprotocols(r.Header.Values("Sec-WebSocket-Protocol"))
 }
 
 func streamStatus(err error) int {
@@ -82,88 +71,11 @@ func writeStreamError(w http.ResponseWriter, err error) {
 	w.WriteHeader(streamStatus(err))
 }
 
-func serveStreamConn(w http.ResponseWriter, r *http.Request, subprotocol string, limit int64) *Conn {
-	reader := bufio.NewReader(r.Body)
-	endpoint := &streamConn{body: reader, writer: w, rc: http.NewResponseController(w), local: streamLocalAddr(r), remote: streamAddr{network: "tcp", address: r.RemoteAddr}}
-	rw := bufio.NewReadWriter(reader, bufio.NewWriter(endpoint))
-	return ServeHijacked(endpoint, rw, subprotocol, limit)
-}
-
-func streamLocalAddr(r *http.Request) net.Addr {
-	if addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-		return addr
+func serveStreamConn(w http.ResponseWriter, r *http.Request, subprotocol string, limit int64) (*Conn?, error) {
+	stream := newConnectStream(w, r)
+	if err := stream.accept(subprotocol); err != nil {
+		return nil, fmt.Errorf("websocket: accept extended CONNECT: %w", err)
 	}
-	return streamAddr{network: "tcp", address: "unknown"}
-}
-
-type streamGuard struct {
-	closed bool
-}
-
-type streamConn struct {
-	body   *bufio.Reader
-	writer http.ResponseWriter
-	rc     *http.ResponseController
-	local  net.Addr
-	remote net.Addr
-	guard  sync.Locked[streamGuard]
-}
-
-func (c *streamConn) closedStream() bool {
-	var closed bool
-	c.guard.WithLock(func(g *streamGuard) {
-		closed = g.closed
-	})
-	return closed
-}
-
-func (c *streamConn) Read(b []byte) (int, error) {
-	if c.closedStream() {
-		return 0, net.ErrClosed
-	}
-	return c.body.Read(b)
-}
-
-func (c *streamConn) Write(b []byte) (int, error) {
-	if c.closedStream() {
-		return 0, net.ErrClosed
-	}
-	n, err := c.writer.Write(b)
-	if err != nil {
-		return n, err
-	}
-	if ferr := c.rc.Flush(); ferr != nil {
-		return n, ferr
-	}
-	return n, nil
-}
-
-func (c *streamConn) Close() error {
-	c.guard.WithLock(func(g *streamGuard) {
-		g.closed = true
-	})
-	return nil
-}
-
-func (c *streamConn) LocalAddr() net.Addr {
-	return c.local
-}
-
-func (c *streamConn) RemoteAddr() net.Addr {
-	return c.remote
-}
-
-func (c *streamConn) SetDeadline(t time.Time) error {
-	if err := c.SetReadDeadline(t); err != nil {
-		return err
-	}
-	return c.SetWriteDeadline(t)
-}
-
-func (c *streamConn) SetReadDeadline(t time.Time) error {
-	return c.rc.SetReadDeadline(t)
-}
-
-func (c *streamConn) SetWriteDeadline(t time.Time) error {
-	return c.rc.SetWriteDeadline(t)
+	reader := bufio.NewReader(stream)
+	return &Conn{conn: stream, reader: reader, stream: stream, subprotocol: subprotocol, engine: newEngine(reader, limit, true)}, nil
 }

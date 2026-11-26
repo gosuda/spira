@@ -1,0 +1,18 @@
+package orm_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/orm"
+)
+
+func TestStaleErrorHidesKey(t *testing.T) {
+	err := &orm.StaleError{Table: "orders", Key: "42"}
+	if strings.Contains(err.Error(), "42") {
+		t.Fatalf("StaleError message discloses key: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "orders") {
+		t.Fatalf("StaleError message must name table: %q", err.Error())
+	}
+}

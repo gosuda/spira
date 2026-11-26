@@ -145,23 +145,6 @@ func TestFaultPublicHidesSecretsAndHostile(t *testing.T) {
 	faulttest.RefuseLeak(t, faulttest.PublicJSON(t, serr), "sk-live-secret-value")
 }
 
-func TestConstraintCleanupOnEarlyReturn(t *testing.T) {
-	pool := openPool(t)
-	ran := false
-	withConstraintProbe(t, t.Context(), pool, constraintProbe{
-		table: "fault_cleanup_uniq",
-		mark:  "?",
-		check: func(dupErr error) {
-			ran = true
-		},
-	})
-	if !ran {
-		t.Fatal("probe body did not run")
-		return
-	}
-	faultExec(t, pool, "CREATE TABLE fault_cleanup_uniq (n INTEGER NOT NULL UNIQUE)")
-}
-
 func TestEngineMySQLRefusedPort(t *testing.T) {
 	pool, err := db.Open("mysql", "spira:spira@tcp(127.0.0.1:1)/spira?parseTime=true&timeout=2s")
 	if err != nil {

@@ -20,7 +20,16 @@ type Dialect interface {
 }
 
 func DialectOf(driver string, dsn string) (Dialect, error)
-func Open(driver string, dsn string) (*Pool?, error)
+func Open(driver string, dsn string, opts ...PoolOptions) (*Pool?, error)
+
+type PoolOptions struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+}
+
+func OpenSQLiteImmediate(dsn string, opts ...PoolOptions) (*Pool?, error)
 
 type Pool struct {
 	// unexported fields
@@ -28,6 +37,7 @@ type Pool struct {
 
 func (p *Pool) Dialect() Dialect
 func (p *Pool) Prepared() int
+func (p *Pool) Stats() sql.DBStats
 func (p *Pool) Prepare(ctx context.Context, query string) error
 func (p *Pool) Start(ctx context.Context) error
 func (p *Pool) Stop(ctx context.Context) error
@@ -40,8 +50,8 @@ type Tx struct {
 
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error)
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-
 func InTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (T, error)
+func InSQLiteImmediateTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (value T, err error)
 func Exec(ctx context.Context, q Querier, query string, args ...any) (sql.Result, error)
 func In(query string, name string, count int) string
 
@@ -95,6 +105,8 @@ func ClassifyDriverError(d Dialect, cause error) error
 - If `parseTime` there is `true`, `1`, `t` or `T`, `DialectOf` MUST return `MySQL`. `true` matches in any letter case.
 - `DialectOf` MUST return `MSSQL` for the driver name `sqlserver`.
 - `Open` MUST record the dialect that `DialectOf` returns for that driver and DSN.
+- `Open` MUST bound the pool: SQLite 4 open and 2 idle, network engines 10 open and 5 idle, each 30 minute lifetime and 5 minute idle time, unless `PoolOptions` overrides a field with a nonzero value.
+- `Open` MUST keep a zero `PoolOptions` field on its dialect default.
 - `Pool` MUST implement [app.Part](app.md).
 - `Start` MUST ping the database.
 - `Stop` MUST close each prepared statement before it closes the database handle.
@@ -105,7 +117,8 @@ func ClassifyDriverError(d Dialect, cause error) error
 ### Transactions
 
 - `InTx` MUST pass the transaction to `work` as the `tx` argument.
-- `InTx` MUST commit when `work` returns a nil error.
+- `InTx` MUST commit when `work` returns a nil error and the caller context is still live.
+- `InTx` MUST check the caller context before commit, roll back when it has ended, and return that context cause without a commit wrap.
 - `InTx` MUST call `Rollback` when `work` returns an error.
 - `InTx` MUST call `Rollback` when `work` panics.
 - `InTx` MUST let that panic continue after `Rollback`.
@@ -173,9 +186,9 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `Postgres` MUST count `SQLState()` `23505` and `23503`.
 - `MSSQL` MUST count `SQLErrorNumber()` `2627`, `2601` and `547`.
 - `MySQL` MUST count `1062`, `1451` and `1452`.
-- The MySQL check MUST read only the fixed `Error <number>` prefix.
+- The MySQL check MUST read the fixed `Error <number>` prefix.
+- After the number, the check MUST require the separator ` (` or `:`.
 - The check MUST run only when the pool dialect is `MySQL`.
-- The check MUST NOT inspect text after the prefix.
 - The prefix MUST serve as the code because `MySQL` exposes no accessor.
 - Scan errors without a dialect MUST use only the method checks.
 - The pool MUST map other driver failures to `db.statement_failed`.
@@ -216,10 +229,9 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
 - `TestDialectOfRejectsParseTimeInThePassword` proves that `parseTime=true` outside the query part does not count.
 - `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the bounded `Stop` and the close that finishes after it. A registered SQL function holds the statement open until the test releases it.
-- `TestStopReturnsByItsDeadlineWhileAStatementRuns` proves the shutdown probe adds no statement to the cache.
 - `TestInTxCommitsOnSuccess` proves that a nil error commits the insert.
-- `TestInTxRollsBackOnError` and `TestInTxRollsBackWhenWorkFails` prove that an error undoes the insert and returns that error.
-- `TestInTxRollsBackOnPanic` and `TestInTxRollsBackWhenWorkPanics` prove that a panic undoes the insert and continues.
+- `TestInTxRollsBackOnError` proves that an error undoes the insert and returns that error.
+- `TestInTxRollsBackOnPanic` proves that a panic undoes the insert and continues.
 - `TestInTxCommitFailureReturnsCommitErrorAlone` proves that a commit failure returns `db.constraint_violation` with the `db: commit` cause.
 - `TestStatementCacheNeverExceedsCapacity` proves the limit of 256 statements.
 - `TestInExpandsTheMarker` proves marker replacement, `NULL`, and a second marker left unchanged.

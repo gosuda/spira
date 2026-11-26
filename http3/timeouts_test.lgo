@@ -189,7 +189,7 @@ func TestH3ServeClosesSlowBodyWithinReadTimeout(t *testing.T) {
 		t.Fatalf("serve over caller sockets: %v; close caller sockets: %v", err, cerr)
 		return
 	}
-	defer stopH3TimeoutServer(t, s)
+	stopH3TimeoutServer(t, s)
 	addr := listener.Addr().String()
 	conn := dialStalledTLSBody(t, addr, $"POST /echo HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 8\r\n\r\nab")
 	defer func() {
@@ -288,5 +288,42 @@ func TestH3QUICClosesIdleConnectionAfterSettings(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("QUIC connection stayed open past the idle bound after SETTINGS")
 		return
+	}
+}
+
+func TestH3QUICMissingSettingsReportsProtocolCode(t *testing.T) {
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, web.NewRouter(), cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, s.BoundUDPAddrForTest(),
+		&tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}},
+		&quic.Config{MaxIdleTimeout: 20 * time.Second})
+	if err != nil {
+		t.Fatalf("QUIC handshake: %v", err)
+		return
+	}
+	defer func() {
+		if err := conn.CloseWithError(0, ""); err != nil {
+			return
+		}
+	}()
+	select {
+	case <-conn.Context().Done():
+		cause := context.Cause(conn.Context())
+		protocol, ok := errors.AsType[*quic.ApplicationError](cause)
+		if !ok || protocol == nil || !protocol.Remote || protocol.ErrorCode != 0x10a {
+			t.Fatalf("missing SETTINGS closed with %v, want remote H3_MISSING_SETTINGS", cause)
+		}
+	case <-ctx.Done():
+		t.Fatal("server did not report missing SETTINGS before the test deadline")
 	}
 }

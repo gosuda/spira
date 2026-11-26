@@ -18,6 +18,10 @@ type CorpusLine = {
 	reject: boolean;
 };
 
+type OwnedLine = CorpusLine & {
+	request: Exclude<CorpusRequest, { kind: "sse-event-name" | "sse-field" }>;
+};
+
 const CORPUS_PATH = resolve(__dirname, "../../wire/corpus.jsonl");
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -110,6 +114,14 @@ function loadCorpus(): CorpusLine[] {
 	});
 }
 
+function isOwned(line: CorpusLine): line is OwnedLine {
+	return (
+		line.request.kind === "slot-id" ||
+		line.request.kind === "island-when" ||
+		line.request.kind === "island-props"
+	);
+}
+
 const corpus = loadCorpus();
 
 const REQUIRED_CORPUS_CASES = [
@@ -185,7 +197,7 @@ beforeAll(() => {
 });
 
 describe("wire corpus", () => {
-	test.each(corpus.map((line) => [line.name, line] as const))(
+	test.each(corpus.filter(isOwned).map((line) => [line.name, line] as const))(
 		"%s",
 		async (_name, line) => {
 			switch (line.request.kind) {
@@ -197,9 +209,6 @@ describe("wire corpus", () => {
 					return;
 				case "island-props":
 					await checkProps(line.request.props, line.response.accepted ?? false);
-					return;
-				case "sse-event-name":
-				case "sse-field":
 					return;
 			}
 		},
@@ -218,17 +227,11 @@ describe("wire corpus coverage", () => {
 
 	test("no unknown owned cases", () => {
 		const required = new Set<string>(REQUIRED_CORPUS_CASES);
-		for (const line of corpus) {
-			if (
-				line.request.kind === "slot-id" ||
-				line.request.kind === "island-when" ||
-				line.request.kind === "island-props"
-			) {
-				if (!required.has(line.name)) {
-					throw new Error(
-						`corpus case "${line.name}" is not in the required list`,
-					);
-				}
+		for (const line of corpus.filter(isOwned)) {
+			if (!required.has(line.name)) {
+				throw new Error(
+					`corpus case "${line.name}" is not in the required list`,
+				);
 			}
 		}
 	});

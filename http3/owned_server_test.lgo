@@ -1,4 +1,4 @@
-package http3
+package http3_test
 
 import (
 	"bufio"
@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/spira/http3"
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
@@ -20,7 +21,7 @@ import (
 )
 
 type h3OwnedTestPeer struct {
-	server  *h3OwnedServer
+	server *http3.OwnedH3ServerForTest
 	conn    *quic.Conn
 	control *bufio.Reader
 }
@@ -32,7 +33,7 @@ func openH3OwnedTestPeer(ctx context.Context, t *testing.T, handler http.Handler
 	serverTLS.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) { return fallback, nil }
 	clientTLS.NextProtos = []string{"h2", "h3"}
 	pc := net.ListenPacket("udp4", "127.0.0.1:0")?
-	server := newH3OwnedServer(handler, serverTLS)
+	server := http3.NewOwnedH3ServerForTest(handler, serverTLS)
 	workers, _ := rt.NewGroup(context.WithoutCancel(ctx), 0)
 	workers.Go(func(_ context.Context) error {
 		err := server.Serve(pc)
@@ -59,7 +60,7 @@ func openH3OwnedTestPeer(ctx context.Context, t *testing.T, handler http.Handler
 	return &h3OwnedTestPeer{server: server, conn: conn, control: control}, nil
 }
 
-func closeH3OwnedTestServer(t *testing.T, server *h3OwnedServer, pc net.PacketConn, workers *rt.Group) {
+func closeH3OwnedTestServer(t *testing.T, server *http3.OwnedH3ServerForTest, pc net.PacketConn, workers *rt.Group) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -84,22 +85,22 @@ func readH3OwnedServerSettings(ctx context.Context, conn *quic.Conn) (*bufio.Rea
 	deadline, _ := ctx.Deadline()
 	stream.SetReadDeadline(deadline)?
 	reader := bufio.NewReader(stream)
-	kind := quicvarint.Read(reader)?
-	frame := readH3FrameHeader(reader)?
-	if kind != 0 || frame.kind != 4 || frame.length > 64 {
+	streamKind := quicvarint.Read(reader)?
+	kind, length := http3.ReadH3FrameHeaderForTest(reader)?
+	if streamKind != 0 || kind != 4 || length > 64 {
 		return nil, errors.New("missing server SETTINGS on the control stream")
 	}
 	var payload [64]byte
-	io.ReadFull(reader, payload[:frame.length])?
-	settings := decodeH3Settings(payload[:frame.length])?
-	if !settings.enableConnectProtocol || settings.enableDatagram || settings.maxFieldSectionSize != http.DefaultMaxHeaderBytes {
+	io.ReadFull(reader, payload[:length])?
+	settings := http3.DecodeH3SettingsForTest(payload[:length])?
+	if !settings.EnableConnectProtocol || settings.EnableDatagram || settings.MaxFieldSectionSize != http.DefaultMaxHeaderBytes {
 		return nil, fmt.Errorf("unexpected server SETTINGS: %+v", settings)
 	}
 	return reader, nil
 }
 
 func (p *h3OwnedTestPeer) sendSettings(ctx context.Context, t *testing.T, payload []byte) error {
-	wire := appendH3FrameHeader([]byte{0}, 4, uint64(len(payload)))
+	wire := http3.AppendH3FrameHeaderForTest([]byte{0}, 4, uint64(len(payload)))
 	return p.sendControl(ctx, t, append(wire, payload...))
 }
 
@@ -201,13 +202,13 @@ func respondH3OwnedTunnel(w http.ResponseWriter, r *http.Request) error {
 
 func readH3OwnedTunnelStatus(stream *quic.Stream) error {
 	reader := quicvarint.NewReader(stream)
-	frame := readH3FrameHeader(reader)?
-	if frame.kind != 1 || frame.length > 64 {
+	kind, length := http3.ReadH3FrameHeaderForTest(reader)?
+	if kind != 1 || length > 64 {
 		return errors.New("missing flushed CONNECT response HEADERS")
 	}
 	var payload [64]byte
-	io.ReadFull(stream, payload[:frame.length])?
-	next := qpack.NewDecoder().Decode(payload[:frame.length])
+	io.ReadFull(stream, payload[:length])?
+	next := qpack.NewDecoder().Decode(payload[:length])
 	status := next()?
 	if status.Name != ":status" || status.Value != "200" {
 		return fmt.Errorf("CONNECT response status = %+v, want 200", status)
@@ -426,14 +427,14 @@ func driveH3OwnedDrain(ctx context.Context, t *testing.T, peer *h3OwnedTestPeer,
 }
 
 func expectH3OwnedGOAWAY(reader *bufio.Reader, want uint64) error {
-	frame := readH3FrameHeader(reader)?
-	if frame.kind != 7 || frame.length == 0 || frame.length > 8 {
-		return fmt.Errorf("invalid GOAWAY frame: %+v", frame)
+	kind, length := http3.ReadH3FrameHeaderForTest(reader)?
+	if kind != 7 || length == 0 || length > 8 {
+		return fmt.Errorf("invalid GOAWAY frame: kind %d length %d", kind, length)
 	}
 	var payload [8]byte
-	io.ReadFull(reader, payload[:frame.length])?
-	id, used := quicvarint.Parse(payload[:frame.length])?
-	if id != want || uint64(used) != frame.length {
+	io.ReadFull(reader, payload[:length])?
+	id, used := quicvarint.Parse(payload[:length])?
+	if id != want || uint64(used) != length {
 		return fmt.Errorf("GOAWAY ID = %d, want %d", id, want)
 	}
 	return nil
@@ -535,12 +536,12 @@ func checkH3OwnedSocketSurvives(ctx context.Context) error {
 	pc := net.ListenPacket("udp4", "127.0.0.1:0")?
 	defer pc.Close()?
 	addr := pc.LocalAddr()
-	bad := newH3OwnedServer(http.DefaultServeMux, &tls.Config{MaxVersion: tls.VersionTLS12})
+	bad := http3.NewOwnedH3ServerForTest(http.DefaultServeMux, &tls.Config{MaxVersion: tls.VersionTLS12})
 	defer bad.Close()?
 	if err := bad.Serve(pc); err == nil || errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("Serve with TLS capped at 1.2 = %w, want setup failure", err)
 	}
-	closed := newH3OwnedServer(http.DefaultServeMux, &tls.Config{})
+	closed := http3.NewOwnedH3ServerForTest(http.DefaultServeMux, &tls.Config{})
 	closed.Shutdown(ctx)?
 	closed.Close()?
 	if err := closed.Serve(pc); !errors.Is(err, http.ErrServerClosed) {

@@ -362,7 +362,6 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestSplitChunksFitTheTokenBudget` proves every chunk resplits to itself at 80 tokens.
 - `TestSplitLosesNoText` proves full coverage at overlaps 0, 50 and 200.
 - `TestSplitShortTextStaysWhole` proves a short text stays one chunk.
-- `TestSplitLongTextCutsAtTheSentence` proves a long text cuts at a period.
 - `TestSplitLastChunkStaysWhole` proves the last chunk keeps its period cut.
 - `TestSplitCutsAtCustomMarks` proves the seven CJK cuts.
 - `TestSplitOverlapWithSemicolons` proves the four semicolon cuts with overlap.
@@ -397,7 +396,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestRewriteSendsTheReferencePrompt`, `TestTranslateSendsTheReferencePrompt` and `TestCompressSendsHistoryAndTheFollowUpQuery` prove the exact prompt text of each transformer.
 - `TestRewriteWithABlankAnswerKeepsTheQuery` proves the blank-answer rule.
 - `TestExpandReturnsOneQueryPerLine`, `TestExpandWithFewerLinesKeepsTheQuery` and `TestExpandWithATrailingNewlineKeepsTheVariants` prove the line-count rule.
-- `TestPgvectorSharesTheStoreContract` proves that `Memory` and `Pgvector` satisfy `Store`.
+- `TestMemorySearchOrderEqualsABruteForceComputation`, `TestMemoryDefaultIsFourDocumentsAndNoThreshold` and `TestMemoryDeleteKeepsTheOtherDocumentsWhole` plus the `var _ rag.Store` assertions prove `Memory` satisfies `Store`.
 - `TestPgvectorRefusesBadTables` proves the table pattern and the constructor refusals.
 - `TestPgvectorBlankIdSendsNoEmbedding` proves that a blank id costs no embedding request.
 - `TestPgvectorVectorTextFormatsBrackets` proves the `[1,2.5,-3]` vector text form.

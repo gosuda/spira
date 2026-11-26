@@ -86,24 +86,14 @@ func Mount(r *web.Router, info Info) {
 		return web.Data{Value: Document(r, info)}, nil
 	})
 	r.Describe("GET", "/openapi.json", web.Doc{Summary: mountSummary})
+	r.Hide("GET", "/openapi.json")
 }
 
 const mountSummary = "Serves this router's OpenAPI 3.1 document"
 
-func isMountRoute(ri web.RouteInfo) bool {
-	if strings.ToUpper(ri.Method) != http.MethodGet {
-		return false
-	}
-	doc := ri.Doc
-	if doc == nil {
-		return false
-	}
-	return doc.Summary == mountSummary
-}
-
 func addRoute(paths map[string]PathItem, origins map[string]string, ri web.RouteInfo) {
 	path := openapiPath(ri.Pattern)
-	if isMountRoute(ri) {
+	if ri.Hidden {
 		return
 	}
 	item := paths[path] ?? PathItem{}
