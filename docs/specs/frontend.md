@@ -8,11 +8,10 @@ File layout:
 
 - `package.json`, `pnpm-lock.yaml`, `biome.json`, `tsconfig.json`
 - `vite.config.ts`, `vitest.config.ts`
-- `src/entry.ts`, `src/island.ts`, `src/slots.ts`
+- `src/entry.ts`, `src/island.ts`, `src/live.ts`, `src/slots.ts`
 - `src/adapters/react.ts`, `src/adapters/svelte.ts`, `src/adapters/solid.ts`, `src/adapters/wasm.ts`
-- `test/island.test.ts`, `test/island-glob.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`
-- `test/fixtures/Counter.react.tsx`, `test/fixtures/Counter.svelte`, `test/fixtures/Counter.solid.tsx`
-- `test/fixtures/wasm/ticker/main.lgo`, `test/fixtures/wasm/ticker/go.mod`
+- `test/island.test.ts`, `test/island-glob.test.ts`, `test/island-move.test.ts`, `test/island-dispose.test.ts`, `test/live.test.ts`, `test/wasm.test.ts`, `test/wasm-retry.test.ts`, `test/wasm-runtime.test.ts`, `test/entry.test.ts`, `test/corpus.test.ts`, `test/production-build.test.ts`, `test/dom-stubs.ts`
+- `test/fixtures/`, including `Counter.react.tsx`, `Counter.svelte`, `Counter.solid.tsx`, and `wasm/ticker/main.lgo` with `wasm/ticker/go.mod`
 
 Scripts in `package.json`:
 
@@ -36,14 +35,14 @@ export type IslandMount = (
 export class SpiraIslandElement extends HTMLElement
 export function defineIslands(table: IslandTable): void
 export function installSlotMover(root?: ParentNode): void
+// src/live.ts
+export function installLiveUpdates(): void
  // src/adapters/react.ts, src/adapters/svelte.ts and src/adapters/solid.ts
  export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): IslandCleanup
  // src/adapters/wasm.ts
  export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): undefined
  export function loader(entry: string): () => Promise<{ default: unknown }>
- ```
- 
- `mount` is exported from each adapter. The React, Svelte and Solid adapters return a cleanup that releases the mount. The wasm adapter returns `undefined` because a started Go program has no per-island release. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`.
+ `mount` is exported from each adapter. The React, Svelte and Solid adapters return a cleanup that releases the mount. The wasm adapter returns `undefined` because a started Go program has no per-island release. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`. `installLiveUpdates` is exported from `src/live.ts` and wires the htmx event-stream handling for live regions.
 
 ## Requirements
 
@@ -56,7 +55,7 @@ export function installSlotMover(root?: ParentNode): void
 - The Vite build MUST write files to `dist`.
 - The Vite build MUST use `src/entry.ts` as its one input.
 - The dev server MUST allow `SPIRA_ORIGIN` when that value is set.
-- The dev server MUST allow `http://localhost:8080` when `SPIRA_ORIGIN` is empty.
+- The dev server MUST allow `http://localhost:8080` when `SPIRA_ORIGIN` is unset.
 - The Svelte plugin MUST apply only to `*.svelte`.
 - The React plugin MUST apply only to `*.react.tsx`.
 - The Solid plugin MUST apply only to `*.solid.tsx`.

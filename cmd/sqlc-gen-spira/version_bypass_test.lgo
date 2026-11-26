@@ -1,0 +1,30 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestVersionedWriteBypassShapesRefused(t *testing.T) {
+	shapes := []string{
+		"/* audit */ UPDATE items SET name = ? WHERE id = ?",
+		"-- audit\nUPDATE items SET name = ? WHERE id = ?",
+		"WITH c AS (SELECT 1) UPDATE items SET name = ? WHERE id = ?",
+		"(UPDATE items SET name = ? WHERE id = ?)",
+		"DELETE FROM items WHERE id = ?",
+		"/* audit */ DELETE FROM items WHERE id = ?",
+	}
+	for _, text := range shapes {
+		req := versionedFixture(t)
+		req.Queries[1].Text = text
+		_, _, err := Generate(req)
+		if err == nil {
+			t.Fatalf("Generate succeeded for %q; want the version refusal", text)
+			return
+		}
+		if !strings.Contains(err.Error(), "writes versioned table items without version") {
+			t.Fatalf("error = %v, want the version refusal for %q", err, text)
+			return
+		}
+	}
+}

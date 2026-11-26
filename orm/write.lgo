@@ -208,9 +208,7 @@ func (row *entityRow[E, K]) update(ctx context.Context) error {
 	}
 	key := *r.keyOf(row.entity)
 	if key != row.key {
-		if _, exists := r.byKey[key]; exists {
-			return tableFault(r.table.Name, "updated key already held by a different entity")
-		}
+		return tableFault(r.table.Name, "key cannot change while tracked")
 	}
 	args = row.updateVersion(&query, args)?
 	row.expectOne(ctx, query.String(), args)?
@@ -292,6 +290,9 @@ func (row *entityRow[E, K]) predicate(query *strings.Builder, args []any) []any 
 
 func (row *entityRow[E, K]) remove(ctx context.Context) error {
 	r := row.table
+	if *r.keyOf(row.entity) != row.key {
+		return tableFault(r.table.Name, "key cannot change while tracked")
+	}
 	var query strings.Builder
 	query.WriteString("DELETE FROM ")
 	query.WriteString(r.name)

@@ -76,16 +76,26 @@ The plugin writes one JSON object to standard output. The object has one field `
 - A column name with a backtick or a control character MUST be an error, because the generated `col` tag is a raw string.
 - On MySQL, an unsigned integer column MUST be an error unless `overrides` names a type.
 
-All engines:
+Every engine:
+
+- `text`, `varchar` and `char` MUST map to `string`.
+- `numeric` and `decimal` MUST map to `string`.
+- `datetime` and `date` MUST map to `time.Time`.
+
+SQLite, PostgreSQL and MySQL:
+
+- `timestamp` MUST map to `time.Time`.
+- `boolean` and `bool` MUST map to `bool`.
+
+PostgreSQL, MySQL and SQL Server:
 
 - `bigint` MUST map to `int64`.
 - `smallint` MUST map to `int16`.
-- `boolean` and `bool` MUST map to `bool`.
-- `text`, `varchar` and `char` MUST map to `string`.
-- `double precision` and `double` MUST map to `float64`.
+
+PostgreSQL and MySQL:
+
+- `double precision` MUST map to `float64`.
 - `json` MUST map to `[]byte`.
-- `timestamp`, `datetime` and `date` MUST map to `time.Time`.
-- `numeric` and `decimal` MUST map to `string`.
 
 SQLite:
 
@@ -140,9 +150,8 @@ SQL Server:
 - For each PostgreSQL enum, the plugin MUST emit a named string type, its constants, and `Valid() bool`.
 - For each table with `key`, the plugin MUST emit `var <Type>Table = orm.Table[<Type>, <key_type>]` with `Name`, `Key` and `Version`.
 - The plugin MUST emit `func PrepareAll(ctx context.Context, p *db.Pool) error`.
-- `PrepareAll` MUST prepare every generated statement through one shared query table in query order.
-- `PrepareAll` MUST return the first failure with the sqlc query name in the message.
-- The failure MUST wrap the engine error with `%w`.
+- `PrepareAll` MUST prepare every generated statement through one shared query table, looping in query order.
+- `PrepareAll` MUST return the first failure as `PrepareAll: <name>: <cause>`, wrapping the engine error with `%w`.
 - The wrapped error MUST satisfy `errors.Is` and `errors.As` to the `db` prepare error.
 - Every emitted call MUST pass a query constant and bound arguments.
 - The plugin MUST NOT build SQL from values.
@@ -164,41 +173,40 @@ SQL Server:
 - The nested field MUST use the embedded table struct name.
 - A nullable key parameter MUST use the underlying option type.
 - An embed column MUST resolve to the nested field without a type lookup.
-- An output column with no name MUST be the error `<Name>: column <i> needs an alias`.
 - Function, constant, row and argument names MUST derive from the query name in Pascal-case.
 - Two parameters with one name MUST differ by the parameter number suffix.
-- Each slice marker in the query text MUST pair with the slice parameter of that name.
+- An output column with no name MUST be the error `sqlc-gen-spira: <Name>: column <i> needs an alias`.
 - A slice parameter without a marker MUST pass as one argument.
 - On SQLite, sqlc numbers each bare `?` before it numbers a slice. A bare `?` MUST bind the next of those numbers, and a slice marker MUST NOT advance that count.
 
 ### Refusals
 
 - A query that writes a versioned table without its version column MUST fail.
-- The error MUST be `<Name>: writes versioned table <table> without <version column>`.
-- `:execresult`, `:copyfrom` and batch commands MUST be the error `<Name>: command <cmd> is not supported`.
+- The error MUST be `sqlc-gen-spira: <Name>: writes versioned table <table> without <version column>`.
+- `:execresult`, `:copyfrom` and batch commands MUST be the error `sqlc-gen-spira: <Name>: command <cmd> is not supported`.
 - The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
-- Two queries with one name MUST be the error `duplicate query "<Name>"`.
+- Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
 ### Gate
 
-- `just sql` MUST read the sqlc config path from `sql_config`.
-- `sql_config` MUST default to `example/shop/sqlc.yaml`.
+- `just sql` MUST read the sqlc config path from its `config` parameter.
+- `config` MUST default to `example/shop/sqlc.yaml`.
 - `just sql` MUST fail with a message that names the path when the file does not exist.
 - `just sql` MUST NOT create output when the file does not exist.
-- `just sql-check` MUST run `just sql` first.
+- `just sql-check` MUST run the raw-query check first, then `sqlc vet`, and MUST regenerate with `just sql` into a scratch directory last and diff it against `db/store`.
 - `just sql-check` MUST fail when generated `*.sql.lgo` files differ from the SQL.
 - `just sql-check` MUST run `sqlc vet` on the same config.
 - `just sql-check` MUST fail when `db.Query`, `db.One` or `db.Exec` appears outside the data packages.
-- The raw-query check MUST skip `_test.lgo` files, generated `*.sql.lgo` files, the generator, and the packages `db`, `orm`, `migrate`, `ai/session` and `ai/rag`.
+- The raw-query check MUST skip generated `*.sql.lgo` files, `cmd/sqlc-gen-spira/gen.lgo`, and the packages `db`, `orm`, `migrate`, `ai/session` and `ai/rag`.
 - Tests MAY call the runtime directly.
 
 ## Errors
 
-- `<Name>: command <cmd> is not supported` for `:execresult`, `:copyfrom` and batch commands.
-- `<Name>: column <i> needs an alias` for an output column with no name.
-- `<Name>: writes versioned table <table> without <version column>` for a versioned write that omits the version column.
-- `duplicate query "<Name>"` for two queries with one name.
+- `sqlc-gen-spira: <Name>: command <cmd> is not supported` for `:execresult`, `:copyfrom` and batch commands.
+- `sqlc-gen-spira: <Name>: column <i> needs an alias` for an output column with no name.
+- `sqlc-gen-spira: <Name>: writes versioned table <table> without <version column>` for a versioned write that omits the version column.
+- `sqlc-gen-spira: duplicate query "<Name>"` for two queries with one name.
 - A slice marker without a slice parameter names the marker and the query.
 - An unknown embed table MUST be the error naming the query and the table.
 - An unmapped type and an array column each produce an error.
@@ -221,8 +229,9 @@ SQL Server:
 - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
-- `TestSQLcSQLiteIntegration` builds the plugin, generates the runtime fixture store, and compiles and runs it with `logos`.
-- The run calls the generated PrepareAll before the items table exists, which MUST report the rejected query name and satisfy `errors.Is` to `db.ErrStatementFailed`.
+- `TestSQLcSQLiteIntegration` builds the plugin with `logos build`, generates the store from `testdata/runtime_sqlite`, and runs the application with `logos run`.
+- `sqlc generate` MUST reject a query that selects a column the migrations do not create.
+- The application calls `store.PrepareAll` on an empty schema and requires the error to satisfy `errors.Is` to `db.ErrStatementFailed` and to name `GetItem`.
 - The raw-query rule is proved on a scratch copy with a planted call and on the clean tree.
 - The shop lane adds `sql-check` to `gate` after it publishes `example/shop/sqlc.yaml`.
 - The end-to-end proof that runs generated functions against `database/sql` is not in this package.
