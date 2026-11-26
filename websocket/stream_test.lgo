@@ -1043,19 +1043,35 @@ func (b *readEntryBody) Read(p []byte) (int, error) {
 	return b.ReadCloser.Read(p)
 }
 
+type streamCancelResult struct {
+	read     error
+	followup error
+}
+
+func reportStreamCancellation(t *testing.T, done chan<- streamCancelResult, result streamCancelResult) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	select {
+	case done <- result:
+	case <-ctx.Done():
+		t.Errorf("stream result was not received: %v", ctx.Err())
+	}
+}
+
 func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 	pending := make(chan context.CancelFunc, 1)
 	reading := make(chan struct{}, 1)
-	done := make(chan error, 1)
+	done := make(chan streamCancelResult, 1)
 	srv := serveStreamTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = &readEntryBody{ReadCloser: r.Body, entered: reading}
 		c, err := websocket.ServeStream(w, r, websocket.Config{})
 		if err != nil {
-			reportStream(r, done, err)
+			reportStreamCancellation(t, done, streamCancelResult{read: err})
 			return
 		}
 		if c == nil {
-			reportStream(r, done, errors.New("serve stream gave no connection"))
+			reportStreamCancellation(t, done, streamCancelResult{read: errors.New("serve stream gave no connection")})
 			return
 		}
 		defer func() {
@@ -1068,14 +1084,14 @@ func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 		select {
 		case pending <- cancel:
 		case <-r.Context().Done():
-			reportStream(r, done, r.Context().Err())
+			reportStreamCancellation(t, done, streamCancelResult{read: r.Context().Err()})
 			return
 		}
 		_, _, err = c.Next(ctx)
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer probeCancel()
 		_, _, perr := c.Next(probeCtx)
-		reportStream(r, done, errors.Join(err, perr))
+		reportStreamCancellation(t, done, streamCancelResult{read: err, followup: perr})
 	}))
 	h := openH2TLS(t, srv)
 	if !h.advertised {
@@ -1091,12 +1107,12 @@ func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 	}
 	cancelAfterStreamRead(t, pending, reading)
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Next after cancel = %v, want context canceled", err)
+	case result := <-done:
+		if !errors.Is(result.read, context.Canceled) {
+			t.Fatalf("pending Next after cancel = %v, want context canceled", result.read)
 		}
-		if !errors.Is(err, websocket.ErrClosed) {
-			t.Fatalf("Next after cancel = %v, want a closed connection after canceling the pending read", err)
+		if !errors.Is(result.followup, websocket.ErrClosed) {
+			t.Fatalf("follow-up Next = %v, want ErrClosed", result.followup)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("Next did not return after cancel")
