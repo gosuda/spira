@@ -21,6 +21,8 @@ type Server struct {
 	Addr              string = ":8080"
 	Router            *web.Router
 	ReadHeaderTimeout time.Duration = 5 * time.Second
+	ReadTimeout       time.Duration = 30 * time.Second
+	IdleTimeout       time.Duration = 120 * time.Second
 	ShutdownGrace     time.Duration = 20 * time.Second
 	TLS               *tls.Config?
 	H2C               bool
@@ -99,7 +101,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.H3 {
 		return s.startH3(ctx)
 	}
-	inner := &web.Server{Addr: s.Addr, Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
+	inner := &web.Server{Addr: s.Addr, Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ReadTimeout: s.ReadTimeout, IdleTimeout: s.IdleTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
 	return s.startRun(func() (*serverRun?, error) {
 		l, lerr := net.Listen("tcp", s.Addr)
 		if lerr != nil {
@@ -171,7 +173,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, conn net.PacketConn)
 			return fmt.Errorf("http3: caller tcp port %d does not match caller udp port %d", tcpPort, udpPort)
 		}
 	}
-	inner := &web.Server{Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
+	inner := &web.Server{Router: s.Router, ReadHeaderTimeout: s.ReadHeaderTimeout, ReadTimeout: s.ReadTimeout, IdleTimeout: s.IdleTimeout, ShutdownGrace: s.ShutdownGrace, TLS: s.TLS, H2C: s.H2C}
 	return s.startRun(func() (*serverRun?, error) {
 		if serr := inner.Serve(ctx, l); serr != nil {
 			return nil, serr

@@ -11,6 +11,8 @@ type Server struct {
 	Addr              string = ":8080"
 	Router            *web.Router
 	ReadHeaderTimeout time.Duration = 5 * time.Second
+	ReadTimeout       time.Duration = 30 * time.Second
+	IdleTimeout       time.Duration = 120 * time.Second
 	ShutdownGrace     time.Duration = 20 * time.Second
 	TLS               *tls.Config?
 	H2C               bool
@@ -30,7 +32,7 @@ var ErrH3Shutdown = fault.New("http3.h3_shutdown", fault.Internal, "The HTTP/3 s
 func Faults() []*fault.Error
 ```
 
-The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on.
+The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on. `ReadTimeout` and `IdleTimeout` bound the TCP listener through the inner `web.Server`; a stalled TCP body MUST close within `ReadTimeout` and an idle TCP keep-alive connection MUST close within `IdleTimeout`, with the same zero and negative rules that [web](web.md) states. A QUIC connection that sends nothing after the handshake MUST close within the backend settings bound of 5 seconds. A QUIC connection idle for 30 seconds MUST close on the backend idle bound, which stays within the default `IdleTimeout` of 120 seconds.
 
 ## Requirements
 
@@ -149,6 +151,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
+- `TestH3TCPClosesSlowBodyWithinReadTimeout` proves that the TCP listener closes a stalled body within `ReadTimeout`.
+- `TestH3TCPClosesIdleConnectionAfterIdleTimeout` proves that the TCP listener closes an idle keep-alive connection within `IdleTimeout`.
+- `TestH3QUICClosesConnectionWithoutSettings` proves that a QUIC connection that sends nothing closes within the backend settings and idle bounds.
 
 ## Not in scope
 

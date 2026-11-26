@@ -1,0 +1,191 @@
+package http3_test
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/gosuda/spira/http3"
+	"github.com/gosuda/spira/web"
+)
+
+func stopH3TimeoutServer(t *testing.T, s *http3.Server) {
+	t.Helper()
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.Stop(cctx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
+}
+
+func TestH3TCPClosesSlowBodyWithinReadTimeout(t *testing.T) {
+	r := web.NewRouter()
+	handlerDone := make(chan struct{})
+	r.Handle("POST", "/echo", func(ctx *web.Context) (web.Reply, error) {
+		data, rerr := web.ReadBody(ctx.Request, 1024)
+		if rerr != nil {
+			return web.Problem{Title: "body read failed", Status: http.StatusBadRequest}, nil
+		}
+		close(handlerDone)
+		return web.Data{Value: string(data)}, nil
+	})
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, ReadTimeout: 300 * time.Millisecond, ShutdownGrace: 2 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopH3TimeoutServer(t, s)
+	addr := s.BoundTCPAddrForTest()
+	if addr == "" {
+		t.Fatal("the started server bound no TCP address")
+		return
+	}
+	conn, derr := net.DialTimeout("tcp", addr, 5*time.Second)
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, werr := fmt.Fprintf(conn, "POST /echo HTTP/1.1\r\nHost: %s\r\nContent-Length: 8\r\n\r\nab", addr); werr != nil {
+		t.Fatalf("write request head: %v", werr)
+		return
+	}
+	if derr := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); derr != nil {
+		t.Fatalf("set read deadline: %v", derr)
+		return
+	}
+	start := time.Now()
+	_, rerr := io.ReadAll(conn)
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("stalled body stayed open %v past the 300ms read timeout", elapsed)
+		return
+	}
+	if rerr != nil && strings.Contains(rerr.Error(), "i/o timeout") {
+		t.Fatalf("stalled body kept the connection open until the test deadline: %v", rerr)
+		return
+	}
+	select {
+	case <-handlerDone:
+		t.Fatal("the handler completed although the body never finished")
+	default:
+	}
+}
+
+func TestH3TCPClosesIdleConnectionAfterIdleTimeout(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	s := &http3.Server{Addr: "127.0.0.1:0", Router: r, IdleTimeout: 300 * time.Millisecond, ShutdownGrace: 2 * time.Second}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+		return
+	}
+	stopH3TimeoutServer(t, s)
+	addr := s.BoundTCPAddrForTest()
+	if addr == "" {
+		t.Fatal("the started server bound no TCP address")
+		return
+	}
+	conn, derr := net.DialTimeout("tcp", addr, 5*time.Second)
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			return
+		}
+	}()
+	if _, werr := fmt.Fprintf(conn, "GET /hello HTTP/1.1\r\nHost: %s\r\n\r\n", addr); werr != nil {
+		t.Fatalf("write request: %v", werr)
+		return
+	}
+	if derr := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); derr != nil {
+		t.Fatalf("set read deadline: %v", derr)
+		return
+	}
+	bufr := bufio.NewReader(conn)
+	res, rerr := http.ReadResponse(bufr, &http.Request{Method: "GET"})
+	if rerr != nil {
+		t.Fatalf("read response: %v", rerr)
+		return
+	}
+	body, berr := io.ReadAll(res.Body)
+	if cerr := res.Body.Close(); cerr != nil {
+		t.Errorf("close response body: %v", cerr)
+	}
+	if berr != nil || !strings.Contains(string(body), "hi") {
+		t.Fatalf("first answer body = %q, %v", body, berr)
+		return
+	}
+	start := time.Now()
+	if _, rerr = bufr.ReadByte(); rerr == nil {
+		t.Fatal("idle connection received a byte instead of a close")
+		return
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("idle connection stayed open %v past the 300ms idle timeout", elapsed)
+		return
+	}
+}
+
+func TestH3QUICClosesConnectionWithoutSettings(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	conn, derr := quic.DialAddr(ctx, udpAddr, &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}}, &quic.Config{})
+	if derr != nil {
+		t.Fatalf("quic dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.CloseWithError(0, ""); cerr != nil {
+			return
+		}
+	}()
+	select {
+	case <-conn.HandshakeComplete():
+	case <-conn.Context().Done():
+		t.Fatalf("QUIC connection closed before the handshake finished: %v", context.Cause(conn.Context()))
+		return
+	case <-ctx.Done():
+		t.Fatalf("QUIC handshake did not finish: %v", ctx.Err())
+		return
+	}
+	select {
+	case <-conn.Context().Done():
+	case <-ctx.Done():
+		t.Fatal("QUIC connection that sent nothing stayed open past the settings and idle bounds")
+		return
+	}
+}
