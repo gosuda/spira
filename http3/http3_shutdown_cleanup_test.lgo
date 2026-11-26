@@ -35,8 +35,34 @@ func (p *heldClosedPacketReader) ReadFrom(buffer []byte) (int, net.Addr, error) 
 
 func stopWithPacketReaderHeld(ctx context.Context, p *deadlineProbe, packet *heldClosedPacketReader, endFetch context.CancelFunc) error {
 	defer packet.release()
-	if err := stopCallerDeadlineAndRebind(ctx, p, endFetch); err != nil {
-		return err
+	defer endFetch()
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		return fmt.Errorf("http3: wait for caller-deadline request: %w", err)
+	}
+	addr := p.srv.BoundUDPAddrForTest()
+	stopCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := p.srv.Stop(stopCtx)
+	elapsed := time.Since(started)
+	if err == nil {
+		return errors.New("http3: Stop past the caller deadline reported success")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("http3: Stop did not retain the caller deadline: %w", err)
+	}
+	if elapsed > 1500*time.Millisecond {
+		return fmt.Errorf("http3: Stop blocked %v past the 300ms caller deadline", elapsed)
+	}
+	if errors.Is(err, http3.ErrH3Shutdown) {
+		return fmt.Errorf("http3: caller cancellation included unfinished shutdown fault: %w", err)
+	}
+	rebound, berr := net.ListenPacket("udp", addr)
+	if berr != nil {
+		return fmt.Errorf("http3: UDP port %s stayed bound after caller-deadline Stop: %w", addr, berr)
+	}
+	if cerr := rebound.Close(); cerr != nil {
+		return fmt.Errorf("http3: close rebound UDP port: %w", cerr)
 	}
 	if err := waitH3Entered(ctx, packet.entered); err != nil {
 		return fmt.Errorf("http3: UDP reader did not observe socket closure: %w", err)
