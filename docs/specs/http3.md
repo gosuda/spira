@@ -2,7 +2,7 @@
 
 `http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-`H3Server` runs over the `github.com/quic-go/quic-go` transport. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
+`H3Server` runs over the `golang.org/x/net/quic` transport in the LoGOs toolchain. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
 
 ## Interface
 
@@ -153,7 +153,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
 - `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
-- `TestH3PublicCapsIncomingUniStreamsAt100` proves that the public listener caps incoming unidirectional streams at 100.
+- `TestH3PublicCapsIncomingUniStreamsAt100` opens 100 peer-visible streams, blocks the 101st, and repeats after three release-and-renew cycles.
 - `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
 - `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
 - `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` releases both sockets and retries a bounded number of times until a transient UDP conflict clears.
