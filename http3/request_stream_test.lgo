@@ -251,6 +251,41 @@ func TestH3RequestStreamOmittedLimitInheritsDefault(t *testing.T) {
 	h3ExpectRequestSendStop(t, pair, 0x100)
 }
 
+func TestH3RequestStreamOmittedLimitInheritsDefaultForTrailers(t *testing.T) {
+	wire := h3StreamTestHeaders(t, h3TestRequestFields())
+	wire = append(wire, h3BodyTestTrailerFrame(t, qpack.HeaderField{Name: "x-note", Value: "arrived"})...)
+	pair, err := openH3RequestStreamPair(t, wire)
+	if err != nil {
+		t.Fatalf("open QUIC request: %v", err)
+		return
+	}
+	if pair == nil {
+		t.Fatal("missing QUIC request stream pair")
+		return
+	}
+	if err := pair.clientSide.Close(); err != nil {
+		t.Fatal(err)
+		return
+	}
+	reached := false
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		if _, err := io.ReadAll(r.Body); err != nil || r.Trailer.Get("X-Note") != "arrived" {
+			t.Errorf("read trailers = %v (%v)", r.Trailer, err)
+		}
+		w.Header()["Date"] = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
+	http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler})
+	if !reached {
+		t.Fatal("valid trailers did not reach the handler with an omitted field-section limit")
+		return
+	}
+	response := h3StreamTestResponse(t, pair.clientSide)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	h3ExpectNoResponseFrames(t, response)
+}
+
 func TestH3RequestStreamBodyCloseKeepsResponse(t *testing.T) {
 	wire := append(h3StreamTestHeaders(t, h3TestRequestFields()), "\x00\x01x"...)
 	pair, err := openH3RequestStreamPair(t, wire)
