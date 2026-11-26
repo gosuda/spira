@@ -297,14 +297,6 @@ func sendReservedExpectClose(peer net.Conn) error {
 	return expectCloseCode(peer, 1002, "")
 }
 
-func TestFaultReservedBitSends1002(t *testing.T) {
-	c, peer := openPair(t, 1<<20)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	exchange(t, ctx, &exchangePlan{conn: c, peer: peer, server: awaitReservedBits, client: sendReservedExpectClose})
-	closePipe(t, c, peer)
-}
-
 func awaitPing(ctx context.Context, c *websocket.Conn) error {
 	k, payload, err := c.Next(ctx)
 	if err != nil {

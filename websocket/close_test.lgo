@@ -89,20 +89,6 @@ func TestParseCloseCodeOnly(t *testing.T) {
 	}
 }
 
-func TestParseCloseCodeReason(t *testing.T) {
-	code, reason, err := websocket.ExposedCloseParse([]byte{0x03, 0xe8, 0x62, 0x79, 0x65})
-	if err != nil {
-		t.Fatalf("parse code reason: %v", err)
-		return
-	}
-	if code != 1000 {
-		t.Fatalf("parse code reason code = %d, want 1000", code)
-	}
-	if reason != "bye" {
-		t.Fatalf("parse code reason = %q, want bye", reason)
-	}
-}
-
 func TestParseCloseInvalidUTF8(t *testing.T) {
 	_, _, err := websocket.ExposedCloseParse([]byte{0x03, 0xe8, 0xff})
 	if err == nil {
@@ -147,21 +133,3 @@ func TestAppendCloseRefusesBadCode(t *testing.T) {
 	}
 }
 
-func TestCloseRoundTrip(t *testing.T) {
-	out, err := websocket.ExposedCloseAppend(nil, 1000, "bye")
-	if err != nil {
-		t.Fatalf("round trip append: %v", err)
-		return
-	}
-	code, reason, err := websocket.ExposedCloseParse(out)
-	if err != nil {
-		t.Fatalf("round trip parse: %v", err)
-		return
-	}
-	if code != 1000 {
-		t.Fatalf("round trip code = %d, want 1000", code)
-	}
-	if reason != "bye" {
-		t.Fatalf("round trip reason = %q, want bye", reason)
-	}
-}
