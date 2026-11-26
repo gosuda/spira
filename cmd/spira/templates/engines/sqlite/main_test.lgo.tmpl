@@ -157,3 +157,35 @@ func TestLoginLookupFailureCarriesAccountFault(t *testing.T) {
 		return
 	}
 }
+
+func TestLoginSurvivesFailedSessionSweep(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	withMigratedPool(t, ctx, "file:sweep-login?mode=memory&cache=shared", func(pool *db.Pool) {
+		hash, err := auth.HashPassword("secret")
+		if err != nil {
+			t.Fatalf("hash: %v", err)
+			return
+		}
+		if _, err := store.CreateUser(ctx, pool, "demo", hash); err != nil {
+			t.Fatalf("create user: %v", err)
+			return
+		}
+		if _, err := pool.ExecContext(ctx, `CREATE TRIGGER refuse_sweep BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'sweep refused'); END;`); err != nil {
+			t.Fatalf("plant sweep failure: %v", err)
+			return
+		}
+		r := web.NewRouter()
+		sessions := &auth.Sessions{Store: &account.DBStore{DB: pool}}
+		(&account.Account{DB: pool, Sessions: sessions}).Mount(r)
+		form := url.Values{"username": []string{"demo"}, "password": []string{"secret"}}
+		req := httptest.NewRequest(http.MethodPost, "/account/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("status %d want 303 body %s", rec.Code, rec.Body.String())
+			return
+		}
+	})
+}

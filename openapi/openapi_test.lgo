@@ -566,3 +566,30 @@ func TestCollapsedWildcardKeepsTheMuxServedOperation(t *testing.T) {
 		}
 	}
 }
+
+func TestDocEndpointStaysHiddenAfterReDescribe(t *testing.T) {
+	r := web.NewRouter()
+	openapi.Mount(r, fixtureInfo())
+	r.Describe("GET", "/openapi.json", web.Doc{Summary: "Custom API reference"})
+	doc := openapi.Document(r, fixtureInfo())
+	if _, bad := doc.Paths["/openapi.json"]; bad {
+		t.Fatal("document lists its own endpoint after the summary changed")
+	}
+}
+
+func TestDocEndpointExclusionIgnoresSummaryText(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/manual", func(ctx *web.Context) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	r.Describe("GET", "/manual", web.Doc{Summary: "Serves this router's OpenAPI 3.1 document"})
+	openapi.Mount(r, fixtureInfo())
+	doc := openapi.Document(r, fixtureInfo())
+	if _, bad := doc.Paths["/openapi.json"]; bad {
+		t.Fatal("document lists its own endpoint")
+	}
+	item := doc.Paths["/manual"] ?? openapi.PathItem{}
+	if item.Get == nil {
+		t.Fatal("document drops the route that reused the mount summary")
+	}
+}

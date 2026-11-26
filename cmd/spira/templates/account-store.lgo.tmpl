@@ -32,7 +32,9 @@ func (s *DBStore) Save(ctx context.Context, id string, p auth.Principal, ttl tim
 	if err := store.SaveSession(ctx, s.DB, args); err != nil {
 		return ErrAccountFailed.Wrap(fmt.Errorf("account: save session: %w", err))
 	}
-	return s.DeleteExpired(ctx)
+	if err := s.DeleteExpired(ctx); err != nil {
+	}
+	return nil
 }
 
 func (s *DBStore) DeleteExpired(ctx context.Context) error {

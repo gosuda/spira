@@ -150,7 +150,7 @@ SQL Server:
 - For each PostgreSQL enum, the plugin MUST emit a named string type, its constants, and `Valid() bool`.
 - For each table with `key`, the plugin MUST emit `var <Type>Table = orm.Table[<Type>, <key_type>]` with `Name`, `Key` and `Version`.
 - The plugin MUST emit `func PrepareAll(ctx context.Context, p *db.Pool) error`.
-- `PrepareAll` MUST loop over every generated statement in query order.
+- `PrepareAll` MUST prepare every generated statement through one shared query table, looping in query order.
 - `PrepareAll` MUST return the first failure as `PrepareAll: <name>: <cause>`, wrapping the engine error with `%w`.
 - The wrapped error MUST satisfy `errors.Is` and `errors.As` to the `db` prepare error.
 - Every emitted call MUST pass a query constant and bound arguments.
@@ -230,8 +230,8 @@ SQL Server:
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
 - `TestSQLcSQLiteIntegration` builds the plugin with `logos build`, generates the store from `testdata/runtime_sqlite`, and runs the application with `logos run`.
-- The application calls `store.PrepareAll` on an empty schema and requires the error to satisfy `errors.Is` to `db.ErrStatementFailed` and to name `GetItem`.
 - `sqlc generate` MUST reject a query that selects a column the migrations do not create.
+- The application calls `store.PrepareAll` on an empty schema and requires the error to satisfy `errors.Is` to `db.ErrStatementFailed` and to name `GetItem`.
 - The raw-query rule is proved on a scratch copy with a planted call and on the clean tree.
 - The shop lane adds `sql-check` to `gate` after it publishes `example/shop/sqlc.yaml`.
 - The end-to-end proof that runs generated functions against `database/sql` is not in this package.

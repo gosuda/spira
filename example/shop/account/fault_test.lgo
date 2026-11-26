@@ -28,3 +28,7 @@ func TestAccountFailedStaysClientSafe(t *testing.T) {
 		return
 	}
 }
+
+func TestAccountFaultsMatchSpecTable(t *testing.T) {
+	faulttest.CheckTable(t, "../../../docs/specs/example-shop.md", account.Faults())
+}

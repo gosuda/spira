@@ -97,3 +97,19 @@ func (r *Router) Describe(method string, pattern string, doc Doc) {
 		panic($"web: describe {method} {pattern}: no such route")
 	}
 }
+
+func (r *Router) Hide(method string, pattern string) {
+	full := fullPattern(r.prefix, pattern)
+	found := false
+	r.routes.items.WithLock(func(list *[]RouteInfo) {
+		for i := range *list {
+			if (*list)[i].Method == method && (*list)[i].Pattern == full {
+				(*list)[i].Hidden = true
+				found = true
+			}
+		}
+	})
+	if !found {
+		panic($"web: hide {method} {pattern}: no such route")
+	}
+}

@@ -23,6 +23,7 @@ type RouteInfo struct {
 	Pattern string
 	In      schema.Schema
 	Doc     Doc?
+	Hidden  bool
 }
 
 type routeList struct {

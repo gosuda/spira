@@ -263,10 +263,11 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 
 ### Extended CONNECT (RFC 8441 sections 3, 4, 5)
 
-- The `:scheme`, `:path` and `:authority` checks stay with the HTTP/2 server: it resets a malformed stream with `PROTOCOL_ERROR` before the handler runs. The server sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` only when the process runs with `GODEBUG=http2xconnect=1`, the one opt-in the toolchain offers.
+- The `:scheme`, `:path` and `:authority` checks stay with the HTTP/2 server: it resets a malformed stream with `PROTOCOL_ERROR` before the handler runs. The server sends `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` when the standard library enables it: with `GODEBUG=http2xconnect=1` for its own servers, or per `web.Server` with `HTTP2ExtendedConnect` set on a TLS or `H2C` listener. A test server that does not advertise the setting answers no extended CONNECT.
 - `ServeStream` MUST require the CONNECT method and HTTP/2, else answer 405 and 400.
 - `ServeStream` MUST require `:protocol` `websocket`, else answer 501. A CONNECT without `:protocol` is a tunnel the package does not proxy, and answers 501 too.
 - `ServeStream` MUST require exactly one non-blank `Sec-WebSocket-Version` value of `13`, else answer 400.
+- `ServeStream` MUST reject a malformed or repeated `Sec-WebSocket-Protocol` offer with 400 before the session runs.
 - `ServeStream` MUST NOT process `Sec-WebSocket-Key` and MUST send no `Sec-WebSocket-Accept`, as RFC 8441 section 5 replaces them with `:protocol`.
 - `ServeStream` MUST apply the same origin check and size limit as `Upgrade`: a foreign origin answers 403 with `ErrForbiddenOrigin`.
 - `ServeStream` MUST pick the subprotocol with `pickSubprotocol` and answer it in `Sec-WebSocket-Protocol`.
@@ -433,7 +434,7 @@ Each detection site wraps its unexported cause in the declared fault for that cl
 - `BenchmarkFrameEcho1KiB` reports allocations per 1 KiB echo over the frame codec.
 - `TestStreamEchoOverTLS` proves that an HTTP/2 client with `:protocol` `websocket` gets 200, the picked subprotocol and its text message back.
 - `TestStreamCloseRoundTrip` proves that a peer close over the stream is echoed once and the handler then ends.
-- `TestStreamRejectsBadHandshakes` proves that a foreign or missing `:protocol` answers 501, a missing or wrong version answers 400, a foreign origin answers 403 and a wrong method answers 405, each with its fault.
+- `TestStreamRejectsBadHandshakes` proves that a foreign or missing `:protocol` answers 501, a missing or wrong version answers 400, a malformed or repeated subprotocol offer answers 400, a foreign origin answers 403 and a wrong method answers 405, each with its fault.
 - `TestStreamRefusesHTTP1Connect` proves that a CONNECT over HTTP/1.1 answers 400.
 - `BenchmarkLoopbackEcho1KiB` reports allocations and latency percentiles per 1 KiB text echo over loopback TCP.
 - `BenchmarkWebSocketEcho1KiBInMemory` reports allocations per message and the p50, p95, p99 and max latency of a 1 KiB binary echo through `ServeHijacked` over `net.Pipe`. Run it with `-benchtime=256x`; another iteration count above 1 skips it.
