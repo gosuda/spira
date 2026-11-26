@@ -23,7 +23,7 @@ type StaleError struct {
 }
 
 func (e *StaleError) Error() string {
-	return fmt.Sprintf("orm: stale row in %s with key %s", e.Table, e.Key)
+	return fmt.Sprintf("orm: stale row in %s", e.Table)
 }
 
 type trackedRow interface {
