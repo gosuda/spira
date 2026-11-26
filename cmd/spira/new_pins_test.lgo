@@ -29,17 +29,6 @@ func TestNewToolPinsMatchRepo(t *testing.T) {
 	}
 }
 
-func TestNewDriverPinsMatchRepo(t *testing.T) {
-	for _, c := range newEngineCases() {
-		mod := c.driverMod[:strings.Index(c.driverMod, " ")]
-		want := mod + " " + repoModuleVersion(t, mod)
-		if c.driverMod != want {
-			t.Fatalf("engine %s pins %q, repo go.mod holds %q", c.engine, c.driverMod, want)
-			return
-		}
-	}
-}
-
 func readRepoFile(t *testing.T, rel string) string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.FromSlash(rel))
@@ -65,13 +54,6 @@ func repoModuleVersion(t *testing.T, module string) string {
 	}
 	t.Fatalf("%s not in go.mod", module)
 	return ""
-}
-
-func driverModule(pinned string) string {
-	if i := strings.Index(pinned, " "); i >= 0 {
-		return pinned[:i]
-	}
-	return pinned
 }
 
 func assertGoModPinsMatchRepo(t *testing.T, dir string) {

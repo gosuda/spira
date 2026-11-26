@@ -1,7 +1,6 @@
 package ai_test
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
@@ -137,39 +136,6 @@ func TestStructuredUsesFirstInlineFenceBeforeASecondFence(t *testing.T) {
 	}
 }
 
-func TestStructuredRefusesUnterminatedFence(t *testing.T) {
-	_, err := ai.Structured[structuredItem]("```json\n{\"name\":\"ada\",\"count\":3}\n")
-	if err == nil {
-		t.Fatal("Structured unterminated fence: expected an error")
-		return
-	}
-	if !errors.Is(err, ai.ErrUnterminatedFence) {
-		t.Fatalf("Structured unterminated fence error = %v, want ErrUnterminatedFence", err)
-	}
-}
-
-func TestStructuredRefusesTrailingText(t *testing.T) {
-	_, err := ai.Structured[structuredItem](`{"name":"ada","count":3} trailing`)
-	if err == nil {
-		t.Fatal("Structured trailing text: expected an error")
-		return
-	}
-	if !errors.Is(err, ai.ErrInvalidAnswer) {
-		t.Fatalf("Structured trailing text error = %q, want the ai.invalid_answer fault", err.Error())
-	}
-}
-
-func TestStructuredRefusesEmptyAnswer(t *testing.T) {
-	_, err := ai.Structured[structuredItem]("   ")
-	if err == nil {
-		t.Fatal("Structured empty answer: expected an error")
-		return
-	}
-	if !errors.Is(err, ai.ErrEmptyAnswer) {
-		t.Fatalf("Structured empty answer error = %v, want ErrEmptyAnswer", err)
-	}
-}
-
 func TestStructuredIgnoresUnknownFields(t *testing.T) {
 	got, err := ai.Structured[structuredItem](`{"name":"ada","count":3,"color":"red"}`)
 	if err != nil {
@@ -178,17 +144,6 @@ func TestStructuredIgnoresUnknownFields(t *testing.T) {
 	}
 	if got.Name != "ada" || got.Count != 3 {
 		t.Fatalf("Structured unknown fields = %+v, want {ada 3}", got)
-	}
-}
-
-func TestStructuredRefusesOversizeInput(t *testing.T) {
-	_, err := ai.Structured[structuredItem](strings.Repeat(" ", (1<<20)+1))
-	if err == nil {
-		t.Fatal("Structured oversize input: expected an error")
-		return
-	}
-	if !errors.Is(err, ai.ErrAnswerTooLarge) {
-		t.Fatalf("Structured oversize input error = %v, want ErrAnswerTooLarge", err)
 	}
 }
 

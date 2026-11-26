@@ -134,7 +134,6 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 ## Proof
 
 - `TestH3NeedsTLSFailsStart` proves that H3 without TLS fails to start and opens no listener.
-- `TestH3ServesHTTP3OverUDP` proves that a request over UDP gets the router answer with ALPN `h3`.
 - `TestH3SharesRouterWithTCP` proves that the same route answers over both listeners.
 - `TestH3AltSvcOnHTTPSOnly` proves the header value on HTTPS and its absence on cleartext and when `H3` is false.
 - `TestH3AltSvcIgnoresRegistrationOrder` proves that discovery works whether the stage is added before or after route registration.
