@@ -105,12 +105,19 @@ func ClassifyDriverError(d Dialect, cause error) error
 - If `parseTime` there is `true`, `1`, `t` or `T`, `DialectOf` MUST return `MySQL`. `true` matches in any letter case.
 - `DialectOf` MUST return `MSSQL` for the driver name `sqlserver`.
 - `Open` MUST record the dialect that `DialectOf` returns for that driver and DSN.
-- `Open` MUST bound the pool: SQLite 4 open and 2 idle, network engines 10 open and 5 idle, each 30 minute lifetime and 5 minute idle time, unless `PoolOptions` overrides a field with a nonzero value.
+- `Open` MUST bound each pool.
+- SQLite pools MUST allow 4 open connections and 2 idle connections.
+- Network engine pools MUST allow 10 open connections and 5 idle connections.
+- Each pool MUST expire connections after 30 minutes of lifetime.
+- Each pool MUST close connections idle for 5 minutes.
+- Outside in-memory SQLite DSNs, a nonzero `PoolOptions` field MUST override its default.
+- When several `PoolOptions` sets arrive, `Open` MUST take each field from the first set that leaves it nonzero.
+- `Open` MUST disable age and idle eviction for in-memory SQLite DSNs.
+- `Open` MUST retain one idle connection for in-memory SQLite DSNs.
 - `Open` MUST keep a zero `PoolOptions` field on its dialect default.
 - `Pool` MUST implement [app.Part](app.md).
 - `Start` MUST ping the database.
 - `Stop` MUST close each prepared statement before it closes the database handle.
-- `Stop` MUST return when its context ends, even if a statement still runs.
 - After such a return, the close MUST continue and finish when the statement ends.
 - The package MUST NOT import a database driver.
 
@@ -119,6 +126,7 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `InTx` MUST pass the transaction to `work` as the `tx` argument.
 - `InTx` MUST commit when `work` returns a nil error and the caller context is still live.
 - `InTx` MUST check the caller context before commit, roll back when it has ended, and return that context cause without a commit wrap.
+- `InTx` MUST return that context error itself when the rollback succeeds or reports `sql.ErrTxDone`.
 - `InTx` MUST call `Rollback` when `work` returns an error.
 - `InTx` MUST call `Rollback` when `work` panics.
 - `InTx` MUST let that panic continue after `Rollback`.

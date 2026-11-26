@@ -94,25 +94,74 @@ func poolDefaults(d Dialect) PoolOptions {
 	panic("db: unknown dialect for pool defaults")
 }
 
-func resolvePoolOptions(d Dialect, opts []PoolOptions) PoolOptions {
+// firstSetPoolOptions merges every option set: each field comes from the
+// first set that leaves it nonzero, so later sets fill the gaps of the
+// earlier ones instead of being ignored.
+func firstSetPoolOptions(opts []PoolOptions) PoolOptions {
+	merged := PoolOptions{}
+	for _, o := range opts {
+		if merged.MaxOpenConns == 0 {
+			merged.MaxOpenConns = o.MaxOpenConns
+		}
+		if merged.MaxIdleConns == 0 {
+			merged.MaxIdleConns = o.MaxIdleConns
+		}
+		if merged.ConnMaxLifetime == 0 {
+			merged.ConnMaxLifetime = o.ConnMaxLifetime
+		}
+		if merged.ConnMaxIdleTime == 0 {
+			merged.ConnMaxIdleTime = o.ConnMaxIdleTime
+		}
+	}
+	return merged
+}
+
+func resolvePoolOptions(d Dialect, dsn string, opts []PoolOptions) PoolOptions {
 	defaults := poolDefaults(d)
-	if len(opts) == 0 {
-		return defaults
+	merged := firstSetPoolOptions(opts)
+	if merged.MaxOpenConns == 0 {
+		merged.MaxOpenConns = defaults.MaxOpenConns
 	}
-	chosen := opts[0]
-	if chosen.MaxOpenConns == 0 {
-		chosen.MaxOpenConns = defaults.MaxOpenConns
+	if merged.MaxIdleConns == 0 {
+		merged.MaxIdleConns = defaults.MaxIdleConns
 	}
-	if chosen.MaxIdleConns == 0 {
-		chosen.MaxIdleConns = defaults.MaxIdleConns
+	if merged.ConnMaxLifetime == 0 {
+		merged.ConnMaxLifetime = defaults.ConnMaxLifetime
 	}
-	if chosen.ConnMaxLifetime == 0 {
-		chosen.ConnMaxLifetime = defaults.ConnMaxLifetime
+	if merged.ConnMaxIdleTime == 0 {
+		merged.ConnMaxIdleTime = defaults.ConnMaxIdleTime
 	}
-	if chosen.ConnMaxIdleTime == 0 {
-		chosen.ConnMaxIdleTime = defaults.ConnMaxIdleTime
+	if isInMemorySQLite(d, dsn) {
+		merged.ConnMaxLifetime = 0
+		merged.ConnMaxIdleTime = 0
+		if merged.MaxIdleConns < 1 {
+			merged.MaxIdleConns = 1
+		}
 	}
-	return chosen
+	return merged
+}
+
+// isInMemorySQLite reports whether the SQLite DSN names an in-memory
+// database. Closing the last connection to one deletes it, so the pool
+// must never evict its final physical connection.
+func isInMemorySQLite(d Dialect, dsn string) bool {
+	if _, ok := d.(SQLite); !ok {
+		return false
+	}
+	name, query, _ := strings.Cut(dsn, "?")
+	if name == ":memory:" {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(name, "file:"); ok {
+		if path, err := url.PathUnescape(rest); err == nil && path == ":memory:" {
+			return true
+		}
+	}
+	params, err := url.ParseQuery(query)
+	if err != nil {
+		return false
+	}
+	return params.Get("mode") == "memory"
 }
 
 func applyPoolLimits(handle *sql.DB, opts PoolOptions) {
@@ -131,7 +180,7 @@ func Open(driver string, dsn string, opts ...PoolOptions) (*Pool?, error) {
 	if err != nil {
 		return nil, ClassifyDriverError(dialect, fmt.Errorf("db: open %s: %w", driver, err))
 	}
-	applyPoolLimits(handle, resolvePoolOptions(dialect, opts))
+	applyPoolLimits(handle, resolvePoolOptions(dialect, dsn, opts))
 	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}}, nil
 }
 
@@ -494,7 +543,13 @@ func finishTx[T any](ctx context.Context, run *Tx, work func(tx *Tx) (T, error))
 		return zero, workErr
 	}
 	if err := ctx.Err(); err != nil {
-		return zero, errors.Join(err, run.tx.Rollback())
+		// The caller is gone: report the context cause itself. A rollback
+		// the driver already performed surfaces as sql.ErrTxDone and must
+		// not join the cause; only a genuine rollback failure joins it.
+		if rerr := run.tx.Rollback(); rerr != nil && !errors.Is(rerr, sql.ErrTxDone) {
+			return zero, errors.Join(err, rerr)
+		}
+		return zero, err
 	}
 	if err := run.tx.Commit(); err != nil {
 		return zero, ClassifyDriverError(run.pool.dialect, fmt.Errorf("db: commit: %w", err))

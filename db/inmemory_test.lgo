@@ -1,0 +1,109 @@
+package db_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+)
+
+func openRawPool(t *testing.T, dsn string, opts ...db.PoolOptions) *db.Pool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := db.Open("sqlite", dsn, opts...)
+	if err != nil {
+		panic(fmt.Sprintf("db_test: open %s: %v", dsn, err))
+	}
+	if pool == nil {
+		panic("db_test: open left no pool")
+	}
+	if serr := pool.Start(ctx); serr != nil {
+		panic(fmt.Sprintf("db_test: start %s: %v", dsn, serr))
+	}
+	t.Cleanup(func() {
+		if serr := pool.Stop(context.Background()); serr != nil {
+			t.Errorf("stop: %v", serr)
+		}
+	})
+	return pool
+}
+
+func execKeep(t *testing.T, q db.Querier, query string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(t.Context(), q, query, args...); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+}
+func countKeepRows(t *testing.T, ctx context.Context, pool *db.Pool) int {
+	t.Helper()
+	got, err := db.Query[int](ctx, pool, "SELECT COUNT(*) FROM keep")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+		return 0
+	}
+	if len(got) != 1 {
+		t.Fatalf("count rows = %d, want 1", len(got))
+		return 0
+	}
+	return got[0]
+}
+
+// TestInMemorySharedPoolSurvivesExpiry proves that pool expiry never deletes
+// the shop's shared in-memory database: with tiny lifetimes the old code let
+// the last connection close, and the next query found no tables.
+func TestInMemorySharedPoolSurvivesExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openRawPool(t, "file:spira_keep_shared?mode=memory&cache=shared",
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Millisecond, ConnMaxIdleTime: time.Millisecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	time.Sleep(200 * time.Millisecond)
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("rows after expiry = %d, want 1: expiry deleted the in-memory database", n)
+	}
+}
+
+// TestInMemoryPlainPoolSurvivesExpiry covers the plain :memory: DSN form with
+// the same guarantee: no eviction may close its only connection.
+func TestInMemoryPlainPoolSurvivesExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openRawPool(t, ":memory:",
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Millisecond, ConnMaxIdleTime: time.Millisecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	time.Sleep(200 * time.Millisecond)
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("rows after expiry = %d, want 1: expiry deleted the in-memory database", n)
+	}
+}
+
+// TestFilePoolNeverDeletesDatabase locks the security property for
+// file-backed shop databases: expiry must neither delete nor replace the
+// underlying file, and its rows must survive.
+func TestFilePoolNeverDeletesDatabase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "shop.db")
+	pool := openRawPool(t, path,
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Millisecond, ConnMaxIdleTime: time.Millisecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	time.Sleep(200 * time.Millisecond)
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("rows after expiry = %d, want 1", n)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("database file missing after expiry: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("database file is empty after expiry")
+	}
+}

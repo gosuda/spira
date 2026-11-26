@@ -1,6 +1,8 @@
 package db_test
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,27 +17,79 @@ func TestOpenSetsPoolLimits(t *testing.T) {
 	}
 }
 
-func TestOpenHonorsCustomPoolOptions(t *testing.T) {
-	key := txPoolKey(t)
-	dsn := "file:spira_custom_" + key + "?mode=memory&cache=shared"
-	pool, err := db.Open("sqlite", dsn, db.PoolOptions{MaxOpenConns: 2, MaxIdleConns: 1, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: 30 * time.Second})
+func openSplitPool(t *testing.T, name string, first db.PoolOptions, second db.PoolOptions) *db.Pool {
+	t.Helper()
+	// A file-backed database: explicit timeouts apply here, while the
+	// in-memory policy would disable eviction to protect the database.
+	path := filepath.Join(t.TempDir(), name)
+	pool, err := db.Open("sqlite", path, first, second)
 	if err != nil {
-		t.Fatalf("Open with options: %v", err)
-		return
+		panic("db_test: open with options failed")
 	}
 	if pool == nil {
-		t.Fatal("Open with options returned no pool")
-		return
+		panic("db_test: open with options left no pool")
 	}
 	t.Cleanup(func() {
-		ctx, cancel := txTimeout()
-		defer cancel()
-		if err := pool.Stop(ctx); err != nil {
-			t.Errorf("Stop: %v", err)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if serr := pool.Stop(stopCtx); serr != nil {
+			t.Errorf("Stop: %v", serr)
 		}
 	})
-	stats := pool.Stats()
-	if stats.MaxOpenConnections != 2 {
+	if serr := pool.Start(t.Context()); serr != nil {
+		panic("db_test: start with options failed")
+	}
+	return pool
+}
+
+func TestOpenHonorsCustomPoolOptions(t *testing.T) {
+	ctx, cancel := txTimeout()
+	defer cancel()
+	pool := openSplitPool(t, "custom.db",
+		db.PoolOptions{MaxOpenConns: 2},
+		db.PoolOptions{MaxIdleConns: 1, ConnMaxLifetime: time.Hour, ConnMaxIdleTime: time.Hour},
+	)
+	if stats := pool.Stats(); stats.MaxOpenConnections != 2 {
 		t.Fatalf("MaxOpenConnections = %d, want 2", stats.MaxOpenConnections)
+	}
+	assertSecondSetIdleCap(t, ctx, pool)
+}
+
+func assertSecondSetIdleCap(t *testing.T, ctx context.Context, pool *db.Pool) {
+	t.Helper()
+	// The idle cap comes from the second set: two held connections must
+	// release down to one idle connection.
+	rows1, err := pool.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("first hold: %v", err)
+		return
+	}
+	rows2, err := pool.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		closeRows(t, rows1)
+		t.Fatalf("second hold: %v", err)
+		return
+	}
+	closeRows(t, rows1)
+	closeRows(t, rows2)
+	if idle := pool.Stats().Idle; idle != 1 {
+		t.Fatalf("Idle = %d, want 1: the second option set was ignored", idle)
+	}
+	if closed := pool.Stats().MaxIdleClosed; closed < 1 {
+		t.Fatalf("MaxIdleClosed = %d, want at least 1", closed)
+	}
+}
+
+func TestOpenHonorsTimeoutOptions(t *testing.T) {
+	pool := openSplitPool(t, "timeouts.db",
+		db.PoolOptions{MaxOpenConns: 2},
+		db.PoolOptions{ConnMaxLifetime: time.Nanosecond, ConnMaxIdleTime: time.Nanosecond},
+	)
+	// Nanosecond timeouts from the second set must evict the connection
+	// on the next checkout: every close counts against the lifetime.
+	execKeep(t, pool, "CREATE TABLE t (n integer not null)")
+	execKeep(t, pool, "INSERT INTO t (n) VALUES (1)")
+	if evicted := pool.Stats().MaxLifetimeClosed; evicted < 1 {
+		t.Fatalf("MaxLifetimeClosed = %d, want at least 1: the second option set was ignored", evicted)
 	}
 }
