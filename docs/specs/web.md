@@ -62,6 +62,7 @@ type RouteInfo struct {
 	Pattern string
 	In      schema.Schema
 	Doc     Doc?
+	Hidden  bool
 }
 
 type Router struct {
@@ -91,6 +92,7 @@ type Response struct {
 func Route[In any](r *Router, method string, pattern string, h func(ctx *Context, in In) (Reply, error))
 func Bind[In any](ctx *Context) (In, error)
 func (r *Router) Describe(method string, pattern string, doc Doc)
+func (r *Router) Hide(method string, pattern string)
 func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler)
 func WebSocket(r *Router, pattern string, cfg websocket.Config, serve func(ctx context.Context, c *websocket.Conn) error)
 
@@ -331,6 +333,9 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Describe` MUST attach the `Doc` to the named route.
 - `Describe` MUST resolve the pattern against the calling router's group prefix.
 - `Describe` MUST panic when the route is unknown.
+- `Hide` MUST mark the named route hidden.
+- `Hide` MUST resolve the pattern against the calling router's group prefix.
+- `Hide` MUST panic when the route is unknown.
 - A field failure message MUST name only the field and the rule.
 - An unknown JSON member MUST fail with rule `unknown`.
 
@@ -479,6 +484,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `web: bind <name> is not a known field` with rule `unknown` and the member name as the field.
 - `web: bind needs a struct input` when `In` is not a struct.
 - `web: describe <method> <pattern>: no such route` panics when `Describe` names no route.
+- `web: hide <method> <pattern>: no such route` panics when `Hide` names no route.
 
 ## Proof
 
@@ -568,6 +574,8 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestRoutesReturnsACopy` proves that mutating one call leaves the next call unchanged.
 - `TestDescribeUnknownRoutePanics` proves the unknown-route panic.
 - `TestDescribeInsideAGroupAttachesTheDoc` proves that `Describe` in a group finds the prefixed route.
+- `TestHideMarksRouteHidden` proves that `Hide` marks plain and grouped routes hidden.
+- `TestHideUnknownRoutePanics` proves the unknown-route panic.
 - `TestRoutesDeepCopiesDocReturns` proves that mutating a returned `Doc` leaves the next call unchanged.
 - `TestWebFaultsMatchSpecCodeTable` proves the declared set equals the code table.
 - `TestFaultKindMapsToStatusAndCode` proves one status and public code per kind.

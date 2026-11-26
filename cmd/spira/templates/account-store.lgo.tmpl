@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,9 @@ func (s *DBStore) Save(ctx context.Context, id string, p auth.Principal, ttl tim
 		return ErrAccountFailed.Wrap(fmt.Errorf("account: save session: %w", err))
 	}
 	if err := s.DeleteExpired(ctx); err != nil {
+		// Login still succeeds: the sweep is best effort, but a
+		// lasting failure must reach the operator log.
+		slog.ErrorContext(ctx, "account: sweep expired sessions", "err", err)
 	}
 	return nil
 }

@@ -158,9 +158,44 @@ func TestLoginLookupFailureCarriesAccountFault(t *testing.T) {
 	}
 }
 
+// seedExpiredSessions inserts two expired sessions so the sweep DELETE
+// matches rows and a planted failure actually fires. Without seeded
+// rows the delete matches nothing and the test passes even if login
+// propagates sweep errors.
+func seedExpiredSessions(t *testing.T, ctx context.Context, pool *db.Pool, name string) {
+	t.Helper()
+	found, err := store.GetUserByName(ctx, pool, name)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+		return
+	}
+	if found == nil {
+		t.Fatal("seed left no user")
+		return
+	}
+	seed := found ?? store.User{}
+	for _, id := range []string{"expired-seed-a", "expired-seed-b"} {
+		if err := store.SaveSession(ctx, pool, store.SaveSessionArgs{
+			IDHash:    store.SessionID(id),
+			UserID:    seed.ID,
+			Roles:     "",
+			ExpiresAt: time.Now().Add(-time.Hour),
+		}); err != nil {
+			t.Fatalf("seed expired session: %v", err)
+			return
+		}
+	}
+}
+
 func TestLoginSurvivesFailedSessionSweep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// The sweep failure must reach the operator log even though login
+	// still succeeds.
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{})))
+	defer slog.SetDefault(prev)
 	withMigratedPool(t, ctx, "file:sweep-login?mode=memory&cache=shared", func(pool *db.Pool) {
 		hash, err := auth.HashPassword("secret")
 		if err != nil {
@@ -171,6 +206,7 @@ func TestLoginSurvivesFailedSessionSweep(t *testing.T) {
 			t.Fatalf("create user: %v", err)
 			return
 		}
+		seedExpiredSessions(t, ctx, pool, "demo")
 		if _, err := pool.ExecContext(ctx, `CREATE TRIGGER refuse_sweep BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'sweep refused'); END;`); err != nil {
 			t.Fatalf("plant sweep failure: %v", err)
 			return
@@ -186,6 +222,9 @@ func TestLoginSurvivesFailedSessionSweep(t *testing.T) {
 		if rec.Code != http.StatusSeeOther {
 			t.Fatalf("status %d want 303 body %s", rec.Code, rec.Body.String())
 			return
+		}
+		if !strings.Contains(buf.String(), "sweep expired sessions") {
+			t.Fatalf("operator log %q lacks the sweep failure: the delete never fired", buf.String())
 		}
 	})
 }
