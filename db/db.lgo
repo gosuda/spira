@@ -76,7 +76,53 @@ func parseTimeOn(value string) bool {
 	return strings.EqualFold(value, "true") || value == "1" || value == "t" || value == "T"
 }
 
-func Open(driver string, dsn string) (*Pool?, error) {
+type PoolOptions struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+}
+
+func poolDefaults(d Dialect) PoolOptions {
+	switch d.(type) {
+	case SQLite:
+		return PoolOptions{MaxOpenConns: 4, MaxIdleConns: 2, ConnMaxLifetime: 30 * time.Minute, ConnMaxIdleTime: 5 * time.Minute}
+	case Postgres, MySQL, MSSQL:
+		return PoolOptions{MaxOpenConns: 10, MaxIdleConns: 5, ConnMaxLifetime: 30 * time.Minute, ConnMaxIdleTime: 5 * time.Minute}
+	case nil:
+	}
+	panic("db: unknown dialect for pool defaults")
+}
+
+func resolvePoolOptions(d Dialect, opts []PoolOptions) PoolOptions {
+	defaults := poolDefaults(d)
+	if len(opts) == 0 {
+		return defaults
+	}
+	chosen := opts[0]
+	if chosen.MaxOpenConns == 0 {
+		chosen.MaxOpenConns = defaults.MaxOpenConns
+	}
+	if chosen.MaxIdleConns == 0 {
+		chosen.MaxIdleConns = defaults.MaxIdleConns
+	}
+	if chosen.ConnMaxLifetime == 0 {
+		chosen.ConnMaxLifetime = defaults.ConnMaxLifetime
+	}
+	if chosen.ConnMaxIdleTime == 0 {
+		chosen.ConnMaxIdleTime = defaults.ConnMaxIdleTime
+	}
+	return chosen
+}
+
+func applyPoolLimits(handle *sql.DB, opts PoolOptions) {
+	handle.SetMaxOpenConns(opts.MaxOpenConns)
+	handle.SetMaxIdleConns(opts.MaxIdleConns)
+	handle.SetConnMaxLifetime(opts.ConnMaxLifetime)
+	handle.SetConnMaxIdleTime(opts.ConnMaxIdleTime)
+}
+
+func Open(driver string, dsn string, opts ...PoolOptions) (*Pool?, error) {
 	dialect, err := DialectOf(driver, dsn)
 	if err != nil {
 		return nil, err
@@ -85,14 +131,15 @@ func Open(driver string, dsn string) (*Pool?, error) {
 	if err != nil {
 		return nil, ClassifyDriverError(dialect, fmt.Errorf("db: open %s: %w", driver, err))
 	}
+	applyPoolLimits(handle, resolvePoolOptions(dialect, opts))
 	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}}, nil
 }
 
 // OpenSQLiteImmediate opens a SQLite pool whose writable transactions begin
 // with a writer reservation. Use InSQLiteImmediateTx to require that mode.
-func OpenSQLiteImmediate(dsn string) (*Pool?, error) {
+func OpenSQLiteImmediate(dsn string, opts ...PoolOptions) (*Pool?, error) {
 	configured := sqliteImmediateDSN(dsn)?
-	pool := Open("sqlite", configured)?
+	pool := Open("sqlite", configured, opts...)?
 	if pool == nil {
 		return nil, ErrStatementFailed.Wrap(errors.New("db: SQLite open returned no pool"))
 	}
@@ -164,6 +211,10 @@ func (p *Pool) Dialect() Dialect {
 
 func (p *Pool) Prepared() int {
 	return p.stmts.size()
+}
+
+func (p *Pool) Stats() sql.DBStats {
+	return p.handle.Stats()
 }
 
 func (p *Pool) Prepare(ctx context.Context, query string) error {
@@ -359,7 +410,7 @@ func InTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) (T, error)) (T,
 	if err != nil {
 		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: begin: %w", err))
 	}
-	return finishTx(&Tx{tx: tx, pool: p}, work)
+	return finishTx(ctx, &Tx{tx: tx, pool: p}, work)
 }
 
 // InSQLiteImmediateTx requires a writer reservation before calling work.
@@ -391,7 +442,7 @@ func InSQLiteImmediateTx[T any](ctx context.Context, p *Pool, work func(tx *Tx) 
 	if err != nil {
 		return zero, ClassifyDriverError(p.dialect, fmt.Errorf("db: begin immediate: %w", err))
 	}
-	return finishTx(&Tx{tx: tx, pool: p}, func(run *Tx) (T, error) {
+	return finishTx(ctx, &Tx{tx: tx, pool: p}, func(run *Tx) (T, error) {
 		requireSQLiteRollback(ctx, tx)?
 		return work(run)
 	})
@@ -436,11 +487,14 @@ func closeSQLiteConn(conn *sql.Conn) error {
 	return err
 }
 
-func finishTx[T any](run *Tx, work func(tx *Tx) (T, error)) (T, error) {
+func finishTx[T any](ctx context.Context, run *Tx, work func(tx *Tx) (T, error)) (T, error) {
 	var zero T
 	v, workErr := runTxWork(run, work)
 	if workErr != nil {
 		return zero, workErr
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, errors.Join(err, run.tx.Rollback())
 	}
 	if err := run.tx.Commit(); err != nil {
 		return zero, ClassifyDriverError(run.pool.dialect, fmt.Errorf("db: commit: %w", err))

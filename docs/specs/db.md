@@ -20,7 +20,14 @@ type Dialect interface {
 }
 
 func DialectOf(driver string, dsn string) (Dialect, error)
-func Open(driver string, dsn string) (*Pool?, error)
+func Open(driver string, dsn string, opts ...PoolOptions) (*Pool?, error)
+
+type PoolOptions struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+}
 
 type Pool struct {
 	// unexported fields
@@ -28,6 +35,7 @@ type Pool struct {
 
 func (p *Pool) Dialect() Dialect
 func (p *Pool) Prepared() int
+func (p *Pool) Stats() sql.DBStats
 func (p *Pool) Prepare(ctx context.Context, query string) error
 func (p *Pool) Start(ctx context.Context) error
 func (p *Pool) Stop(ctx context.Context) error
@@ -95,6 +103,8 @@ func ClassifyDriverError(d Dialect, cause error) error
 - If `parseTime` there is `true`, `1`, `t` or `T`, `DialectOf` MUST return `MySQL`. `true` matches in any letter case.
 - `DialectOf` MUST return `MSSQL` for the driver name `sqlserver`.
 - `Open` MUST record the dialect that `DialectOf` returns for that driver and DSN.
+- `Open` MUST bound the pool: SQLite 4 open and 2 idle, network engines 10 open and 5 idle, each 30 minute lifetime and 5 minute idle time, unless `PoolOptions` overrides a field with a nonzero value.
+- `Open` MUST keep a zero `PoolOptions` field on its dialect default.
 - `Pool` MUST implement [app.Part](app.md).
 - `Start` MUST ping the database.
 - `Stop` MUST close each prepared statement before it closes the database handle.
@@ -105,7 +115,8 @@ func ClassifyDriverError(d Dialect, cause error) error
 ### Transactions
 
 - `InTx` MUST pass the transaction to `work` as the `tx` argument.
-- `InTx` MUST commit when `work` returns a nil error.
+- `InTx` MUST commit when `work` returns a nil error and the caller context is still live.
+- `InTx` MUST check the caller context before commit, roll back when it has ended, and return that context cause without a commit wrap.
 - `InTx` MUST call `Rollback` when `work` returns an error.
 - `InTx` MUST call `Rollback` when `work` panics.
 - `InTx` MUST let that panic continue after `Rollback`.
