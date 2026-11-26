@@ -101,7 +101,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - When a client attempts TLS session resumption, the QUIC layer MUST clear the early data flag on the session. The server MUST accept no 0-RTT data and MUST keep no 0-RTT replay window.
 - The QUIC backend MUST issue no session tickets. The server MAY resume with a ticket from another issuer if the TLS configuration accepts it.
-- A restart MUST NOT drop the ability to resume a session established before the restart.
+- A restart MUST NOT drop the ability to resume a session that stays eligible after the restart.
 - The TLS configuration MUST retain a valid ticket key for such a session, or recover its state with `UnwrapSession`.
 - `http3.Server` MUST NOT manage ticket key storage or rotation.
 - `SessionTicketsDisabled` on the effective TLS configuration MUST disable resumption.
@@ -153,6 +153,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestFaultsMatchSpecCodeTable` proves `Faults` matches the code table without duplicates.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
 - `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
+- `TestH3PublicCapsIncomingUniStreamsAt100` proves that the public listener caps incoming unidirectional streams at 100.
 - `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
 - `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
 - `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` releases both sockets and retries a bounded number of times until a transient UDP conflict clears.
