@@ -1054,16 +1054,22 @@ func startCancelProbeStream(t *testing.T, pending chan context.CancelFunc, done 
 			reportStream(r, done, r.Context().Err())
 			return
 		}
-		// Keep reading: the ping below is answered from inside Next,
-		// so the pong proves this test performed a blocking stream
-		// read before the cancel arrives.
-		for {
-			_, _, err = c.Next(ctx)
-			if err != nil {
-				reportStream(r, done, err)
-				return
-			}
+	// Keep reading: the ping below is answered from inside Next, so the
+	// pong proves the loop is alive and reading again. The follow-up
+	// Next proves the cancel landed in a blocking read: only that path
+	// closes the connection, so the follow-up must be ErrClosed. A
+	// cancel that lands between reads returns at the context check
+	// without closing, and the follow-up times out instead.
+	for {
+		_, _, err = c.Next(ctx)
+		if err != nil {
+			break
 		}
+	}
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer probeCancel()
+	_, _, perr := c.Next(probeCtx)
+	reportStream(r, done, errors.Join(err, perr))
 	}))
 }
 
@@ -1088,6 +1094,9 @@ func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 		return
 	}
 	awaitParkedStreamNext(t, h, id)
+	// Let the server park in the next blocking read: re-entry takes
+	// microseconds, so this margin makes the cancel land while blocked.
+	time.Sleep(100 * time.Millisecond)
 	cancel()
 	select {
 	case err := <-done:
@@ -1095,18 +1104,23 @@ func TestStreamCancelUnblocksPendingNext(t *testing.T) {
 			t.Fatal("Next after cancel returned no error")
 			return
 		}
-		if !errors.Is(err, websocket.ErrClosed) && !errors.Is(err, context.Canceled) {
-			t.Fatalf("Next after cancel = %v, want ErrClosed or context canceled", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Next after cancel = %v, want context canceled", err)
+		}
+		if !errors.Is(err, websocket.ErrClosed) {
+			t.Fatalf("Next after cancel = %v, want a closed connection proving the cancel landed in a blocking read", err)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("Next did not return after cancel")
 	}
 }
 
-// awaitParkedStreamNext proves the server is parked in a blocking Next
-// call: the ping is answered from inside that call, so the pong only
-// arrives after the server performed a stream read. Cancelling first
-// would let Next return at its context check without ever blocking.
+// awaitParkedStreamNext proves the server loop is alive: the ping is
+// answered from inside a Next call, so the pong only arrives after the
+// server performed a stream read and looped back for the next one. It
+// cannot prove the next Next is already blocking, so the test also
+// requires ErrClosed from a follow-up Next: only cancellation of a
+// blocking read closes the connection.
 func awaitParkedStreamNext(t *testing.T, h *h2client, id uint32) {
 	t.Helper()
 	h.writeFrame(t, h2frame{ftype: 0x0, flags: 0x0, id: id, payload: wsMasked(0x89, []byte("ping"))})
