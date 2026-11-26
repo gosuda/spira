@@ -205,6 +205,9 @@ func (rl *relay) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp, err := rl.send(req, &rl.hops[(start+i)%len(rl.hops)])
 		if err != nil {
 			cause = err
+			if errors.Is(err, resilience.ErrCircuitOpen) {
+				continue
+			}
 		} else {
 			if r := resp; r != nil {
 				return r, nil
