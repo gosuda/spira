@@ -129,6 +129,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - A UDP listen failure MUST map to `http3.listen_udp` with the address in the cause.
 - An HTTP/3 serve failure MUST map to `http3.h3_serve` with the cause.
 - An HTTP/3 shutdown failure MUST map to `http3.h3_shutdown` with the cause.
+- After HTTP/3 shutdown fails, `Stop` MUST close the backend and join any close error with `http3.h3_shutdown`.
 
 ### Code table
 
@@ -158,9 +159,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
 - `TestH3TCPClosesSlowBodyWithinReadTimeout` proves that a stalled body read fails and its test handler returns before the client deadline.
 - `TestH3TCPClosesIdleConnectionAfterIdleTimeout` proves that the TCP listener closes an idle keep-alive connection within `IdleTimeout`.
-- `TestH3ServeClosesSlowBodyWithinReadTimeout` proves that `Serve` applies `ReadTimeout` to the TCP listener when `H3` is on.
+- `TestH3ServeTimesOutSlowBodyRead` proves that `Serve` applies `ReadTimeout` to the TCP listener when `H3` is on.
 - `TestH3QUICClosesIdleConnectionAfterSettings` observes an idle timeout after sending SETTINGS; it does not identify which endpoint's idle timer fires.
-- `TestH3QUICMissingSettingsReportsProtocolCode` requires the remote `H3_MISSING_SETTINGS` code, excluding transport failures and client timeouts.
+- `TestH3QUICMissingSettingsReportsProtocolCode` requires remote `H3_MISSING_SETTINGS` within five seconds plus one second of observation tolerance.
 - `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
 - `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
 - `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
