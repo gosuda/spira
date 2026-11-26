@@ -92,6 +92,7 @@ func Route[In any](r *Router, method string, pattern string, h func(ctx *Context
 func Bind[In any](ctx *Context) (In, error)
 func (r *Router) Describe(method string, pattern string, doc Doc)
 func (r *Router) MountRoute(method string, pattern string, in schema.Schema, h Handler)
+func WebSocket(r *Router, pattern string, cfg websocket.Config, serve func(ctx context.Context, c *websocket.Conn) error)
 
 type BindCtx struct {
 	Req      *http.Request
@@ -320,7 +321,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `Bind` MUST answer 422 when `Check` returns errors.
 - A missing non-option value MUST fail with rule `required`.
 - An absent option value MUST stay absent with no error.
-- Field types MUST be string, bool, the int kinds, float64, `time.Duration`, named strings and their option forms.
+- Field types MUST be string, bool, the int kinds, `float32`, `float64`, `time.Duration`, named strings and their option forms.
 - `Route` MUST set each top-level `Wire` to the binding-tag key.
 - Each `Source` MUST name its source or stay empty.
 - `Route` MUST list a field that has a binding tag even when its `json` tag is `-`.
@@ -473,7 +474,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - An encode or write failure of a reply is logged once as `web: reply write failed`, and the client gets the internal problem.
 - An error after the response was written is logged as `web: error after the response was written`.
 - `web: bind form cannot be read` when the form does not parse.
-- `web: bind body is larger than the limit` when the body passes `MaxBody`.
+- `web.body_too_large: The request body is too large.` when the body passes `MaxBody`, followed by the limit in bytes.
 - `web: bind body is not valid JSON for this request` when the body does not decode.
 - `web: bind <name> is not a known field` with rule `unknown` and the member name as the field.
 - `web: bind needs a struct input` when `In` is not a struct.
@@ -523,7 +524,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestServerClosesSlowBodyWithinReadTimeout` proves that the server closes a connection whose body stalls beyond `ReadTimeout`.
 - `TestServerClosesIdleConnectionAfterIdleTimeout` proves that the server closes an idle keep-alive connection after `IdleTimeout`.
 - `TestSecondStartOnTakenPortFails` proves the listen error.
-- `TestStartWithoutTLSCertificateFailsAndFreesThePort` proves that a missing certificate fails `Start` before binding and leaves the port free.
+- `TestStartWithoutTLSCertificateFailsBeforeBinding` proves that a missing certificate fails `Start` before binding and leaves the port free.
 - `TestStartWithDynamicCertificateConfigServes` proves that a dynamic certificate config still starts.
 - `TestCloneTLSKeepsTheFloorOnDynamicConfigs` proves the TLS 1.3 floor on `GetConfigForClient` configs.
 - `TestServerServesAfterStartContextCancel` proves that a cancelled start context does not stop the server.
@@ -542,7 +543,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestServerStopReturnsWithinGraceForH2WhenHandlerNeverReturns` proves the grace deadline for an h2 stream.
 - `TestServerStopClosesH2StreamWhenShutdownTimesOut` proves a timed-out shutdown ends an h2 stream context.
 - `TestTrackConnWithoutServerReturnsUntracked` proves `TrackConn` without server state returns the same connection.
-- `TestHTTP2WebSocketEchoAndClose` proves extended CONNECT through a `Server` with `H2C` and `HTTP2ExtendedConnect` enabled.
+- `TestWebSocketEchoOverH2ThroughRouter` proves extended CONNECT through a `Server` with `H2C` and `HTTP2ExtendedConnect` enabled.
 - `TestRouteBindsTypedFields` proves path, query, header, cookie and form binding.
 - `TestBindCollectsEveryFieldError` proves that one 400 lists every bad field.
 - `TestBindRequiredFieldMissing` proves the `required` rule.

@@ -1,7 +1,5 @@
 # orm
 
-Status: specified; the package is not in the tree yet.
-
 Package `orm` tracks entity rows in one transaction. The application loads a row, changes fields, and calls `Flush`.
 
 ## Interface
@@ -18,12 +16,28 @@ type StaleError struct {
 	Key   string
 }
 
+type Session struct {
+	// unexported fields
+}
+
 func InSession[T any](ctx context.Context, p *db.Pool, work func(s *Session) (T, error)) (T, error)
+func InSQLiteImmediateSession[T any](ctx context.Context, p *db.Pool, work func(s *Session) (T, error)) (T, error)
 func Get[E any, K comparable](ctx context.Context, s *Session, t Table[E, K], key K) (*E?, error)
 func Attach[E any, K comparable](s *Session, t Table[E, K], rows []E) []*E
 func Add[E any, K comparable](s *Session, t Table[E, K], e *E)
 func Remove[E any, K comparable](s *Session, t Table[E, K], e *E)
 func Touch[E any, K comparable](s *Session, t Table[E, K], e *E)
+func MapTable[E any, K comparable](s *Session, t Table[E, K]) *MappedTable[E, K]
+func ResolveTable[E any, K comparable](s *Session, t Table[E, K], mapColumns func(*MappedTable[E, K])) *MappedTable[E, K]
+func MapColumn[E any, K comparable, F any](r *MappedTable[E, K], name string, project func(*E) *F)
+type MappedTable[E any, K comparable] struct {
+	// unexported fields
+}
+func (r *MappedTable[E, K]) Get(key K, read func(string) (E?, error)) (*E?, error)
+func (r *MappedTable[E, K]) Attach(source []E) []*E
+func (r *MappedTable[E, K]) Add(entity *E)
+func (r *MappedTable[E, K]) Remove(entity *E)
+func (r *MappedTable[E, K]) Touch(entity *E)
 func (s *Session) Flush(ctx context.Context) error
 func (s *Session) Tx() *db.Tx
 ```

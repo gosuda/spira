@@ -892,31 +892,130 @@ func sliceMarkers(text string) []string {
 }
 
 func (r *resolver) refuseVersionedWrite(q *Query) error {
-	target, ok := writeTarget(q.Text)
-	if !ok {
-		return nil
-	}
-	versioned, ok := r.versions[strings.ToLower(target)]
-	if !ok || versioned.version == "" {
-		return nil
-	}
-	if !strings.Contains(strings.ToUpper(q.Text), strings.ToUpper(versioned.version)) {
-		return fmt.Errorf("sqlc-gen-spira: %s: writes versioned table %s without %s", q.Name, versioned.name, versioned.version)
+	upper := strings.ToUpper(q.Text)
+	for _, target := range writeTargets(upper) {
+		versioned, ok := r.versions[strings.ToLower(target)]
+		if !ok || versioned.version == "" {
+			continue
+		}
+		if !strings.Contains(upper, strings.ToUpper(versioned.version)) {
+			return fmt.Errorf("sqlc-gen-spira: %s: writes versioned table %s without %s", q.Name, versioned.name, versioned.version)
+		}
 	}
 	return nil
 }
 
-func writeTarget(text string) (string, bool) {
-	upper := strings.ToUpper(strings.TrimSpace(text))
-	rest, ok := strings.CutPrefix(upper, "UPDATE ")
-	if ok {
-		return firstWord(rest)
+func writeTargets(upper string) []string {
+	var out []string
+	out = append(out, updateTargets(upper)...)
+	out = append(out, deleteTargets(upper)...)
+	return out
+}
+
+func updateTargets(upper string) []string {
+	var out []string
+	pos := 0
+	for {
+		found := keywordAt(upper, pos, "UPDATE")
+		if found < 0 {
+			return out
+		}
+		rest := skipSpaces(upper[found+len("UPDATE"):])
+		if target, ok := firstWord(rest); ok {
+			out = append(out, target)
+		}
+		pos = found + len("UPDATE")
 	}
-	rest, ok = strings.CutPrefix(upper, "DELETE FROM ")
-	if ok {
-		return firstWord(rest)
+}
+
+func deleteTargets(upper string) []string {
+	var out []string
+	pos := 0
+	for {
+		found := keywordAt(upper, pos, "DELETE")
+		if found < 0 {
+			return out
+		}
+		rest := skipSpaces(upper[found+len("DELETE"):])
+		after, ok := cutWord(rest, "FROM")
+		if !ok {
+			pos = found + len("DELETE")
+			continue
+		}
+		rest = skipSpaces(after)
+		if target, ok := firstWord(rest); ok {
+			out = append(out, target)
+		}
+		pos = found + len("DELETE")
 	}
-	return "", false
+}
+
+func keywordAt(upper string, pos int, word string) int {
+	offset := 0
+	for {
+		search := upper[pos+offset:]
+		idx := strings.Index(search, word)
+		if idx < 0 {
+			return -1
+		}
+		abs := pos + offset + idx
+		if isWordBoundary(upper, abs, len(word)) {
+			return abs
+		}
+		offset += idx + len(word)
+	}
+}
+
+func isWordBoundary(s string, pos int, length int) bool {
+	if pos > 0 && isWordChar(s[pos-1]) {
+		return false
+	}
+	if pos+length < len(s) && isWordChar(s[pos+length]) {
+		return false
+	}
+	return true
+}
+
+func isWordChar(c byte) bool {
+	if c == '_' {
+		return true
+	}
+	if c >= 'A' && c <= 'Z' {
+		return true
+	}
+	if c >= '0' && c <= '9' {
+		return true
+	}
+	return false
+}
+
+func skipSpaces(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		break
+	}
+	if i == 0 {
+		return s
+	}
+	return s[i:]
+}
+
+func cutWord(s string, word string) (string, bool) {
+	if len(s) < len(word) {
+		return "", false
+	}
+	if s[:len(word)] != word {
+		return "", false
+	}
+	if len(s) > len(word) && isWordChar(s[len(word)]) {
+		return "", false
+	}
+	return s[len(word):], true
 }
 
 func firstWord(s string) (string, bool) {

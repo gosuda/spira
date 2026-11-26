@@ -179,7 +179,7 @@ func Mount(r *web.Router, path string, tools []ai.Tool, guard web.Stage)
 
 ## Proof
 
-- `ai/mcp/testdata/` holds the example messages of the `basic/lifecycle`, `basic/transports` and `server/tools` pages.
+- `ai/mcp/testdata/` holds the example messages of the `basic/lifecycle` and `server/tools` pages. The `basic/transports` page holds no example messages, so it has no fixtures; `testdata/SOURCES` records that.
 - `testdata/SOURCES` names each page URL and file.
 - `TestFixtureReplay` reads those fixtures through both transports.
 - Stdio runs over an in-process pipe pair.
