@@ -1,0 +1,41 @@
+package db_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+)
+
+func TestOpenSetsPoolLimits(t *testing.T) {
+	pool := openPool(t)
+	stats := pool.Stats()
+	if stats.MaxOpenConnections != 4 {
+		t.Fatalf("MaxOpenConnections = %d, want 4 for SQLite", stats.MaxOpenConnections)
+	}
+}
+
+func TestOpenHonorsCustomPoolOptions(t *testing.T) {
+	key := txPoolKey(t)
+	dsn := "file:spira_custom_" + key + "?mode=memory&cache=shared"
+	pool, err := db.Open("sqlite", dsn, db.PoolOptions{MaxOpenConns: 2, MaxIdleConns: 1, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("Open with options: %v", err)
+		return
+	}
+	if pool == nil {
+		t.Fatal("Open with options returned no pool")
+		return
+	}
+	t.Cleanup(func() {
+		ctx, cancel := txTimeout()
+		defer cancel()
+		if err := pool.Stop(ctx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	stats := pool.Stats()
+	if stats.MaxOpenConnections != 2 {
+		t.Fatalf("MaxOpenConnections = %d, want 2", stats.MaxOpenConnections)
+	}
+}
