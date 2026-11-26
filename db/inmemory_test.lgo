@@ -26,7 +26,9 @@ func openRawPool(t *testing.T, dsn string, opts ...db.PoolOptions) *db.Pool {
 		panic(fmt.Sprintf("db_test: start %s: %v", dsn, serr))
 	}
 	t.Cleanup(func() {
-		if serr := pool.Stop(context.Background()); serr != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if serr := pool.Stop(stopCtx); serr != nil {
 			t.Errorf("stop: %v", serr)
 		}
 	})
@@ -35,7 +37,9 @@ func openRawPool(t *testing.T, dsn string, opts ...db.PoolOptions) *db.Pool {
 
 func execKeep(t *testing.T, q db.Querier, query string, args ...any) {
 	t.Helper()
-	if _, err := db.Exec(t.Context(), q, query, args...); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := db.Exec(ctx, q, query, args...); err != nil {
 		t.Fatalf("exec: %v", err)
 	}
 }
@@ -51,6 +55,40 @@ func countKeepRows(t *testing.T, ctx context.Context, pool *db.Pool) int {
 		return 0
 	}
 	return got[0]
+}
+
+func TestPlainFilenameMemoryQueryKeepsExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plain.db")
+	pool := openRawPool(t, path+"?mode=memory",
+		db.PoolOptions{ConnMaxLifetime: time.Nanosecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("file-backed rows = %d, want 1", n)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("plain filename did not open a real file: %v", err)
+	}
+	if pool.Stats().MaxLifetimeClosed == 0 {
+		t.Fatal("plain filename query disabled connection expiry")
+	}
+}
+
+func TestMemoryURIFragmentKeepsRows(t *testing.T) {
+	pool := openRawPool(t, "file:spira_keep_fragment?cache=shared&mode=memory#shop",
+		db.PoolOptions{MaxOpenConns: 1, ConnMaxLifetime: time.Nanosecond})
+	execKeep(t, pool, "CREATE TABLE keep (n integer not null)")
+	execKeep(t, pool, "INSERT INTO keep (n) VALUES (1)")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if n := countKeepRows(t, ctx, pool); n != 1 {
+		t.Fatalf("fragmented memory URI lost rows: %d", n)
+	}
+	if pool.Stats().MaxLifetimeClosed != 0 {
+		t.Fatal("fragmented memory URI allowed connection expiry")
+	}
 }
 
 // TestInMemorySharedPoolSurvivesExpiry proves that pool expiry never deletes

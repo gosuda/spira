@@ -148,14 +148,18 @@ func isInMemorySQLite(d Dialect, dsn string) bool {
 	if _, ok := d.(SQLite); !ok {
 		return false
 	}
-	name, query, _ := strings.Cut(dsn, "?")
+	name, _, _ := strings.Cut(dsn, "?")
 	if name == ":memory:" {
 		return true
 	}
-	if rest, ok := strings.CutPrefix(name, "file:"); ok {
-		if path, err := url.PathUnescape(rest); err == nil && path == ":memory:" {
-			return true
-		}
+	uri, ok := strings.CutPrefix(dsn, "file:")
+	if !ok {
+		return false
+	}
+	uri, _, _ = strings.Cut(uri, "#")
+	name, query, _ := strings.Cut(uri, "?")
+	if path, err := url.PathUnescape(name); err == nil && path == ":memory:" {
+		return true
 	}
 	params, err := url.ParseQuery(query)
 	if err != nil {

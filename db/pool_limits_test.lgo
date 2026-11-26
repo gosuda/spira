@@ -36,7 +36,9 @@ func openSplitPool(t *testing.T, name string, first db.PoolOptions, second db.Po
 			t.Errorf("Stop: %v", serr)
 		}
 	})
-	if serr := pool.Start(t.Context()); serr != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if serr := pool.Start(ctx); serr != nil {
 		panic("db_test: start with options failed")
 	}
 	return pool
@@ -91,5 +93,27 @@ func TestOpenHonorsTimeoutOptions(t *testing.T) {
 	execKeep(t, pool, "INSERT INTO t (n) VALUES (1)")
 	if evicted := pool.Stats().MaxLifetimeClosed; evicted < 1 {
 		t.Fatalf("MaxLifetimeClosed = %d, want at least 1: the second option set was ignored", evicted)
+	}
+}
+
+func TestOpenHonorsSecondIdleTimeout(t *testing.T) {
+	pool := openSplitPool(t, "idle-timeout.db",
+		db.PoolOptions{MaxOpenConns: 2},
+		db.PoolOptions{ConnMaxIdleTime: time.Nanosecond},
+	)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for pool.Stats().MaxIdleTimeClosed == 0 {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("second idle timeout was ignored: %+v", pool.Stats())
+			return
+		}
+	}
+	if pool.Stats().MaxLifetimeClosed != 0 {
+		t.Fatal("lifetime expiry masked the idle-timeout assertion")
 	}
 }

@@ -106,18 +106,22 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `DialectOf` MUST return `MSSQL` for the driver name `sqlserver`.
 - `Open` MUST record the dialect that `DialectOf` returns for that driver and DSN.
 - `Open` MUST bound each pool.
-- SQLite pools MUST allow 4 open connections and 2 idle connections.
-- Network engine pools MUST allow 10 open connections and 5 idle connections.
-- Each pool MUST expire connections after 30 minutes of lifetime.
-- Each pool MUST close connections idle for 5 minutes.
+- By default, SQLite pools MUST allow 4 open connections and 2 idle connections.
+- By default, network engine pools MUST allow 10 open connections and 5 idle connections.
+- File-backed and network pools MUST default to 30-minute lifetime expiry and 5-minute idle expiry.
 - Outside in-memory SQLite DSNs, a nonzero `PoolOptions` field MUST override its default.
 - When several `PoolOptions` sets arrive, `Open` MUST take each field from the first set that leaves it nonzero.
 - `Open` MUST disable age and idle eviction for in-memory SQLite DSNs.
-- `Open` MUST retain one idle connection for in-memory SQLite DSNs.
+- An in-memory SQLite pool MUST preserve its resolved open-connection limit.
+- An in-memory SQLite pool MUST raise a resolved idle-connection limit below one to one.
+- It MUST preserve larger resolved idle-connection limits, including explicit values.
+- Only `file:` URI query parameters MUST affect SQLite memory classification.
+- SQLite URI fragments MUST NOT affect memory classification.
 - `Open` MUST keep a zero `PoolOptions` field on its dialect default.
 - `Pool` MUST implement [app.Part](app.md).
 - `Start` MUST ping the database.
 - `Stop` MUST close each prepared statement before it closes the database handle.
+- `Stop` MUST return when the caller deadline expires, even while a statement remains active.
 - After such a return, the close MUST continue and finish when the statement ends.
 - The package MUST NOT import a database driver.
 
@@ -232,6 +236,10 @@ func ClassifyDriverError(d Dialect, cause error) error
 - Public views MUST NOT carry table names, column names or values.
 
 ## Proof
+
+- `TestPlainFilenameMemoryQueryKeepsExpiry` proves that a plain filename with `mode=memory` retains lifetime expiry and file contents.
+- `TestMemoryURIFragmentKeepsRows` proves that a URI fragment cannot re-enable expiry for shared memory.
+- `TestOpenHonorsSecondIdleTimeout` proves that the second option set controls idle expiry independently of lifetime expiry.
 
 - `TestDialectOfMatchesEachDriverName` proves the four driver names.
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
