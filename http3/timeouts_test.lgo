@@ -168,22 +168,26 @@ func TestH3TCPClosesIdleConnectionAfterIdleTimeout(t *testing.T) {
 	}
 }
 
-func TestH3ServeClosesSlowBodyWithinReadTimeout(t *testing.T) {
+func TestH3ServeTimesOutSlowBodyRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	readResult := make(chan error, 1)
 	r := web.NewRouter()
-	handlerDone := make(chan struct{})
-	r.Handle("POST", "/echo", func(ctx *web.Context) (web.Reply, error) {
-		data, rerr := web.ReadBody(ctx.Request, 1024)
-		if rerr != nil {
+	r.Handle("POST", "/echo", func(call *web.Context) (web.Reply, error) {
+		data, err := web.ReadBody(call.Request, 1024)
+		select {
+		case readResult <- err:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if err != nil {
 			return web.Problem{Title: "body read failed", Status: http.StatusBadRequest}, nil
 		}
-		close(handlerDone)
 		return web.Data{Value: string(data)}, nil
 	})
 	cert, _ := testCert(t)
 	listener, packet := bindH3CallerSockets(t)
 	s := &http3.Server{Router: r, TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true, ReadTimeout: 300 * time.Millisecond, ShutdownGrace: 2 * time.Second}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
 	if err := s.Serve(ctx, listener, packet); err != nil {
 		cerr := errors.Join(listener.Close(), packet.Close())
 		t.Fatalf("serve over caller sockets: %v; close caller sockets: %v", err, cerr)
@@ -193,25 +197,28 @@ func TestH3ServeClosesSlowBodyWithinReadTimeout(t *testing.T) {
 	addr := listener.Addr().String()
 	conn := dialStalledTLSBody(t, addr, $"POST /echo HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 8\r\n\r\nab")
 	defer func() {
-		if cerr := conn.Close(); cerr != nil {
-			return
+		if err := conn.Close(); err != nil {
+			t.Errorf("close stalled connection: %v", err)
 		}
 	}()
-	start := time.Now()
-	_, rerr := io.ReadAll(conn)
-	elapsed := time.Since(start)
-	if elapsed > 2*time.Second {
-		t.Fatalf("stalled body stayed open %v past the 300ms read timeout", elapsed)
-		return
-	}
-	if rerr != nil && strings.Contains(rerr.Error(), "i/o timeout") {
-		t.Fatalf("stalled body kept the connection open until the test deadline: %v", rerr)
-		return
-	}
+	requireH3BodyReadTimeout(t, ctx, readResult)
+}
+
+func requireH3BodyReadTimeout(t *testing.T, ctx context.Context, readResult <-chan error) {
+	t.Helper()
+	started := time.Now()
 	select {
-	case <-handlerDone:
-		t.Fatal("the handler completed although the body never finished")
-	default:
+	case err := <-readResult:
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("handler body read = %v, want a network timeout", err)
+			return
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			t.Fatalf("handler body read took %v, want the 300ms read timeout", elapsed)
+		}
+	case <-ctx.Done():
+		t.Fatalf("handler body read did not time out: %v", ctx.Err())
 	}
 }
 
@@ -316,6 +323,14 @@ func TestH3QUICMissingSettingsReportsProtocolCode(t *testing.T) {
 			return
 		}
 	}()
+	requireMissingH3SettingsClose(t, conn)
+}
+
+func requireMissingH3SettingsClose(t *testing.T, conn *quic.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Second)
+	defer cancel()
+	started := time.Now()
 	select {
 	case <-conn.Context().Done():
 		cause := context.Cause(conn.Context())
@@ -323,7 +338,10 @@ func TestH3QUICMissingSettingsReportsProtocolCode(t *testing.T) {
 		if !ok || protocol == nil || !protocol.Remote || protocol.ErrorCode != 0x10a {
 			t.Fatalf("missing SETTINGS closed with %v, want remote H3_MISSING_SETTINGS", cause)
 		}
+		if elapsed := time.Since(started); elapsed > 6*time.Second {
+			t.Fatalf("missing SETTINGS took %v, want five seconds plus one second observation tolerance", elapsed)
+		}
 	case <-ctx.Done():
-		t.Fatal("server did not report missing SETTINGS before the test deadline")
+		t.Fatal("missing SETTINGS exceeded five seconds plus one second observation tolerance")
 	}
 }
