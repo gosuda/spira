@@ -17,6 +17,7 @@ const stockControl =
 	'<button id="stock-toggle" type="button" data-live-toggle aria-pressed="false" hidden>Pause live stock updates</button>';
 
 beforeEach(() => {
+	vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 	document.body.innerHTML = `
 		<section data-live-region="stock" hx-ext="sse" sse-connect="/stock/events">
 			<ul id="results"><li><span id="stock-7">Mug: $12.00, 7 in stock</span></li></ul>
@@ -31,6 +32,16 @@ beforeEach(() => {
 		</section>
 		<div id="outside-stock"></div>`;
 	document.body.dispatchEvent(new CustomEvent("htmx:load", { bubbles: true }));
+});
+
+afterEach(async () => {
+	try {
+		await vi.runOnlyPendingTimersAsync();
+		expect(document.querySelector(".htmx-settling")).toBeNull();
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+	}
 });
 
 function fixtureElement(id: string): HTMLElement {
