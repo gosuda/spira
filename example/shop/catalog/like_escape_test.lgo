@@ -1,0 +1,21 @@
+package catalog_test
+
+import (
+	"strings"
+	"testing"
+)
+func TestSearchEscapesLikeWildcards(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	rec := get(t, testRouter(pool), "/catalog/search?q=%25", htmxHeaders())
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+		return
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "Widget") || strings.Contains(body, "Gadget") {
+		t.Fatalf("percent query broadened to the whole catalog: %q", body)
+	}
+}

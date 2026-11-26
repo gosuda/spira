@@ -23,7 +23,7 @@ func ListProducts(ctx context.Context, q db.Querier) ([]Product, error) {
 
 const SearchProductsQuery = `SELECT id, name, price, stock, created_at
 FROM products
-WHERE name LIKE ?
+WHERE name LIKE ? ESCAPE '\'
 ORDER BY id`
 
 func SearchProducts(ctx context.Context, q db.Querier, Name string) ([]Product, error) {

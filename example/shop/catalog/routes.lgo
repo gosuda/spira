@@ -1,13 +1,14 @@
 package catalog
 
 import (
-	"time"
 	"cmp"
 	"context"
 	"fmt"
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gosuda/spira/asset"
 	"github.com/gosuda/spira/db"
@@ -96,11 +97,18 @@ func productsFor(ctx context.Context, q db.Querier, query string) ([]store.Produ
 		}
 		return items, nil
 	}
-	items, err := store.SearchProducts(ctx, q, "%"+query+"%")
+	items, err := store.SearchProducts(ctx, q, "%"+escapeLike(query)+"%")
 	if err != nil {
 		return nil, fmt.Errorf("catalog: search products: %w", err)
 	}
 	return items, nil
+}
+
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
 
 func sortProducts(items []store.Product, order string) {
