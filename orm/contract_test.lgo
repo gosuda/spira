@@ -1,0 +1,110 @@
+package orm_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/db"
+	"github.com/gosuda/spira/orm"
+)
+
+type contractID int64
+
+type contractItem struct {
+	ID      contractID `col:"id"`
+	Name    string     `col:"name"`
+	Note    string?    `col:"note"`
+	Version int64      `col:"version"`
+}
+
+var contractItems = orm.Table[contractItem, contractID]{Name: "orm_contract", Key: "id", Version: "version"}
+
+func TestKeyChangeIsRejected(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := exec(ctx, pool, "CREATE TABLE orm_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec(ctx, pool, "INSERT INTO orm_items (id, name, version) VALUES (1, 'one', 1)"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		row := orm.Get[item, itemID](ctx, s, items, 1)?
+		if row == nil {
+			return 0, fmt.Errorf("missing seed row 1")
+		}
+		row.ID = 99
+		s.Flush(ctx)?
+		return 0, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "key cannot change") {
+		t.Fatalf("update key change err = %v, want key-immutable fault", err)
+	}
+	_, err = orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		row := orm.Get[item, itemID](ctx, s, items, 1)?
+		if row == nil {
+			return 0, fmt.Errorf("missing seed row 1")
+		}
+		row.ID = 98
+		orm.Remove[item, itemID](s, items, row)
+		s.Flush(ctx)?
+		return 0, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "key cannot change") {
+		t.Fatalf("remove key change err = %v, want key-immutable fault", err)
+	}
+	rows, rerr := db.Query[item](ctx, pool, "SELECT id, name, version FROM orm_items")
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(rows) != 1 || rows[0].ID != 1 {
+		t.Fatalf("rows after rejected key change = %+v, want the seed row 1", rows)
+	}
+}
+
+func TestVersionedChangedColumnsOnly(t *testing.T) {
+	pool := sqlitePool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, ddl := range []string{
+		"CREATE TABLE orm_contract (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT, version INTEGER NOT NULL)",
+		"INSERT INTO orm_contract (id, name, note, version) VALUES (1, 'a', 'n', 1)",
+		"CREATE TRIGGER no_note_write BEFORE UPDATE OF note ON orm_contract BEGIN SELECT RAISE(ABORT, 'unchanged note was written'); END",
+	} {
+		if err := exec(ctx, pool, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+		row := orm.Get[contractItem, contractID](ctx, s, contractItems, 1)?
+		if row == nil {
+			return 0, fmt.Errorf("missing seed row 1")
+		}
+		row.Name = "b"
+		s.Flush(ctx)?
+		orm.Touch[contractItem, contractID](s, contractItems, row)
+		s.Flush(ctx)?
+		return 0, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, gerr := db.One[contractItem](ctx, pool, "SELECT id, name, note, version FROM orm_contract WHERE id = 1")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got == nil {
+		t.Fatal("missing row 1")
+		return
+	}
+	if got.Name != "b" || got.Version != 3 {
+		t.Fatalf("row = %+v, want name b at version 3", got)
+	}
+	if got.Note == nil || (got.Note ?? "") != "n" {
+		t.Fatalf("row = %+v, want note n preserved", got)
+	}
+}
