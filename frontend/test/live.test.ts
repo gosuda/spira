@@ -163,12 +163,6 @@ test("resume applies the instance updates paused in the region", () => {
 });
 
 test("resume replays the bare dashboard row paused in the region", async () => {
-	// The retained row payload must reach htmx.swap with the sink swap style
-	// when the region resumes, and it must target the dashboard row with the
-	// replayed content: the swap spy alone cannot tell a delivered payload
-	// from a dropped one. happy-dom's DOMParser drops a bare tr, so htmx
-	// cannot apply the oob swap in this environment; parse the payload in a
-	// table context instead and require the target row to exist.
 	const { default: htmx } = await import("htmx.org");
 	const swapSpy = vi.spyOn(htmx, "swap");
 	try {
@@ -190,10 +184,8 @@ test("resume replays the bare dashboard row paused in the region", async () => {
 				settleDelay: htmx.config.defaultSettleDelay,
 			},
 		);
-		const row = document.createElement("template");
-		row.innerHTML = `<table><tbody>${down}</tbody></table>`;
-		expect(row.content.textContent).toBe("shopdown");
 		expect(fixtureElement("instance-shop").tagName).toBe("TR");
+		expect(fixtureElement("instance-shop").textContent).toBe("shopdown");
 	} finally {
 		swapSpy.mockRestore();
 	}
@@ -261,17 +253,8 @@ test("resume keeps the quiet dashboard row when a busier row outlasts it", async
 		for (const call of swapSpy.mock.calls) {
 			expect(call[0]).toBe(fixtureElement("admin-sink"));
 		}
-		// happy-dom's DOMParser drops a bare tr, so htmx cannot apply the oob
-		// swap in this environment; parse each replayed payload in a table
-		// context instead and require the target row to exist in the fixture.
-		const shopRow = document.createElement("template");
-		shopRow.innerHTML = `<table><tbody>${payloads[0]}</tbody></table>`;
-		expect(shopRow.content.textContent).toBe("shopdown");
-		expect(fixtureElement("instance-shop").tagName).toBe("TR");
-		const cartRow = document.createElement("template");
-		cartRow.innerHTML = `<table><tbody>${payloads[1]}</tbody></table>`;
-		expect(cartRow.content.textContent).toBe("cartdown");
-		expect(fixtureElement("instance-cart").tagName).toBe("TR");
+		expect(fixtureElement("instance-shop").textContent).toBe("shopdown");
+		expect(fixtureElement("instance-cart").textContent).toBe("cartdown");
 	} finally {
 		swapSpy.mockRestore();
 	}
