@@ -135,7 +135,6 @@ func RefuseLeak(t *testing.T, public []byte, planted ...string)
 - `TestViewCarriesNoStatus` proves rule 7 on the encoded bytes. Planted fault: adding a status member to `View`.
 - `TestOperatorTextCarriesCodeMessageAndCause` proves rule 8 for the operator text. Planted fault: dropping the cause chain from `Error`.
 - `TestIsMatchesCodeAcrossWraps` proves code comparison through three wraps. Planted fault: pointer equality in `Is`.
-- `TestAsFindsFaultThroughWraps` proves recovery of the fault through three wraps. Planted fault: losing the fault past one wrap.
 - `TestOfReturnsOutermostFault` proves the outermost choice. Planted fault: returning the innermost fault.
 - `TestKindStringIsLowerSnake` proves the kind texts.
 - `TestViewUsesWireNames` proves the wire names of `View` and `Field`.
