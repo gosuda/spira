@@ -32,7 +32,7 @@ var ErrH3Shutdown = fault.New("http3.h3_shutdown", fault.Internal, "The HTTP/3 s
 func Faults() []*fault.Error
 ```
 
-The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on. `ReadTimeout` and `IdleTimeout` bound the TCP listener through the inner `web.Server`; a stalled TCP body MUST close within `ReadTimeout` and an idle TCP keep-alive connection MUST close within `IdleTimeout`, with the same zero and negative rules that [web](web.md) states. A QUIC connection that sends nothing after the handshake MUST close within the backend settings bound of 5 seconds. A QUIC connection idle for 30 seconds MUST close on the backend idle bound, which stays within the default `IdleTimeout` of 120 seconds.
+The other fields keep the meaning that [web](web.md) gives them, except `ReadHeaderTimeout`, which bounds the TCP listener only. `H3` turns HTTP/3 on. `ReadTimeout` and `IdleTimeout` reach the TCP listener through the inner `web.Server`.
 
 ## Requirements
 
@@ -60,6 +60,15 @@ The other fields keep the meaning that [web](web.md) gives them, except `ReadHea
 - The stage MUST skip a cleartext request, a stopped server and a server with `H3` false.
 - `Start` MUST NOT add the stage to the router itself.
 - When `H3` is false, `Start` MUST serve TCP only and open no UDP listener.
+
+### Timeouts
+
+- A stalled TCP body MUST close within `ReadTimeout`.
+- An idle TCP keep-alive connection MUST close within `IdleTimeout`.
+- The zero and negative rules of [web](web.md) MUST apply to both timeouts.
+- A QUIC connection that sends nothing after the handshake MUST close within 5 seconds.
+- A QUIC connection idle for 30 seconds MUST close on the backend idle bound.
+- The idle bound MUST stay within the default `IdleTimeout` of 120 seconds.
 
 ### Limits and timeouts
 
@@ -125,14 +134,6 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 | `http3.h3_serve` | internal | "The HTTP/3 server failed." |
 | `http3.h3_shutdown` | internal | "The HTTP/3 shutdown failed." |
 
-## Errors
-
-- A nil `TLS` with `H3` MUST map to `http3.h3_needs_tls`.
-- A UDP listen failure MUST map to `http3.listen_udp` with the address in the cause.
-- An HTTP/3 serve failure MUST map to `http3.h3_serve` with the cause.
-- An HTTP/3 shutdown failure MUST map to `http3.h3_shutdown` with the cause. `Stop` then closes the HTTP/3 server and joins that error.
-- Public views MUST NOT carry addresses, ports or transport details.
-
 ## Proof
 
 - `TestH3NeedsTLSFailsStart` proves that H3 without TLS fails to start and opens no listener.
@@ -153,7 +154,8 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestFaultPublicHidesSecrets` proves public views hide secrets and hostile text.
 - `TestH3TCPClosesSlowBodyWithinReadTimeout` proves that the TCP listener closes a stalled body within `ReadTimeout`.
 - `TestH3TCPClosesIdleConnectionAfterIdleTimeout` proves that the TCP listener closes an idle keep-alive connection within `IdleTimeout`.
-- `TestH3QUICClosesConnectionWithoutSettings` proves that a QUIC connection that sends nothing closes within the backend settings and idle bounds.
+- `TestH3ServeClosesSlowBodyWithinReadTimeout` proves that `Serve` applies `ReadTimeout` to the TCP listener when `H3` is on.
+- `TestH3QUICClosesIdleConnectionAfterSettings` proves that a QUIC connection that sends `SETTINGS` closes on the backend idle bound.
 
 ## Not in scope
 
