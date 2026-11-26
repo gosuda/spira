@@ -1,0 +1,5 @@
+package main
+
+func MethodOK(arg string) bool {
+	return methodOK(arg)
+}

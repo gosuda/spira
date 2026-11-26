@@ -1,4 +1,4 @@
-package main
+package main_test
 
 import (
 	"encoding/json/v2"
@@ -6,28 +6,30 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	sqlcgen "github.com/gosuda/spira/cmd/sqlc-gen-spira"
 )
 type wantField struct {
 	goName string
 	goType string
 }
 
-func loadRequest(t *testing.T, fixture string) *Request {
+func loadRequest(t *testing.T, fixture string) *sqlcgen.Request {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", fixture, "request.json"))
 	if err != nil {
 		t.Fatalf("read %s request: %v", fixture, err)
-		return &Request{}
+		return &sqlcgen.Request{}
 	}
-	var req Request
+	var req sqlcgen.Request
 	if err := json.Unmarshal(data, &req); err != nil {
 		t.Fatalf("decode %s request: %v", fixture, err)
-		return &Request{}
+		return &sqlcgen.Request{}
 	}
 	return &req
 }
 
-func generateFile(t *testing.T, req *Request) string {
+func generateFile(t *testing.T, req *sqlcgen.Request) string {
 	t.Helper()
 	for _, f := range generateFiles(t, req) {
 		if f.Name == "models.sql.lgo" {
@@ -38,7 +40,7 @@ func generateFile(t *testing.T, req *Request) string {
 	return ""
 }
 
-func queryFile(t *testing.T, req *Request, name string) string {
+func queryFile(t *testing.T, req *sqlcgen.Request, name string) string {
 	t.Helper()
 	for _, f := range generateFiles(t, req) {
 		if f.Name == name {
@@ -48,9 +50,9 @@ func queryFile(t *testing.T, req *Request, name string) string {
 	t.Fatalf("no %s in generated files", name)
 	return ""
 }
-func generateFiles(t *testing.T, req *Request) []File {
+func generateFiles(t *testing.T, req *sqlcgen.Request) []sqlcgen.File {
 	t.Helper()
-	model, files, err := Generate(req)
+	model, files, err := sqlcgen.Generate(req)
 	_ = model
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -197,7 +199,7 @@ func TestGenerateTypesPostgresql(t *testing.T) {
 	}
 }
 
-func patchRequest(t *testing.T, fixture string, mutate func(*Request)) *Request {
+func patchRequest(t *testing.T, fixture string, mutate func(*sqlcgen.Request)) *sqlcgen.Request {
 	t.Helper()
 	req := loadRequest(t, fixture)
 	mutate(req)
@@ -214,17 +216,17 @@ func pluginOptions(t *testing.T, opts map[string]any) []byte {
 	return raw
 }
 
-func enumFixture(t *testing.T) *Request {
-	items := Table{Rel: Identifier{Name: "items"}, Columns: []Column{
-		{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "order_id", Length: -1, Type: Identifier{Name: "INTEGER"}},
+func enumFixture(t *testing.T) *sqlcgen.Request {
+	items := sqlcgen.Table{Rel: sqlcgen.Identifier{Name: "items"}, Columns: []sqlcgen.Column{
+		{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "order_id", Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
 	}}
-	lines := Table{Rel: Identifier{Name: "order_lines"}, Columns: []Column{
-		{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "order_id", Length: -1, Type: Identifier{Name: "INTEGER"}},
+	lines := sqlcgen.Table{Rel: sqlcgen.Identifier{Name: "order_lines"}, Columns: []sqlcgen.Column{
+		{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "order_id", Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
 	}}
 	req := loadRequest(t, "sqlite")
-	req.Catalog.Schemas[0].Tables = []Table{items, lines}
+	req.Catalog.Schemas[0].Tables = []sqlcgen.Table{items, lines}
 	req.Queries = nil
 	req.PluginOptions = pluginOptions(t, map[string]any{
 		"tables": map[string]any{
@@ -262,20 +264,20 @@ func TestKeyTypesAndRefs(t *testing.T) {
 
 func TestNullableKeyColumnUsesUnderlyingOption(t *testing.T) {
 	req := enumFixture(t)
-	lineID := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "order_lines"}}
-	lineOwner := Column{Name: "order_id", NotNull: false, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "order_lines"}}
-	kindCol := Column{Name: "kind", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "order_lines"}}
-	req.Queries = []Query{{
+	lineID := sqlcgen.Column{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "order_lines"}}
+	lineOwner := sqlcgen.Column{Name: "order_id", NotNull: false, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "order_lines"}}
+	kindCol := sqlcgen.Column{Name: "kind", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: sqlcgen.Identifier{Name: "order_lines"}}
+	req.Queries = []sqlcgen.Query{{
 		Name: "GetLine", Cmd: ":one", Filename: "lines.sql",
 		Text: "SELECT id, order_id FROM order_lines WHERE order_id = ? AND kind = ? AND id = ?",
-		Columns: []Column{lineID, lineOwner},
-		Params: []Parameter{
+		Columns: []sqlcgen.Column{lineID, lineOwner},
+		Params: []sqlcgen.Parameter{
 			{Number: 1, Column: lineOwner},
 			{Number: 2, Column: kindCol},
 			{Number: 3, Column: lineID},
 		},
 	}}
-	model, _, err := Generate(req)
+	model, _, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -321,26 +323,26 @@ func TestGenerateErrors(t *testing.T) {
 	cases := []struct {
 		name    string
 		fixture string
-		mutate  func(*Request)
+		mutate  func(*sqlcgen.Request)
 		want    string
 	}{
-		{"unmapped type", "sqlite", func(r *Request) {
+		{"unmapped type", "sqlite", func(r *sqlcgen.Request) {
 			r.Catalog.Schemas[0].Tables[0].Columns[0].Type.Name = "GEOMETRY"
 		}, "unmapped type"},
-		{"array column", "sqlite", func(r *Request) {
+		{"array column", "sqlite", func(r *sqlcgen.Request) {
 			r.Catalog.Schemas[0].Tables[0].Columns[1].IsArray = true
 		}, "is an array"},
-		{"unsigned mysql", "mysql", func(r *Request) {
+		{"unsigned mysql", "mysql", func(r *sqlcgen.Request) {
 			r.Catalog.Schemas[0].Tables[0].Columns[0].Unsigned = true
 		}, "unsigned"},
-		{"unknown engine", "sqlite", func(r *Request) {
+		{"unknown engine", "sqlite", func(r *sqlcgen.Request) {
 			r.Settings.Engine = "oracle"
 		}, "unknown engine"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := patchRequest(t, tc.fixture, tc.mutate)
-			_, _, err := Generate(req)
+			_, _, err := sqlcgen.Generate(req)
 			if err == nil {
 				t.Fatalf("Generate succeeded; want error containing %q", tc.want)
 				return
@@ -359,8 +361,8 @@ func TestGenerateJSONRoundTrip(t *testing.T) {
 		t.Fatal(err)
 		return
 	}
-	var resp Response
-	if out, gerr := GenerateJSON(raw); gerr != nil {
+	var resp sqlcgen.Response
+	if out, gerr := sqlcgen.GenerateJSON(raw); gerr != nil {
 		t.Fatalf("GenerateJSON: %v", gerr)
 		return
 	} else {
@@ -378,7 +380,7 @@ func TestGenerateJSONRoundTrip(t *testing.T) {
 			Contents []byte `json:"contents"`
 		} `json:"files"`
 	}
-	if out, gerr := GenerateJSON(raw); gerr != nil {
+	if out, gerr := sqlcgen.GenerateJSON(raw); gerr != nil {
 		t.Fatalf("GenerateJSON second pass: %v", gerr)
 		return
 	} else {
@@ -417,9 +419,9 @@ func TestDigitNamesGetXPrefixed(t *testing.T) {
 	req.Queries = nil
 	table := &req.Catalog.Schemas[0].Tables[0]
 	table.Rel.Name = "2_items"
-	table.Columns = []Column{
-		{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "2fa", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}},
+	table.Columns = []sqlcgen.Column{
+		{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "2fa", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}},
 	}
 	src := generateFile(t, req)
 	if !strings.Contains(src, "type X2Items struct") {
@@ -443,7 +445,7 @@ func TestKeywordColumnNamesBuild(t *testing.T) {
 	table.Rel.Name = "kw"
 	table.Columns = nil
 	for _, kw := range logosKeywords {
-		table.Columns = append(table.Columns, Column{Name: kw, NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}})
+		table.Columns = append(table.Columns, sqlcgen.Column{Name: kw, NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}})
 	}
 	src := generateFile(t, req)
 	fields := structFields(t, src, "Kw")
@@ -460,11 +462,11 @@ func TestColumnCollisionNamesBothColumns(t *testing.T) {
 	req := loadRequest(t, "sqlite")
 	req.Queries = nil
 	table := &req.Catalog.Schemas[0].Tables[0]
-	table.Columns = []Column{
-		{Name: "order_id", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}},
-		{Name: "order-id", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}},
+	table.Columns = []sqlcgen.Column{
+		{Name: "order_id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}},
+		{Name: "order-id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}},
 	}
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want column collision error")
 		return
@@ -479,8 +481,8 @@ func TestTableTypeCollisionNamesBothTables(t *testing.T) {
 	req := loadRequest(t, "sqlite")
 	req.Queries = nil
 	items := req.Catalog.Schemas[0].Tables[0]
-	req.Catalog.Schemas = append(req.Catalog.Schemas, Schema{Name: "audit", Tables: []Table{items}})
-	_, _, err := Generate(req)
+	req.Catalog.Schemas = append(req.Catalog.Schemas, sqlcgen.Schema{Name: "audit", Tables: []sqlcgen.Table{items}})
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want table type collision error")
 		return
@@ -500,7 +502,7 @@ func TestRefsShapeError(t *testing.T) {
 		},
 		"refs": map[string]any{"order_lines": "items"},
 	})
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want refs shape error")
 		return
@@ -521,7 +523,7 @@ func TestRefsMissingNames(t *testing.T) {
 			},
 			"refs": map[string]any{"order_lines.order_id": "ghosts"},
 		})
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatal("Generate succeeded; want missing table error")
 			return
@@ -539,7 +541,7 @@ func TestRefsMissingNames(t *testing.T) {
 			},
 			"refs": map[string]any{"order_lines.ghost": "items"},
 		})
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatal("Generate succeeded; want missing column error")
 			return
@@ -554,11 +556,11 @@ func TestAmbiguousTableName(t *testing.T) {
 	req := loadRequest(t, "sqlite")
 	req.Queries = nil
 	items := req.Catalog.Schemas[0].Tables[0]
-	req.Catalog.Schemas = append(req.Catalog.Schemas, Schema{Name: "audit", Tables: []Table{items}})
+	req.Catalog.Schemas = append(req.Catalog.Schemas, sqlcgen.Schema{Name: "audit", Tables: []sqlcgen.Table{items}})
 	req.PluginOptions = pluginOptions(t, map[string]any{
 		"tables": map[string]any{"items": map[string]any{"key": "id"}},
 	})
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want ambiguity error")
 		return
@@ -573,7 +575,7 @@ func TestUnknownOptionKey(t *testing.T) {
 	t.Run("top level", func(t *testing.T) {
 		req := loadRequest(t, "sqlite")
 		req.PluginOptions = pluginOptions(t, map[string]any{"packages": "x"})
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatal("Generate succeeded; want unknown option key error")
 			return
@@ -591,7 +593,7 @@ func TestUnknownOptionKey(t *testing.T) {
 		req.PluginOptions = pluginOptions(t, map[string]any{
 			"tables": map[string]any{"items": map[string]any{"kye": "id"}},
 		})
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatal("Generate succeeded; want unknown option key error")
 			return
@@ -603,7 +605,7 @@ func TestUnknownOptionKey(t *testing.T) {
 	t.Run("malformed json", func(t *testing.T) {
 		req := loadRequest(t, "sqlite")
 		req.PluginOptions = []byte("{broken")
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatal("Generate succeeded; want decode error")
 			return
@@ -635,25 +637,25 @@ func TestDeterministicModels(t *testing.T) {
 }
 
 func TestMethodOK(t *testing.T) {
-	if !methodOK("generate") {
+	if !sqlcgen.MethodOK("generate") {
 		t.Fatal("manual generate argument rejected")
 		return
 	}
-	if !methodOK("/plugin.CodegenService/Generate") {
+	if !sqlcgen.MethodOK("/plugin.CodegenService/Generate") {
 		t.Fatal("sqlc grpc method path rejected")
 		return
 	}
-	if methodOK("Generate") {
+	if sqlcgen.MethodOK("Generate") {
 		t.Fatal("bare Generate accepted; only the full method path is valid")
 		return
 	}
-	if methodOK("") {
+	if sqlcgen.MethodOK("") {
 		t.Fatal("empty argument accepted")
 		return
 	}
 }
 
-func findQuery(t *testing.T, m Model, name string) QueryDef {
+func findQuery(t *testing.T, m sqlcgen.Model, name string) sqlcgen.QueryDef {
 	t.Helper()
 	for i := range m.Queries {
 		if m.Queries[i].Name == name {
@@ -661,10 +663,10 @@ func findQuery(t *testing.T, m Model, name string) QueryDef {
 		}
 	}
 	t.Fatalf("query %s not in model", name)
-	return QueryDef{}
+	return sqlcgen.QueryDef{}
 }
 
-func fileNames(files []File) []string {
+func fileNames(files []sqlcgen.File) []string {
 	var out []string
 	for _, f := range files {
 		out = append(out, f.Name)
@@ -672,7 +674,7 @@ func fileNames(files []File) []string {
 	return out
 }
 
-func hasFile(files []File, name string) bool {
+func hasFile(files []sqlcgen.File, name string) bool {
 	for _, f := range files {
 		if f.Name == name {
 			return true
@@ -705,7 +707,7 @@ func TestEngineQueryModels(t *testing.T) {
 func checkEngineCase(t *testing.T, tc engineCase) {
 	t.Helper()
 	req := loadRequest(t, tc.fixture)
-	model, files, err := Generate(req)
+	model, files, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -746,7 +748,7 @@ func checkEngineCase(t *testing.T, tc engineCase) {
 	checkEngineFiles(t, tc, req, files)
 }
 
-func checkEngineFiles(t *testing.T, tc engineCase, req *Request, files []File) {
+func checkEngineFiles(t *testing.T, tc engineCase, req *sqlcgen.Request, files []sqlcgen.File) {
 	t.Helper()
 	if !hasFile(files, "models.sql.lgo") || !hasFile(files, "items.sql.lgo") {
 		t.Fatalf("files = %v, want models.sql.lgo and items.sql.lgo", fileNames(files))
@@ -764,7 +766,7 @@ func checkEngineFiles(t *testing.T, tc engineCase, req *Request, files []File) {
 	}
 }
 
-func versionedFixture(t *testing.T) *Request {
+func versionedFixture(t *testing.T) *sqlcgen.Request {
 	t.Helper()
 	req := loadRequest(t, "sqlite")
 	req.PluginOptions = pluginOptions(t, map[string]any{
@@ -772,25 +774,25 @@ func versionedFixture(t *testing.T) *Request {
 			"items": map[string]any{"type": "Item", "key": "id", "key_type": "ItemID", "version": "version"},
 		},
 	})
-	nameCol := Column{Name: "name", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
-	idCol := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}}
-	req.Queries = []Query{
+	nameCol := sqlcgen.Column{Name: "name", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: sqlcgen.Identifier{Name: "items"}}
+	idCol := sqlcgen.Column{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}}
+	req.Queries = []sqlcgen.Query{
 		{
 			Name: "GoodUpdate", Cmd: ":exec", Filename: "items.sql",
 			Text:   "UPDATE items SET name = ?, version = version + 1 WHERE id = ?",
-			Params: []Parameter{{Number: 1, Column: nameCol}, {Number: 2, Column: idCol}},
+			Params: []sqlcgen.Parameter{{Number: 1, Column: nameCol}, {Number: 2, Column: idCol}},
 		},
 		{
 			Name: "BadUpdate", Cmd: ":exec", Filename: "items.sql",
 			Text:   "UPDATE items SET name = ? WHERE id = ?",
-			Params: []Parameter{{Number: 1, Column: nameCol}, {Number: 2, Column: idCol}},
+			Params: []sqlcgen.Parameter{{Number: 1, Column: nameCol}, {Number: 2, Column: idCol}},
 		},
 	}
 	return req
 }
 
 func TestVersionedWriteRefused(t *testing.T) {
-	_, _, err := Generate(versionedFixture(t))
+	_, _, err := sqlcgen.Generate(versionedFixture(t))
 	if err == nil {
 		t.Fatal("Generate succeeded; want the version refusal for BadUpdate")
 		return
@@ -803,16 +805,16 @@ func TestVersionedWriteRefused(t *testing.T) {
 
 func TestUnsupportedCommand(t *testing.T) {
 	for _, cmd := range []string{":execresult", ":copyfrom", ":batchmany"} {
-		req := patchRequest(t, "sqlite", func(r *Request) {
-			r.Queries = []Query{{
+		req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
+			r.Queries = []sqlcgen.Query{{
 				Name: "Bulk", Cmd: cmd, Filename: "items.sql",
 				Text: "SELECT id FROM items",
-				Columns: []Column{
-					{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}},
+				Columns: []sqlcgen.Column{
+					{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}},
 				},
 			}}
 		})
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatalf("Generate succeeded for %s; want the unsupported command error", cmd)
 			return
@@ -825,17 +827,17 @@ func TestUnsupportedCommand(t *testing.T) {
 }
 
 func TestUnnamedOutputColumn(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(r *Request) {
-		r.Queries = []Query{{
+	req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
+		r.Queries = []sqlcgen.Query{{
 			Name: "CountThings", Cmd: ":one", Filename: "items.sql",
 			Text: "SELECT id, COUNT(*) FROM items",
-			Columns: []Column{
-				{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}},
-				{Name: "", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}},
+			Columns: []sqlcgen.Column{
+				{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}},
+				{Name: "", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}},
 			},
 		}}
 	})
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want the missing alias error")
 		return
@@ -846,10 +848,10 @@ func TestUnnamedOutputColumn(t *testing.T) {
 }
 
 func TestUnmappedTypeNamesTableAndColumn(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(r *Request) {
+	req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
 		r.Catalog.Schemas[0].Tables[0].Columns[0].Type.Name = "GEOMETRY"
 	})
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want the unmapped type error")
 		return
@@ -864,10 +866,10 @@ func TestUnmappedTypeNamesTableAndColumn(t *testing.T) {
 
 func TestTableColumnNameThatBreaksTheStructTagIsRefused(t *testing.T) {
 	for _, name := range []string{"a`b", "a\nb", "a\x00b"} {
-		req := patchRequest(t, "sqlite", func(r *Request) {
+		req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
 			r.Catalog.Schemas[0].Tables[0].Columns[0].Name = name
 		})
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatalf("Generate accepted table column name %q; want a struct tag error", name)
 			return
@@ -885,7 +887,7 @@ func TestQueryColumnNameThatBreaksTheStructTagIsRefused(t *testing.T) {
 	for _, name := range []string{"ti`tle", "ti\ntle"} {
 		req := sliceFixture(t)
 		req.Queries[0].Columns[1].Name = name
-		_, _, err := Generate(req)
+		_, _, err := sqlcgen.Generate(req)
 		if err == nil {
 			t.Fatalf("Generate accepted query column name %q; want a struct tag error", name)
 			return
@@ -918,7 +920,7 @@ func TestPackageNameThatIsNotAGoIdentifierIsRefused(t *testing.T) {
 		if tc.pkg != "" {
 			req.PluginOptions = pluginOptions(t, map[string]any{"package": tc.pkg})
 		}
-		_, files, err := Generate(req)
+		_, files, err := sqlcgen.Generate(req)
 		if err == nil {
 			head, _, _ := strings.Cut(string(files[0].Contents), "\n\nimport")
 			t.Fatalf("Generate accepted package %q with out %q; models.sql.lgo begins %q", tc.pkg, tc.out, head)
@@ -945,7 +947,7 @@ func TestUnicodePackageNameIsAccepted(t *testing.T) {
 		if tc.pkg != "" {
 			req.PluginOptions = pluginOptions(t, map[string]any{"package": tc.pkg})
 		}
-		_, files, err := Generate(req)
+		_, files, err := sqlcgen.Generate(req)
 		if err != nil {
 			t.Fatalf("Generate refused package %q with out %q: %v", tc.pkg, tc.out, err)
 			return
@@ -958,30 +960,30 @@ func TestUnicodePackageNameIsAccepted(t *testing.T) {
 	}
 }
 
-func sliceFixture(t *testing.T) *Request {
+func sliceFixture(t *testing.T) *sqlcgen.Request {
 	t.Helper()
 	req := loadRequest(t, "sqlite")
-	req.Catalog.Schemas[0].Tables[0].Columns = []Column{
-		{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "kind", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}},
-		{Name: "title", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}},
+	req.Catalog.Schemas[0].Tables[0].Columns = []sqlcgen.Column{
+		{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "kind", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}},
+		{Name: "title", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}},
 	}
-	kindCol := Column{Name: "kind", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
-	idsCol := Column{Name: "ids", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}, IsSQLCSlice: true}
-	idCol := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}}
-	titleCol := Column{Name: "title", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
-	req.Queries = []Query{
+	kindCol := sqlcgen.Column{Name: "kind", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: sqlcgen.Identifier{Name: "items"}}
+	idsCol := sqlcgen.Column{Name: "ids", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}, IsSQLCSlice: true}
+	idCol := sqlcgen.Column{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}}
+	titleCol := sqlcgen.Column{Name: "title", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: sqlcgen.Identifier{Name: "items"}}
+	req.Queries = []sqlcgen.Query{
 		{
 			Name: "FindDocs", Cmd: ":many", Filename: "docs.sql",
 			Text:    "SELECT id, title FROM items WHERE kind = ? AND id IN (/*SLICE:ids*/?) ORDER BY id",
-			Columns: []Column{idCol, titleCol},
-			Params:  []Parameter{{Number: 1, Column: kindCol}, {Number: 2, Name: "ids", Column: idsCol}},
+			Columns: []sqlcgen.Column{idCol, titleCol},
+			Params:  []sqlcgen.Parameter{{Number: 1, Column: kindCol}, {Number: 2, Name: "ids", Column: idsCol}},
 		},
 		{
 			Name: "FindAny", Cmd: ":many", Filename: "docs.sql",
 			Text:    "SELECT id FROM items WHERE id = ANY(?)",
-			Columns: []Column{idCol},
-			Params:  []Parameter{{Number: 1, Name: "ids", Column: idsCol}},
+			Columns: []sqlcgen.Column{idCol},
+			Params:  []sqlcgen.Parameter{{Number: 1, Name: "ids", Column: idsCol}},
 		},
 	}
 	return req
@@ -989,7 +991,7 @@ func sliceFixture(t *testing.T) *Request {
 
 func TestSliceQuery(t *testing.T) {
 	req := sliceFixture(t)
-	model, _, err := Generate(req)
+	model, _, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -1034,15 +1036,15 @@ func TestSliceQuery(t *testing.T) {
 
 func TestSliceQueryBindAfterSliceMarker(t *testing.T) {
 	req := sliceFixture(t)
-	kindCol := Column{Name: "kind", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
-	idsCol := Column{Name: "ids", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}, IsSQLCSlice: true}
-	idCol := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}}
-	titleCol := Column{Name: "title", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: Identifier{Name: "items"}}
-	req.Queries = append(req.Queries, Query{
+	kindCol := sqlcgen.Column{Name: "kind", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: sqlcgen.Identifier{Name: "items"}}
+	idsCol := sqlcgen.Column{Name: "ids", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}, IsSQLCSlice: true}
+	idCol := sqlcgen.Column{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}}
+	titleCol := sqlcgen.Column{Name: "title", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: sqlcgen.Identifier{Name: "items"}}
+	req.Queries = append(req.Queries, sqlcgen.Query{
 		Name: "FindByKindSliceTitle", Cmd: ":many", Filename: "docs.sql",
 		Text:    "SELECT id, title FROM items WHERE kind = ? AND id IN (/*SLICE:ids*/?) AND title = ?",
-		Columns: []Column{idCol, titleCol},
-		Params:  []Parameter{{Number: 1, Column: kindCol}, {Number: 2, Column: titleCol}, {Number: 3, Name: "ids", Column: idsCol}},
+		Columns: []sqlcgen.Column{idCol, titleCol},
+		Params:  []sqlcgen.Parameter{{Number: 1, Column: kindCol}, {Number: 2, Column: titleCol}, {Number: 3, Name: "ids", Column: idsCol}},
 	})
 	src := queryFile(t, req, "docs.sql.lgo")
 	for _, want := range []string{
@@ -1058,7 +1060,7 @@ func TestSliceQueryBindAfterSliceMarker(t *testing.T) {
 }
 
 func TestQueryFileOmitsTimeImportForEntityRows(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(req *Request) {
+	req := patchRequest(t, "sqlite", func(req *sqlcgen.Request) {
 		req.PluginOptions = pluginOptions(t, map[string]any{
 			"tables": map[string]any{
 				"items": map[string]any{"type": "Item", "key": "id", "key_type": "ItemID"},
@@ -1081,7 +1083,7 @@ func TestQueryFileOmitsTimeImportForEntityRows(t *testing.T) {
 	}
 }
 
-func embedFixture(t *testing.T) *Request {
+func embedFixture(t *testing.T) *sqlcgen.Request {
 	t.Helper()
 	req := loadRequest(t, "sqlite")
 	req.PluginOptions = pluginOptions(t, map[string]any{
@@ -1091,29 +1093,29 @@ func embedFixture(t *testing.T) *Request {
 		},
 		"refs": map[string]any{"cart_items.product_id": "products"},
 	})
-	items := Table{Rel: Identifier{Name: "cart_items"}, Columns: []Column{
-		{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "product_id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "quantity", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
+	items := sqlcgen.Table{Rel: sqlcgen.Identifier{Name: "cart_items"}, Columns: []sqlcgen.Column{
+		{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "product_id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "quantity", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
 	}}
-	products := Table{Rel: Identifier{Name: "products"}, Columns: []Column{
-		{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}},
-		{Name: "name", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}},
+	products := sqlcgen.Table{Rel: sqlcgen.Identifier{Name: "products"}, Columns: []sqlcgen.Column{
+		{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}},
+		{Name: "name", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}},
 	}}
-	req.Catalog.Schemas[0].Tables = []Table{items, products}
-	embed := Identifier{Name: "products"}
-	cart := Identifier{Name: "cart_items"}
-	req.Queries = []Query{{
+	req.Catalog.Schemas[0].Tables = []sqlcgen.Table{items, products}
+	embed := sqlcgen.Identifier{Name: "products"}
+	cart := sqlcgen.Identifier{Name: "cart_items"}
+	req.Queries = []sqlcgen.Query{{
 		Name: "ListCartItems", Cmd: ":many", Filename: "cart.sql",
 		Text: "SELECT cart_items.id, products.id, products.name, cart_items.quantity FROM cart_items JOIN products",
-		Columns: []Column{
-			{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: cart},
-			{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: embed, EmbedTable: embed},
-			{Name: "name", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: embed, EmbedTable: embed},
-			{Name: "quantity", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: cart},
+		Columns: []sqlcgen.Column{
+			{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: cart},
+			{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: embed, EmbedTable: embed},
+			{Name: "name", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: embed, EmbedTable: embed},
+			{Name: "quantity", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: cart},
 		},
-		Params: []Parameter{
-			{Number: 1, Column: Column{Name: "kind", NotNull: true, Length: -1, Type: Identifier{Name: "TEXT"}, Table: cart}},
+		Params: []sqlcgen.Parameter{
+			{Number: 1, Column: sqlcgen.Column{Name: "kind", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "TEXT"}, Table: cart}},
 		},
 	}}
 	return req
@@ -1121,7 +1123,7 @@ func embedFixture(t *testing.T) *Request {
 
 func TestEmbedQuery(t *testing.T) {
 	req := embedFixture(t)
-	model, _, err := Generate(req)
+	model, _, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -1154,11 +1156,11 @@ func TestEmbedQuery(t *testing.T) {
 }
 
 func TestDuplicateQuery(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(r *Request) {
+	req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
 		dup := r.Queries[0]
-		r.Queries = []Query{dup, dup}
+		r.Queries = []sqlcgen.Query{dup, dup}
 	})
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want the duplicate query error")
 		return
@@ -1169,18 +1171,18 @@ func TestDuplicateQuery(t *testing.T) {
 }
 
 func TestDuplicateParamsShareOneName(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(r *Request) {
-		idCol := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}}
-		r.Queries = []Query{{
+	req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
+		idCol := sqlcgen.Column{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}}
+		r.Queries = []sqlcgen.Query{{
 			Name: "FindTwice", Cmd: ":many", Filename: "items.sql",
 			Text: "SELECT id FROM items WHERE id = ? OR id = ?",
-			Columns: []Column{
-				{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}},
+			Columns: []sqlcgen.Column{
+				{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}},
 			},
-			Params: []Parameter{{Number: 1, Column: idCol}, {Number: 2, Column: idCol}},
+			Params: []sqlcgen.Parameter{{Number: 1, Column: idCol}, {Number: 2, Column: idCol}},
 		}}
 	})
-	model, _, err := Generate(req)
+	model, _, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -1192,18 +1194,18 @@ func TestDuplicateParamsShareOneName(t *testing.T) {
 }
 
 func TestMarkerWithoutParam(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(r *Request) {
-		idCol := Column{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}}
-		r.Queries = []Query{{
+	req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
+		idCol := sqlcgen.Column{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}}
+		r.Queries = []sqlcgen.Query{{
 			Name: "Stale", Cmd: ":many", Filename: "items.sql",
 			Text: "SELECT id FROM items WHERE id IN (/*SLICE:ids*/?)",
-			Columns: []Column{
-				{Name: "id", NotNull: true, Length: -1, Type: Identifier{Name: "INTEGER"}, Table: Identifier{Name: "items"}},
+			Columns: []sqlcgen.Column{
+				{Name: "id", NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: "INTEGER"}, Table: sqlcgen.Identifier{Name: "items"}},
 			},
-			Params: []Parameter{{Number: 1, Column: idCol}},
+			Params: []sqlcgen.Parameter{{Number: 1, Column: idCol}},
 		}}
 	})
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want the orphan marker error")
 		return
@@ -1214,13 +1216,13 @@ func TestMarkerWithoutParam(t *testing.T) {
 }
 
 func TestOverridesNormalizeCase(t *testing.T) {
-	req := patchRequest(t, "sqlite", func(r *Request) {
+	req := patchRequest(t, "sqlite", func(r *sqlcgen.Request) {
 		r.Queries = nil
 	})
 	req.PluginOptions = pluginOptions(t, map[string]any{
 		"overrides": map[string]any{"INTEGER": "ItemCode"},
 	})
-	model, _, err := Generate(req)
+	model, _, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -1234,7 +1236,7 @@ func TestOverridesNormalizeCase(t *testing.T) {
 	}
 }
 
-func singleColumnEmbedFixture(t *testing.T) *Request {
+func singleColumnEmbedFixture(t *testing.T) *sqlcgen.Request {
 	t.Helper()
 	req := loadRequest(t, "embed")
 	req.PluginOptions = pluginOptions(t, map[string]any{
@@ -1249,7 +1251,7 @@ func singleColumnEmbedFixture(t *testing.T) *Request {
 
 func TestSingleColumnEmbed(t *testing.T) {
 	req := singleColumnEmbedFixture(t)
-	model, _, err := Generate(req)
+	model, _, err := sqlcgen.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 		return
@@ -1284,7 +1286,7 @@ func TestSingleColumnEmbed(t *testing.T) {
 func TestMissingEmbedTable(t *testing.T) {
 	req := singleColumnEmbedFixture(t)
 	req.Queries[0].Columns[1].EmbedTable.Name = "ghosts"
-	_, _, err := Generate(req)
+	_, _, err := sqlcgen.Generate(req)
 	if err == nil {
 		t.Fatal("Generate succeeded; want the missing embed table error")
 		return
