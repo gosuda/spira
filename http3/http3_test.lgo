@@ -1289,6 +1289,22 @@ func assertH3CallerPacketRoundTrips(t *testing.T, packet net.PacketConn) {
 	}
 }
 
+func assertH3CallerTLSKept(t *testing.T, base *tls.Config, selected *tls.Config, callback *tls.Config) {
+	t.Helper()
+	if len(base.NextProtos) != 1 || base.NextProtos[0] != "not-h3" {
+		t.Errorf("base TLS ALPN changed: %v", base.NextProtos)
+	}
+	if len(selected.NextProtos) != 1 || selected.NextProtos[0] != "not-h3" {
+		t.Errorf("callback TLS ALPN changed: %v", selected.NextProtos)
+	}
+	if selected.MinVersion != tls.VersionTLS12 {
+		t.Errorf("callback TLS minimum version changed: %v", selected.MinVersion)
+	}
+	if len(callback.NextProtos) != 1 || callback.NextProtos[0] != "not-h3" {
+		t.Errorf("callback config ALPN changed: %v", callback.NextProtos)
+	}
+}
+
 func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 	cert, pool := testCert(t)
 	if pool == nil {
@@ -1296,7 +1312,7 @@ func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 		return
 	}
 	base := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"not-h3"}}
-	selected := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"not-h3"}}
+	selected := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"not-h3"}, MinVersion: tls.VersionTLS12}
 	callback := &tls.Config{
 		NextProtos: []string{"not-h3"},
 		GetConfigForClient: func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -1337,12 +1353,7 @@ func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 			}
 		})
 	}
-	if len(base.NextProtos) != 1 || base.NextProtos[0] != "not-h3" {
-		t.Errorf("base TLS ALPN changed: %v", base.NextProtos)
-	}
-	if len(selected.NextProtos) != 1 || selected.NextProtos[0] != "not-h3" {
-		t.Errorf("callback TLS ALPN changed: %v", selected.NextProtos)
-	}
+	assertH3CallerTLSKept(t, base, selected, callback)
 }
 
 type h3ConflictProbe struct {
@@ -1447,6 +1458,166 @@ func TestH3StartUDPConflictHonorsContext(t *testing.T) {
 			t.Fatalf("UDP bound after canceled start: %s", addr)
 		}
 	})
+}
+
+func TestH3StartReleasesUDPAfterTCPConflict(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tcp, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("occupy TCP port: %v", err)
+			return
+		}
+		defer func() {
+			if err := tcp.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close TCP port: %v", err)
+			}
+		}()
+		addr := tcp.Addr().String()
+		cert, _ := testCert(t)
+		server := &http3.Server{Addr: addr, Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true, ShutdownGrace: 2 * time.Second}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		err = server.Start(ctx)
+		if err == nil {
+			defer stopH3Server(t, server)
+			t.Fatal("Start over an occupied TCP port succeeded")
+			return
+		}
+		op, ok := errors.AsType[*net.OpError](err)
+		if !ok || op.Op != "listen" || op.Net != "tcp" || !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("Start error = %v, want TCP listen EADDRINUSE", err)
+			return
+		}
+		rebound, berr := net.ListenPacket("udp", addr)
+		if berr != nil {
+			t.Fatalf("UDP port %s stayed bound after failed Start: %v", addr, berr)
+			return
+		}
+		defer func() {
+			if err := rebound.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close rebound UDP port: %v", err)
+			}
+		}()
+	})
+}
+
+func TestH3StartPersistentUDPConflictExhaustsRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("occupy UDP port: %v", err)
+			return
+		}
+		defer func() {
+			if err := packet.Close(); err != nil {
+				t.Errorf("close UDP port: %v", err)
+			}
+		}()
+		cert, _ := testCert(t)
+		server := &http3.Server{Addr: packet.LocalAddr().String(), Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+		defer stopH3Server(t, server)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		started := time.Now()
+		err = server.Start(ctx)
+		if !errors.Is(err, http3.ErrListenUDP) || !errors.Is(err, syscall.EADDRINUSE) || ctx.Err() != nil {
+			t.Fatalf("persistent UDP conflict = %v, context %v, want exhausted UDP EADDRINUSE before deadline", err, ctx.Err())
+			return
+		}
+		if elapsed := time.Since(started); elapsed != 70*time.Millisecond {
+			t.Fatalf("retry duration = %v, want the 70ms retry budget", elapsed)
+		}
+		if addr := server.BoundUDPAddrForTest(); addr != "" {
+			t.Fatalf("UDP bound after exhausted retries: %s", addr)
+		}
+	})
+}
+
+func releaseH3RetryPort(ctx context.Context, packet net.PacketConn, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt)*10*time.Millisecond - 5*time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		if err := packet.Close(); err != nil {
+			return fmt.Errorf("http3: release UDP before retry %d: %w", attempt, err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func driveH3RetryInterval(ctx context.Context, probe *h3ConflictProbe, attempt int) error {
+	if attempt == 0 {
+		if err := probe.packet.Close(); err != nil {
+			return fmt.Errorf("http3: release UDP before initial bind: %w", err)
+		}
+		return startH3DuringConflict(ctx, probe)
+	}
+	go group (ctx) {
+		go startH3DuringConflict(ctx, probe)
+		go releaseH3RetryPort(ctx, probe.packet, attempt)
+	}
+	return nil
+}
+
+func TestH3RetryReleaseErrorsCarryPackagePrefix(t *testing.T) {
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy UDP port: %v", err)
+		return
+	}
+	if cerr := packet.Close(); cerr != nil {
+		t.Fatalf("close UDP port: %v", cerr)
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := releaseH3RetryPort(ctx, packet, 1); err == nil || !strings.HasPrefix(err.Error(), "http3: release UDP before retry 1: ") {
+		t.Fatalf("retry release error = %v, want the http3-prefixed retry cause", err)
+		return
+	}
+	probe := &h3ConflictProbe{server: &http3.Server{}, packet: packet, result: make(chan error, 1)}
+	if err := driveH3RetryInterval(ctx, probe, 0); err == nil || !strings.HasPrefix(err.Error(), "http3: release UDP before initial bind: ") {
+		t.Fatalf("initial release error = %v, want the http3-prefixed bind cause", err)
+	}
+}
+
+func TestH3StartRetriesAtEveryInterval(t *testing.T) {
+	for attempt := 0; attempt < 8; attempt++ {
+		t.Run(fmt.Sprintf("attempt-%d", attempt), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				tcp, packet := bindH3CallerSockets(t)
+				defer closeH3CallerSockets(t, tcp, packet)
+				cert, _ := testCert(t)
+				server := &http3.Server{Addr: tcp.Addr().String(), Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+				defer stopH3Server(t, server)
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+				defer cancel()
+				probe := &h3ConflictProbe{server: server, packet: packet, result: make(chan error, 1)}
+				started := time.Now()
+				if err := driveH3RetryInterval(ctx, probe, attempt); err != nil {
+					t.Fatalf("retry %d probe: %v", attempt, err)
+					return
+				}
+				elapsed := time.Since(started)
+				select {
+				case err := <-probe.result:
+					op, ok := errors.AsType[*net.OpError](err)
+					if !ok || op.Op != "listen" || op.Net != "tcp" || !errors.Is(err, syscall.EADDRINUSE) {
+						t.Fatalf("retry %d = %v, want TCP listen EADDRINUSE after UDP release", attempt, err)
+						return
+					}
+				case <-ctx.Done():
+					t.Fatalf("retry %d returned no result: %v", attempt, ctx.Err())
+					return
+				}
+				if want := time.Duration(attempt) * 10 * time.Millisecond; elapsed != want {
+					t.Fatalf("retry %d reached TCP conflict after %v, want %v", attempt, elapsed, want)
+				}
+			})
+		})
+	}
 }
 
 type h3ReplyCase struct {
