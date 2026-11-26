@@ -77,7 +77,7 @@ func Mount(r *web.Router, info Info)
 - `Document` MUST build one path item per distinct path of `Routes`.
 - `Document` MUST skip a route whose method has no item field.
 - `Document` MUST strip a host prefix from the pattern before it builds the path.
-- `Document` MUST skip the route that `Mount` serves, under whatever prefix the router carries, and keep every other method and path.
+- `Document` MUST skip the route that `Mount` serves, including its router prefix.
 - `Document` MUST skip a route whose `RouteInfo` is hidden.
 - `Document` MUST rewrite a `{name...}` segment to `{name}` and drop a trailing `{$}` segment, keeping the slash, before it builds the path. When two routes collapse to one path, `Document` MUST document the operation the mux serves: host patterns over hostless ones, fewer `...` wildcards first, and exact paths over subtree paths; a later registration that is no more specific MUST NOT replace the kept operation.
 - `Document` MUST take each path parameter from a `{name}` segment of the path.

@@ -541,10 +541,19 @@ func attemptH3EarlyData(ctx context.Context, addr string, clientTLS *tls.Config,
 		return errors.New("QUIC handshake completed before the 0-RTT attempt")
 	}
 	stream := conn.OpenUniStream()?
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("early-data probe requires a deadline")
+	}
+	stream.SetWriteDeadline(deadline)?
 	var multiPacketProbe [4096]byte
 	multiPacketProbe[0] = 0x21
-	stream.Write(multiPacketProbe[:])?
-	stream.Close()?
+	if _, err := stream.Write(multiPacketProbe[:]); err != nil && !errors.Is(err, quic.Err0RTTRejected) {
+		return fmt.Errorf("write early data: %w", err)
+	}
+	if err := stream.Close(); err != nil && !errors.Is(err, quic.Err0RTTRejected) {
+		return fmt.Errorf("close early-data stream: %w", err)
+	}
 	select {
 	case <-sent:
 	case <-ctx.Done():
