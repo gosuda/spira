@@ -410,7 +410,7 @@ func Structured[T any](text string) (T, error)
 - `TestRunEndsWhenTheContextEndsDuringATool` proves context end and its canceled report.
 - `TestRunReportsTimeoutWhenTheDeadlineEndsDuringATool` proves the timeout report.
 - `TestRunKeepsADeclaredModelFault` proves a declared model fault survives `Run`.
-- `TestRunWrapsTheModelError` proves model error wrap.
+- `TestFaultModelFailed` proves model error wrap.
 - `TestRunNeverCallsAToolWhenTheContextEndedBeforeTheBatch` proves the pre-batch context check.
 - `TestRunCarriesUsageAndReplyStateAcrossAConfirmation` proves the paused reply state.
 - `TestRunCarriesTheAccumulatedUsageIntoTheResumedReply` proves usage across a confirmation.
@@ -428,7 +428,7 @@ func Structured[T any](text string) (T, error)
 - `TestSearchToolsDropsTheLastWordsOfAQueryThatIsTooLong` proves pattern cap.
 - `TestSearchToolsReturnsEveryToolUpToTheLimitForABlankQuery` proves blank query.
 - `TestSearchToolsReturnsAnEmptyListWhenNothingMatches` proves empty result.
-- `TestSearchToolsRefusesArgumentsThatAreNotJSON` proves argument refusal.
+- `TestFaultInvalidToolArguments` proves argument refusal.
 - `TestSearchToolsShowsTheModelOnlyTheSearchToolAndWhatEarlierSearchesFound` proves layer narrowing.
 - `TestSearchToolsIgnoresASearchResultItCannotReadAndNamesItDoesNotManage` proves ignored results.
 - `TestSearchToolsNamesOnlyToolsTheRequestCarries` proves the search scope.
@@ -449,11 +449,11 @@ func Structured[T any](text string) (T, error)
 - `TestStructuredDecodesFenceHoldingFenceInsideAString` proves the fence with a delimiter inside a string.
 - `TestStructuredExtractsInlineFenceBeforeTrailingProse` proves the inline fence with prose after it.
 - `TestStructuredUsesFirstInlineFenceBeforeASecondFence` proves the first inline fence with a second fence after it.
-- `TestStructuredRefusesUnterminatedFence` proves the unterminated fence error.
-- `TestStructuredRefusesTrailingText` proves the trailing text error.
-- `TestStructuredRefusesEmptyAnswer` proves the empty answer error.
+- `TestFaultUnterminatedFence` proves the unterminated fence error.
+- `TestFaultInvalidAnswer` proves the trailing text error.
+- `TestFaultEmptyAnswer` proves the empty answer error.
 - `TestStructuredIgnoresUnknownFields` proves that unknown fields are ignored.
-- `TestStructuredRefusesOversizeInput` proves the size bound.
+- `TestFaultAnswerTooLarge` proves the size bound.
 - `TestFormatInstructionOmitsSchema` proves the instruction without a schema.
 
 ## Not in scope
