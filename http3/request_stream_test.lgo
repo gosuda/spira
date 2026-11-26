@@ -224,6 +224,33 @@ func TestH3RequestStreamFinishesWithoutReadingRequest(t *testing.T) {
 	h3ExpectRequestSendStop(t, pair, 0x100)
 }
 
+func TestH3RequestStreamOmittedLimitInheritsDefault(t *testing.T) {
+	pair, err := openH3RequestStreamPair(t, h3StreamTestHeaders(t, h3TestRequestFields()))
+	if err != nil {
+		t.Fatalf("open QUIC request: %v", err)
+		return
+	}
+	if pair == nil {
+		t.Fatal("missing QUIC request stream pair")
+		return
+	}
+	reached := false
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.Header()["Date"] = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
+	http3.ServeH3RequestStreamForTest(pair.server.Context(), pair.server, pair.serverSide, http3.H3RequestStreamConfigForTest{Handler: handler})
+	if !reached {
+		t.Fatal("valid request did not reach the handler with an omitted field-section limit")
+		return
+	}
+	response := h3StreamTestResponse(t, pair.clientSide)
+	h3ExpectResponseFields(t, response, map[string][]string{":status": {"204"}})
+	h3ExpectNoResponseFrames(t, response)
+	h3ExpectRequestSendStop(t, pair, 0x100)
+}
+
 func TestH3RequestStreamBodyCloseKeepsResponse(t *testing.T) {
 	wire := append(h3StreamTestHeaders(t, h3TestRequestFields()), "\x00\x01x"...)
 	pair, err := openH3RequestStreamPair(t, wire)
