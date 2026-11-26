@@ -130,10 +130,10 @@ func Faults() []*fault.Error
 - `TestCheckReversiblePasses` proves that a correct pair leaves no table. The oracle is a direct fingerprint.
 - `TestCheckReversibleFailsOnLeftoverColumn` proves the mismatch error.
 - `TestCheckReversibleRefusesNonEmpty` proves the empty-database rule.
-- `TestFaultMissingDown` proves missing pair files return `migrate.missing_down`.
-- `TestFaultOrderMismatch` proves reordered steps return `migrate.order_mismatch`.
-- `TestFaultNotReversible` proves a bad pair returns `migrate.not_reversible`.
-- `TestFaultScratchNotEmpty` proves a dirty scratch database returns `migrate.scratch_not_empty`.
+- `TestLoadRefusesUpWithoutDown` proves missing pair files return `migrate.missing_down`.
+- `TestApplyRefusesReorderedSteps` proves reordered steps return `migrate.order_mismatch`.
+- `TestCheckReversibleFailsOnLeftoverColumn` proves a bad pair returns `migrate.not_reversible`.
+- `TestCheckReversibleRefusesNonEmpty` proves a dirty scratch database returns `migrate.scratch_not_empty`.
 - `TestFaultUnavailable` proves store failures return `migrate.unavailable`.
 - `TestEnginePartialDDLMySQL` proves a bad MySQL `up` returns `migrate.partial_ddl`.
 - `TestEngineCheckReversiblePostgres` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on PostgreSQL, failing without `SPIRA_TEST_POSTGRES_DSN`.
