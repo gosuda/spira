@@ -105,12 +105,23 @@ func ClassifyDriverError(d Dialect, cause error) error
 - If `parseTime` there is `true`, `1`, `t` or `T`, `DialectOf` MUST return `MySQL`. `true` matches in any letter case.
 - `DialectOf` MUST return `MSSQL` for the driver name `sqlserver`.
 - `Open` MUST record the dialect that `DialectOf` returns for that driver and DSN.
-- `Open` MUST bound the pool: SQLite 4 open and 2 idle, network engines 10 open and 5 idle, each 30 minute lifetime and 5 minute idle time, unless `PoolOptions` overrides a field with a nonzero value.
+- `Open` MUST bound each pool.
+- By default, SQLite pools MUST allow 4 open connections and 2 idle connections.
+- By default, network engine pools MUST allow 10 open connections and 5 idle connections.
+- File-backed and network pools MUST default to 30-minute lifetime expiry and 5-minute idle expiry.
+- Outside in-memory SQLite DSNs, a nonzero `PoolOptions` field MUST override its default.
+- When several `PoolOptions` sets arrive, `Open` MUST take each field from the first set that leaves it nonzero.
+- `Open` MUST disable age and idle eviction for in-memory SQLite DSNs.
+- An in-memory SQLite pool MUST preserve its resolved open-connection limit.
+- An in-memory SQLite pool MUST raise a resolved idle-connection limit below one to one.
+- Larger resolved idle limits MUST remain effective up to a positive open-connection limit.
+- Only `file:` URI query parameters MUST affect SQLite memory classification.
+- SQLite URI fragments MUST NOT affect memory classification.
 - `Open` MUST keep a zero `PoolOptions` field on its dialect default.
 - `Pool` MUST implement [app.Part](app.md).
 - `Start` MUST ping the database.
 - `Stop` MUST close each prepared statement before it closes the database handle.
-- `Stop` MUST return when its context ends, even if a statement still runs.
+- `Stop` MUST return when the caller deadline expires, even while a statement remains active.
 - After such a return, the close MUST continue and finish when the statement ends.
 - The package MUST NOT import a database driver.
 
@@ -119,6 +130,7 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `InTx` MUST pass the transaction to `work` as the `tx` argument.
 - `InTx` MUST commit when `work` returns a nil error and the caller context is still live.
 - `InTx` MUST check the caller context before commit, roll back when it has ended, and return that context cause without a commit wrap.
+- `InTx` MUST return that context error itself when the rollback succeeds or reports `sql.ErrTxDone`.
 - `InTx` MUST call `Rollback` when `work` returns an error.
 - `InTx` MUST call `Rollback` when `work` panics.
 - `InTx` MUST let that panic continue after `Rollback`.
@@ -224,6 +236,12 @@ func ClassifyDriverError(d Dialect, cause error) error
 - Public views MUST NOT carry table names, column names or values.
 
 ## Proof
+
+- `TestMemoryPoolCapsIdleAtOpenLimit` proves that an explicit larger idle limit cannot raise the open cap.
+
+- `TestPlainFilenameMemoryQueryKeepsExpiry` proves that a plain filename with `mode=memory` retains lifetime expiry and file contents.
+- `TestMemoryURIFragmentKeepsRows` proves that a URI fragment cannot re-enable expiry for shared memory.
+- `TestOpenHonorsSecondIdleTimeout` proves that the second option set controls idle expiry independently of lifetime expiry.
 
 - `TestDialectOfMatchesEachDriverName` proves the four driver names.
 - `TestOpenRejectsUnknownDriver` and `TestOpenRejectsMysqlWithoutParseTime` prove the two open refusals.
