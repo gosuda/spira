@@ -2,7 +2,7 @@
 
 `http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-`H3Server` runs over the `github.com/quic-go/quic-go` transport. It clones the TLS configuration for UDP, requires TLS 1.3, and sets ALPN to `h3`.
+The native `H3Server` uses the LoGOs toolchain transport. Ejected code uses `github.com/quic-go/quic-go`. Both clone the TLS configuration for UDP, require TLS 1.3, and set ALPN to `h3`.
 
 ## Interface
 
@@ -97,8 +97,11 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `Stop` MUST close the UDP listener before it returns, after the drain or the timeout ends it.
 - `Stop` MUST send GOAWAY on HTTP/3 connections, then wait for open requests until `ShutdownGrace` ends (RFC 9114).
 - `Stop` MUST return at the caller deadline when that deadline is sooner.
-- If `Stop` returns through the caller-cancellation path, it MUST close the UDP listener and join any listener close error with the caller error. That path MUST NOT wait for or include the backend cleanup result.
-- If backend cleanup and caller cancellation are both ready, `Stop` MAY select either path. A completed cleanup result MAY therefore include the shutdown fault even after the caller deadline.
+- When caller cancellation ends `Stop`, it MUST close the UDP listener.
+- That return MUST join the caller error with any listener close error.
+- That return MUST NOT wait for background cleanup or include its result.
+- If cleanup and caller cancellation are both ready, `Stop` MAY select either path.
+- A completed cleanup result MAY include the shutdown fault after the caller deadline.
 - `Stop` MUST close HTTP/3 connections when shutdown times out.
 - `Stop` of a server that is not started MUST return a nil error.
 - On each connection with an open HTTP/3 control stream, a graceful drain MUST send one GOAWAY frame.
@@ -131,8 +134,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - A UDP listen failure MUST map to `http3.listen_udp` with the address in the cause.
 - An HTTP/3 serve failure MUST map to `http3.h3_serve` with the cause.
 - An HTTP/3 shutdown failure MUST map to `http3.h3_shutdown` with the cause.
-- After HTTP/3 shutdown fails, background cleanup MUST close the backend and join any backend close error with `http3.h3_shutdown`.
-- If `Stop` observes cleanup completion, it MUST include the joined shutdown and backend close errors. The caller-cancellation path above does not include this background result.
+- After HTTP/3 shutdown fails, background cleanup MUST close the backend.
+- Cleanup MUST join any backend close error with `http3.h3_shutdown`.
+- If `Stop` observes cleanup completion, it MUST include the joined errors.
 
 ### Code table
 
@@ -156,6 +160,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3RefusesExtendedConnect` proves that an extended CONNECT request answers 501 without reaching the router while plain H3 traffic still passes.
 - `TestH3StopMeetsCallerDeadline` proves that `Stop` returns at the caller deadline with a stuck handler.
 - `TestH3StopCallerDeadlineClosesUDPWithCallerError` proves that a caller-deadline `Stop` returns promptly with the deadline cause and closes the UDP listener, whether or not completed cleanup also contributes a shutdown fault.
+- `TestH3StopReturnsWhileTransportCleanupBlocked` proves that caller cancellation returns while a real UDP reader holds transport cleanup.
 - `TestH3RefusesEarlyData` sends QUIC 0-RTT data and checks that the server resumes the TLS session without accepting that data.
 - `TestH3StopClosesOnTimeout` proves that a timed-out shutdown ends the HTTP/3 request.
 - `TestH3AltSvcAbsentWhenH3False` proves no header without `H3`.
