@@ -42,6 +42,7 @@ A file that starts with the line `Status: specified; the package is not in the t
 - [frontend](frontend.md): the browser workspace and its island adapters.
 - [live](live.md): server-sent events.
 - [bus](bus.md): typed topics inside one process.
+- [websocket](websocket.md): RFC 6455 connections over HTTP/1.1 and HTTP/2.
 
 ## Data
 
@@ -51,11 +52,11 @@ A file that starts with the line `Status: specified; the package is not in the t
 - [orm](orm.md): sessions over generated entity types.
 
 ## Security and operations
-
 - [auth](auth.md): password hashes, sessions and the stages that guard a route.
 - [meter](meter.md): counters, gauges and histograms with a cardinality cap.
 - [ops](ops.md): the health, readiness and metrics endpoints.
 - [admin](admin.md): the console that lists instances.
+- [fault](fault.md): the shared error vocabulary with client-safe views.
 
 ## Resilience and background work
 
