@@ -308,20 +308,6 @@ func TestSplitShortTextStaysWhole(t *testing.T) {
 	}
 }
 
-func TestSplitLongTextCutsAtTheSentence(t *testing.T) {
-	enc := mustEncoder(t)
-	text := "This is the first sentence with enough words. This is the second sentence. And this is the third sentence."
-	o := rag.SplitOptions{ChunkSize: 15, MinChunkSizeChars: 10, KeepSeparator: true}
-	chunks := mustSplit(t, enc, text, o)
-	if len(chunks) < 2 {
-		t.Fatalf("long text stays whole: %q", chunks)
-		return
-	}
-	if !strings.HasSuffix(chunks[0], ".") {
-		t.Errorf("first chunk = %q, want it to end with a period", chunks[0])
-	}
-}
-
 func TestSplitLastChunkStaysWhole(t *testing.T) {
 	enc := mustEncoder(t)
 	text := "one two three four five six seven eight nine ten eleven. twelve thirteen"

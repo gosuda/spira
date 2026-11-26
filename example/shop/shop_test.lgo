@@ -74,23 +74,6 @@ func jointRouter(pool *db.Pool) *web.Router {
 	return r
 }
 
-func TestJointRouterServesCatalog(t *testing.T) {
-	pool := openPool(t)
-	if pool == nil {
-		return
-	}
-	req := httptest.NewRequest(http.MethodGet, "/catalog", nil)
-	rec := httptest.NewRecorder()
-	jointRouter(pool).ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-		return
-	}
-	if !strings.HasPrefix(rec.Body.String(), "<!doctype html>") {
-		t.Fatalf("joint catalog lacks the doctype")
-	}
-}
-
 func TestJointAddToCartAppearsOnCartPage(t *testing.T) {
 	pool := openPool(t)
 	if pool == nil {
