@@ -30,16 +30,23 @@ type faultUniq struct {
 
 func TestFaultConstraintViolation(t *testing.T) {
 	pool := openPool(t)
-	faultExec(t, pool, "CREATE TABLE fault_uniq (n INTEGER NOT NULL UNIQUE)")
-	faultExec(t, pool, "INSERT INTO fault_uniq (n) VALUES (7)")
-	_, err := db.Exec(t.Context(), pool, "INSERT INTO fault_uniq (n) VALUES (7)")
-	if !errors.Is(err, db.ErrConstraintViolation) {
-		t.Fatalf("Exec error = %v, want db.ErrConstraintViolation", err)
-		return
-	}
-	if errors.Is(err, db.ErrUnavailable) {
-		t.Fatalf("Exec error = %v, must not be db.ErrUnavailable", err)
-		return
+	for _, table := range []string{"fault_uniq", "fault_uniq_retry"} {
+		withConstraintProbe(t, t.Context(), pool, constraintProbe{
+			table: table,
+			mark:  "?",
+			check: func(dupErr error) {
+				if !errors.Is(dupErr, db.ErrConstraintViolation) {
+					t.Fatalf("Exec error = %v, want db.ErrConstraintViolation", dupErr)
+					return
+				}
+				if errors.Is(dupErr, db.ErrUnavailable) {
+					t.Fatalf("Exec error = %v, must not be db.ErrUnavailable", dupErr)
+					return
+				}
+			},
+		})
+		faultExec(t, pool, "CREATE TABLE "+table+" (n INTEGER NOT NULL UNIQUE)")
+		faultExec(t, pool, "DROP TABLE "+table)
 	}
 }
 

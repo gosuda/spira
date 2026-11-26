@@ -1,0 +1,54 @@
+package catalog_test
+
+import (
+	"encoding/json"
+	"errors"
+	"maps"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/gosuda/spira/example/shop/catalog"
+	"github.com/gosuda/spira/fault/faulttest"
+)
+
+func TestCatalogUnknownProductStaysClientSafe(t *testing.T) {
+	const secret = "SECRET-CATALOG-73019"
+	raw := faulttest.PublicJSON(t, catalog.ErrUnknownProduct.Wrap(errors.New(secret)))
+	faulttest.RefuseLeak(t, raw, secret)
+	if !strings.Contains(string(raw), `"catalog.unknown_product"`) {
+		t.Fatalf("public view %s lacks the fault code", raw)
+		return
+	}
+	if !strings.Contains(string(raw), "The product was not found.") {
+		t.Fatalf("public view %s lacks the constant message", raw)
+		return
+	}
+}
+
+func TestCatalogMissingProductHidesWrappedCause(t *testing.T) {
+	pool := openPool(t)
+	if pool == nil {
+		return
+	}
+	router := testRouter(pool)
+	missing := get(t, router, "/catalog/999", nil)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d, want 404", missing.Code)
+		return
+	}
+	faulttest.RefuseLeak(t, missing.Body.Bytes(), "SECRET-CATALOG-73019")
+	var problem map[string]string
+	if err := json.Unmarshal(missing.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode missing product fault: %v", err)
+		return
+	}
+	want := map[string]string{
+		"code":    "catalog.unknown_product",
+		"message": "The product was not found.",
+	}
+	if !maps.Equal(problem, want) {
+		t.Fatalf("missing product fault = %v, want only %v", problem, want)
+		return
+	}
+}
