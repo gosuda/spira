@@ -1542,7 +1542,7 @@ func releaseH3RetryPort(ctx context.Context, packet net.PacketConn, attempt int)
 	select {
 	case <-timer.C:
 		if err := packet.Close(); err != nil {
-			return fmt.Errorf("release UDP before retry %d: %w", attempt, err)
+			return fmt.Errorf("http3: release UDP before retry %d: %w", attempt, err)
 		}
 		return nil
 	case <-ctx.Done():
@@ -1553,7 +1553,7 @@ func releaseH3RetryPort(ctx context.Context, packet net.PacketConn, attempt int)
 func driveH3RetryInterval(ctx context.Context, probe *h3ConflictProbe, attempt int) error {
 	if attempt == 0 {
 		if err := probe.packet.Close(); err != nil {
-			return fmt.Errorf("release UDP before initial bind: %w", err)
+			return fmt.Errorf("http3: release UDP before initial bind: %w", err)
 		}
 		return startH3DuringConflict(ctx, probe)
 	}
@@ -1562,6 +1562,28 @@ func driveH3RetryInterval(ctx context.Context, probe *h3ConflictProbe, attempt i
 		go releaseH3RetryPort(ctx, probe.packet, attempt)
 	}
 	return nil
+}
+
+func TestH3RetryReleaseErrorsCarryPackagePrefix(t *testing.T) {
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy UDP port: %v", err)
+		return
+	}
+	if cerr := packet.Close(); cerr != nil {
+		t.Fatalf("close UDP port: %v", cerr)
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := releaseH3RetryPort(ctx, packet, 1); err == nil || !strings.HasPrefix(err.Error(), "http3: release UDP before retry 1: ") {
+		t.Fatalf("retry release error = %v, want the http3-prefixed retry cause", err)
+		return
+	}
+	probe := &h3ConflictProbe{server: &http3.Server{}, packet: packet, result: make(chan error, 1)}
+	if err := driveH3RetryInterval(ctx, probe, 0); err == nil || !strings.HasPrefix(err.Error(), "http3: release UDP before initial bind: ") {
+		t.Fatalf("initial release error = %v, want the http3-prefixed bind cause", err)
+	}
 }
 
 func TestH3StartRetriesAtEveryInterval(t *testing.T) {
