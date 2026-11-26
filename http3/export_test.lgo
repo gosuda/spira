@@ -151,7 +151,11 @@ type H3RequestStreamConfigForTest struct {
 }
 
 func ServeH3RequestStreamForTest(ctx context.Context, conn *quic.Conn, stream *quic.Stream, cfg H3RequestStreamConfigForTest) {
-	serveH3RequestStream(ctx, conn, stream, h3RequestStreamConfig{handler: cfg.Handler, maxFieldSectionSize: cfg.MaxFieldSectionSize})
+	limit := cfg.MaxFieldSectionSize
+	if limit == 0 {
+		limit = http.DefaultMaxHeaderBytes
+	}
+	serveH3RequestStream(ctx, conn, stream, h3RequestStreamConfig{handler: cfg.Handler, maxFieldSectionSize: limit})
 }
 
 type H3ResponseWriterForTest interface {
