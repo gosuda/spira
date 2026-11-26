@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -143,5 +144,33 @@ func TestFilePoolNeverDeletesDatabase(t *testing.T) {
 	}
 	if info.Size() == 0 {
 		t.Fatal("database file is empty after expiry")
+	}
+}
+
+func TestMemoryPoolCapsIdleAtOpenLimit(t *testing.T) {
+	pool := openRawPool(t, "file:idle_open_cap?mode=memory&cache=shared",
+		db.PoolOptions{MaxOpenConns: 1, MaxIdleConns: 8})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	held, err := pool.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("hold connection: %v", err)
+		return
+	}
+	wait, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+	extra, err := pool.QueryContext(wait, "SELECT 1")
+	stop()
+	closeRows(t, held)
+	if err == nil {
+		closeRows(t, extra)
+		t.Fatal("idle limit overrode the smaller open-connection cap")
+		return
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second connection = %v, want the open-cap deadline", err)
+		return
+	}
+	if stats := pool.Stats(); stats.MaxOpenConnections != 1 || stats.OpenConnections != 1 || stats.Idle != 1 {
+		t.Fatalf("released memory pool = %+v, want one open and idle connection", stats)
 	}
 }

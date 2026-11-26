@@ -114,7 +114,7 @@ func ClassifyDriverError(d Dialect, cause error) error
 - `Open` MUST disable age and idle eviction for in-memory SQLite DSNs.
 - An in-memory SQLite pool MUST preserve its resolved open-connection limit.
 - An in-memory SQLite pool MUST raise a resolved idle-connection limit below one to one.
-- It MUST preserve larger resolved idle-connection limits, including explicit values.
+- Larger resolved idle limits MUST remain effective up to a positive open-connection limit.
 - Only `file:` URI query parameters MUST affect SQLite memory classification.
 - SQLite URI fragments MUST NOT affect memory classification.
 - `Open` MUST keep a zero `PoolOptions` field on its dialect default.
@@ -236,6 +236,8 @@ func ClassifyDriverError(d Dialect, cause error) error
 - Public views MUST NOT carry table names, column names or values.
 
 ## Proof
+
+- `TestMemoryPoolCapsIdleAtOpenLimit` proves that an explicit larger idle limit cannot raise the open cap.
 
 - `TestPlainFilenameMemoryQueryKeepsExpiry` proves that a plain filename with `mode=memory` retains lifetime expiry and file contents.
 - `TestMemoryURIFragmentKeepsRows` proves that a URI fragment cannot re-enable expiry for shared memory.
