@@ -155,7 +155,9 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
 - `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
 - `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
-- `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` retries a bounded number of times until a transient UDP conflict clears.
+- `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` succeeds after a transient UDP conflict clears.
+- `TestH3StartPersistentUDPConflictExhaustsRetries` proves that persistent contention returns UDP `EADDRINUSE` after seven waits, before the caller deadline.
+- `TestH3StartReleasesUDPAfterTCPConflict` requires TCP listen `EADDRINUSE` and proves the acquired UDP socket was released.
 - `TestH3StartReleasesUDPAfterTCPConflict` proves that a TCP conflict closes the bound UDP socket.
 - `TestH3RunsStagesAndRepliesLikeTCP` proves that one router runs the same stages and writes the same data, page, and problem replies over UDP and TCP.
 - `TestH3AltSvcEdgeCases` proves that `Start` installs no stage, that disabled `H3` binds no UDP, and that a stopped server advertises nothing.

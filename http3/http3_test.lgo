@@ -1480,9 +1480,15 @@ func TestH3StartReleasesUDPAfterTCPConflict(t *testing.T) {
 		server := &http3.Server{Addr: addr, Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true, ShutdownGrace: 2 * time.Second}
 		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 		defer cancel()
-		if err := server.Start(ctx); err == nil {
+		err = server.Start(ctx)
+		if err == nil {
 			defer stopH3Server(t, server)
 			t.Fatal("Start over an occupied TCP port succeeded")
+			return
+		}
+		op, ok := errors.AsType[*net.OpError](err)
+		if !ok || op.Op != "listen" || op.Net != "tcp" || !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("Start error = %v, want TCP listen EADDRINUSE", err)
 			return
 		}
 		rebound, berr := net.ListenPacket("udp", addr)
@@ -1495,6 +1501,38 @@ func TestH3StartReleasesUDPAfterTCPConflict(t *testing.T) {
 				t.Errorf("close rebound UDP port: %v", err)
 			}
 		}()
+	})
+}
+
+func TestH3StartPersistentUDPConflictExhaustsRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("occupy UDP port: %v", err)
+			return
+		}
+		defer func() {
+			if err := packet.Close(); err != nil {
+				t.Errorf("close UDP port: %v", err)
+			}
+		}()
+		cert, _ := testCert(t)
+		server := &http3.Server{Addr: packet.LocalAddr().String(), Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true}
+		defer stopH3Server(t, server)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		started := time.Now()
+		err = server.Start(ctx)
+		if !errors.Is(err, http3.ErrListenUDP) || !errors.Is(err, syscall.EADDRINUSE) || ctx.Err() != nil {
+			t.Fatalf("persistent UDP conflict = %v, context %v, want exhausted UDP EADDRINUSE before deadline", err, ctx.Err())
+			return
+		}
+		if elapsed := time.Since(started); elapsed != 70*time.Millisecond {
+			t.Fatalf("retry duration = %v, want seven 10ms waits", elapsed)
+		}
+		if addr := server.BoundUDPAddrForTest(); addr != "" {
+			t.Fatalf("UDP bound after exhausted retries: %s", addr)
+		}
 	})
 }
 

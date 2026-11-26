@@ -161,15 +161,12 @@ func readH3GoAwayTail(reader quicvarint.Reader) error {
 		if err != nil {
 			return nil
 		}
+		if frame == 7 {
+			return errors.New("duplicate GOAWAY frame on the control stream")
+		}
 		size, err := quicvarint.Read(reader)
 		if err != nil {
 			return nil
-		}
-		if frame == 7 {
-			if cerr := checkH3GoAway(reader, size); cerr != nil {
-				return cerr
-			}
-			return errors.New("duplicate GOAWAY frame on the control stream")
 		}
 		if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
 			return nil
@@ -265,5 +262,13 @@ func TestReadH3GoAwayTailRejectsDuplicate(t *testing.T) {
 	if err := readH3GoAwayTail(quicvarint.NewReader(bytes.NewBuffer(nil))); err != nil {
 		t.Fatalf("empty control tail rejected: %v", err)
 		return
+	}
+}
+
+func TestReadH3GoAwayTailRejectsTruncatedDuplicate(t *testing.T) {
+	for _, tail := range [][]byte{{0x07}, {0x07, 0x40}, {0x07, 0x80, 0x00, 0x00}} {
+		if err := readH3GoAwayTail(quicvarint.NewReader(bytes.NewReader(tail))); err == nil || err.Error() != "duplicate GOAWAY frame on the control stream" {
+			t.Errorf("truncated duplicate GOAWAY %x = %v, want duplicate rejection", tail, err)
+		}
 	}
 }
