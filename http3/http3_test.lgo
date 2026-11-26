@@ -1292,6 +1292,22 @@ func assertH3CallerPacketRoundTrips(t *testing.T, packet net.PacketConn) {
 	}
 }
 
+func assertH3CallerTLSKept(t *testing.T, base *tls.Config, selected *tls.Config, callback *tls.Config) {
+	t.Helper()
+	if len(base.NextProtos) != 1 || base.NextProtos[0] != "not-h3" {
+		t.Errorf("base TLS ALPN changed: %v", base.NextProtos)
+	}
+	if len(selected.NextProtos) != 1 || selected.NextProtos[0] != "not-h3" {
+		t.Errorf("callback TLS ALPN changed: %v", selected.NextProtos)
+	}
+	if selected.MinVersion != tls.VersionTLS12 {
+		t.Errorf("callback TLS minimum version changed: %v", selected.MinVersion)
+	}
+	if len(callback.NextProtos) != 1 || callback.NextProtos[0] != "not-h3" {
+		t.Errorf("callback config ALPN changed: %v", callback.NextProtos)
+	}
+}
+
 func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 	cert, pool := testCert(t)
 	if pool == nil {
@@ -1299,7 +1315,7 @@ func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 		return
 	}
 	base := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"not-h3"}}
-	selected := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"not-h3"}}
+	selected := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"not-h3"}, MinVersion: tls.VersionTLS12}
 	callback := &tls.Config{
 		NextProtos: []string{"not-h3"},
 		GetConfigForClient: func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -1340,12 +1356,7 @@ func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 			}
 		})
 	}
-	if len(base.NextProtos) != 1 || base.NextProtos[0] != "not-h3" {
-		t.Errorf("base TLS ALPN changed: %v", base.NextProtos)
-	}
-	if len(selected.NextProtos) != 1 || selected.NextProtos[0] != "not-h3" {
-		t.Errorf("callback TLS ALPN changed: %v", selected.NextProtos)
-	}
+	assertH3CallerTLSKept(t, base, selected, callback)
 }
 
 type h3ConflictProbe struct {
@@ -1449,6 +1460,41 @@ func TestH3StartUDPConflictHonorsContext(t *testing.T) {
 		if addr := server.BoundUDPAddrForTest(); addr != "" {
 			t.Fatalf("UDP bound after canceled start: %s", addr)
 		}
+	})
+}
+
+func TestH3StartReleasesUDPAfterTCPConflict(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tcp, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("occupy TCP port: %v", err)
+			return
+		}
+		defer func() {
+			if err := tcp.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close TCP port: %v", err)
+			}
+		}()
+		addr := tcp.Addr().String()
+		cert, _ := testCert(t)
+		server := &http3.Server{Addr: addr, Router: web.NewRouter(), TLS: &tls.Config{Certificates: []tls.Certificate{cert}}, H3: true, ShutdownGrace: 2 * time.Second}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		if err := server.Start(ctx); err == nil {
+			defer stopH3Server(t, server)
+			t.Fatal("Start over an occupied TCP port succeeded")
+			return
+		}
+		rebound, berr := net.ListenPacket("udp", addr)
+		if berr != nil {
+			t.Fatalf("UDP port %s stayed bound after failed Start: %v", addr, berr)
+			return
+		}
+		defer func() {
+			if err := rebound.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close rebound UDP port: %v", err)
+			}
+		}()
 	})
 }
 

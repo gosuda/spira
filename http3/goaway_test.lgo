@@ -1,6 +1,7 @@
 package http3_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -120,7 +121,6 @@ func stopH3ForGoAway(ctx context.Context, p *h3GoAwayProbe) error {
 }
 
 func observeH3GoAway(ctx context.Context, p *h3GoAwayProbe) error {
-	defer close(p.slow.release)
 	if err := waitH3Entered(ctx, p.slow.entered); err != nil {
 		return err
 	}
@@ -131,8 +131,9 @@ func observeH3GoAway(ctx context.Context, p *h3GoAwayProbe) error {
 	case <-p.finished:
 		return errors.New("request finished before GOAWAY")
 	default:
-		return nil
 	}
+	close(p.slow.release)
+	return readH3GoAwayTail(p.control)
 }
 
 func readH3GoAway(reader quicvarint.Reader) error {
@@ -150,6 +151,28 @@ func readH3GoAway(reader quicvarint.Reader) error {
 		}
 		if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
 			return fmt.Errorf("skip control frame: %w", err)
+		}
+	}
+}
+
+func readH3GoAwayTail(reader quicvarint.Reader) error {
+	for {
+		frame, err := quicvarint.Read(reader)
+		if err != nil {
+			return nil
+		}
+		size, err := quicvarint.Read(reader)
+		if err != nil {
+			return nil
+		}
+		if frame == 7 {
+			if cerr := checkH3GoAway(reader, size); cerr != nil {
+				return cerr
+			}
+			return errors.New("duplicate GOAWAY frame on the control stream")
+		}
+		if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
+			return nil
 		}
 	}
 }
@@ -220,5 +243,27 @@ func TestH3StopSendsGOAWAYBeforeDrain(t *testing.T) {
 	probe := &h3GoAwayProbe{server: server, client: client, conn: conn, control: control, slow: slow, finished: make(chan struct{}), url: "https://" + addr + "/slow"}
 	if err := driveH3GoAway(ctx, probe); err != nil {
 		t.Fatalf("GOAWAY before drain: %v", err)
+	}
+}
+
+func TestReadH3GoAwayTailRejectsDuplicate(t *testing.T) {
+	dup := []byte{0x07, 0x01, 0x00, 0x07, 0x01, 0x00}
+	if err := readH3GoAwayTail(quicvarint.NewReader(bytes.NewBuffer(dup))); err == nil {
+		t.Fatal("duplicate GOAWAY accepted")
+		return
+	}
+	interleaved := []byte{0x04, 0x00, 0x07, 0x01, 0x00}
+	if err := readH3GoAwayTail(quicvarint.NewReader(bytes.NewBuffer(interleaved))); err == nil {
+		t.Fatal("GOAWAY after SETTINGS accepted as the only one")
+		return
+	}
+	settingsOnly := []byte{0x04, 0x00}
+	if err := readH3GoAwayTail(quicvarint.NewReader(bytes.NewBuffer(settingsOnly))); err != nil {
+		t.Fatalf("clean control tail rejected: %v", err)
+		return
+	}
+	if err := readH3GoAwayTail(quicvarint.NewReader(bytes.NewBuffer(nil))); err != nil {
+		t.Fatalf("empty control tail rejected: %v", err)
+		return
 	}
 }
