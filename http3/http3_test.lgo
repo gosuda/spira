@@ -1356,6 +1356,116 @@ func TestH3RejectsNonH3ALPNOnUDP(t *testing.T) {
 	assertH3CallerTLSKept(t, base, selected, callback)
 }
 
+func openH3PartialUni(t *testing.T, ctx context.Context, conn *quic.Conn, payload []byte) *quic.SendStream {
+	t.Helper()
+	stream, err := conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open peer-visible stream: %v", err)
+	}
+	if err := stream.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("publish stream: %v", err)
+	}
+	return stream
+}
+
+func assertH3UniOpenBlocked(t *testing.T, ctx context.Context, conn *quic.Conn) {
+	t.Helper()
+	probe, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	stream, err := conn.OpenUniStreamSync(probe)
+	if err == nil {
+		if err := stream.Close(); err != nil {
+			t.Errorf("close unexpectedly accepted stream: %v", err)
+		}
+		stream.CancelWrite(0x100)
+		t.Fatal("the 101st active stream opened past the 100-stream cap")
+		return
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || conn.Context().Err() != nil {
+		t.Fatalf("101st stream error = %v; connection cause = %v", err, context.Cause(conn.Context()))
+		return
+	}
+}
+
+func assertH3StreamCap(t *testing.T, ctx context.Context, conn *quic.Conn) {
+	t.Helper()
+	control := openH3PartialUni(t, ctx, conn, []byte{0x00, 0x04, 0x00})
+	defer func() {
+		if err := control.Close(); err != nil {
+			t.Errorf("close control stream: %v", err)
+		}
+		control.CancelWrite(0x100)
+	}()
+	opened := make([]*quic.SendStream, 0, 99)
+	defer func() {
+		for _, stream := range opened {
+			stream.CancelWrite(0x100)
+		}
+	}()
+	for range 99 {
+		// An incomplete two-byte stream type reaches the peer and keeps its reader open.
+		opened = append(opened, openH3PartialUni(t, ctx, conn, []byte{0x40}))
+	}
+	assertH3UniOpenBlocked(t, ctx, conn)
+	for range 3 {
+		if err := opened[0].Close(); err != nil {
+			t.Fatalf("release one active stream: %v", err)
+			return
+		}
+		opened = opened[1:]
+		credit, cancel := context.WithTimeout(ctx, 2*time.Second)
+		stream := openH3PartialUni(t, credit, conn, []byte{0x40})
+		cancel()
+		opened = append(opened, stream)
+		assertH3UniOpenBlocked(t, ctx, conn)
+	}
+}
+
+func TestH3PublicCapsIncomingUniStreamsAt100(t *testing.T) {
+	r := web.NewRouter()
+	r.Handle("GET", "/hello", h3Hello)
+	cert, pool := testCert(t)
+	if pool == nil {
+		t.Fatal("cert pool missing")
+		return
+	}
+	s := startH3Server(t, r, cert, 2*time.Second)
+	if s == nil {
+		t.Fatal("server did not start")
+		return
+	}
+	udpAddr := s.BoundUDPAddrForTest()
+	if udpAddr == "" {
+		t.Fatal("no UDP bound address")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, derr := quic.DialAddr(ctx, udpAddr, &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h3"}}, &quic.Config{})
+	if derr != nil {
+		t.Fatalf("quic dial: %v", derr)
+		return
+	}
+	defer func() {
+		if cerr := conn.CloseWithError(0, ""); cerr != nil {
+			return
+		}
+	}()
+	select {
+	case <-conn.HandshakeComplete():
+	case <-conn.Context().Done():
+		t.Fatalf("QUIC connection closed before the handshake finished: %v", context.Cause(conn.Context()))
+		return
+	case <-ctx.Done():
+		t.Fatalf("QUIC handshake did not finish: %v", ctx.Err())
+		return
+	}
+	assertH3StreamCap(t, ctx, conn)
+}
+
 type h3ConflictProbe struct {
 	server *http3.Server
 	packet net.PacketConn

@@ -2,7 +2,7 @@
 
 `http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-The native `H3Server` uses the LoGOs toolchain transport. Ejected code uses `github.com/quic-go/quic-go`. Both clone the TLS configuration for UDP, require TLS 1.3, and set ALPN to `h3`.
+The native `H3Server` uses `golang.org/x/net/quic` in the LoGOs toolchain. Ejected code uses `github.com/quic-go/quic-go`. Both clone the TLS configuration for UDP, require TLS 1.3, and set ALPN to `h3`.
 
 ## Interface
 
@@ -118,7 +118,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - The server MUST refuse 0-RTT early data, because early data replays and a replayed request could run twice.
 - When a client attempts TLS session resumption, the QUIC layer MUST clear the early data flag on the session. The server MUST accept no 0-RTT data and MUST keep no 0-RTT replay window.
 - The QUIC backend MUST issue no session tickets. The server MAY resume with a ticket from another issuer if the TLS configuration accepts it.
-- A restart MUST NOT drop the ability to resume a session established before the restart.
+- A restart MUST NOT drop the ability to resume a session that stays eligible after the restart.
 - The TLS configuration MUST retain a valid ticket key for such a session, or recover its state with `UnwrapSession`.
 - `http3.Server` MUST NOT manage ticket key storage or rotation.
 - `SessionTicketsDisabled` on the effective TLS configuration MUST disable resumption.
@@ -172,6 +172,7 @@ These limits and timeouts apply to the LoGOs backend that `http3.Server` uses.
 - `TestH3QUICClosesIdleConnectionAfterSettings` observes an idle timeout after sending SETTINGS; it does not identify which endpoint's idle timer fires.
 - `TestH3QUICMissingSettingsReportsProtocolCode` requires remote `H3_MISSING_SETTINGS` within five seconds plus one second of observation tolerance.
 - `TestH3ServeWithoutH3OpensNoUDP` proves that `Serve` with `H3` false serves TCP from the caller listener without TLS and binds no UDP.
+- `TestH3PublicCapsIncomingUniStreamsAt100` opens 100 peer-visible streams, blocks the 101st, and repeats after three release-and-renew cycles.
 - `TestH3RejectsNonH3ALPNOnUDP` proves that the UDP listener negotiates only ALPN `h3`, including for `GetConfigForClient` configs, without mutating the caller configs.
 - `TestH3ServeUsesCallerSocketsAndKeepsThemOnFailure` proves that `Serve` answers on both caller sockets and leaves them usable after a missing router, missing TLS, or a busy server.
 - `TestH3StartSucceedsAfterTransientUDPConflict` proves that `Start` succeeds after a transient UDP conflict clears.
