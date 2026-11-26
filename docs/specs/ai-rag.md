@@ -396,7 +396,7 @@ func ReadJSON(r io.Reader, keys ...string) ([]Document, error)
 - `TestRewriteSendsTheReferencePrompt`, `TestTranslateSendsTheReferencePrompt` and `TestCompressSendsHistoryAndTheFollowUpQuery` prove the exact prompt text of each transformer.
 - `TestRewriteWithABlankAnswerKeepsTheQuery` proves the blank-answer rule.
 - `TestExpandReturnsOneQueryPerLine`, `TestExpandWithFewerLinesKeepsTheQuery` and `TestExpandWithATrailingNewlineKeepsTheVariants` prove the line-count rule.
-- `TestMemorySearchOrderEqualsABruteForceComputation`, `TestMemoryDefaultIsFourDocumentsAndNoThreshold` and `TestMemoryDeleteKeepsTheOtherDocumentsWhole` plus the `var _ rag.Store` assertions prove `Memory` satisfies `Store`.
+- `TestMemorySearchOrderEqualsABruteForceComputation`, `TestMemoryDefaultIsFourDocumentsAndNoThreshold` and `TestMemoryDeleteKeepsTheOtherDocumentsWhole` plus the `var _ rag.Store` assertions prove `Memory` and `Pgvector` satisfy `Store`.
 - `TestPgvectorRefusesBadTables` proves the table pattern and the constructor refusals.
 - `TestPgvectorBlankIdSendsNoEmbedding` proves that a blank id costs no embedding request.
 - `TestPgvectorVectorTextFormatsBrackets` proves the `[1,2.5,-3]` vector text form.
