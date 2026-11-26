@@ -1,0 +1,42 @@
+package migrate_test
+
+import (
+	"testing"
+
+	"github.com/gosuda/spira/migrate"
+	"logos/sync"
+)
+
+func TestConcurrentApplySerializes(t *testing.T) {
+	pool := openPool(t)
+	steps := []migrate.Step{
+		{Name: "0001_conc", Up: "CREATE TABLE conc_apply (n integer);", Down: "DROP TABLE conc_apply;"},
+	}
+	ctx := t.Context()
+	var errs sync.Locked[[]error]
+	run := func() error {
+		go group (ctx, limit = 8) {
+			for range 8 {
+				go {
+					if err := migrate.Apply(ctx, pool, steps); err != nil {
+						errs.WithLock(func(e *[]error) {
+							*e = append(*e, err)
+						})
+					}
+				}
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("group: %v", err)
+		return
+	}
+	var collected []error
+	errs.WithLock(func(e *[]error) {
+		collected = *e
+	})
+	if len(collected) != 0 {
+		t.Fatalf("concurrent Apply failed with %d errors, first: %v", len(collected), collected[0])
+	}
+}
