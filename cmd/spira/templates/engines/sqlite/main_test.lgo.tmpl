@@ -226,5 +226,8 @@ func TestLoginSurvivesFailedSessionSweep(t *testing.T) {
 		if !strings.Contains(buf.String(), "sweep expired sessions") {
 			t.Fatalf("operator log %q lacks the sweep failure: the delete never fired", buf.String())
 		}
+		if !strings.Contains(buf.String(), "sweep refused") {
+			t.Fatalf("operator log %q lacks the sweep cause: the error details never fired", buf.String())
+		}
 	})
 }
