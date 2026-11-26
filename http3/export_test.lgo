@@ -1,8 +1,15 @@
 package http3
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+
+	"github.com/quic-go/quic-go"
 )
 
 func (s *Server) BoundTCPAddrForTest() string {
@@ -44,4 +51,187 @@ func (s *Server) WaitH3ServeForTest(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type H3SettingsForTest struct {
+	MaxFieldSectionSize   uint64
+	QpackMaxTableCapacity uint64
+	QpackBlockedStreams   uint64
+	EnableConnectProtocol bool
+	EnableDatagram        bool
+}
+
+func snapshotH3SettingsForTest(s h3Settings) H3SettingsForTest {
+	return H3SettingsForTest{
+		MaxFieldSectionSize:   s.maxFieldSectionSize,
+		QpackMaxTableCapacity: s.qpackMaxTableCapacity,
+		QpackBlockedStreams:   s.qpackBlockedStreams,
+		EnableConnectProtocol: s.enableConnectProtocol,
+		EnableDatagram:        s.enableDatagram,
+	}
+}
+
+func DecodeH3SettingsForTest(payload []byte) (H3SettingsForTest, error) {
+	s, err := decodeH3Settings(payload)
+	if err != nil {
+		return H3SettingsForTest{}, err
+	}
+	return snapshotH3SettingsForTest(s), nil
+}
+
+func ReadH3FrameHeaderForTest(r io.ByteReader) (uint64, uint64, error) {
+	h, err := readH3FrameHeader(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	return h.kind, h.length, nil
+}
+
+func AppendH3FrameHeaderForTest(dst []byte, kind, length uint64) []byte {
+	return appendH3FrameHeader(dst, kind, length)
+}
+
+func H3UnlimitedFieldSectionSizeForTest() uint64 {
+	return h3UnlimitedFieldSectionSize
+}
+
+func ErrH3SettingsMalformedForTest() error {
+	return errH3SettingsMalformed
+}
+
+func ErrH3SettingsTooLargeForTest() error {
+	return errH3SettingsTooLarge
+}
+
+func ErrH3MalformedMessageForTest() error {
+	return errH3MalformedMessage
+}
+
+func ErrH3FrameTruncatedForTest() error {
+	return errH3FrameTruncated
+}
+
+func ErrH3FrameUnexpectedForTest() error {
+	return errH3FrameUnexpected
+}
+
+func ErrH3QPACKForTest() error {
+	return errH3QPACK
+}
+
+func ErrH3FieldSectionTooLargeForTest() error {
+	return errH3FieldSectionTooLarge
+}
+
+type H3RequestBodyLimitsForTest struct {
+	ContentLength       int64
+	MaxTrailerBytes     uint64
+	MaxFieldSectionSize uint64
+}
+
+func NewH3RequestBodyReaderForTest(reader *bufio.Reader, trailers http.Header, limits H3RequestBodyLimitsForTest) io.Reader {
+	return newH3RequestBodyReader(reader, trailers, h3RequestBodyLimits{
+		contentLength:       limits.ContentLength,
+		maxTrailerBytes:     limits.MaxTrailerBytes,
+		maxFieldSectionSize: limits.MaxFieldSectionSize,
+	})
+}
+
+func DecodeH3RequestForTest(block []byte, maxFieldSectionSize uint64) (*http.Request?, error) {
+	return decodeH3Request(block, maxFieldSectionSize)
+}
+
+func DecodeH3TrailersForTest(block []byte, maxFieldSectionSize uint64) (http.Header, error) {
+	return decodeH3Trailers(block, maxFieldSectionSize)
+}
+
+type H3RequestStreamConfigForTest struct {
+	Handler             http.Handler
+	MaxFieldSectionSize uint64
+}
+
+func ServeH3RequestStreamForTest(ctx context.Context, conn *quic.Conn, stream *quic.Stream, cfg H3RequestStreamConfigForTest) {
+	serveH3RequestStream(ctx, conn, stream, h3RequestStreamConfig{handler: cfg.Handler, maxFieldSectionSize: cfg.MaxFieldSectionSize})
+}
+
+type H3ResponseWriterForTest interface {
+	http.ResponseWriter
+	Flush()
+	FlushError() error
+}
+
+func NewH3ResponseWriterForTest(stream h3ResponseStream, method string, maxFieldSectionSize uint64) H3ResponseWriterForTest {
+	return newH3ResponseWriter(stream, method, maxFieldSectionSize)
+}
+
+func FinishH3ResponseForTest(w http.ResponseWriter) error {
+	writer, ok := w.(*h3ResponseWriter)
+	if !ok {
+		return errors.New("http3: test response writer wraps another implementation")
+	}
+	return writer.finish()
+}
+
+type H3ControlForTest struct {
+	control *h3Control
+}
+
+func StartH3ControlForTest(ctx context.Context, conn *quic.Conn, maxFieldSectionSize uint64) (*H3ControlForTest?, error) {
+	control, err := startH3Control(ctx, conn, maxFieldSectionSize)
+	if err != nil {
+		return nil, err
+	}
+	if control == nil {
+		return nil, errors.New("http3: test control stream missing")
+	}
+	return &H3ControlForTest{control: control}, nil
+}
+
+func (c *H3ControlForTest) SendGoAwayForTest(ctx context.Context, id uint64) error {
+	return c.control.sendGoAway(ctx, quic.StreamID(id))
+}
+
+func (c *H3ControlForTest) HandlePeerUniForTest(ctx context.Context, stream *quic.ReceiveStream) error {
+	return c.control.handlePeerUni(ctx, stream)
+}
+
+func (c *H3ControlForTest) PeerSettingsForTest() (H3SettingsForTest, bool) {
+	settings, ready := c.control.peerSettings()
+	return snapshotH3SettingsForTest(settings), ready
+}
+
+func (c *H3ControlForTest) AwaitPeerSettingsForTest(ctx context.Context) (H3SettingsForTest, error) {
+	settings, err := c.control.awaitPeerSettings(ctx)
+	if err != nil {
+		return H3SettingsForTest{}, err
+	}
+	return snapshotH3SettingsForTest(settings), nil
+}
+
+func (c *H3ControlForTest) WatchLocalForTest(ctx context.Context) error {
+	return c.control.watchLocal(ctx)
+}
+
+func (c *H3ControlForTest) LocalContextForTest() context.Context {
+	return c.control.local.Context()
+}
+
+type OwnedH3ServerForTest struct {
+	server *h3OwnedServer
+}
+
+func NewOwnedH3ServerForTest(handler http.Handler, config *tls.Config?) *OwnedH3ServerForTest {
+	return &OwnedH3ServerForTest{server: newH3OwnedServer(handler, config)}
+}
+
+func (s *OwnedH3ServerForTest) Serve(pc net.PacketConn) error {
+	return s.server.Serve(pc)
+}
+
+func (s *OwnedH3ServerForTest) Shutdown(ctx context.Context) error {
+	return s.server.Shutdown(ctx)
+}
+
+func (s *OwnedH3ServerForTest) Close() error {
+	return s.server.Close()
 }

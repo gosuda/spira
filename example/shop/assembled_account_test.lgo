@@ -1,4 +1,4 @@
-package main
+package main_test
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/gosuda/spira/asset"
 	"github.com/gosuda/spira/auth"
+	shopmain "github.com/gosuda/spira/example/shop"
 	"github.com/gosuda/spira/example/shop/db/store"
 	"github.com/gosuda/spira/view"
 )
@@ -40,7 +41,7 @@ func TestAssembledShopAccount(t *testing.T) {
 	}
 
 	assets := asset.Dev("http://localhost:5173")
-	router, _ := buildRouter(shopParts{pool: pool, assets: assets, tags: view.Group{}, dev: true})
+	router, _ := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
 	shop := scheduledStockServer(t, router)
 	shop.Client().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
