@@ -171,7 +171,7 @@ func (grd *requestGuard) httpClient(t *testing.T) *http.Client {
 	t.Cleanup(func() {
 		fresh.CloseIdleConnections()
 	})
-	return &http.Client{Transport: &markedTransport{want: grd.want, base: fresh}}
+	return &http.Client{Timeout: 10 * time.Second, Transport: &markedTransport{want: grd.want, base: fresh}}
 }
 
 func (m *markedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
