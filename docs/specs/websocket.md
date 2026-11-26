@@ -1,6 +1,5 @@
 # websocket
 
-Package `websocket` speaks RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 on `net/http` types.
 Package `websocket` speaks RFC 6455 over HTTP/1.1 and over HTTP/2 extended CONNECT (RFC 8441) on `net/http` types. It checks the opening handshake, guards the origin, picks a subprotocol, moves frames and closes cleanly.
 
 The package owns the handshake answer, the frame loop and the close handshake. It holds no global session state.
