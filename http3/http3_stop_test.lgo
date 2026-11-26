@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -13,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"logos/rt"
 	"logos/sync"
 
 	"github.com/gosuda/spira/http3"
@@ -319,75 +317,50 @@ func TestH3StopCallerDeadlineClosesUDPWithCallerError(t *testing.T) {
 	}
 	tr := http3peer.NewTransport(&tls.Config{RootCAs: pool})
 	defer closeH3Transport(t, tr)
+	p := &deadlineProbe{entered: entered, tr: tr, url: "https://" + udpAddr + "/sync", srv: s}
 	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer bcancel()
 	fetchCtx, endFetch := context.WithCancel(bctx)
 	defer endFetch()
-	finished := make(chan struct{})
-	if ferr := fetchSyncPage(fetchCtx, tr, "https://"+udpAddr+"/sync", finished); ferr != nil {
-		t.Fatalf("start sync fetch: %v", ferr)
-		return
-	}
-	select {
-	case <-entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("handler did not start")
-		return
-	}
-	stopCtx, cancel := context.WithTimeout(bctx, 300*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	serr := s.Stop(stopCtx)
-	elapsed := time.Since(start)
-	if !errors.Is(serr, context.DeadlineExceeded) {
-		t.Fatalf("Stop past the caller deadline = %v, want the caller deadline", serr)
-		return
-	}
-	if errors.Is(serr, http3.ErrH3Shutdown) {
-		t.Fatalf("Stop past the caller deadline joined the shutdown fault: %v", serr)
-		return
-	}
-	if elapsed > 1500*time.Millisecond {
-		t.Fatalf("Stop blocked %v past the 300ms caller deadline", elapsed)
-		return
-	}
-	requireUDPRebound(t, udpAddr)
-	<-finished
-}
-
-func fetchSyncPage(ctx context.Context, tr http.RoundTripper, url string, finished chan struct{}) error {
-	fetchers, _ := rt.NewGroup(context.WithoutCancel(ctx), 0)
-	fetchers.Go(func(_ context.Context) error {
-		defer close(finished)
-		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if rerr != nil {
-			return nil
-		}
-		resp, err := tr.RoundTrip(req)
-		if err != nil {
-			return nil
-		}
-		if _, cerr := io.Copy(io.Discard, resp.Body); cerr != nil {
-			return nil
-		}
-		if cerr := resp.Body.Close(); cerr != nil {
-			return nil
+	if err := func() error {
+		go group (bctx) {
+			go fetchSyncDeadline(fetchCtx, p)
+			go stopCallerDeadlineAndRebind(bctx, p, endFetch)
 		}
 		return nil
-	})
-	return nil
+	}(); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func requireUDPRebound(t *testing.T, addr string) {
-	t.Helper()
+func stopCallerDeadlineAndRebind(ctx context.Context, p *deadlineProbe, endFetch context.CancelFunc) error {
+	defer endFetch()
+	if err := waitH3Entered(ctx, p.entered); err != nil {
+		return fmt.Errorf("http3: wait for caller-deadline request: %w", err)
+	}
+	addr := p.srv.BoundUDPAddrForTest()
+	stopCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := p.srv.Stop(stopCtx)
+	elapsed := time.Since(started)
+	if err == nil {
+		return errors.New("http3: Stop past the caller deadline reported success")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("http3: Stop did not retain the caller deadline: %w", err)
+	}
+	if elapsed > 1500*time.Millisecond {
+		return fmt.Errorf("http3: Stop blocked %v past the 300ms caller deadline", elapsed)
+	}
 	rebound, berr := net.ListenPacket("udp", addr)
 	if berr != nil {
-		t.Fatalf("UDP port %s stayed bound after caller-deadline Stop: %v", addr, berr)
-		return
+		return fmt.Errorf("http3: UDP port %s stayed bound after caller-deadline Stop: %w", addr, berr)
 	}
 	if cerr := rebound.Close(); cerr != nil {
-		t.Errorf("close rebound UDP port: %v", cerr)
+		return fmt.Errorf("http3: close rebound UDP port: %w", cerr)
 	}
+	return nil
 }
 
 type h3GraceProbe struct {
