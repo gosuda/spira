@@ -10,23 +10,34 @@ import (
 
 	"github.com/gosuda/spira/example/shop/catalog"
 	"github.com/gosuda/spira/fault/faulttest"
+	"github.com/gosuda/spira/web"
 )
 
+const catalogProbeCause = "SECRET-CATALOG-73019\n<catalog-probe data-value=\"untrusted\">"
+
 func TestCatalogUnknownProductStaysClientSafe(t *testing.T) {
-	const secret = "SECRET-CATALOG-73019"
-	raw := faulttest.PublicJSON(t, catalog.ErrUnknownProduct.Wrap(errors.New(secret)))
-	faulttest.RefuseLeak(t, raw, secret)
-	if !strings.Contains(string(raw), `"catalog.unknown_product"`) {
-		t.Fatalf("public view %s lacks the fault code", raw)
+	wrapped := catalog.ErrUnknownProduct.Wrap(errors.New(catalogProbeCause))
+	if !strings.Contains(wrapped.Error(), catalogProbeCause) {
+		t.Fatalf("operator diagnostic %q lost its cause", wrapped.Error())
 		return
 	}
-	if !strings.Contains(string(raw), "The product was not found.") {
-		t.Fatalf("public view %s lacks the constant message", raw)
-		return
-	}
+	assertCatalogPublic(t, faulttest.PublicJSON(t, wrapped))
 }
 
-func TestCatalogMissingProductHidesWrappedCause(t *testing.T) {
+func TestCatalogWrappedFaultHTTPHidesCause(t *testing.T) {
+	router := web.NewRouter()
+	router.Handle(http.MethodGet, "/catalog-fault", func(_ *web.Context) (web.Reply, error) {
+		return nil, catalog.ErrUnknownProduct.Wrap(errors.New(catalogProbeCause))
+	})
+	response := get(t, router, "/catalog-fault", nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("wrapped fault status = %d, want 404", response.Code)
+		return
+	}
+	assertCatalogPublic(t, response.Body.Bytes())
+}
+
+func TestCatalogMissingProductReturnsSafeNotFound(t *testing.T) {
 	pool := openPool(t)
 	if pool == nil {
 		return
@@ -37,9 +48,14 @@ func TestCatalogMissingProductHidesWrappedCause(t *testing.T) {
 		t.Fatalf("missing status = %d, want 404", missing.Code)
 		return
 	}
-	faulttest.RefuseLeak(t, missing.Body.Bytes(), "SECRET-CATALOG-73019")
+	assertCatalogPublic(t, missing.Body.Bytes())
+}
+
+func assertCatalogPublic(t *testing.T, raw []byte) {
+	t.Helper()
+	faulttest.RefuseLeak(t, raw, "SECRET-CATALOG-73019", "catalog-probe", "untrusted")
 	var problem map[string]string
-	if err := json.Unmarshal(missing.Body.Bytes(), &problem); err != nil {
+	if err := json.Unmarshal(raw, &problem); err != nil {
 		t.Fatalf("decode missing product fault: %v", err)
 		return
 	}
