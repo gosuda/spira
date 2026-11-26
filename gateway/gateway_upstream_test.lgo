@@ -880,3 +880,26 @@ func TestUnknownLengthNonemptyBodyIsPreserved(t *testing.T) {
 		return
 	}
 }
+
+func TestGatewayClientDeadlineFailsFast(t *testing.T) {
+	grd := newRequestGuard(t)
+	hc := grd.httpClient(t)
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(stalled.Close)
+	start := time.Now()
+	_, err := hc.Get(stalled.URL)
+	if err == nil {
+		t.Fatal("stalled server answered without an error")
+		return
+	}
+	if took := time.Since(start); took > 20*time.Second {
+		t.Fatalf("stalled server held the client for %s", took)
+		return
+	}
+}
