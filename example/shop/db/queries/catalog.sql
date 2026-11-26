@@ -6,7 +6,7 @@ ORDER BY id;
 -- name: SearchProducts :many
 SELECT id, name, price, stock, created_at
 FROM products
-WHERE name LIKE ?
+WHERE name LIKE ? ESCAPE '\'
 ORDER BY id;
 
 -- name: GetProduct :one
