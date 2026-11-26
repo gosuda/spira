@@ -20,6 +20,31 @@ class FakeXPathEvaluator {
 	}
 }
 
+// happy-dom drops table rows while DOMParser reads template contents.
+// Use its fragment parser for htmx's own template wrapper, as browsers do.
+class TemplateDOMParser extends DOMParser {
+	override parseFromString(
+		input: string,
+		type: DOMParserSupportedType,
+	): Document {
+		const parsed = super.parseFromString(input, type);
+		const prefix = '<body><template class="internal-htmx-wrapper">';
+		const suffix = "</template></body>";
+		if (
+			type === "text/html" &&
+			input.startsWith(prefix) &&
+			input.endsWith(suffix)
+		) {
+			const template = parsed.querySelector("template");
+			if (!template) {
+				throw new Error("htmx fragment wrapper is missing");
+			}
+			template.innerHTML = input.slice(prefix.length, -suffix.length);
+		}
+		return parsed;
+	}
+}
+
 function realmBase(node: object, base: string): object {
 	let current: unknown = (node as { constructor: unknown }).constructor;
 	while (
@@ -35,6 +60,7 @@ function realmBase(node: object, base: string): object {
 }
 
 export function stubDomGlobals(): void {
+	vi.stubGlobal("DOMParser", TemplateDOMParser);
 	vi.stubGlobal("XPathEvaluator", FakeXPathEvaluator);
 	vi.stubGlobal("XPathResult", {});
 	vi.stubGlobal("Document", realmBase(document, "Document"));
