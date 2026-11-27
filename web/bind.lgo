@@ -93,9 +93,9 @@ func BindRecord[In any](ctx *Context, row *In) (In, error) {
 	if ferr := ParseFormBody(ctx, req, CountForm[In]() > 0); ferr != nil {
 		rejected.Add("form", "form", ferr.Error())
 		LogRejected(rejected)
- 		if errors.Is(ferr, ErrBodyTooLarge) {
- 			return zero, bodyTooLarge()
- 		}
+		if errors.Is(ferr, ErrBodyTooLarge) {
+			return zero, BindProblem(ErrBodyTooLarge, nil)
+		}
 		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "form", Rule: "form", Message: "web: bind form cannot be read"}})
 	}
 	const if comptime.IsStruct[In]() {
@@ -123,16 +123,12 @@ func BindRecord[In any](ctx *Context, row *In) (In, error) {
 	}
 }
 
- func BindProblem(base *fault.Error, errs validate.Errors) error {
- 	var fields []fault.Field
- 	for _, e := range errs {
- 		fields = append(fields, fault.Field{Name: e.Field, Rule: e.Rule, Message: e.Message})
- 	}
- 	return base.WithFields(fields...).Err()
- }
-
-func bodyTooLarge() error {
-	return BindProblem(ErrBodyTooLarge, nil)
+func BindProblem(base *fault.Error, errs validate.Errors) error {
+	var fields []fault.Field
+	for _, e := range errs {
+		fields = append(fields, fault.Field{Name: e.Field, Rule: e.Rule, Message: e.Message})
+	}
+	return base.WithFields(fields...).Err()
 }
 
 func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectLog) ([]byte, error) {
@@ -143,10 +139,10 @@ func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectL
 	if rerr == nil {
 		return body, nil
 	}
- 	if errors.Is(rerr, ErrBodyTooLarge) {
- 		return nil, bodyTooLarge()
- 	}
- 	rejected.Add("body", "body", rerr.Error())
+	if errors.Is(rerr, ErrBodyTooLarge) {
+		return nil, BindProblem(ErrBodyTooLarge, nil)
+	}
+	rejected.Add("body", "body", rerr.Error())
 	return nil, BindProblem(ErrBindInvalid, validate.Errors{{Field: "body", Rule: "body", Message: "web: bind body cannot be read"}})
 }
 
