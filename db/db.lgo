@@ -185,7 +185,7 @@ func Open(driver string, dsn string, opts ...PoolOptions) (*Pool?, error) {
 		return nil, ClassifyDriverError(dialect, fmt.Errorf("db: open %s: %w", driver, err))
 	}
 	applyPoolLimits(handle, resolvePoolOptions(dialect, dsn, opts))
-	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}}, nil
+	return &Pool{handle: handle, dialect: dialect, stmts: &stmtCache{}, migSem: make(chan struct{}, 1)}, nil
 }
 
 // OpenSQLiteImmediate opens a SQLite pool whose writable transactions begin
@@ -251,16 +251,33 @@ func checkSQLiteDatabaseName(dsn string, name string, mode string, cache string)
 	return nil
 }
 
-type Pool struct {
-	handle          *sql.DB
-	dialect         Dialect
-	stmts           *stmtCache
-	sqliteImmediate bool
-}
+ type Pool struct {
+ 	handle          *sql.DB
+ 	dialect         Dialect
+ 	stmts           *stmtCache
+ 	sqliteImmediate bool
+ 	migSem          chan struct{}
+ }
+ func (p *Pool) Dialect() Dialect {
+ 	return p.dialect
+ }
 
-func (p *Pool) Dialect() Dialect {
-	return p.dialect
-}
+ // AcquireMigrationTurn takes the pool's migration turn. Release it with the
+ // returned function, which is idempotent. A done context fails instead of
+ // queueing behind a turn that another migration holds.
+ func (p *Pool) AcquireMigrationTurn(ctx context.Context) (func(), error) {
+ 	select {
+ 	case p.migSem <- struct{}{}:
+ 		return func() {
+ 			select {
+ 			case <-p.migSem:
+ 			default:
+ 			}
+ 		}, nil
+ 	case <-ctx.Done():
+ 		return nil, fmt.Errorf("db: wait for migration turn: %w", ctx.Err())
+ 	}
+ }
 
 func (p *Pool) Prepared() int {
 	return p.stmts.size()

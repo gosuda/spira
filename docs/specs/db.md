@@ -40,9 +40,10 @@ func (p *Pool) Prepared() int
 func (p *Pool) Stats() sql.DBStats
 func (p *Pool) Prepare(ctx context.Context, query string) error
 func (p *Pool) Start(ctx context.Context) error
-func (p *Pool) Stop(ctx context.Context) error
-func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error)
-func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+ func (p *Pool) Stop(ctx context.Context) error
+ func (p *Pool) AcquireMigrationTurn(ctx context.Context) (func(), error)
+ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows?, error)
+ func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 
 type Tx struct {
 	// unexported fields

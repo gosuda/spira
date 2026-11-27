@@ -43,9 +43,12 @@ func Faults() []*fault.Error
 - `Apply` MUST read the applied names with `ORDER BY name`.
 - `Apply` MUST store a step name as applied only after its `up` text has run in the same transaction.
 
-### Apply
+ ### Apply
 
-- `Apply` MUST run only the steps after the applied prefix.
+ - `Apply` and `Rollback` on one pool MUST serialize in this process.
+ - Serialization MUST be per pool: migrations on another pool MUST NOT wait.
+ - A done context MUST fail the wait instead of queueing.
+ - `Apply` MUST run only the steps after the applied prefix.
 - If an applied name is not the step name at the same index, `Apply` MUST fail.
 - That failure MUST change no schema.
 - If an applied name is outside the given steps, `Apply` MUST fail.
@@ -140,6 +143,9 @@ func Faults() []*fault.Error
 - `TestEngineCheckReversibleMySQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on MySQL, failing without `SPIRA_TEST_MYSQL_DSN`.
 - `TestEngineCheckReversibleMSSQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on SQL Server, failing without `SPIRA_TEST_MSSQL_DSN`.
 - `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
+ - `TestConcurrentApplySerializes` proves concurrent `Apply` calls on one pool all succeed.
+ - `TestMigrationSerialIsPerPool` proves a held turn on one pool never blocks another pool.
+ - `TestQueuedApplyHonorsContext` proves a queued `Apply` fails on its context deadline and changes nothing.
 - `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
 
 ## Not in scope
