@@ -479,7 +479,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - An encode or write failure of a reply is logged once as `web: reply write failed`, and the client gets the internal problem.
 - An error after the response was written is logged as `web: error after the response was written`.
 - `web: bind form cannot be read` when the form does not parse.
-- `web.body_too_large: The request body is too large.` when the body passes `MaxBody`, followed by the limit in bytes.
+- A body over `MaxBody` MUST answer `web.body_too_large` with the constant message.
 - `web: bind body is not valid JSON for this request` when the body does not decode.
 - `web: bind <name> is not a known field` with rule `unknown` and the member name as the field.
 - `web: bind needs a struct input` when `In` is not a struct.
@@ -560,7 +560,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestBindDurationAndNamedString` proves durations and named strings.
 - `TestRouteBindsBodyField` proves JSON body decoding.
  - `TestBindBodyOverMaxBody` proves the 413 answer.
- - `TestBindBodyOverMaxBodyNamesLimit` proves the 413 problem names the byte limit.
+ - `TestBindBodyOverMaxBodyKeepsConstantMessage` proves the 413 problem carries the constant message.
 - `TestMalformedFormWithSemicolonQueryIsRejected` proves that a malformed form body fails even when the query parses.
 - `TestSemicolonQueryAloneKeepsTheForm` proves that a semicolon query does not disturb a valid form.
 - `TestFormFieldMissingFromBodyIsRequired` proves that a form field missing from the body fails instead of reading the query.

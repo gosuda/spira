@@ -94,7 +94,7 @@ func BindRecord[In any](ctx *Context, row *In) (In, error) {
 		rejected.Add("form", "form", ferr.Error())
 		LogRejected(rejected)
  		if errors.Is(ferr, ErrBodyTooLarge) {
- 			return zero, bodyTooLarge(ctx.root.MaxBody)
+ 			return zero, bodyTooLarge()
  		}
 		return zero, BindProblem(ErrBindInvalid, validate.Errors{{Field: "form", Rule: "form", Message: "web: bind form cannot be read"}})
 	}
@@ -131,11 +131,9 @@ func BindRecord[In any](ctx *Context, row *In) (In, error) {
  	return base.WithFields(fields...).Err()
  }
 
- func bodyTooLarge(max int64) error {
- 	over := *ErrBodyTooLarge
- 	over.Message = fmt.Sprintf("%s (%d bytes)", ErrBodyTooLarge.Message, max)
- 	return BindProblem(&over, nil)
- }
+func bodyTooLarge() error {
+	return BindProblem(ErrBodyTooLarge, nil)
+}
 
 func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectLog) ([]byte, error) {
 	if !want {
@@ -146,7 +144,7 @@ func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectL
 		return body, nil
 	}
  	if errors.Is(rerr, ErrBodyTooLarge) {
- 		return nil, bodyTooLarge(ctx.root.MaxBody)
+ 		return nil, bodyTooLarge()
  	}
 	return nil, BindProblem(ErrBindInvalid, validate.Errors{{Field: "body", Rule: "body", Message: "web: bind body cannot be read"}})
 }
