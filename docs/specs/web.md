@@ -562,6 +562,7 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
  - `TestBindBodyOverMaxBody` proves the 413 answer.
  - `TestBindBodyOverMaxBodyKeepsConstantMessage` proves the 413 problem carries the constant message.
 - `TestMalformedFormWithSemicolonQueryIsRejected` proves that a malformed form body fails even when the query parses.
+- `TestBindBodyReadFailureKeepsTheCause` proves a body read failure logs its cause and answers the generic 400.
 - `TestSemicolonQueryAloneKeepsTheForm` proves that a semicolon query does not disturb a valid form.
 - `TestFormFieldMissingFromBodyIsRequired` proves that a form field missing from the body fails instead of reading the query.
 - `TestGetFormFieldsBindFromTheQuery` proves that form fields without a form body bind from the query.
