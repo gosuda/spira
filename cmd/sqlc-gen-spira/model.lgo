@@ -891,19 +891,93 @@ func sliceMarkers(text string) []string {
 	}
 }
 
-func (r *resolver) refuseVersionedWrite(q *Query) error {
-	upper := strings.ToUpper(q.Text)
-	for _, target := range writeTargets(upper) {
-		versioned, ok := r.versions[strings.ToLower(target)]
-		if !ok || versioned.version == "" {
-			continue
-		}
-		if !strings.Contains(upper, strings.ToUpper(versioned.version)) {
-			return fmt.Errorf("sqlc-gen-spira: %s: writes versioned table %s without %s", q.Name, versioned.name, versioned.version)
-		}
-	}
-	return nil
-}
+ func (r *resolver) refuseVersionedWrite(q *Query) error {
+ 	upper := strings.ToUpper(maskSQL(q.Text))
+ 	for _, target := range writeTargets(upper) {
+ 		versioned, ok := r.versions[strings.ToLower(target)]
+ 		if !ok || versioned.version == "" {
+ 			continue
+ 		}
+ 		if !strings.Contains(upper, strings.ToUpper(versioned.version)) {
+ 			return fmt.Errorf("sqlc-gen-spira: %s: writes versioned table %s without %s", q.Name, versioned.name, versioned.version)
+ 		}
+ 	}
+ 	return nil
+ }
+
+ // maskSQL blanks string literals and comments so the write scan sees
+ // statements, not text. Quoted identifiers stay: they may name columns.
+ func maskSQL(text string) string {
+ 	out := []byte(text)
+ 	i := 0
+ 	for i < len(out) {
+ 		i = maskAt(out, i)
+ 	}
+ 	return string(out)
+ }
+
+ func maskAt(out []byte, i int) int {
+ 	if out[i] == '\'' {
+ 		return maskQuoted(out, i)
+ 	}
+ 	if out[i] == '-' && i+1 < len(out) && out[i+1] == '-' {
+ 		return maskLine(out, i)
+ 	}
+ 	if out[i] == '/' && i+1 < len(out) && out[i+1] == '*' {
+ 		return maskBlock(out, i)
+ 	}
+ 	return i + 1
+ }
+
+ func maskQuoted(out []byte, i int) int {
+ 	j := i + 1
+ 	for j < len(out) {
+ 		if out[j] == '\\' && j+1 < len(out) {
+ 			j += 2
+ 			continue
+ 		}
+ 		if out[j] == '\'' {
+ 			if j+1 < len(out) && out[j+1] == '\'' {
+ 				j += 2
+ 				continue
+ 			}
+ 			j++
+ 			break
+ 		}
+ 		j++
+ 	}
+ 	blank(out, i, j)
+ 	return j
+ }
+
+ func maskLine(out []byte, i int) int {
+ 	j := i + 2
+ 	for j < len(out) && out[j] != '\n' {
+ 		j++
+ 	}
+ 	blank(out, i, j)
+ 	return j
+ }
+
+ func maskBlock(out []byte, i int) int {
+ 	j := i + 2
+ 	for j+1 < len(out) && !(out[j] == '*' && out[j+1] == '/') {
+ 		j++
+ 	}
+ 	if j+1 < len(out) {
+ 		j += 2
+ 	} else {
+ 		j = len(out)
+ 	}
+ 	blank(out, i, j)
+ 	return j
+ }
+
+ func blank(out []byte, from int, to int) {
+ 	for k := from; k < to; k++ {
+ 		out[k] = ' '
+ 	}
+ }
 
 func writeTargets(upper string) []string {
 	var out []string

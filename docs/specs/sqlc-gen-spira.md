@@ -191,7 +191,8 @@ SQL Server:
 - A query that writes a versioned table without its version column MUST fail.
 - The error MUST be `sqlc-gen-spira: <Name>: writes versioned table <table> without <version column>`.
 - `:execresult`, `:copyfrom` and batch commands MUST be the error `sqlc-gen-spira: <Name>: command <cmd> is not supported`.
-- The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
+ - The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
+ - `UPDATE` and `DELETE` detection MUST ignore string literals and SQL comments.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -201,7 +202,9 @@ SQL Server:
 - `config` MUST default to `example/shop/sqlc.yaml`.
 - `just sql` MUST fail with a message that names the path when the file does not exist.
 - `just sql` MUST NOT create output when the file does not exist.
-- `just sql-check` MUST run the raw-query check first, then `sqlc vet`, and MUST regenerate with `just sql` into a scratch directory last and diff it against `db/store`.
+ - `just sql-check` MUST run the raw-query check first, then `sqlc vet`.
+ - `just sql-check` MUST regenerate with `just sql` into a scratch directory last.
+ - `just sql-check` MUST diff that scratch output against `db/store`.
 - `just sql-check` MUST fail when generated `*.sql.lgo` files differ from the SQL.
 - `just sql-check` MUST run `sqlc vet` on the same config.
 - `just sql-check` MUST fail when `db.Query`, `db.One` or `db.Exec` appears outside the data packages.
@@ -231,9 +234,10 @@ SQL Server:
 - `TestSliceQuery` proves a `sqlc.slice` parameter becomes a `[]T` expanded with `db.In`, and a marker-less slice passes as one argument.
 - `TestEmbedQuery` proves a `sqlc.embed` table becomes a nested field of the row struct.
 - `TestSingleColumnEmbed` proves one embed column with no type becomes the same nested field.
-- Each negative case requires the named message.
-- The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
-- The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
+ - Each negative case requires the named message.
+ - The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
+ - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
+ - The literal tests prove a read-only query with write words in string data generates, and that string data alone never satisfies the version check.
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
 - `TestSQLcSQLiteIntegration` builds the plugin with `logos build`, generates the store from `testdata/runtime_sqlite`, and runs the application with `logos run`.
