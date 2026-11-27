@@ -2,7 +2,7 @@
 
 `http3.Server` serves HTTP/3 through `logos/net/http.H3Server`. `Start` opens one UDP listener on the same port as the TCP listener. The router answers HTTP/3 requests with the same stages and replies as other versions.
 
-The native `H3Server` uses the LoGOs toolchain transport. Ejected code uses `github.com/quic-go/quic-go`. Both clone the TLS configuration for UDP, require TLS 1.3, and set ALPN to `h3`.
+`H3Server` runs on `golang.org/x/net/quic`, natively through the toolchain package and after eject through its support copy. Both clone the TLS configuration for UDP, require TLS 1.3, and set ALPN to `h3`.
 
 ## Interface
 
