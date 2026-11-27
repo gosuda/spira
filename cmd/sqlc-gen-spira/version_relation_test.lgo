@@ -1,0 +1,36 @@
+package main_test
+
+import (
+	"encoding/json/v2"
+	"os"
+	"testing"
+)
+
+func TestPostgresRelationReferenceRoles(t *testing.T) {
+	data, err := os.ReadFile("testdata/version-relation-roles.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var cases []continuedStringCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 30 {
+		t.Fatalf("relation reference cases = %d; want 30", len(cases))
+		return
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			diagnostic := ""
+			if !tc.Allow {
+				diagnostic = "writes versioned table items without version"
+			}
+			checkVersionCatalogCase(t, versionCatalogCase{
+				Name: tc.Name, Columns: []string{"version", "time"}, Option: "version",
+				SQL: tc.SQL, Error: diagnostic,
+			})
+		})
+	}
+}

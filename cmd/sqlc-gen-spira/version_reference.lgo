@@ -24,6 +24,7 @@ func postgresReferencesColumn(text string, column string) bool {
 	excluded := make([]bool, len(tokens))
 	excludeReferenceDeclarations(tokens, excluded)
 	excludeWriteHeaders(tokens, excluded)
+	excludeRelationAliases(tokens, excluded)
 	excludeOutputAliases(tokens, excluded)
 	for i := 0; i < len(tokens); {
 		if !tokens[i].isName() {
@@ -312,6 +313,9 @@ func referenceEndsOperand(tokens []sqlReferenceToken, index int) bool {
 			return !referenceClosesOperator(tokens, index)
 		}
 		return token.punctuation("]")
+	}
+	if index > 0 && tokens[index-1].punctuation(".") {
+		return true
 	}
 	switch token.text {
 	case "as", "collate", "and", "or", "not", "is", "distinct", "from", "like", "ilike", "similar",
