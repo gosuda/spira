@@ -59,6 +59,8 @@ func Faults() []*fault.Error
 - On PostgreSQL, `Apply` MUST use `$1`, `$2` and so on.
 - On SQL Server, `Apply` MUST use `@p1`, `@p2` and so on.
 
+- A release callback MUST free the turn only once.
+
 ### Rollback
 
 - `Rollback` MUST undo the last `count` applied steps in name order.
@@ -143,6 +145,7 @@ func Faults() []*fault.Error
 - `TestEngineCheckReversibleMySQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on MySQL, failing without `SPIRA_TEST_MYSQL_DSN`.
 - `TestEngineCheckReversibleMSSQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on SQL Server, failing without `SPIRA_TEST_MSSQL_DSN`.
 - `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
+ - `TestReleaseFreesTheTurnOnlyOnce` proves a repeated release keeps the next turn held.
  - `TestConcurrentApplySerializes` proves concurrent `Apply` calls on one pool all succeed.
  - `TestMigrationSerialIsPerPool` proves a held turn on one pool never blocks another pool.
  - `TestQueuedApplyHonorsContext` proves a queued `Apply` fails on its context deadline and changes nothing.

@@ -108,3 +108,31 @@ func TestQueuedApplyHonorsContext(t *testing.T) {
  		t.Fatalf("tables after queued Apply = %v; want no queued_apply", names)
  	}
  }
+
+func TestReleaseFreesTheTurnOnlyOnce(t *testing.T) {
+	pool := openPool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	releaseA, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+		return
+	}
+	releaseA()
+	releaseB, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+		return
+	}
+	releaseA()
+	probe, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer stop()
+	if _, err := pool.AcquireMigrationTurn(probe); err == nil {
+		t.Fatal("a repeated release freed another migration turn; want the second turn to stay held")
+		return
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probe acquire err = %v; want context deadline exceeded", err)
+		return
+	}
+	releaseB()
+}
