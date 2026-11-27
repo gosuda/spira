@@ -269,16 +269,17 @@ SQL Server:
 - `TestPostgresVersionCTEs` checks 26 native-validated CTE and declaration boundaries, including nested headers, `WITH ORDINALITY`, and recursive `SEARCH`/`CYCLE` suffixes.
 - `TestPostgresCTEProjectionRoles` checks ten native-validated SELECT outputs inside materialized CTEs. Quoted, explicit and bare aliases cannot satisfy the guard; genuine columns remain visible through SELECT modifiers, function arguments, qualified operators and sibling targets.
 - `TestPostgresCTEProjectionClauseBoundaries` distinguishes an output alias from a genuine right operand after `IS [NOT] DISTINCT FROM`.
-- `TestPostgresRelationReferenceRoles` checks 30 native-validated relation and qualified-identifier boundaries.
+- `TestPostgresRelationReferenceRoles` checks 32 native-validated relation, identifier, and fixture configuration cases.
+- The direct suite reads each fixture's columns and version option.
 - It preserves real operands in function arguments, join conditions, `USING` lists, and arrays.
 - `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on 60 inputs, retaining the 20 reference-role cases alongside the prior 40 literal cases.
 - Its 56 reachable inputs require 40 generated packages and 16 specific version refusals.
 - The test compiles every generated package and compares its query constant with captured sqlc text at runtime.
 - Four native-valid comment-continuation inputs require their observed upstream syntax errors and no generated source.
-- `TestSQLcPostgresVersionPipeline` invokes SQLc for 67 catalog, CTE, and relation-role cases.
+- `TestSQLcPostgresVersionPipeline` invokes SQLc for 69 catalog, CTE, and relation-role cases.
 - Each plugin request preserves frozen query text, version configuration, and catalog column names.
-- The test compiles 30 generated packages and checks their query constants at runtime.
-- Another 34 cases require their specific plugin refusal.
+- The test compiles 31 generated packages and checks their query constants at runtime.
+- Another 35 cases require their specific plugin refusal.
 - Three cases require their observed SQLc error before plugin invocation.
 
 - Request-model tests build the model from captured fixtures.

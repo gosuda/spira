@@ -38,8 +38,8 @@ func TestSQLcPostgresVersionPipeline(t *testing.T) {
 		t.Fatal(err)
 		return
 	}
-	if len(cases) != 67 {
-		t.Fatalf("version pipeline cases = %d; want 67", len(cases))
+	if len(cases) != 69 {
+		t.Fatalf("version pipeline cases = %d; want 69", len(cases))
 		return
 	}
 	work := t.TempDir()
