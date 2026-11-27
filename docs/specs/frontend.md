@@ -42,7 +42,9 @@ export function installLiveUpdates(): void
  // src/adapters/wasm.ts
  export function mount(target: HTMLElement, component: unknown, props: Record<string, unknown>): undefined
  export function loader(entry: string): () => Promise<{ default: unknown }>
+ ```
  `mount` is exported from each adapter. The React, Svelte and Solid adapters return a cleanup that releases the mount. The wasm adapter returns `undefined` because a started Go program has no per-island release. `loader` is exported from `src/adapters/wasm.ts`. `installSlotMover` defaults `root` to `document`. `installLiveUpdates` is exported from `src/live.ts` and wires the htmx event-stream handling for live regions.
+
 
 ## Requirements
 
