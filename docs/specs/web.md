@@ -559,7 +559,8 @@ func TrackConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 - `TestBindHostileValueNeverEchoed` proves submitted values never reach the response.
 - `TestBindDurationAndNamedString` proves durations and named strings.
 - `TestRouteBindsBodyField` proves JSON body decoding.
-- `TestBindBodyOverMaxBody` proves the 413 answer.
+ - `TestBindBodyOverMaxBody` proves the 413 answer.
+ - `TestBindBodyOverMaxBodyNamesLimit` proves the 413 problem names the byte limit.
 - `TestMalformedFormWithSemicolonQueryIsRejected` proves that a malformed form body fails even when the query parses.
 - `TestSemicolonQueryAloneKeepsTheForm` proves that a semicolon query does not disturb a valid form.
 - `TestFormFieldMissingFromBodyIsRequired` proves that a form field missing from the body fails instead of reading the query.

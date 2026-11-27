@@ -262,6 +262,21 @@ func TestBindBodyOverMaxBody(t *testing.T) {
 	assertProblemJSON(t, call(t, r, req), http.StatusRequestEntityTooLarge)
 }
 
+ func TestBindBodyOverMaxBodyNamesLimit(t *testing.T) {
+ 	r := web.NewRouter()
+ 	r.MaxBody = 16
+ 	web.Route(r, "POST", "/doc", func(ctx *web.Context, in BindDocIn) (web.Reply, error) {
+ 		return web.Empty{}, nil
+ 	})
+ 	req := httptest.NewRequest(http.MethodPost, "/doc", strings.NewReader(`{"term":"this is way too long"}`))
+ 	req.Header.Set("Content-Type", "application/json")
+ 	rec := call(t, r, req)
+ 	assertProblemJSON(t, rec, http.StatusRequestEntityTooLarge)
+ 	if !strings.Contains(rec.Body.String(), "(16 bytes)") {
+ 		t.Fatalf("over-limit problem body %s; want the byte limit", rec.Body.String())
+ 	}
+ }
+
 func bindField(obj schema.Object, name string) (string, string, bool) {
 	for _, fld := range obj.Fields {
 		if fld.Name == name {
