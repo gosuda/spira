@@ -198,6 +198,7 @@ SQL Server:
  - `UPDATE` and `DELETE` detection MUST ignore string literals and SQL comments.
  - A backslash MUST escape only in MySQL strings and PostgreSQL escape strings.
 - PostgreSQL continuation segments MUST keep the first string segment's escape mode.
+- PostgreSQL escape prefixes MUST begin outside an identifier.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -233,8 +234,12 @@ SQL Server:
 ## Proof
 
 - `TestPostgresContinuedEscapeStrings` checks continued escape strings, independent literals, and version words hidden in strings or comments.
+- `TestPostgresTypedLiteralBoundaries` checks typed literals ending in `e` and genuine escape prefixes using native-validated fixtures.
+- `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on the same 26 inputs.
+- Its 22 reachable inputs require 20 generated query literals matching captured sqlc text and two specific version refusals.
+- Four native-valid comment-continuation inputs require their observed upstream syntax errors and no generated source.
 
-- Each test builds the request model from a captured fixture.
+- Request-model tests build the model from captured fixtures.
 - The model asserts entity types and fields, key types, query names, commands and row types.
 - `TestEngineQueryModels` proves four fixtures give one `Items` entity and a `:one` `GetItem` over it.
 - It also proves a three-parameter `UpdateItem` with one `UpdateItemArgs` struct.
@@ -256,6 +261,8 @@ SQL Server:
  - `compareQueries` in `testdata/runtime_sqlite` proves the generated functions match direct `database/sql` calls for insert, rename, get, slice, delete and repeated binds.
 
 ## Not in scope
+
+- The pinned sqlc rejects the four tested comment-continuation forms before invoking the plugin. Direct-generator coverage does not imply sqlc acceptance.
 
 - The plugin does not support `:execresult`, `:copyfrom` or batch commands. No requirement names them.
 - The plugin does not build a query builder. The `.sql` files are the source of truth.

@@ -983,9 +983,13 @@ func backslashEscapes(engine string, out []byte, i int) bool {
 		return true
 	}
 	if engine == "postgresql" && i > 0 && (out[i-1] == 'E' || out[i-1] == 'e') {
-		return true
+		return i == 1 || !isPostgresIdentPart(out[i-2])
 	}
 	return false
+}
+
+func isPostgresIdentPart(c byte) bool {
+	return isASCIILetter(c) || isASCIIDigit(c) || c == '_' || c == '$' || c >= 0x80
 }
 
 func maskQuotedFor(out []byte, i int, escape bool) int {

@@ -1,0 +1,151 @@
+package main_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+type sqlcLiteralExpectation struct {
+	Name      string `json:"name"`
+	Text      string `json:"text"`
+	SQLcError string `json:"sqlc_error"`
+}
+
+type sqlcLiteralCase struct {
+	Input    continuedStringCase
+	Expected sqlcLiteralExpectation
+}
+
+func TestSQLcPostgresLiteralPipeline(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	cases, err := readSQLcLiteralInputs()
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	data, err := os.ReadFile("testdata/sqlc-literal-pipeline.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var expected []sqlcLiteralExpectation
+	if err := json.Unmarshal(data, &expected); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 26 || len(expected) != len(cases) {
+		t.Fatalf("pipeline inputs/expectations = %d/%d; want 26/26", len(cases), len(expected))
+		return
+	}
+	work := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	build := exec.CommandContext(ctx, "logos", "build", "-o", filepath.Join(work, "sqlc-gen-spira"), "./cmd/sqlc-gen-spira")
+	build.Dir = root
+	if err := runSQLcSQLiteCommand(build); err != nil {
+		t.Fatal(err)
+		return
+	}
+	for i, tc := range cases {
+		want := expected[i]
+		if tc.Name != want.Name {
+			t.Fatalf("pipeline fixture %d = %q; want %q", i, tc.Name, want.Name)
+			return
+		}
+		t.Run(tc.Name, func(t *testing.T) {
+			if err := exerciseSQLcPostgresLiteral(ctx, root, filepath.Join(work, tc.Name), sqlcLiteralCase{Input: tc, Expected: want}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func readSQLcLiteralInputs() ([]continuedStringCase, error) {
+	var cases []continuedStringCase
+	for _, name := range []string{"continued-strings.json", "typed-literals.json"} {
+		data := os.ReadFile(filepath.Join("testdata", name))?
+		var part []continuedStringCase
+		json.Unmarshal(data, &part)?
+		cases = append(cases, part...)
+	}
+	return cases, nil
+}
+
+func exerciseSQLcPostgresLiteral(ctx context.Context, root string, dir string, fixture sqlcLiteralCase) error {
+	tc, want := fixture.Input, fixture.Expected
+	os.Mkdir(dir, 0o755)?
+	schema := os.ReadFile(filepath.Join(root, "cmd", "sqlc-gen-spira", "testdata", "literal-schema.sql"))?
+	os.WriteFile(filepath.Join(dir, "schema.sql"), schema, 0o644)?
+	os.WriteFile(filepath.Join(dir, "queries.sql"), []byte("-- name: ContinueItem :exec\n"+tc.SQL+"\n"), 0o644)?
+	config := fmt.Sprintf(`version: "2"
+plugins:
+  - name: spira
+    process:
+      cmd: %s
+      format: json
+sql:
+  - engine: postgresql
+    schema: schema.sql
+    queries: queries.sql
+    codegen:
+      - plugin: spira
+        out: generated
+        options:
+          package: generated
+          tables:
+            items: {type: Item, key: id, key_type: ItemID, version: version}
+`, strconv.Quote(filepath.Join(filepath.Dir(dir), "sqlc-gen-spira")))
+	os.WriteFile(filepath.Join(dir, "sqlc.yaml"), []byte(config), 0o644)?
+	cmd := exec.CommandContext(ctx, "go", "-C", filepath.Join(root, "tools"), "tool", "sqlc", "generate", "-f", filepath.Join(dir, "sqlc.yaml"))
+	cmd.Dir = root
+	err := runSQLcSQLiteCommand(cmd)
+	files := filepath.Glob(filepath.Join(dir, "generated", "*.lgo"))?
+	if want.SQLcError != "" {
+		return checkSQLcLiteralRefusal(ctx, err, want.SQLcError, files)
+	}
+	if !tc.Allow {
+		return checkSQLcLiteralRefusal(ctx, err, "ContinueItem: writes versioned table items without version", files)
+	}
+	if err != nil {
+		return err
+	}
+	if len(files) != 2 {
+		return fmt.Errorf("sqlc generated %d source files; want 2", len(files))
+	}
+	generated := os.ReadFile(filepath.Join(dir, "generated", "queries.sql.lgo"))?
+	query := "const ContinueItemQuery = `" + want.Text + "`\n"
+	if strings.Count(string(generated), "const ContinueItemQuery = ") != 1 || !strings.Contains(string(generated), query) {
+		return fmt.Errorf("generated query differs from the captured sqlc text %q", want.Text)
+	}
+	return nil
+}
+
+func checkSQLcLiteralRefusal(ctx context.Context, err error, diagnostic string, files []string) error {
+	if err == nil {
+		return errors.New("sqlc accepted a frozen refusal case")
+	}
+	exit, exited := errors.AsType[*exec.ExitError](err)
+	if !exited || exit.ExitCode() != 1 || ctx.Err() != nil {
+		return fmt.Errorf("sqlc did not complete the expected refusal: %w", err)
+	}
+	if !strings.Contains(err.Error(), diagnostic) {
+		return fmt.Errorf("sqlc refusal did not contain %q: %w", diagnostic, err)
+	}
+	if len(files) != 0 {
+		return fmt.Errorf("sqlc emitted %d source files after a refusal", len(files))
+	}
+	return nil
+}
