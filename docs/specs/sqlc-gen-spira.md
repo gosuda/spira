@@ -211,7 +211,7 @@ SQL Server:
 - `just sql-check` MUST run `sqlc vet` on the same config.
 - `just sql-check` MUST fail when `db.Query`, `db.One` or `db.Exec` appears outside the data packages.
 - The raw-query check MUST skip generated `*.sql.lgo` files, `cmd/sqlc-gen-spira/gen.lgo`, and the packages `db`, `orm`, `migrate`, `ai/session` and `ai/rag`.
-- Tests MAY call the runtime directly.
+ - Outside the data packages, tests MUST use generated functions.
 
 ## Errors
 
