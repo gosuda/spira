@@ -143,6 +143,7 @@ SQL Server:
 - `nchar`, `nvarchar`, `ntext` and `uniqueidentifier` MUST map to `string`.
  - `datetime2`, `smalldatetime`, `datetimeoffset` and `time` MUST map to `time.Time`.
 - `money` and `smallmoney` MUST map to `string`.
+- `binary`, `varbinary` and `image` MUST map to `[]byte`.
 
 ### Models
 
