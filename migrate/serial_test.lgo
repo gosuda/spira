@@ -149,3 +149,24 @@ func TestMigrationTurnRejectsEndedContextOnFreePool(t *testing.T) {
 		return
 	}
 }
+
+func TestRollbackZeroSkipsTheTurn(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	before := sqliteSchemaSnapshot(t, pool)
+	held, err := pool.AcquireMigrationTurn(t.Context())
+	if err != nil {
+		t.Fatalf("hold pool turn: %v", err)
+		return
+	}
+	defer held()
+	cancelled, stop := context.WithCancel(t.Context())
+	stop()
+	if err := migrate.Rollback(cancelled, pool, steps, 0); err != nil {
+		t.Fatalf("Rollback(0) with a cancelled context and a held turn: %v; want nil", err)
+		return
+	}
+	if after := sqliteSchemaSnapshot(t, pool); !slices.Equal(before, after) {
+		t.Fatalf("SQLite schema changed after Rollback(0): before=%v, after=%+v", before, after)
+	}
+}

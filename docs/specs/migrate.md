@@ -147,7 +147,7 @@ func Faults() []*fault.Error
 - `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
  - `TestReleaseFreesTheTurnOnlyOnce` proves a repeated release keeps the next turn held.
  - `TestMigrationTurnRejectsEndedContextOnFreePool` proves a cancelled context fails on a free pool.
- - `TestMigrationSerialIsPerPool` proves a held turn on one pool never blocks another pool.
+ - `TestRollbackZeroSkipsTheTurn` proves `Rollback` with `count` 0 skips the turn on a cancelled context.
  - `TestQueuedApplyHonorsContext` proves a queued `Apply` fails on its context deadline and changes nothing.
 - `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
 
