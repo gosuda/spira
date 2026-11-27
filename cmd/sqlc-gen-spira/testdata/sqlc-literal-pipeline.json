@@ -198,5 +198,105 @@
     "name": "dollar-escaped-quoted-identifier",
     "text": "UPDATE items SET name = v.\"a\"\"$tag$'b\", version = version + 1 FROM (VALUES ('quoted')) AS v(\"a\"\"$tag$'b\") WHERE items.id = 1",
     "sqlc_error": ""
+  },
+  {
+    "name": "reported-alias",
+    "text": "UPDATE items SET name = 'changed' RETURNING name AS \"item's version\"",
+    "sqlc_error": ""
+  },
+  {
+    "name": "alias-exact",
+    "text": "UPDATE items SET name = 'changed' RETURNING name AS version",
+    "sqlc_error": ""
+  },
+  {
+    "name": "alias-quoted",
+    "text": "UPDATE items SET name = 'changed' RETURNING name AS \"version\"",
+    "sqlc_error": ""
+  },
+  {
+    "name": "alias-bare",
+    "text": "UPDATE items SET name = 'changed' RETURNING name version",
+    "sqlc_error": ""
+  },
+  {
+    "name": "alias-bare-quoted",
+    "text": "UPDATE items SET name = 'changed' RETURNING name \"version\"",
+    "sqlc_error": ""
+  },
+  {
+    "name": "qualifier-only",
+    "text": "UPDATE items AS version SET name = 'changed' RETURNING version.name",
+    "sqlc_error": ""
+  },
+  {
+    "name": "function-name",
+    "text": "UPDATE items SET name = left(version(), 0) || 'changed'",
+    "sqlc_error": ""
+  },
+  {
+    "name": "cast-type",
+    "text": "UPDATE items SET name = CAST('changed' AS version)",
+    "sqlc_error": ""
+  },
+  {
+    "name": "postfix-type",
+    "text": "UPDATE items SET name = 'changed'::version",
+    "sqlc_error": ""
+  },
+  {
+    "name": "typed-literal",
+    "text": "UPDATE items SET name = version 'changed'",
+    "sqlc_error": ""
+  },
+  {
+    "name": "collation-name",
+    "text": "UPDATE items SET name = 'changed' COLLATE version",
+    "sqlc_error": ""
+  },
+  {
+    "name": "longer-identifier",
+    "text": "UPDATE items AS conversion SET name = 'changed'",
+    "sqlc_error": ""
+  },
+  {
+    "name": "quoted-assignment",
+    "text": "UPDATE items SET \"version\" = \"version\" + 1",
+    "sqlc_error": ""
+  },
+  {
+    "name": "unquoted-assignment",
+    "text": "UPDATE items SET version = version + 1",
+    "sqlc_error": ""
+  },
+  {
+    "name": "predicate-only",
+    "text": "UPDATE items SET name = 'changed' WHERE version = 0",
+    "sqlc_error": ""
+  },
+  {
+    "name": "qualified-predicate",
+    "text": "UPDATE items AS i SET name = 'changed' WHERE i.\"version\" = 0",
+    "sqlc_error": ""
+  },
+  {
+    "name": "returned-reference",
+    "text": "UPDATE items SET name = 'changed' RETURNING \"version\" AS v",
+    "sqlc_error": ""
+  },
+  {
+    "name": "function-argument",
+    "text": "UPDATE items SET name = 'changed' RETURNING abs(version)",
+    "sqlc_error": ""
+  },
+  {
+    "name": "delete-reference",
+    "text": "DELETE FROM items WHERE \"version\" = -1",
+    "sqlc_error": ""
+  },
+  {
+    "name": "qualified-returned",
+    "text": "UPDATE items SET name = 'changed' RETURNING items.\"version\"",
+    "sqlc_error": ""
   }
 ]

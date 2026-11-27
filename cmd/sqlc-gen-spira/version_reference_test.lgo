@@ -49,3 +49,25 @@ func TestPostgresVersionReferenceRoleBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestPostgresVersionCTEs(t *testing.T) {
+	data, err := os.ReadFile("testdata/version-ctes.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var cases []continuedStringCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 26 {
+		t.Fatalf("version CTE cases = %d; want 26", len(cases))
+		return
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			checkContinuedString(t, tc)
+		})
+	}
+}

@@ -46,8 +46,8 @@ func TestSQLcPostgresLiteralPipeline(t *testing.T) {
 		t.Fatal(err)
 		return
 	}
-	if len(cases) != 40 || len(expected) != len(cases) {
-		t.Fatalf("pipeline inputs/expectations = %d/%d; want 40/40", len(cases), len(expected))
+	if len(cases) != 60 || len(expected) != len(cases) {
+		t.Fatalf("pipeline inputs/expectations = %d/%d; want 60/60", len(cases), len(expected))
 		return
 	}
 	work := t.TempDir()
@@ -84,7 +84,7 @@ func TestSQLcPostgresLiteralPipeline(t *testing.T) {
 
 func readSQLcLiteralInputs() ([]continuedStringCase, error) {
 	var cases []continuedStringCase
-	for _, name := range []string{"continued-strings.json", "typed-literals.json", "dollar-strings.json"} {
+	for _, name := range []string{"continued-strings.json", "typed-literals.json", "dollar-strings.json", "version-references.json"} {
 		data := os.ReadFile(filepath.Join("testdata", name))?
 		var part []continuedStringCase
 		json.Unmarshal(data, &part)?

@@ -202,8 +202,12 @@ SQL Server:
 - PostgreSQL escape prefixes MUST begin outside an identifier.
 - PostgreSQL dollar strings MUST end at their matching case-sensitive delimiter.
 - Dollar delimiters MUST begin outside quoted or unquoted identifiers.
-- PostgreSQL version matching MUST use complete identifiers, folding unquoted ASCII letters and preserving quoted names after doubled-quote unescaping.
-- PostgreSQL `RETURNING` aliases, recognized UPDATE/DELETE relation headers, call heads, `CAST`/`::`/typed-literal heads and `COLLATE` names MUST NOT satisfy the version check.
+- PostgreSQL version configuration MUST resolve an exact catalog column name first, then a unique case-insensitive match. A missing or ambiguous configured name MUST fail.
+- The resolved catalog spelling MUST be used for the write guard. PostgreSQL SQL identifiers remain exact after unquoted ASCII folding and quoted-name unescaping; a differently cased quoted sibling does not satisfy the check.
+- PostgreSQL `SELECT` and `RETURNING` output aliases, recognized UPDATE/DELETE relation headers, call heads, `CAST`/`::`/typed-literal heads and `COLLATE` names MUST NOT satisfy the version check.
+- CTE query bodies, including `AS MATERIALIZED` and `AS NOT MATERIALIZED`, MUST remain visible to the version-reference scan.
+- CTE headers MUST begin at a query-block entry. `WITH ORDINALITY` in a table expression MUST NOT turn an ordinary alias list into a CTE body.
+- A CTE sibling walk MUST consume complete `SEARCH` and `CYCLE` clauses, including their key-list commas and optional cycle marks, before the next sibling. Nested `WITH` headers remain independently visible.
 - A version-column reference in an assignment, predicate or returned expression is sufficient; the guard does not require an increment.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
@@ -246,8 +250,12 @@ SQL Server:
 - Both generated-package test suites invoke their nested `logos test` process with `-race`.
 - `TestPostgresVersionReferenceRoles` checks 20 native-validated name-role cases: 12 refusals and eight genuine references.
 - `TestPostgresVersionReferenceRoleBoundaries` checks eight boundaries: parenthesized aliases, qualified casts, a function's `FROM` operand, quoted punctuation, a qualified operator's right operand, a qualified function named `operator`, and the unqualified spelling that PostgreSQL rejects.
-- `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on the same 40 inputs.
-- Its 36 reachable inputs require 32 generated packages and four specific version refusals.
+- `TestPostgresVersionCatalogResolution` checks 11 catalog configuration cases, including exact-match precedence, unique folded matching, missing and ambiguous names, and quoted siblings.
+- `TestPostgresVersionCTEs` checks 26 native-validated CTE and declaration boundaries, including nested headers, `WITH ORDINALITY`, and recursive `SEARCH`/`CYCLE` suffixes.
+- `TestPostgresCTEProjectionRoles` checks ten native-validated SELECT outputs inside materialized CTEs. Quoted, explicit and bare aliases cannot satisfy the guard; genuine columns remain visible through SELECT modifiers, function arguments, qualified operators and sibling targets.
+- `TestPostgresCTEProjectionClauseBoundaries` distinguishes an output alias from a genuine right operand after `IS [NOT] DISTINCT FROM`.
+- `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on 60 inputs, retaining the 20 reference-role cases alongside the prior 40 literal cases.
+- Its 56 reachable inputs require 40 generated packages and 16 specific version refusals.
 - The test compiles every generated package and compares its query constant with captured sqlc text at runtime.
 - Four native-valid comment-continuation inputs require their observed upstream syntax errors and no generated source.
 
@@ -276,7 +284,7 @@ SQL Server:
 
 - The write guard checks syntactic presence. It does not establish reference-to-table binding across nested query or CTE scopes. The other engines retain their existing version-matching behavior.
 
-- The pinned sqlc rejects the four tested comment-continuation forms before invoking the plugin. Direct-generator coverage does not imply sqlc acceptance.
+- The pinned sqlc rejects the four tested comment-continuation forms and the tested nested materialized CTE before invoking the plugin. The nested CTE is valid in PostgreSQL and remains a positive direct-generator case; its sqlc refusal names the inner relation `b`. Direct-generator coverage does not imply sqlc acceptance.
 
 - The plugin does not support `:execresult`, `:copyfrom` or batch commands. No requirement names them.
 - The plugin does not build a query builder. The `.sql` files are the source of truth.

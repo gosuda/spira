@@ -24,7 +24,7 @@ func postgresReferencesColumn(text string, column string) bool {
 	excluded := make([]bool, len(tokens))
 	excludeReferenceDeclarations(tokens, excluded)
 	excludeWriteHeaders(tokens, excluded)
-	excludeReturningAliases(tokens, excluded)
+	excludeOutputAliases(tokens, excluded)
 	for i := 0; i < len(tokens); {
 		if !tokens[i].isName() {
 			i++
@@ -158,6 +158,7 @@ func referenceNameHead(tokens []sqlReferenceToken, end int) bool {
 }
 
 func excludeReferenceDeclarations(tokens []sqlReferenceToken, excluded []bool) {
+	cteHeaders := referenceCTEHeaders(tokens)
 	for i, token := range tokens {
 		if !token.keyword("as") && !token.keyword("collate") && !token.punctuation("::") {
 			continue
@@ -167,7 +168,7 @@ func excludeReferenceDeclarations(tokens []sqlReferenceToken, excluded []bool) {
 		}
 		end := referenceNameEnd(tokens, i+1)
 		excludeReferenceRange(excluded, i+1, end)
-		if end < len(tokens) && tokens[end].punctuation("(") {
+		if !cteHeaders[i] && end < len(tokens) && tokens[end].punctuation("(") {
 			close := referenceParenthesisEnd(tokens, end)
 			excludeReferenceRange(excluded, end, close)
 		}
@@ -229,26 +230,69 @@ func referenceDeleteHeaderEnd(tokens []sqlReferenceToken, start int, depth int) 
 	return len(tokens)
 }
 
-func excludeReturningAliases(tokens []sqlReferenceToken, excluded []bool) {
+func excludeOutputAliases(tokens []sqlReferenceToken, excluded []bool) {
 	for i, token := range tokens {
-		if !token.keyword("returning") {
+		if !token.keyword("returning") && !token.keyword("select") {
 			continue
 		}
-		start := i + 1
+		start := referenceOutputStart(tokens, i)
 		for end := start; end <= len(tokens); end++ {
-			if end == len(tokens) || tokens[end].depth < token.depth || tokens[end].punctuation(";") {
-				excludeReturningAlias(tokens[start:end], excluded[start:end])
+			if referenceOutputEnd(tokens, end, token) {
+				excludeOutputAlias(tokens[start:end], excluded[start:end])
 				break
 			}
 			if tokens[end].depth == token.depth && tokens[end].punctuation(",") {
-				excludeReturningAlias(tokens[start:end], excluded[start:end])
+				excludeOutputAlias(tokens[start:end], excluded[start:end])
 				start = end + 1
 			}
 		}
 	}
 }
 
-func excludeReturningAlias(tokens []sqlReferenceToken, excluded []bool) {
+// SELECT modifiers precede its target expressions. RETURNING has no prefix.
+func referenceOutputStart(tokens []sqlReferenceToken, owner int) int {
+	start := owner + 1
+	if !tokens[owner].keyword("select") || start == len(tokens) {
+		return start
+	}
+	if tokens[start].keyword("all") {
+		return start + 1
+	}
+	if !tokens[start].keyword("distinct") {
+		return start
+	}
+	start++
+	if start+1 < len(tokens) && tokens[start].keyword("on") && tokens[start+1].punctuation("(") {
+		return referenceParenthesisEnd(tokens, start+1)
+	}
+	return start
+}
+
+// Only unqualified clause keywords at the SELECT depth end its target list.
+// AS labels, qualified components and IS DISTINCT FROM stay in the expression.
+func referenceOutputEnd(tokens []sqlReferenceToken, index int, owner sqlReferenceToken) bool {
+	if index == len(tokens) || tokens[index].depth < owner.depth || tokens[index].punctuation(";") {
+		return true
+	}
+	token := tokens[index]
+	if !owner.keyword("select") || token.depth != owner.depth || token.kind != referenceName {
+		return false
+	}
+	if tokens[index-1].punctuation(".") || tokens[index-1].keyword("as") ||
+		(token.keyword("from") && tokens[index-1].keyword("distinct")) {
+		return false
+	}
+	switch token.text {
+	case "group", "order":
+		return index+1 < len(tokens) && tokens[index+1].keyword("by")
+	case "from", "into", "where", "having", "window", "union", "intersect", "except",
+		"limit", "offset", "fetch", "for", "returning":
+		return true
+	}
+	return false
+}
+
+func excludeOutputAlias(tokens []sqlReferenceToken, excluded []bool) {
 	if len(tokens) < 2 {
 		return
 	}

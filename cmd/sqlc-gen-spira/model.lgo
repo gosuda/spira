@@ -1249,12 +1249,42 @@ func (r *resolver) buildVersions(tables []catalogTable) error {
 		if err != nil {
 			return fmt.Errorf("sqlc-gen-spira: tables.%s: %w", name, err)
 		}
+		if r.engine == "postgresql" {
+			canonical, err := catalogVersionColumn(ct, version)
+			if err != nil {
+				return fmt.Errorf("sqlc-gen-spira: tables.%s.version %q %w", name, version, err)
+			}
+			version = canonical
+		}
 		key := strings.ToLower(ct.table.Rel.Name)
 		if _, dup := r.versions[key]; !dup {
 			r.versions[key] = tableVersion{name: ct.table.Rel.Name, version: version}
 		}
 	}
 	return nil
+}
+
+// Catalog spelling wins before the unique case-insensitive configuration match.
+func catalogVersionColumn(table catalogTable, option string) (string, error) {
+	for _, column := range table.table.Columns {
+		if column.Name == option {
+			return column.Name, nil
+		}
+	}
+	var folded string
+	for _, column := range table.table.Columns {
+		if !strings.EqualFold(column.Name, option) {
+			continue
+		}
+		if folded != "" {
+			return "", fmt.Errorf("is ambiguous in %s.%s", table.schema, table.table.Rel.Name)
+		}
+		folded = column.Name
+	}
+	if folded == "" {
+		return "", fmt.Errorf("is not a column of %s.%s", table.schema, table.table.Rel.Name)
+	}
+	return folded, nil
 }
 
 func (r *resolver) classifyRow(q *Query, qd *QueryDef) error {

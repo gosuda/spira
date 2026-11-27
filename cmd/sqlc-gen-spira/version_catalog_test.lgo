@@ -1,0 +1,113 @@
+package main_test
+
+import (
+	"encoding/json/v2"
+	"os"
+	"strings"
+	"testing"
+
+	sqlcgen "github.com/gosuda/spira/cmd/sqlc-gen-spira"
+)
+
+type versionCatalogCase struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns"`
+	Option  string   `json:"option"`
+	SQL     string   `json:"sql"`
+	Error   string   `json:"error"`
+}
+
+func TestPostgresVersionCatalogResolution(t *testing.T) {
+	data, err := os.ReadFile("testdata/version-catalog.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var cases []versionCatalogCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 11 {
+		t.Fatalf("version catalog cases = %d; want 11", len(cases))
+		return
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			checkVersionCatalogCase(t, tc)
+		})
+	}
+}
+
+func checkVersionCatalogCase(t *testing.T, tc versionCatalogCase) {
+	t.Helper()
+	req := versionCatalogRequest(t, tc)
+	model, files, err := sqlcgen.Generate(req)
+	if err != nil {
+		if tc.Error == "" {
+			t.Fatalf("Generate rejected option %q for columns %q: %v", tc.Option, tc.Columns, err)
+			return
+		}
+		if !strings.Contains(err.Error(), tc.Error) {
+			t.Fatalf("Generate error = %v; want %q", err, tc.Error)
+		}
+		return
+	}
+	if tc.Error != "" {
+		t.Fatalf("Generate error = %v; want %q", err, tc.Error)
+		return
+	}
+	if model.Engine != "postgresql" || len(files) != 2 {
+		t.Fatalf("Generate result = %q, %d files; want PostgreSQL model and query files", model.Engine, len(files))
+		return
+	}
+	if query := findQuery(t, model, "VersionCatalog"); query.Text != tc.SQL {
+		t.Fatalf("generated SQL = %q; want exact input %q", query.Text, tc.SQL)
+	}
+}
+
+func versionCatalogRequest(t *testing.T, tc versionCatalogCase) *sqlcgen.Request {
+	t.Helper()
+	req := loadRequest(t, "postgresql")
+	matched := 0
+	for si := range req.Catalog.Schemas {
+		for ti := range req.Catalog.Schemas[si].Tables {
+			table := &req.Catalog.Schemas[si].Tables[ti]
+			if table.Rel.Name != "items" {
+				continue
+			}
+			columns, count := versionCatalogColumns(table.Columns, tc.Columns)
+			table.Columns = columns
+			matched += count
+		}
+	}
+	if matched != 1 {
+		t.Fatalf("catalog version columns = %d; want 1 before the fixture substitution", matched)
+	}
+	req.PluginOptions = pluginOptions(t, map[string]any{
+		"tables": map[string]any{
+			"items": map[string]any{"type": "Item", "key": "id", "key_type": "ItemID", "version": tc.Option},
+		},
+	})
+	req.Queries = []sqlcgen.Query{{
+		Name: "VersionCatalog", Cmd: ":exec", Filename: "items.sql", Text: tc.SQL,
+	}}
+	return req
+}
+
+func versionCatalogColumns(input []sqlcgen.Column, names []string) ([]sqlcgen.Column, int) {
+	var columns []sqlcgen.Column
+	matched := 0
+	for _, column := range input {
+		if column.Name != "version" {
+			columns = append(columns, column)
+			continue
+		}
+		matched++
+		for _, name := range names {
+			column.Name = name
+			columns = append(columns, column)
+		}
+	}
+	return columns, matched
+}

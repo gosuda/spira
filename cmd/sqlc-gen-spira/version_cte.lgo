@@ -1,0 +1,156 @@
+package main
+
+// Mark only AS tokens in query-block CTE headers. The outer walk still visits
+// nested WITH clauses after the local sibling walk skips each balanced body.
+func referenceCTEHeaders(tokens []sqlReferenceToken) []bool {
+	headers := make([]bool, len(tokens))
+	for i, token := range tokens {
+		if token.keyword("with") && referenceCTEEntry(tokens, i) {
+			markReferenceCTEList(tokens, i+1, headers)
+		}
+	}
+	return headers
+}
+
+func referenceCTEEntry(tokens []sqlReferenceToken, index int) bool {
+	return index == 0 || tokens[index-1].punctuation(";") || tokens[index-1].punctuation("(")
+}
+
+func markReferenceCTEList(tokens []sqlReferenceToken, start int, headers []bool) {
+	if start < len(tokens) && tokens[start].keyword("recursive") {
+		start++
+	}
+	for start < len(tokens) {
+		asIndex, end := referenceCTEHeaderEnd(tokens, start)
+		if asIndex < 0 || end < 0 {
+			return
+		}
+		headers[asIndex] = true
+		end = referenceCTESuffixEnd(tokens, end)
+		if end < 0 || end == len(tokens) || !tokens[end].punctuation(",") {
+			return
+		}
+		start = end + 1
+	}
+}
+
+func referenceCTEHeaderEnd(tokens []sqlReferenceToken, start int) (int, int) {
+	if start >= len(tokens) || !tokens[start].isName() {
+		return -1, -1
+	}
+	index := start + 1
+	if index < len(tokens) && tokens[index].punctuation("(") {
+		end := referenceCTEColumnsEnd(tokens, index+1)
+		if end < 0 || end == len(tokens) || !tokens[end].punctuation(")") ||
+			tokens[end].depth != tokens[index].depth {
+			return -1, -1
+		}
+		index = end + 1
+	}
+	if index == len(tokens) || !tokens[index].keyword("as") {
+		return -1, -1
+	}
+	return index, referenceCTEBodyEnd(tokens, index+1)
+}
+
+func referenceCTEBodyEnd(tokens []sqlReferenceToken, start int) int {
+	if start < len(tokens) && tokens[start].keyword("not") {
+		start++
+		if start == len(tokens) || !tokens[start].keyword("materialized") {
+			return -1
+		}
+	}
+	if start < len(tokens) && tokens[start].keyword("materialized") {
+		start++
+	}
+	if start == len(tokens) || !tokens[start].punctuation("(") {
+		return -1
+	}
+	end := referenceParenthesisEnd(tokens, start)
+	if !tokens[end-1].punctuation(")") || tokens[end-1].depth != tokens[start].depth {
+		return -1
+	}
+	return end
+}
+
+func referenceCTESuffixEnd(tokens []sqlReferenceToken, start int) int {
+	if start < len(tokens) && tokens[start].keyword("search") {
+		start = referenceCTESearchEnd(tokens, start)
+		if start < 0 {
+			return -1
+		}
+	}
+	if start < len(tokens) && tokens[start].keyword("cycle") {
+		return referenceCTECycleEnd(tokens, start)
+	}
+	return start
+}
+
+func referenceCTESearchEnd(tokens []sqlReferenceToken, start int) int {
+	if start+3 >= len(tokens) || (!tokens[start+1].keyword("depth") && !tokens[start+1].keyword("breadth")) ||
+		!tokens[start+2].keyword("first") || !tokens[start+3].keyword("by") {
+		return -1
+	}
+	end := referenceCTEColumnsEnd(tokens, start+4)
+	if end < 0 || end+1 >= len(tokens) || !tokens[end].keyword("set") || !tokens[end+1].isName() {
+		return -1
+	}
+	return end + 2
+}
+
+func referenceCTECycleEnd(tokens []sqlReferenceToken, start int) int {
+	end := referenceCTEColumnsEnd(tokens, start+1)
+	if end < 0 || end+2 >= len(tokens) || !tokens[end].keyword("set") || !tokens[end+1].isName() {
+		return -1
+	}
+	end += 2
+	if tokens[end].keyword("to") {
+		end = referenceCTEConstantEnd(tokens, end+1, "default")
+		if end < 0 {
+			return -1
+		}
+		end = referenceCTEConstantEnd(tokens, end+1, "using")
+		if end < 0 {
+			return -1
+		}
+	}
+	if end+1 >= len(tokens) || !tokens[end].keyword("using") || !tokens[end+1].isName() {
+		return -1
+	}
+	return end + 2
+}
+
+// A footer's key-list commas belong to the footer, not to the CTE sibling list.
+func referenceCTEColumnsEnd(tokens []sqlReferenceToken, start int) int {
+	if start >= len(tokens) || !tokens[start].isName() {
+		return -1
+	}
+	end := start + 1
+	for end < len(tokens) && tokens[end].punctuation(",") {
+		if end+1 == len(tokens) || !tokens[end+1].isName() {
+			return -1
+		}
+		end += 2
+	}
+	return end
+}
+
+// Constants may contain type-modifier parentheses. Only an unqualified keyword
+// at the footer depth ends the constant; quoted names and literals stay opaque.
+func referenceCTEConstantEnd(tokens []sqlReferenceToken, start int, keyword string) int {
+	if start >= len(tokens) || tokens[start].keyword(keyword) {
+		return -1
+	}
+	depth := tokens[start].depth
+	for index := start + 1; index < len(tokens); index++ {
+		token := tokens[index]
+		if token.depth < depth || token.punctuation(";") ||
+			(token.depth == depth && token.punctuation(",")) {
+			return -1
+		}
+		if token.depth == depth && token.keyword(keyword) && !tokens[index-1].punctuation(".") {
+			return index
+		}
+	}
+	return -1
+}
