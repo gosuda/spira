@@ -265,10 +265,21 @@ func checkSQLiteDatabaseName(dsn string, name string, mode string, cache string)
 
 // AcquireMigrationTurn takes the pool's migration turn. Release it with the
 // returned function, which frees the turn only once. A done context fails
-// instead of queueing behind a turn that another migration holds.
+// instead of queueing behind a turn that another migration holds, and an
+// already-ended context fails even when the turn is free.
 func (p *Pool) AcquireMigrationTurn(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("db: wait for migration turn: %w", err)
+	}
 	select {
 	case p.migSem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			select {
+			case <-p.migSem:
+			default:
+			}
+			return nil, fmt.Errorf("db: wait for migration turn: %w", err)
+		}
 		var used atomic.Bool
 		return func() {
 			if !used.CompareAndSwap(false, true) {

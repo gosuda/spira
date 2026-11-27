@@ -136,3 +136,16 @@ func TestReleaseFreesTheTurnOnlyOnce(t *testing.T) {
 	}
 	releaseB()
 }
+
+func TestMigrationTurnRejectsEndedContextOnFreePool(t *testing.T) {
+	pool := openPool(t)
+	cancelled, stop := context.WithCancel(t.Context())
+	stop()
+	if _, err := pool.AcquireMigrationTurn(cancelled); err == nil {
+		t.Fatal("AcquireMigrationTurn with a cancelled context on a free pool succeeded; want the context error")
+		return
+	} else if !errors.Is(err, context.Canceled) {
+		t.Fatalf("free-pool acquire err = %v; want context canceled", err)
+		return
+	}
+}

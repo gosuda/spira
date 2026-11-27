@@ -48,7 +48,7 @@ func Faults() []*fault.Error
  - `Apply` and `Rollback` on one pool MUST serialize in this process.
  - Serialization MUST be per pool: migrations on another pool MUST NOT wait.
  - A done context MUST fail the wait instead of queueing.
- - `Apply` MUST run only the steps after the applied prefix.
+ - A done context MUST fail even when the turn is free.
 - If an applied name is not the step name at the same index, `Apply` MUST fail.
 - That failure MUST change no schema.
 - If an applied name is outside the given steps, `Apply` MUST fail.
@@ -146,7 +146,7 @@ func Faults() []*fault.Error
 - `TestEngineCheckReversibleMSSQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on SQL Server, failing without `SPIRA_TEST_MSSQL_DSN`.
 - `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
  - `TestReleaseFreesTheTurnOnlyOnce` proves a repeated release keeps the next turn held.
- - `TestConcurrentApplySerializes` proves concurrent `Apply` calls on one pool all succeed.
+ - `TestMigrationTurnRejectsEndedContextOnFreePool` proves a cancelled context fails on a free pool.
  - `TestMigrationSerialIsPerPool` proves a held turn on one pool never blocks another pool.
  - `TestQueuedApplyHonorsContext` proves a queued `Apply` fails on its context deadline and changes nothing.
 - `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
