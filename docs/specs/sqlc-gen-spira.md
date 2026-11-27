@@ -247,7 +247,7 @@ SQL Server:
 - The application calls `store.PrepareAll` on an empty schema and requires the error to satisfy `errors.Is` to `db.ErrStatementFailed` and to name `GetItem`.
 - The raw-query rule is proved on a scratch copy with a planted call and on the clean tree.
 - The shop lane adds `sql-check` to `gate` after it publishes `example/shop/sqlc.yaml`.
-- The end-to-end proof that runs generated functions against `database/sql` is not in this package.
+ - `compareQueries` in `testdata/runtime_sqlite` proves the generated functions match direct `database/sql` calls for insert, rename, get, slice, delete and repeated binds.
 
 ## Not in scope
 
