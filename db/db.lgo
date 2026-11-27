@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -280,15 +279,18 @@ func (p *Pool) AcquireMigrationTurn(ctx context.Context) (func(), error) {
 			}
 			return nil, fmt.Errorf("db: wait for migration turn: %w", err)
 		}
-		var used atomic.Bool
+		var used sync.Locked[bool]
 		return func() {
-			if !used.CompareAndSwap(false, true) {
-				return
-			}
-			select {
-			case <-p.migSem:
-			default:
-			}
+			used.WithLock(func(released *bool) {
+				if *released {
+					return
+				}
+				*released = true
+				select {
+				case <-p.migSem:
+				default:
+				}
+			})
 		}, nil
 	case <-ctx.Done():
 		return nil, fmt.Errorf("db: wait for migration turn: %w", ctx.Err())

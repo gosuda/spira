@@ -197,6 +197,7 @@ SQL Server:
  - The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
  - `UPDATE` and `DELETE` detection MUST ignore string literals and SQL comments.
  - A backslash MUST escape only in MySQL strings and PostgreSQL escape strings.
+- PostgreSQL continuation segments MUST keep the first string segment's escape mode.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -230,6 +231,8 @@ SQL Server:
 - Any engine other than `sqlite`, `postgresql`, `mysql` and `mssql` produces an error.
 
 ## Proof
+
+- `TestPostgresContinuedEscapeStrings` checks continued escape strings, independent literals, and version words hidden in strings or comments.
 
 - Each test builds the request model from a captured fixture.
 - The model asserts entity types and fields, key types, query names, commands and row types.

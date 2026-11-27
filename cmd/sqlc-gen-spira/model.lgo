@@ -910,6 +910,7 @@ func (r *resolver) refuseVersionedWrite(q *Query) error {
 // A backslash escapes the next character only in literal forms that support
 // it: MySQL strings and PostgreSQL escape strings. Everywhere else the
 // backslash is an ordinary character, so the literal ends at its quote.
+// PostgreSQL continuation segments keep the first segment's escape mode.
 func maskSQLFor(engine string, text string) string {
 	out := []byte(text)
 	i := 0
@@ -921,7 +922,7 @@ func maskSQLFor(engine string, text string) string {
 
 func maskAtFor(out []byte, i int, engine string) int {
 	if out[i] == '\'' {
-		return maskQuotedFor(out, i, backslashEscapes(engine, out, i))
+		return maskStringFor(out, i, engine)
 	}
 	if out[i] == '-' && i+1 < len(out) && out[i+1] == '-' {
 		return maskLine(out, i)
@@ -930,6 +931,51 @@ func maskAtFor(out []byte, i int, engine string) int {
 		return maskBlock(out, i)
 	}
 	return i + 1
+}
+
+func maskStringFor(out []byte, i int, engine string) int {
+	escape := backslashEscapes(engine, out, i)
+	for {
+		end := maskQuotedFor(out, i, escape)
+		if engine != "postgresql" {
+			return end
+		}
+		next := postgresContinuedQuote(out, end)
+		if next == nil {
+			return end
+		}
+		blank(out, end, next)
+		i = next
+	}
+}
+
+func postgresContinuedQuote(out []byte, i int) int? {
+	newline := false
+	for i < len(out) {
+		if out[i] == '-' && i+1 < len(out) && out[i+1] == '-' {
+			i = postgresLineEnd(out, i+2)
+			continue
+		}
+		switch out[i] {
+		case '\r', '\n':
+			newline = true
+		case ' ', '\t', '\f', '\v':
+		default:
+			if newline && out[i] == '\'' {
+				return i
+			}
+			return nil
+		}
+		i++
+	}
+	return nil
+}
+
+func postgresLineEnd(out []byte, i int) int {
+	for i < len(out) && out[i] != '\r' && out[i] != '\n' {
+		i++
+	}
+	return i
 }
 
 func backslashEscapes(engine string, out []byte, i int) bool {

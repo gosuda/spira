@@ -3,8 +3,8 @@ package migrate_test
 import (
 	"context"
 	"errors"
+	"logos/sync"
 	"slices"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,16 +80,16 @@ func TestQueuedApplyHonorsContext(t *testing.T) {
 	applyCtx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer stop()
 	done := make(chan error, 1)
-	var watchdogFired atomic.Bool
-	watchdog := time.AfterFunc(5*time.Second, func() {
-		watchdogFired.Store(true)
-		release()
-	})
-	defer watchdog.Stop()
+	finished := make(chan struct{})
+	var watchdogFired sync.Locked[bool]
 	run := func() error {
-		go group (t.Context(), limit = 1) {
+		go group (t.Context(), limit = 2) {
 			go {
+				defer close(finished)
 				done <- migrate.Apply(applyCtx, pool, steps)
+			}
+			go {
+				releaseStalledApply(finished, release, &watchdogFired)
 			}
 		}
 		return nil
@@ -98,10 +98,11 @@ func TestQueuedApplyHonorsContext(t *testing.T) {
 		t.Fatalf("group: %v", err)
 		return
 	}
-	watchdog.Stop()
+	fired := false
+	watchdogFired.WithLock(func(value *bool) { fired = *value })
 	select {
 	case err := <-done:
-		if watchdogFired.Load() {
+		if fired {
 			t.Fatal("queued Apply ignored its context deadline; the watchdog freed the turn")
 			return
 		}
@@ -118,6 +119,17 @@ func TestQueuedApplyHonorsContext(t *testing.T) {
 	}
 	if names := tableNames(t, pool); slices.Contains(names, "queued_apply") {
 		t.Fatalf("tables after queued Apply = %v; want no queued_apply", names)
+	}
+}
+
+func releaseStalledApply(finished <-chan struct{}, release func(), fired *sync.Locked[bool]) {
+	watchdog := time.NewTimer(5 * time.Second)
+	defer watchdog.Stop()
+	select {
+	case <-finished:
+	case <-watchdog.C:
+		fired.WithLock(func(value *bool) { *value = true })
+		release()
 	}
 }
 

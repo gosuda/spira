@@ -54,6 +54,7 @@ func Faults() []*fault.Error
 - That failure MUST change no schema.
 - If an applied name is outside the given steps, `Apply` MUST fail.
 - A second `Apply` of the same steps MUST succeed and MUST not write a second bookkeeping row.
+- `Apply` MUST skip the applied prefix and run only the remaining steps.
 - Each step MUST run its `up` text and its bookkeeping insert in one transaction.
 - `Apply` MUST use the dialect of `p` for each placeholder.
 - On SQLite and MySQL, `Apply` MUST use `?` for each placeholder.
