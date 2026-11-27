@@ -51,7 +51,7 @@ func checkContinuedString(t *testing.T, tc continuedStringCase) {
 	model, files, err := sqlcgen.Generate(req)
 	if !tc.Allow {
 		if err == nil {
-			t.Fatal("Generate accepted a write whose version appears only in literal data or comments")
+			t.Fatal("Generate accepted a write without a version-column reference")
 			return
 		}
 		if !strings.Contains(err.Error(), "writes versioned table items without version") {

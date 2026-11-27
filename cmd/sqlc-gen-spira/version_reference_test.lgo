@@ -1,0 +1,51 @@
+package main_test
+
+import (
+	"encoding/json/v2"
+	"os"
+	"testing"
+)
+
+func TestPostgresVersionReferenceRoles(t *testing.T) {
+	data, err := os.ReadFile("testdata/version-references.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var cases []continuedStringCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 20 {
+		t.Fatalf("version reference cases = %d; want 20", len(cases))
+		return
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			checkContinuedString(t, tc)
+		})
+	}
+}
+
+func TestPostgresVersionReferenceRoleBoundaries(t *testing.T) {
+	data, err := os.ReadFile("testdata/version-reference-boundaries.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var cases []continuedStringCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 8 {
+		t.Fatalf("version reference boundary cases = %d; want 8", len(cases))
+		return
+	}
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			checkContinuedString(t, tc)
+		})
+	}
+}

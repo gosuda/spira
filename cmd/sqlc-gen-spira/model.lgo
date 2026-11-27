@@ -899,7 +899,11 @@ func (r *resolver) refuseVersionedWrite(q *Query) error {
 		if !ok || versioned.version == "" {
 			continue
 		}
-		if !strings.Contains(upper, strings.ToUpper(versioned.version)) {
+		referenced := strings.Contains(upper, strings.ToUpper(versioned.version))
+		if r.engine == "postgresql" {
+			referenced = postgresReferencesColumn(q.Text, versioned.version)
+		}
+		if !referenced {
 			return fmt.Errorf("sqlc-gen-spira: %s: writes versioned table %s without %s", q.Name, versioned.name, versioned.version)
 		}
 	}

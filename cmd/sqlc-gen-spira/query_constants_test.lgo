@@ -81,7 +81,7 @@ func checkCompiledSQLcQueries(t *testing.T, ctx context.Context, dir string, exp
 	root := filepath.Abs(filepath.Join("..", ".."))?
 	configureSQLcSQLite(ctx, root, dir)?
 	writeCompiledQueryFixture(dir, expected)?
-	cmd := exec.CommandContext(ctx, "logos", "test", "-count=1", "-v", ".")
+	cmd := exec.CommandContext(ctx, "logos", "test", "-race", "-count=1", "-v", ".")
 	cmd.Dir = dir
 	err := runSQLcSQLiteCommand(cmd)
 	data, readErr := os.ReadFile(filepath.Join(dir, "observed.json"))

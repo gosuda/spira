@@ -202,6 +202,9 @@ SQL Server:
 - PostgreSQL escape prefixes MUST begin outside an identifier.
 - PostgreSQL dollar strings MUST end at their matching case-sensitive delimiter.
 - Dollar delimiters MUST begin outside quoted or unquoted identifiers.
+- PostgreSQL version matching MUST use complete identifiers, folding unquoted ASCII letters and preserving quoted names after doubled-quote unescaping.
+- PostgreSQL `RETURNING` aliases, recognized UPDATE/DELETE relation headers, call heads, `CAST`/`::`/typed-literal heads and `COLLATE` names MUST NOT satisfy the version check.
+- A version-column reference in an assignment, predicate or returned expression is sufficient; the guard does not require an increment.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -240,6 +243,9 @@ SQL Server:
 - `TestPostgresTypedLiteralBoundaries` checks typed literals ending in `e` and genuine escape prefixes using native-validated fixtures.
 - `TestPostgresDollarQuotedBoundaries` checks 14 native-validated dollar-string and identifier boundaries.
 - `TestGeneratedQueryConstants` compiles eight full generated packages and checks their query values against runtime JSON.
+- Both generated-package test suites invoke their nested `logos test` process with `-race`.
+- `TestPostgresVersionReferenceRoles` checks 20 native-validated name-role cases: 12 refusals and eight genuine references.
+- `TestPostgresVersionReferenceRoleBoundaries` checks eight boundaries: parenthesized aliases, qualified casts, a function's `FROM` operand, quoted punctuation, a qualified operator's right operand, a qualified function named `operator`, and the unqualified spelling that PostgreSQL rejects.
 - `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on the same 40 inputs.
 - Its 36 reachable inputs require 32 generated packages and four specific version refusals.
 - The test compiles every generated package and compares its query constant with captured sqlc text at runtime.
@@ -267,6 +273,8 @@ SQL Server:
  - `compareQueries` in `testdata/runtime_sqlite` proves the generated functions match direct `database/sql` calls for insert, rename, get, slice, delete and repeated binds.
 
 ## Not in scope
+
+- The write guard checks syntactic presence. It does not establish reference-to-table binding across nested query or CTE scopes. The other engines retain their existing version-matching behavior.
 
 - The pinned sqlc rejects the four tested comment-continuation forms before invoking the plugin. Direct-generator coverage does not imply sqlc acceptance.
 
