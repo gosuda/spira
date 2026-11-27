@@ -156,14 +156,17 @@ func prefixError(applied []string, steps const []Step) error {
 	return nil
 }
 
- func Apply(ctx context.Context, p *db.Pool, steps const []Step) error {
- 	release, err := p.AcquireMigrationTurn(ctx)
- 	if err != nil {
- 		return fmt.Errorf("migrate: apply: %w", err)
- 	}
- 	defer release()
- 	return applyLocked(ctx, p, steps)
- }
+// Apply runs the steps after the applied prefix. It coordinates only the
+// callers that share p: open one Pool per database, never two pools that
+// migrate the same database.
+func Apply(ctx context.Context, p *db.Pool, steps const []Step) error {
+	release, err := p.AcquireMigrationTurn(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: apply: %w", err)
+	}
+	defer release()
+	return applyLocked(ctx, p, steps)
+}
 
 func applyLocked(ctx context.Context, p *db.Pool, steps const []Step) error {
 	if err := ensureTable(ctx, p); err != nil {

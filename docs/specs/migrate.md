@@ -48,7 +48,7 @@ func Faults() []*fault.Error
  - `Apply` and `Rollback` on one pool MUST serialize in this process.
  - Serialization MUST be per pool: migrations on another pool MUST NOT wait.
  - A done context MUST fail the wait instead of queueing.
- - A done context MUST fail even when the turn is free.
+ - Operators MUST open one `Pool` per database; two pools MUST NOT migrate one database.
 - If an applied name is not the step name at the same index, `Apply` MUST fail.
 - That failure MUST change no schema.
 - If an applied name is outside the given steps, `Apply` MUST fail.
