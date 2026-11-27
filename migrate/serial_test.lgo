@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,44 +71,55 @@ func TestQueuedApplyHonorsContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
- 	release, err := pool.AcquireMigrationTurn(ctx)
- 	if err != nil {
- 		t.Fatalf("hold pool turn: %v", err)
- 		return
- 	}
- 	defer release()
- 	applyCtx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
- 	defer stop()
- 	done := make(chan error, 1)
- 	run := func() error {
- 		go group (t.Context(), limit = 1) {
- 			go {
- 				done <- migrate.Apply(applyCtx, pool, steps)
- 			}
- 		}
- 		return nil
- 	}
- 	if err := run(); err != nil {
- 		t.Fatalf("group: %v", err)
- 		return
- 	}
- 	select {
- 	case err := <-done:
- 		if err == nil {
- 			t.Fatal("queued Apply succeeded past its context deadline; want the context error")
- 			return
- 		}
- 		if !errors.Is(err, context.DeadlineExceeded) {
- 			t.Fatalf("queued Apply err = %v; want context deadline exceeded", err)
- 			return
- 		}
- 	case <-time.After(5 * time.Second):
- 		t.Fatal("queued Apply ignored its context deadline")
- 	}
- 	if names := tableNames(t, pool); slices.Contains(names, "queued_apply") {
- 		t.Fatalf("tables after queued Apply = %v; want no queued_apply", names)
- 	}
- }
+	release, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("hold pool turn: %v", err)
+		return
+	}
+	defer release()
+	applyCtx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer stop()
+	done := make(chan error, 1)
+	var watchdogFired atomic.Bool
+	watchdog := time.AfterFunc(5*time.Second, func() {
+		watchdogFired.Store(true)
+		release()
+	})
+	defer watchdog.Stop()
+	run := func() error {
+		go group (t.Context(), limit = 1) {
+			go {
+				done <- migrate.Apply(applyCtx, pool, steps)
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("group: %v", err)
+		return
+	}
+	watchdog.Stop()
+	select {
+	case err := <-done:
+		if watchdogFired.Load() {
+			t.Fatal("queued Apply ignored its context deadline; the watchdog freed the turn")
+			return
+		}
+		if err == nil {
+			t.Fatal("queued Apply succeeded past its context deadline; want the context error")
+			return
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("queued Apply err = %v; want context deadline exceeded", err)
+			return
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued Apply ignored its context deadline")
+	}
+	if names := tableNames(t, pool); slices.Contains(names, "queued_apply") {
+		t.Fatalf("tables after queued Apply = %v; want no queued_apply", names)
+	}
+}
 
 func TestReleaseFreesTheTurnOnlyOnce(t *testing.T) {
 	pool := openPool(t)
