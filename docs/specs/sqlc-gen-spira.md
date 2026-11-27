@@ -115,18 +115,21 @@ PostgreSQL:
 - `int8` and `bigserial` MUST map to `int64`.
 - `integer`, `int`, `int4` and `serial` MUST map to `int32`.
 - `int2` MUST map to `int16`.
-- `uuid` MUST map to `string`.
+ - `uuid` MUST map to `string`.
+ - `name` MUST map to `string`.
 - `bpchar` MUST map to `string` because a fixed `CHAR(n)` arrives as `bpchar`.
-- `float8` MUST map to `float64`.
+ - `float8` MUST map to `float64`.
+ - `real` and `float4` MUST map to `float32`.
 - `bytea` and `jsonb` MUST map to `[]byte`.
 - `timestamptz` MUST map to `time.Time`.
 
 MySQL:
 
 - `tinyint` with `length` 1 MUST map to `bool`.
-- `tinyint` with any other `length` MUST map to `int16`.
-- `mediumint`, `int` and `integer` MUST map to `int32`.
-- `float` MUST map to `float32`.
+ - `tinyint` with any other `length` MUST map to `int16`.
+ - `mediumint`, `int` and `integer` MUST map to `int32`.
+ - `float` MUST map to `float32`.
+ - `double` MUST map to `float64`.
 - `tinytext`, `mediumtext` and `longtext` MUST map to `string`.
 - `binary`, `varbinary`, `tinyblob`, `blob`, `mediumblob` and `longblob` MUST map to `[]byte`.
 
@@ -138,8 +141,7 @@ SQL Server:
 - `real` MUST map to `float32`.
 - `float` MUST map to `float64`.
 - `nchar`, `nvarchar`, `ntext` and `uniqueidentifier` MUST map to `string`.
-- `binary`, `varbinary` and `image` MUST map to `[]byte`.
-- `datetime2`, `smalldatetime` and `datetimeoffset` MUST map to `time.Time`.
+ - `datetime2`, `smalldatetime`, `datetimeoffset` and `time` MUST map to `time.Time`.
 - `money` and `smallmoney` MUST map to `string`.
 
 ### Models
