@@ -11,10 +11,12 @@ type Table[E any, K comparable] struct {
 	Version string
 }
 
-type StaleError struct {
-	Table string
-	Key   string
-}
+ type StaleError struct {
+ 	Table string
+ 	Key   string
+ }
+
+ func (e *StaleError) Error() string
 
 type Session struct {
 	// unexported fields
@@ -64,7 +66,8 @@ func (s *Session) Tx() *db.Tx
 - `Attach` MUST return the held pointer for a key that the session already holds.
 - `Attach` MUST return a tracked pointer for a row that the session does not hold.
 - `Attach` MUST NOT overwrite a held entity with a row that has the same key.
-- A second `Get` of one key MUST return the same pointer.
+ - A second `Get` of one key MUST return the same pointer.
+ - `Flush` MUST reject an update or remove whose key differs from the loaded key.
 
 ### Change detection
 
@@ -115,8 +118,10 @@ func (s *Session) Tx() *db.Tx
 
 - The model-based property test compares `Get`, change, add, remove, touch and flush against a plain map as the oracle.
 - The two-session test loads one row in two sessions, flushes the first, and requires `*StaleError` from the second flush.
-- `Get` twice returns the same pointer.
-- `Attach` returns the held pointer for a known key.
+ - `Attach` returns the held pointer for a known key.
+ - `TestKeyChangeIsRejected` fails an update and a remove after a key change.
+ - `TestPendingInsertKeyChangeIsRejected` fails a first flush after an added key changes.
+ - `TestVersionedChangedColumnsOnly` writes only the changed column and then the touched version.
 - The engine-tagged test runs the two-session `*StaleError` case on PostgreSQL, MySQL and SQL Server.
 
 ## Not in scope

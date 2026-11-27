@@ -48,13 +48,16 @@ func appendPlaceholder(out *strings.Builder, d db.Dialect, n int) {
 
 func (row *entityRow[E, K]) insert(ctx context.Context) error {
 	r := row.table
-	key := *r.keyOf(row.entity)
-	var zero K
-	if key != row.key && key != zero {
-		if _, duplicate := r.byKey[key]; duplicate {
-			return tableFault(r.table.Name, "insert key already held by a different entity")
-		}
-	}
+ 	key := *r.keyOf(row.entity)
+ 	var zero K
+ 	if row.key != zero && key != row.key {
+ 		return tableFault(r.table.Name, "key cannot change while tracked")
+ 	}
+ 	if key != row.key && key != zero {
+ 		if _, duplicate := r.byKey[key]; duplicate {
+ 			return tableFault(r.table.Name, "insert key already held by a different entity")
+ 		}
+ 	}
 	query, args := row.insertStatement(key == zero)
 	if key == zero {
 		key = row.generatedKey(ctx, query, args)?

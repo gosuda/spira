@@ -1,0 +1,111 @@
+package main_test
+
+import (
+	"context"
+	"encoding/json/v2"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	sqlcgen "github.com/gosuda/spira/cmd/sqlc-gen-spira"
+)
+
+func TestGeneratedQueryConstants(t *testing.T) {
+	data, err := os.ReadFile("testdata/query-constant-values.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var cases []continuedStringCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(cases) != 8 {
+		t.Fatalf("query constant cases = %d; want 8", len(cases))
+		return
+	}
+	work := t.TempDir()
+	expected := make([]sqlcLiteralExpectation, 0, len(cases))
+	for _, tc := range cases {
+		writeQueryConstantPackage(t, work, tc)
+		expected = append(expected, sqlcLiteralExpectation{Name: tc.Name, Text: tc.SQL})
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if err := checkCompiledSQLcQueries(t, ctx, work, expected); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeQueryConstantPackage(t *testing.T, work string, tc continuedStringCase) {
+	t.Helper()
+	req := loadRequest(t, "postgresql")
+	req.PluginOptions = pluginOptions(t, map[string]any{
+		"package": "generated",
+		"tables": map[string]any{
+			"items": map[string]any{"type": "Item", "key": "id", "key_type": "ItemID", "version": "version"},
+		},
+	})
+	req.Queries = []sqlcgen.Query{{
+		Name: "ContinueItem", Cmd: ":exec", Filename: "queries.sql", Text: tc.SQL,
+	}}
+	_, files, err := sqlcgen.Generate(req)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(files) != 2 || files[0].Name != "models.sql.lgo" || files[1].Name != "queries.sql.lgo" {
+		t.Fatal("generated runtime fixture must contain exactly models.sql.lgo and queries.sql.lgo")
+		return
+	}
+	dir := filepath.Join(work, tc.Name, "generated")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+		return
+	}
+	for _, file := range files {
+		if err := os.WriteFile(filepath.Join(dir, file.Name), file.Contents, 0o644); err != nil {
+			t.Fatal(err)
+			return
+		}
+	}
+}
+
+func checkCompiledSQLcQueries(t *testing.T, ctx context.Context, dir string, expected []sqlcLiteralExpectation) error {
+	t.Helper()
+	root := filepath.Abs(filepath.Join("..", ".."))?
+	configureSQLcSQLite(ctx, root, dir)?
+	writeCompiledQueryFixture(dir, expected)?
+	cmd := exec.CommandContext(ctx, "logos", "test", "-race", "-count=1", "-v", ".")
+	cmd.Dir = dir
+	err := runSQLcSQLiteCommand(cmd)
+	data, readErr := os.ReadFile(filepath.Join(dir, "observed.json"))
+	if readErr != nil {
+		if err != nil {
+			return err
+		}
+		return readErr
+	}
+	t.Logf("COMPILED_SQLC_QUERY_VALUES %s", data)
+	return err
+}
+
+func writeCompiledQueryFixture(dir string, expected []sqlcLiteralExpectation) error {
+	template := os.ReadFile("testdata/query_constants_test.lgo.tmpl")?
+	var imports strings.Builder
+	var values strings.Builder
+	for i, tc := range expected {
+		fmt.Fprintf(&imports, "\tq%d %q\n", i, "example.com/spira-sqlc-runtime/"+tc.Name+"/generated")
+		fmt.Fprintf(&values, "\t\t%q: q%d.ContinueItemQuery,\n", tc.Name, i)
+	}
+	source := strings.Replace(string(template), "// QUERY_IMPORTS", imports.String(), 1)
+	source = strings.Replace(source, "// QUERY_VALUES", values.String(), 1)
+	os.WriteFile(filepath.Join(dir, "query_constants_test.lgo"), []byte(source), 0o644)?
+	data := json.Marshal(expected)?
+	return os.WriteFile(filepath.Join(dir, "expected.json"), data, 0o644)
+}

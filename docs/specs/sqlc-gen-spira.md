@@ -115,18 +115,21 @@ PostgreSQL:
 - `int8` and `bigserial` MUST map to `int64`.
 - `integer`, `int`, `int4` and `serial` MUST map to `int32`.
 - `int2` MUST map to `int16`.
-- `uuid` MUST map to `string`.
+ - `uuid` MUST map to `string`.
+ - `name` MUST map to `string`.
 - `bpchar` MUST map to `string` because a fixed `CHAR(n)` arrives as `bpchar`.
-- `float8` MUST map to `float64`.
+ - `float8` MUST map to `float64`.
+ - `real` and `float4` MUST map to `float32`.
 - `bytea` and `jsonb` MUST map to `[]byte`.
 - `timestamptz` MUST map to `time.Time`.
 
 MySQL:
 
 - `tinyint` with `length` 1 MUST map to `bool`.
-- `tinyint` with any other `length` MUST map to `int16`.
-- `mediumint`, `int` and `integer` MUST map to `int32`.
-- `float` MUST map to `float32`.
+ - `tinyint` with any other `length` MUST map to `int16`.
+ - `mediumint`, `int` and `integer` MUST map to `int32`.
+ - `float` MUST map to `float32`.
+ - `double` MUST map to `float64`.
 - `tinytext`, `mediumtext` and `longtext` MUST map to `string`.
 - `binary`, `varbinary`, `tinyblob`, `blob`, `mediumblob` and `longblob` MUST map to `[]byte`.
 
@@ -138,9 +141,9 @@ SQL Server:
 - `real` MUST map to `float32`.
 - `float` MUST map to `float64`.
 - `nchar`, `nvarchar`, `ntext` and `uniqueidentifier` MUST map to `string`.
-- `binary`, `varbinary` and `image` MUST map to `[]byte`.
-- `datetime2`, `smalldatetime` and `datetimeoffset` MUST map to `time.Time`.
+ - `datetime2`, `smalldatetime`, `datetimeoffset` and `time` MUST map to `time.Time`.
 - `money` and `smallmoney` MUST map to `string`.
+- `binary`, `varbinary` and `image` MUST map to `[]byte`.
 
 ### Models
 
@@ -161,6 +164,7 @@ SQL Server:
 - `PrepareAll` MUST return the first failure as `PrepareAll: <name>: <cause>`, wrapping the engine error with `%w`.
 - The wrapped error MUST satisfy `errors.Is` and `errors.As` to the `db` prepare error.
 - Every emitted call MUST pass a query constant and bound arguments.
+- Compiled query constants MUST preserve every SQL byte, including carriage returns.
 - The plugin MUST NOT build SQL from values.
 
 ### Queries
@@ -191,7 +195,35 @@ SQL Server:
 - A query that writes a versioned table without its version column MUST fail.
 - The error MUST be `sqlc-gen-spira: <Name>: writes versioned table <table> without <version column>`.
 - `:execresult`, `:copyfrom` and batch commands MUST be the error `sqlc-gen-spira: <Name>: command <cmd> is not supported`.
-- The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
+ - The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
+ - `UPDATE` and `DELETE` detection MUST ignore string literals and SQL comments.
+ - A backslash MUST escape only in MySQL strings and PostgreSQL escape strings.
+- PostgreSQL continuation segments MUST keep the first string segment's escape mode.
+- PostgreSQL escape prefixes MUST begin outside an identifier.
+- PostgreSQL dollar strings MUST end at their matching case-sensitive delimiter.
+- Dollar delimiters MUST begin outside quoted or unquoted identifiers.
+- PostgreSQL version configuration MUST first resolve an exact catalog column name.
+- Without an exact match, configuration MUST resolve one unique case-insensitive catalog match.
+- Missing or ambiguous configured names MUST fail.
+- The write guard MUST use the resolved catalog spelling.
+- PostgreSQL unquoted identifiers MUST undergo ASCII case folding.
+- Quoted identifiers MUST keep their unescaped spelling.
+- A differently cased quoted sibling MUST NOT satisfy the check.
+- PostgreSQL `SELECT` and `RETURNING` output aliases MUST NOT satisfy the version check.
+- Recognized PostgreSQL relation headers and aliases MUST NOT satisfy the version check.
+- Qualified name tails MUST remain operands regardless of bare-keyword spelling.
+- Table-function arguments and JOIN ON or USING operands MUST remain visible.
+- Commas inside array expressions MUST NOT start new relation declarations.
+- PostgreSQL call heads and `CAST`, `::`, or typed-literal heads MUST NOT satisfy the version check.
+- PostgreSQL `COLLATE` names MUST NOT satisfy the version check.
+- CTE query bodies MUST remain visible to the version-reference scan.
+- This visibility MUST include `AS MATERIALIZED` and `AS NOT MATERIALIZED` bodies.
+- CTE headers MUST begin at a query-block entry.
+- `WITH ORDINALITY` MUST NOT classify an ordinary alias list as a CTE body.
+- A CTE sibling walk MUST consume complete `SEARCH` and `CYCLE` clauses before advancing.
+- The walk MUST keep their key-list commas and optional cycle marks within those clauses.
+- Nested `WITH` headers MUST remain independently visible.
+- A version-column reference in an assignment, predicate or returned expression is sufficient; the guard does not require an increment.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -201,12 +233,14 @@ SQL Server:
 - `config` MUST default to `example/shop/sqlc.yaml`.
 - `just sql` MUST fail with a message that names the path when the file does not exist.
 - `just sql` MUST NOT create output when the file does not exist.
-- `just sql-check` MUST run the raw-query check first, then `sqlc vet`, and MUST regenerate with `just sql` into a scratch directory last and diff it against `db/store`.
+ - `just sql-check` MUST run the raw-query check first, then `sqlc vet`.
+ - `just sql-check` MUST regenerate with `just sql` into a scratch directory last.
+ - `just sql-check` MUST diff that scratch output against `db/store`.
 - `just sql-check` MUST fail when generated `*.sql.lgo` files differ from the SQL.
 - `just sql-check` MUST run `sqlc vet` on the same config.
 - `just sql-check` MUST fail when `db.Query`, `db.One` or `db.Exec` appears outside the data packages.
 - The raw-query check MUST skip generated `*.sql.lgo` files, `cmd/sqlc-gen-spira/gen.lgo`, and the packages `db`, `orm`, `migrate`, `ai/session` and `ai/rag`.
-- Tests MAY call the runtime directly.
+ - Outside the data packages, tests MUST use generated functions.
 
 ## Errors
 
@@ -224,16 +258,42 @@ SQL Server:
 
 ## Proof
 
-- Each test builds the request model from a captured fixture.
+- `TestPostgresContinuedEscapeStrings` checks continued escape strings, independent literals, and version words hidden in strings or comments.
+- `TestPostgresTypedLiteralBoundaries` checks typed literals ending in `e` and genuine escape prefixes using native-validated fixtures.
+- `TestPostgresDollarQuotedBoundaries` checks 14 native-validated dollar-string and identifier boundaries.
+- `TestGeneratedQueryConstants` compiles eight full generated packages and checks their query values against runtime JSON.
+- All generated-package test suites invoke their nested `logos test` process with `-race`.
+- `TestPostgresVersionReferenceRoles` checks 20 native-validated name-role cases: 12 refusals and eight genuine references.
+- `TestPostgresVersionReferenceRoleBoundaries` checks eight boundaries: parenthesized aliases, qualified casts, a function's `FROM` operand, quoted punctuation, a qualified operator's right operand, a qualified function named `operator`, and the unqualified spelling that PostgreSQL rejects.
+- `TestPostgresVersionCatalogResolution` checks 11 catalog configuration cases, including exact-match precedence, unique folded matching, missing and ambiguous names, and quoted siblings.
+- `TestPostgresVersionCTEs` checks 26 native-validated CTE and declaration boundaries, including nested headers, `WITH ORDINALITY`, and recursive `SEARCH`/`CYCLE` suffixes.
+- `TestPostgresCTEProjectionRoles` checks ten native-validated SELECT outputs inside materialized CTEs. Quoted, explicit and bare aliases cannot satisfy the guard; genuine columns remain visible through SELECT modifiers, function arguments, qualified operators and sibling targets.
+- `TestPostgresCTEProjectionClauseBoundaries` distinguishes an output alias from a genuine right operand after `IS [NOT] DISTINCT FROM`.
+- `TestPostgresRelationReferenceRoles` checks 32 native-validated relation, identifier, and fixture configuration cases.
+- The direct suite reads each fixture's columns and version option.
+- It preserves real operands in function arguments, join conditions, `USING` lists, and arrays.
+- `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on 60 inputs, retaining the 20 reference-role cases alongside the prior 40 literal cases.
+- Its 56 reachable inputs require 40 generated packages and 16 specific version refusals.
+- The test compiles every generated package and compares its query constant with captured sqlc text at runtime.
+- Four native-valid comment-continuation inputs require their observed upstream syntax errors and no generated source.
+- `TestSQLcPostgresVersionPipeline` invokes SQLc for 69 catalog, CTE, and relation-role cases.
+- Each plugin request preserves frozen query text, version configuration, and catalog column names.
+- The test compiles 31 generated packages and checks their query constants at runtime.
+- Another 35 cases require their specific plugin refusal.
+- Three cases require their observed SQLc error before plugin invocation.
+
+- Request-model tests build the model from captured fixtures.
 - The model asserts entity types and fields, key types, query names, commands and row types.
 - `TestEngineQueryModels` proves four fixtures give one `Items` entity and a `:one` `GetItem` over it.
 - It also proves a three-parameter `UpdateItem` with one `UpdateItemArgs` struct.
 - `TestSliceQuery` proves a `sqlc.slice` parameter becomes a `[]T` expanded with `db.In`, and a marker-less slice passes as one argument.
 - `TestEmbedQuery` proves a `sqlc.embed` table becomes a nested field of the row struct.
 - `TestSingleColumnEmbed` proves one embed column with no type becomes the same nested field.
-- Each negative case requires the named message.
-- The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
-- The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
+ - Each negative case requires the named message.
+ - The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
+ - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
+ - `TestVersionedWriteAcceptsBackslashEscapeBeforeVersion` proves a SQLite backslash escape keeps the version predicate visible.
+ - The literal tests prove a read-only query with write words in string data generates, and that string data alone never satisfies the version check.
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
 - `TestSQLcSQLiteIntegration` builds the plugin with `logos build`, generates the store from `testdata/runtime_sqlite`, and runs the application with `logos run`.
@@ -241,9 +301,14 @@ SQL Server:
 - The application calls `store.PrepareAll` on an empty schema and requires the error to satisfy `errors.Is` to `db.ErrStatementFailed` and to name `GetItem`.
 - The raw-query rule is proved on a scratch copy with a planted call and on the clean tree.
 - The shop lane adds `sql-check` to `gate` after it publishes `example/shop/sqlc.yaml`.
-- The end-to-end proof that runs generated functions against `database/sql` is not in this package.
+ - `compareQueries` in `testdata/runtime_sqlite` proves the generated functions match direct `database/sql` calls for insert, rename, get, slice, delete and repeated binds.
 
 ## Not in scope
+
+- The write guard checks syntactic presence. It does not establish reference-to-table binding across nested query or CTE scopes. The other engines retain their existing version-matching behavior.
+
+- The pinned sqlc rejects the four tested comment-continuation forms and the tested nested materialized CTE before invoking the plugin. The nested CTE is valid in PostgreSQL and remains a positive direct-generator case; its sqlc refusal names the inner relation `b`. Direct-generator coverage does not imply sqlc acceptance.
+- The pinned SQLc analyzer also rejects the two tested relation-column-list queries because it does not resolve their renamed `x` column. PostgreSQL accepts both; the direct generator still checks their alias roles.
 
 - The plugin does not support `:execresult`, `:copyfrom` or batch commands. No requirement names them.
 - The plugin does not build a query builder. The `.sql` files are the source of truth.

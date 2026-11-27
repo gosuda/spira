@@ -139,10 +139,10 @@ func BindBodyBytes(ctx *Context, req *http.Request, want bool, rejected *RejectL
 	if rerr == nil {
 		return body, nil
 	}
-	rejected.Add("body", "body", rerr.Error())
 	if errors.Is(rerr, ErrBodyTooLarge) {
 		return nil, BindProblem(ErrBodyTooLarge, nil)
 	}
+	rejected.Add("body", "body", rerr.Error())
 	return nil, BindProblem(ErrBindInvalid, validate.Errors{{Field: "body", Rule: "body", Message: "web: bind body cannot be read"}})
 }
 

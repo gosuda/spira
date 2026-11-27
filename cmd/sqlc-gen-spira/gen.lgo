@@ -283,7 +283,7 @@ func emitQueryConst(b *strings.Builder, qd *QueryDef) {
 }
 
 func goStringLit(s string) string {
-	if !strings.Contains(s, "`") {
+	if !strings.ContainsAny(s, "`\r") {
 		return "`" + s + "`"
 	}
 	out := strings.ReplaceAll(s, `\`, `\\`)

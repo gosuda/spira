@@ -87,9 +87,11 @@ func Faults() []*fault.Error
 - Any other upstream status MUST pass through to the client.
 - A passed-through status MUST NOT open the breaker.
 - An open breaker MUST skip that upstream.
-- A request with no body MUST try the later upstreams after a delivery failure only when its method is idempotent.
-- Idempotent methods are GET, HEAD, OPTIONS, TRACE, PUT and DELETE (RFC 9110 section 9.2.2).
-- A breaker refusal MUST NOT count as a delivery attempt: the proxy MUST skip that upstream and try the next.
+ - A request with no body MUST try the later upstreams after a delivery failure.
+ - That retry MUST happen only when its method is idempotent.
+ - Idempotent methods are GET, HEAD, OPTIONS, TRACE, PUT and DELETE (RFC 9110 section 9.2.2).
+ - A breaker refusal MUST NOT count as a delivery attempt.
+ - The proxy MUST skip that upstream and try the next.
 - A bodyless POST or PATCH MUST stop after its first delivery attempt, as a request with a body does.
 - A request whose body is nil or `http.NoBody` MUST count as a request with no body.
 - A request with a body MUST stop after its first delivery attempt.

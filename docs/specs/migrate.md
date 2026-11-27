@@ -43,18 +43,25 @@ func Faults() []*fault.Error
 - `Apply` MUST read the applied names with `ORDER BY name`.
 - `Apply` MUST store a step name as applied only after its `up` text has run in the same transaction.
 
-### Apply
+ ### Apply
 
-- `Apply` MUST run only the steps after the applied prefix.
+ - `Apply` and `Rollback` on one pool MUST serialize in this process.
+ - Serialization MUST be per pool: migrations on another pool MUST NOT wait.
+ - A done context MUST fail the wait instead of queueing.
+ - A done context MUST fail even when the turn is free.
+ - Operators MUST open one `Pool` per database; two pools MUST NOT migrate one database.
 - If an applied name is not the step name at the same index, `Apply` MUST fail.
 - That failure MUST change no schema.
 - If an applied name is outside the given steps, `Apply` MUST fail.
 - A second `Apply` of the same steps MUST succeed and MUST not write a second bookkeeping row.
+- `Apply` MUST skip the applied prefix and run only the remaining steps.
 - Each step MUST run its `up` text and its bookkeeping insert in one transaction.
 - `Apply` MUST use the dialect of `p` for each placeholder.
 - On SQLite and MySQL, `Apply` MUST use `?` for each placeholder.
 - On PostgreSQL, `Apply` MUST use `$1`, `$2` and so on.
 - On SQL Server, `Apply` MUST use `@p1`, `@p2` and so on.
+
+- A release callback MUST free the turn only once.
 
 ### Rollback
 
@@ -140,6 +147,10 @@ func Faults() []*fault.Error
 - `TestEngineCheckReversibleMySQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on MySQL, failing without `SPIRA_TEST_MYSQL_DSN`.
 - `TestEngineCheckReversibleMSSQL` proves `CheckReversible` passes a correct pair and fails a pair whose down leaves a column on SQL Server, failing without `SPIRA_TEST_MSSQL_DSN`.
 - `TestFaultsMatchSpecTable` proves `Faults()` matches the code table without duplicates.
+ - `TestReleaseFreesTheTurnOnlyOnce` proves a repeated release keeps the next turn held.
+ - `TestMigrationTurnRejectsEndedContextOnFreePool` proves a cancelled context fails on a free pool.
+ - `TestRollbackZeroSkipsTheTurn` proves `Rollback` with `count` 0 skips the turn on a cancelled context.
+ - `TestQueuedApplyHonorsContext` proves a queued `Apply` fails on its context deadline and changes nothing.
 - `TestFaultPublicHidesSecretsAndHostile` proves public views hide secrets and hostile text.
 
 ## Not in scope

@@ -1,0 +1,61 @@
+package queryproof_test
+
+import (
+	"encoding/json/v2"
+	"os"
+	"testing"
+
+// QUERY_IMPORTS
+)
+
+type queryExpectation struct {
+	Name string `json:"name"`
+	Text string `json:"text"`
+}
+
+func TestCompiledQueryValues(t *testing.T) {
+	data, err := os.ReadFile("expected.json")
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	var expected []queryExpectation
+	if err := json.Unmarshal(data, &expected); err != nil {
+		t.Fatal(err)
+		return
+	}
+	actual := compiledQueryValues()
+	encoded, err := json.Marshal(actual)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	if err := os.WriteFile("observed.json", encoded, 0o644); err != nil {
+		t.Fatal(err)
+		return
+	}
+	if len(actual) != len(expected) {
+		t.Fatalf("compiled queries = %d; want %d", len(actual), len(expected))
+		return
+	}
+	seen := map[string]bool{}
+	for _, want := range expected {
+		t.Run(want.Name, func(t *testing.T) {
+			if seen[want.Name] ?? false {
+				t.Fatalf("duplicate expected query %q", want.Name)
+				return
+			}
+			seen[want.Name] = true
+			got, ok := actual[want.Name]
+			if !ok || got != want.Text {
+				t.Errorf("compiled query %s = %q; want exact bytes %q", want.Name, got, want.Text)
+			}
+		})
+	}
+}
+
+func compiledQueryValues() map[string]string {
+	return map[string]string{
+// QUERY_VALUES
+	}
+}

@@ -65,6 +65,32 @@ func TestKeyChangeIsRejected(t *testing.T) {
 		t.Fatalf("rows after rejected key change = %+v, want the seed row 1", rows)
 	}
 }
+ func TestPendingInsertKeyChangeIsRejected(t *testing.T) {
+ 	pool := sqlitePool(t)
+ 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+ 	defer cancel()
+ 	if err := exec(ctx, pool, "CREATE TABLE orm_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL)"); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	_, err := orm.InSession[int](ctx, pool, func(s *orm.Session) (int, error) {
+ 		added := &item{ID: 7, Name: "seven"}
+ 		orm.Add[item, itemID](s, items, added)
+ 		added.ID = 8
+ 		s.Flush(ctx)?
+ 		return 0, nil
+ 	})
+ 	if err == nil || !strings.Contains(err.Error(), "key cannot change") {
+ 		t.Fatalf("pending insert key change err = %v, want key-immutable fault", err)
+ 	}
+ 	rows, rerr := db.Query[item](ctx, pool, "SELECT id, name, version FROM orm_items")
+ 	if rerr != nil {
+ 		t.Fatal(rerr)
+ 	}
+ 	if len(rows) != 0 {
+ 		t.Fatalf("rows after rejected insert = %+v, want no rows", rows)
+ 	}
+ }
+
 
 func TestVersionedChangedColumnsOnly(t *testing.T) {
 	pool := sqlitePool(t)

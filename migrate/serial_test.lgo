@@ -1,0 +1,196 @@
+package migrate_test
+
+import (
+	"context"
+	"errors"
+	"logos/sync"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/gosuda/spira/migrate"
+)
+
+func TestApplyWithCancelledContextChangesNothing(t *testing.T) {
+	pool := openPool(t)
+	steps := []migrate.Step{
+		{Name: "0001_cancelled", Up: "CREATE TABLE cancelled_apply (n integer);", Down: "DROP TABLE cancelled_apply;"},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := migrate.Apply(ctx, pool, steps); err == nil {
+		t.Fatal("Apply with a cancelled context succeeded; want the context error")
+		return
+	}
+	if names := tableNames(t, pool); slices.Contains(names, "cancelled_apply") {
+		t.Fatalf("tables after cancelled Apply = %v; want no cancelled_apply", names)
+	}
+}
+
+func TestMigrationSerialIsPerPool(t *testing.T) {
+	first := openPool(t)
+	second := openPool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	release, err := first.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("hold first pool turn: %v", err)
+		return
+	}
+	defer release()
+	other, err := second.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("second pool turn: %v; want no wait on another pool", err)
+		return
+	}
+	defer other()
+}
+
+func TestMigrationTurnHonorsCancel(t *testing.T) {
+	pool := openPool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	release, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("hold pool turn: %v", err)
+		return
+	}
+	defer release()
+	cancelled, stop := context.WithCancel(t.Context())
+	stop()
+	if _, err := pool.AcquireMigrationTurn(cancelled); err == nil {
+		t.Fatal("AcquireMigrationTurn with a cancelled context succeeded; want the context error")
+		return
+	}
+}
+
+func TestQueuedApplyHonorsContext(t *testing.T) {
+	pool := openPool(t)
+	steps := []migrate.Step{
+		{Name: "0001_queued", Up: "CREATE TABLE queued_apply (n integer);", Down: "DROP TABLE queued_apply;"},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	release, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("hold pool turn: %v", err)
+		return
+	}
+	defer release()
+	applyCtx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer stop()
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	var watchdogFired sync.Locked[bool]
+	run := func() error {
+		go group (t.Context(), limit = 2) {
+			go {
+				defer close(finished)
+				done <- migrate.Apply(applyCtx, pool, steps)
+			}
+			go {
+				releaseStalledApply(finished, release, &watchdogFired)
+			}
+		}
+		return nil
+	}
+	if err := run(); err != nil {
+		t.Fatalf("group: %v", err)
+		return
+	}
+	fired := false
+	watchdogFired.WithLock(func(value *bool) { fired = *value })
+	select {
+	case err := <-done:
+		if fired {
+			t.Fatal("queued Apply ignored its context deadline; the watchdog freed the turn")
+			return
+		}
+		if err == nil {
+			t.Fatal("queued Apply succeeded past its context deadline; want the context error")
+			return
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("queued Apply err = %v; want context deadline exceeded", err)
+			return
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued Apply ignored its context deadline")
+	}
+	if names := tableNames(t, pool); slices.Contains(names, "queued_apply") {
+		t.Fatalf("tables after queued Apply = %v; want no queued_apply", names)
+	}
+}
+
+func releaseStalledApply(finished <-chan struct{}, release func(), fired *sync.Locked[bool]) {
+	watchdog := time.NewTimer(5 * time.Second)
+	defer watchdog.Stop()
+	select {
+	case <-finished:
+	case <-watchdog.C:
+		fired.WithLock(func(value *bool) { *value = true })
+		release()
+	}
+}
+
+func TestReleaseFreesTheTurnOnlyOnce(t *testing.T) {
+	pool := openPool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	releaseA, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+		return
+	}
+	releaseA()
+	releaseB, err := pool.AcquireMigrationTurn(ctx)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+		return
+	}
+	releaseA()
+	probe, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer stop()
+	if _, err := pool.AcquireMigrationTurn(probe); err == nil {
+		t.Fatal("a repeated release freed another migration turn; want the second turn to stay held")
+		return
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probe acquire err = %v; want context deadline exceeded", err)
+		return
+	}
+	releaseB()
+}
+
+func TestMigrationTurnRejectsEndedContextOnFreePool(t *testing.T) {
+	pool := openPool(t)
+	cancelled, stop := context.WithCancel(t.Context())
+	stop()
+	if _, err := pool.AcquireMigrationTurn(cancelled); err == nil {
+		t.Fatal("AcquireMigrationTurn with a cancelled context on a free pool succeeded; want the context error")
+		return
+	} else if !errors.Is(err, context.Canceled) {
+		t.Fatalf("free-pool acquire err = %v; want context canceled", err)
+		return
+	}
+}
+
+func TestRollbackZeroSkipsTheTurn(t *testing.T) {
+	pool := openPool(t)
+	steps := loadSteps(t, "good")
+	before := sqliteSchemaSnapshot(t, pool)
+	held, err := pool.AcquireMigrationTurn(t.Context())
+	if err != nil {
+		t.Fatalf("hold pool turn: %v", err)
+		return
+	}
+	defer held()
+	cancelled, stop := context.WithCancel(t.Context())
+	stop()
+	if err := migrate.Rollback(cancelled, pool, steps, 0); err != nil {
+		t.Fatalf("Rollback(0) with a cancelled context and a held turn: %v; want nil", err)
+		return
+	}
+	if after := sqliteSchemaSnapshot(t, pool); !slices.Equal(before, after) {
+		t.Fatalf("SQLite schema changed after Rollback(0): before=%v, after=%+v", before, after)
+	}
+}

@@ -30,3 +30,55 @@ func TestVersionedWriteBypassShapesRefused(t *testing.T) {
 		}
 	}
 }
+
+ func TestVersionedWriteIgnoresLiteralsAndComments(t *testing.T) {
+ 	texts := []string{
+ 		"SELECT id, name FROM items WHERE name = 'update items now'",
+ 		"SELECT id, name FROM items WHERE name = 'DELETE FROM items' -- UPDATE items",
+ 		"SELECT id, name FROM items /* UPDATE items SET name = ? */ WHERE id = 1",
+ 	}
+ 	for _, text := range texts {
+ 		req := versionedFixture(t)
+ 		req.Queries[1] = versionedRead(text)
+ 		_, _, err := sqlcgen.Generate(req)
+ 		if err != nil {
+ 			t.Fatalf("Generate failed for read-only %q: %v", text, err)
+ 			return
+ 		}
+ 	}
+ }
+
+ func versionedRead(text string) sqlcgen.Query {
+ 	col := func(name string, typ string) sqlcgen.Column {
+ 		return sqlcgen.Column{Name: name, NotNull: true, Length: -1, Type: sqlcgen.Identifier{Name: typ}, Table: sqlcgen.Identifier{Name: "items"}}
+ 	}
+ 	return sqlcgen.Query{
+ 		Name: "FindItems", Cmd: ":many", Filename: "items.sql",
+ 		Text:    text,
+ 		Columns: []sqlcgen.Column{col("id", "INTEGER"), col("name", "TEXT")},
+ 	}
+ }
+
+ func TestVersionedWriteRefusesStringOnlyVersion(t *testing.T) {
+ 	req := versionedFixture(t)
+ 	req.Queries[1].Text = "UPDATE items SET name = 'Version 2' WHERE id = ?"
+ 	_, _, err := sqlcgen.Generate(req)
+ 	if err == nil {
+ 		t.Fatal("Generate succeeded for a versioned update whose only version mention is string data; want the version refusal")
+ 		return
+ 	}
+ 	if !strings.Contains(err.Error(), "writes versioned table items without version") {
+ 		t.Fatalf("error = %v, want the version refusal", err)
+ 		return
+ 	}
+ }
+
+func TestVersionedWriteAcceptsBackslashEscapeBeforeVersion(t *testing.T) {
+	req := versionedFixture(t)
+	req.Queries[1].Text = "UPDATE items SET name = ? WHERE id = ? AND name LIKE 'x' ESCAPE '\\' AND version = version + 1"
+	_, _, err := sqlcgen.Generate(req)
+	if err != nil {
+		t.Fatalf("Generate failed for a versioned write with a backslash escape literal: %v", err)
+		return
+	}
+}

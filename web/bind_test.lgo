@@ -1,6 +1,9 @@
 package web_test
 
 import (
+	"bytes"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -260,6 +263,57 @@ func TestBindBodyOverMaxBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/doc", strings.NewReader(`{"term":"this is way too long"}`))
 	req.Header.Set("Content-Type", "application/json")
 	assertProblemJSON(t, call(t, r, req), http.StatusRequestEntityTooLarge)
+}
+
+func TestBindBodyOverMaxBodyKeepsConstantMessage(t *testing.T) {
+	r := web.NewRouter()
+	r.MaxBody = 16
+	web.Route(r, "POST", "/doc", func(ctx *web.Context, in BindDocIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/doc", strings.NewReader(`{"term":"this is way too long"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := call(t, r, req)
+	doc := assertFault(t, rec, http.StatusRequestEntityTooLarge, "web.body_too_large")
+	if doc.Message != "The request body is too large." {
+		t.Fatalf("over-limit fault message %q; want the constant message", doc.Message)
+	}
+	if strings.Contains(rec.Body.String(), "(16 bytes)") {
+		t.Fatalf("over-limit problem body %s; must not name the byte limit", rec.Body.String())
+	}
+}
+
+type failBody struct {
+	cause string
+}
+
+func (b failBody) Read([]byte) (int, error) {
+	return 0, errors.New(b.cause)
+}
+
+func (b failBody) Close() error {
+	return nil
+}
+
+func TestBindBodyReadFailureKeepsTheCause(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	r := web.NewRouter()
+	web.Route(r, "POST", "/doc", func(ctx *web.Context, in BindDocIn) (web.Reply, error) {
+		return web.Empty{}, nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/doc", failBody{cause: "cut-stream-probe"})
+	req.Header.Set("Content-Type", "application/json")
+	rec := call(t, r, req)
+	assertProblemJSON(t, rec, http.StatusBadRequest)
+	if !strings.Contains(buf.String(), "cut-stream-probe") {
+		t.Fatalf("reject log %q; want the body read cause", buf.String())
+	}
+	if strings.Contains(rec.Body.String(), "cut-stream-probe") {
+		t.Fatalf("public problem body %s; must not carry the cause", rec.Body.String())
+	}
 }
 
 func bindField(obj schema.Object, name string) (string, string, bool) {
