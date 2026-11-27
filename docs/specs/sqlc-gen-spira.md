@@ -164,6 +164,7 @@ SQL Server:
 - `PrepareAll` MUST return the first failure as `PrepareAll: <name>: <cause>`, wrapping the engine error with `%w`.
 - The wrapped error MUST satisfy `errors.Is` and `errors.As` to the `db` prepare error.
 - Every emitted call MUST pass a query constant and bound arguments.
+- Compiled query constants MUST preserve every SQL byte, including carriage returns.
 - The plugin MUST NOT build SQL from values.
 
 ### Queries
@@ -199,6 +200,8 @@ SQL Server:
  - A backslash MUST escape only in MySQL strings and PostgreSQL escape strings.
 - PostgreSQL continuation segments MUST keep the first string segment's escape mode.
 - PostgreSQL escape prefixes MUST begin outside an identifier.
+- PostgreSQL dollar strings MUST end at their matching case-sensitive delimiter.
+- Dollar delimiters MUST begin outside quoted or unquoted identifiers.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -235,8 +238,11 @@ SQL Server:
 
 - `TestPostgresContinuedEscapeStrings` checks continued escape strings, independent literals, and version words hidden in strings or comments.
 - `TestPostgresTypedLiteralBoundaries` checks typed literals ending in `e` and genuine escape prefixes using native-validated fixtures.
-- `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on the same 26 inputs.
-- Its 22 reachable inputs require 20 generated query literals matching captured sqlc text and two specific version refusals.
+- `TestPostgresDollarQuotedBoundaries` checks 14 native-validated dollar-string and identifier boundaries.
+- `TestGeneratedQueryConstants` compiles eight full generated packages and checks their query values against runtime JSON.
+- `TestSQLcPostgresLiteralPipeline` builds the plugin and runs the source-pinned `sqlc generate` on the same 40 inputs.
+- Its 36 reachable inputs require 32 generated packages and four specific version refusals.
+- The test compiles every generated package and compares its query constant with captured sqlc text at runtime.
 - Four native-valid comment-continuation inputs require their observed upstream syntax errors and no generated source.
 
 - Request-model tests build the model from captured fixtures.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"unicode"
@@ -921,6 +922,14 @@ func maskSQLFor(engine string, text string) string {
 }
 
 func maskAtFor(out []byte, i int, engine string) int {
+	if engine == "postgresql" {
+		if out[i] == '"' {
+			return postgresIdentifierEnd(out, i)
+		}
+		if out[i] == '$' {
+			return maskPostgresDollar(out, i)
+		}
+	}
 	if out[i] == '\'' {
 		return maskStringFor(out, i, engine)
 	}
@@ -931,6 +940,60 @@ func maskAtFor(out []byte, i int, engine string) int {
 		return maskBlock(out, i)
 	}
 	return i + 1
+}
+
+// postgresIdentifierEnd preserves identifier bytes and skips doubled quotes.
+func postgresIdentifierEnd(out []byte, i int) int {
+	for j := i + 1; j < len(out); j++ {
+		if out[j] != '"' {
+			continue
+		}
+		if j+1 < len(out) && out[j+1] == '"' {
+			j++
+			continue
+		}
+		return j + 1
+	}
+	return len(out)
+}
+
+func maskPostgresDollar(out []byte, i int) int {
+	end := postgresDollarDelimiterEnd(out, i)
+	if end == nil {
+		return i + 1
+	}
+	delimiter := out[i:end]
+	finish := len(out)
+	if close := bytes.Index(out[end:], delimiter); close >= 0 {
+		finish = end + close + len(delimiter)
+	}
+	blank(out, i, finish)
+	return finish
+}
+
+func postgresDollarDelimiterEnd(out []byte, i int) int? {
+	if i > 0 && isPostgresIdentPart(out[i-1]) {
+		return nil
+	}
+	j := i + 1
+	if j < len(out) && out[j] == '$' {
+		return j + 1
+	}
+	if j == len(out) || !isPostgresTagStart(out[j]) {
+		return nil
+	}
+	j++
+	for j < len(out) && (isPostgresTagStart(out[j]) || isASCIIDigit(out[j])) {
+		j++
+	}
+	if j < len(out) && out[j] == '$' {
+		return j + 1
+	}
+	return nil
+}
+
+func isPostgresTagStart(c byte) bool {
+	return isASCIILetter(c) || c == '_' || c >= 0x80
 }
 
 func maskStringFor(out []byte, i int, engine string) int {
