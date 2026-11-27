@@ -72,3 +72,13 @@ func TestVersionedWriteBypassShapesRefused(t *testing.T) {
  		return
  	}
  }
+
+func TestVersionedWriteAcceptsBackslashEscapeBeforeVersion(t *testing.T) {
+	req := versionedFixture(t)
+	req.Queries[1].Text = "UPDATE items SET name = ? WHERE id = ? AND name LIKE 'x' ESCAPE '\\' AND version = version + 1"
+	_, _, err := sqlcgen.Generate(req)
+	if err != nil {
+		t.Fatalf("Generate failed for a versioned write with a backslash escape literal: %v", err)
+		return
+	}
+}

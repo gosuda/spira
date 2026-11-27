@@ -195,6 +195,7 @@ SQL Server:
 - `:execresult`, `:copyfrom` and batch commands MUST be the error `sqlc-gen-spira: <Name>: command <cmd> is not supported`.
  - The plugin MUST refuse an `UPDATE` or `DELETE` that omits the version column name.
  - `UPDATE` and `DELETE` detection MUST ignore string literals and SQL comments.
+ - A backslash MUST escape only in MySQL strings and PostgreSQL escape strings.
 - Two queries with one name MUST be the error `sqlc-gen-spira: duplicate query "<Name>"`.
 - A slice marker without a slice parameter MUST name the marker.
 
@@ -239,6 +240,7 @@ SQL Server:
  - Each negative case requires the named message.
  - The cases are an unmapped type, an array column, an unsigned integer, an unknown engine, and a versioned write.
  - The rest are an unsupported command, an unnamed column, a duplicate query name, and an orphan marker.
+ - `TestVersionedWriteAcceptsBackslashEscapeBeforeVersion` proves a SQLite backslash escape keeps the version predicate visible.
  - The literal tests prove a read-only query with write words in string data generates, and that string data alone never satisfies the version check.
 - The four request files under `cmd/sqlc-gen-spira/testdata/<engine>/request.json` record the engine and the column type names that sqlc reports.
 - The `mssql` file has `settings.engine` equal to `mssql`.
