@@ -3,13 +3,21 @@ package ai_test
 import (
 	"context"
 	"encoding/json/v2"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"logos/rt"
 
 	"github.com/gosuda/spira/ai"
+	"github.com/gosuda/spira/ai/openai"
+	"github.com/gosuda/spira/resilience"
 )
 
 type lookupArgs struct {
@@ -137,14 +145,41 @@ func TestToolOfDecodesBlankArgumentsAsAnEmptyObject(t *testing.T) {
 	}
 }
 
+const lookupFirstReply = `{"id":"chatcmpl-lookup","object":"chat.completion","created":1694268190,"model":"gpt-6-astra",` +
+	`"choices":[{"index":0,"message":{"role":"assistant","content":null,` +
+	`"tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"rain\",\"limit\":2}"}}]},` +
+	`"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21}}`
+
+const lookupFinalReply = `{"id":"chatcmpl-lookup-done","object":"chat.completion","created":1694268190,"model":"gpt-6-astra",` +
+	`"choices":[{"index":0,"message":{"role":"assistant","content":"Rain likely."},"finish_reason":"stop"}],` +
+	`"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21}}`
+
 func TestToolOfRunsThroughRun(t *testing.T) {
 	var seen lookupArgs
 	var ran bool
 	tool := lookupTool(&seen, &ran, "found ")
-	model := &scripted{replies: []ai.Reply{
-		asking(ai.ToolCall{ID: "c1", Name: "lookup", Arguments: `{"query":"rain","limit":2}`}),
-		saying("Rain likely."),
-	}}
+	var mu sync.Mutex
+	var bodies []string
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		next := lookupFirstReply
+		if calls.Add(1) > 1 {
+			next = lookupFinalReply
+		}
+		if _, err := io.WriteString(w, next); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+	defer srv.Close()
+	model := &openai.Client{BaseURL: srv.URL, Model: "gpt-6-astra", HTTP: srv.Client(), Policy: resilience.Policy{Timeout: 2 * time.Second}}
 	reply, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: []ai.Tool{tool}}, ai.Limits{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -163,7 +198,15 @@ func TestToolOfRunsThroughRun(t *testing.T) {
 	if text := textOf(reply.Message); text != "Rain likely." {
 		t.Fatalf("final text = %q, want Rain likely.", text)
 	}
-	requireStrings(t, "results sent to the model", resultsOf(model.seen[1].Messages[2]), "c1=found rain")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("Run: server saw %d requests, want 2", len(bodies))
+		return
+	}
+	if !strings.Contains(bodies[1], "found rain") {
+		t.Fatalf("Run: second request lacks the tool result: %s", bodies[1])
+	}
 }
 
 type searchFilter struct {
