@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"logos/sync"
 	"testing"
 	"time"
 	"github.com/gosuda/spira/db"
@@ -19,10 +20,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func openPool(t *testing.T) *db.Pool? {
+func openPool(t *testing.T, opts ...db.PoolOptions) *db.Pool? {
 	t.Helper()
 	key := strings.NewReplacer("/", "_").Replace(t.Name())
-	pool, err := db.Open("sqlite", fmt.Sprintf("file:spira_cart_%s?mode=memory&cache=shared", key))
+	pool, err := db.Open("sqlite", fmt.Sprintf("file:spira_cart_%s?mode=memory&cache=shared", key), opts...)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 		return nil
@@ -260,5 +261,88 @@ func TestCountAPIReportsSummedQuantity(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"count":3`) {
 		t.Fatalf("count body = %q, want the summed quantity 3", rec.Body.String())
+	}
+}
+
+func TestCartPageReturnsWhenThePoolIsStalled(t *testing.T) {
+	pool := openPool(t, db.PoolOptions{MaxOpenConns: 1})
+	if pool == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	reqCtx, stopRequest := context.WithTimeout(t.Context(), 25*time.Second)
+	defer stopRequest()
+	acquired := make(chan struct{})
+	release := make(chan struct{})
+	var code sync.Locked[int]
+	code.WithLock(func(slot *int) {
+		*slot = -1
+	})
+	start := time.Now()
+	if gerr := func() error {
+		go group (ctx) {
+			go {
+				holdPoolConn(t, ctx, poolHold{pool: pool, acquired: acquired, release: release})
+			}
+			go {
+				select {
+				case <-acquired:
+					rec := stalledGet(t, testRouter(pool), reqCtx)
+					code.WithLock(func(slot *int) {
+						*slot = rec.Code
+					})
+				case <-ctx.Done():
+				}
+				close(release)
+			}
+		}
+		return nil
+	}(); gerr != nil {
+		t.Fatalf("go group: %v", gerr)
+		return
+	}
+	elapsed := time.Since(start)
+	status := 0
+	code.WithLock(func(slot *int) {
+		status = *slot
+	})
+	if status == -1 {
+		t.Fatal("the stalled cart page recorded no response")
+		return
+	}
+	if status != http.StatusInternalServerError {
+		t.Fatalf("stalled cart page status = %d, want 500", status)
+		return
+	}
+	if elapsed > 20*time.Second {
+		t.Fatalf("stalled cart page took %v, want it back inside the 10 s store bound", elapsed)
+	}
+}
+
+func stalledGet(t *testing.T, r *web.Router, ctx context.Context) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cart", nil).WithContext(ctx))
+	return rec
+}
+
+type poolHold struct {
+	pool     *db.Pool
+	acquired chan struct{}
+	release  chan struct{}
+}
+
+func holdPoolConn(t *testing.T, ctx context.Context, hold poolHold) {
+	t.Helper()
+	if _, err := db.InTx[int](context.Background(), hold.pool, func(tx *db.Tx) (int, error) {
+		close(hold.acquired)
+		select {
+		case <-hold.release:
+		case <-ctx.Done():
+		}
+		return 0, nil
+	}); err != nil {
+		t.Errorf("holder: %v", err)
 	}
 }

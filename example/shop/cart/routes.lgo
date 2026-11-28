@@ -1,11 +1,13 @@
 package cart
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gosuda/spira/auth"
 	"github.com/gosuda/spira/db"
@@ -17,6 +19,8 @@ import (
 )
 
 const cartCookie = "spira_cart"
+
+const callTimeout = 10 * time.Second
 
 type Feature struct {
 	DB *db.Pool
@@ -42,6 +46,8 @@ func (f *Feature) Register(r *web.Router) {
 }
 
 func (f *Feature) page(ctx *web.Context) (web.Reply, error) {
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
 	kind, key, set, err := ownerOf(ctx)
 	if err != nil {
 		return nil, err
@@ -49,7 +55,7 @@ func (f *Feature) page(ctx *web.Context) (web.Reply, error) {
 	if set != nil {
 		ctx.ResponseHeader().Set("Set-Cookie", set.String())
 	}
-	items, err := store.ListCartItems(ctx.Ctx(), f.DB, kind, key)
+	items, err := store.ListCartItems(call, f.DB, kind, key)
 	if err != nil {
 		return nil, fmt.Errorf("cart: list items: %w", err)
 	}
@@ -57,7 +63,9 @@ func (f *Feature) page(ctx *web.Context) (web.Reply, error) {
 }
 
 func (f *Feature) add(ctx *web.Context, in AddItemInput) (web.Reply, error) {
-	row, err := store.GetProduct(ctx.Ctx(), f.DB, store.ProductID(in.ProductID))
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
+	row, err := store.GetProduct(call, f.DB, store.ProductID(in.ProductID))
 	if err != nil {
 		return nil, fmt.Errorf("cart: get product: %w", err)
 	}
@@ -75,10 +83,10 @@ func (f *Feature) add(ctx *web.Context, in AddItemInput) (web.Reply, error) {
 		ctx.ResponseHeader().Set("Set-Cookie", set.String())
 	}
 	args := store.UpsertCartItemArgs{OwnerKind: kind, OwnerKey: key, ProductID: store.ProductID(in.ProductID), Quantity: in.Quantity}
-	if _, err := store.UpsertCartItem(ctx.Ctx(), f.DB, args); err != nil {
+	if _, err := store.UpsertCartItem(call, f.DB, args); err != nil {
 		return nil, fmt.Errorf("cart: add item: %w", err)
 	}
-	items, err := store.ListCartItems(ctx.Ctx(), f.DB, kind, key)
+	items, err := store.ListCartItems(call, f.DB, kind, key)
 	if err != nil {
 		return nil, fmt.Errorf("cart: list items: %w", err)
 	}
@@ -97,12 +105,14 @@ func (f *Feature) remove(ctx *web.Context) (web.Reply, error) {
 	if err != nil || id <= 0 {
 		return nil, ErrUnknownItem.Err()
 	}
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
 	kind, key, _, err := ownerOf(ctx)
 	if err != nil {
 		return nil, err
 	}
 	args := store.RemoveCartItemArgs{ID: store.CartItemID(id), OwnerKind: kind, OwnerKey: key}
-	if _, err := store.RemoveCartItem(ctx.Ctx(), f.DB, args); err != nil {
+	if _, err := store.RemoveCartItem(call, f.DB, args); err != nil {
 		return nil, fmt.Errorf("cart: remove item: %w", err)
 	}
 	if layout.WantsFragment(ctx) {
@@ -112,11 +122,13 @@ func (f *Feature) remove(ctx *web.Context) (web.Reply, error) {
 }
 
 func (f *Feature) count(ctx *web.Context) (web.Reply, error) {
+	call, cancel := context.WithTimeout(ctx.Ctx(), callTimeout)
+	defer cancel()
 	kind, key, _, err := ownerOf(ctx)
 	if err != nil {
 		return nil, err
 	}
-	items, err := store.ListCartItems(ctx.Ctx(), f.DB, kind, key)
+	items, err := store.ListCartItems(call, f.DB, kind, key)
 	if err != nil {
 		return nil, fmt.Errorf("cart: list items: %w", err)
 	}
