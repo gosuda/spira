@@ -608,3 +608,63 @@ func TestToolOfMarksOptionSliceItemsNullable(t *testing.T) {
 		t.Fatalf("ToolOf option slice schema = %s, want %s", tool.Schema, hand)
 	}
 }
+
+func TestToolOfAcceptsIntegralDecimalsAndExponents(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{"exponent", `{"n":1e3}`, 1000},
+		{"capital exponent", `{"n":1E2}`, 100},
+		{"negative exponent", `{"n":-2e2}`, -200},
+		{"decimal", `{"n":1000.0}`, 1000},
+		{"plain", `{"n":42}`, 42},
+	}
+	for _, c := range cases {
+		var seen bigArgs
+		tool := ai.ToolOf[bigArgs]("big", "Take a big integer.", func(ctx context.Context, in bigArgs) (string, error) {
+			seen = in
+			return "ok", nil
+		})
+		if _, err := tool.Call(t.Context(), c.raw); err != nil {
+			t.Fatalf("ToolOf %s: %v", c.name, err)
+			return
+		}
+		if seen.N != c.want {
+			t.Fatalf("ToolOf %s = %d, want %d", c.name, seen.N, c.want)
+		}
+	}
+}
+
+func TestToolOfRejectsFractionsAndOverflowInIntegerFields(t *testing.T) {
+	for _, raw := range []string{`{"n":1.5}`, `{"n":1e400}`, `{"n":"1e3"}`} {
+		var ran bool
+		tool := ai.ToolOf[bigArgs]("big", "Take a big integer.", func(ctx context.Context, in bigArgs) (string, error) {
+			ran = true
+			return "ok", nil
+		})
+		if _, err := tool.Call(t.Context(), raw); err == nil {
+			t.Fatalf("ToolOf %s: expected an error", raw)
+			return
+		}
+		if ran {
+			t.Fatalf("ToolOf %s: the function ran", raw)
+		}
+	}
+}
+
+func TestToolOfAcceptsAnIntegralExponentAtTheRoot(t *testing.T) {
+	var seen int64
+	tool := ai.ToolOf[int64]("n", "Take an integer.", func(ctx context.Context, in int64) (string, error) {
+		seen = in
+		return "ok", nil
+	})
+	if _, err := tool.Call(t.Context(), "1e3"); err != nil {
+		t.Fatalf("ToolOf root exponent: %v", err)
+		return
+	}
+	if seen != 1000 {
+		t.Fatalf("ToolOf root exponent = %d, want 1000", seen)
+	}
+}
