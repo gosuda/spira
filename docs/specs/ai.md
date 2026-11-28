@@ -294,6 +294,7 @@ func Structured[T any](text string) (T, error)
 - `ToolOf` MUST panic at derivation when `schema.Of[In]()` names an unsupported field type.
 - `ToolFromSchema` MUST keep the given name, description and call in the returned `Tool`.
 - The tool call MUST decode its arguments into `In`.
+- A null struct argument MUST fail decoding.
 - The tool call MUST call with the zero value of `In` for blank arguments.
 - The tool call MUST reject unknown JSON members.
 - Argument keys MUST match wire names byte for byte.

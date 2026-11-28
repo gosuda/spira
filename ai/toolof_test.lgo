@@ -429,3 +429,34 @@ func TestToolOfTopLevelBytesKeepTheLiteralString(t *testing.T) {
 		t.Fatalf("ToolOf top-level bytes = %q, want the four literal characters", string(seen))
 	}
 }
+
+type optionalArgs struct {
+	Limit int32? `json:"limit"`
+}
+
+func TestToolOfRejectsANullObjectWithoutRunningTheFunction(t *testing.T) {
+	var ran bool
+	tool := ai.ToolOf[optionalArgs]("limits", "Take optional limits.", func(ctx context.Context, in optionalArgs) (string, error) {
+		ran = true
+		return "ok", nil
+	})
+	if _, err := tool.Call(t.Context(), "null"); err == nil {
+		t.Fatal("ToolOf null object: expected an error")
+		return
+	}
+	if ran {
+		t.Fatal("ToolOf null object: the function ran")
+		return
+	}
+	if _, err := tool.Call(t.Context(), "{}"); err != nil {
+		t.Fatalf("ToolOf empty object: %v", err)
+		return
+	}
+	if _, err := tool.Call(t.Context(), `{"limit":null}`); err != nil {
+		t.Fatalf("ToolOf null option field: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf empty object: the function did not run")
+	}
+}
