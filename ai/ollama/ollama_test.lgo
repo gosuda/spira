@@ -904,3 +904,108 @@ func TestStreamStopsAtTheStreamBound(t *testing.T) {
 		t.Errorf("the server wrote %d bytes before the client closed, want at most %d", got, streamBound+boundSlack)
 	}
 }
+
+type bigIntArgs struct {
+	N int64 `json:"n"`
+}
+
+func TestRunKeepsLargeIntegersThroughOllama(t *testing.T) {
+	const want int64 = 9007199254740993
+	seq := &runSequence{
+		first: `{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"bignum","arguments":{"n":9007199254740993}}}]},"done":true,"done_reason":"tool_calls","prompt_eval_count":12,"eval_count":34}`,
+		final: `{"model":"llama3.2","message":{"role":"assistant","content":"Done."},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":2}`,
+	}
+	srv := seq.serve(t)
+	defer srv.Close()
+	seen, ran := runBigIntTool(t, testClient(srv))
+	if !ran {
+		t.Fatal("Run: the typed function did not run")
+		return
+	}
+	if seen != want {
+		t.Fatalf("Run: callback saw %d, want %d", seen, want)
+	}
+	sent := seq.bodies()
+	if len(sent) != 2 {
+		t.Fatalf("Run: server saw %d requests, want 2", len(sent))
+		return
+	}
+	if !strings.Contains(sent[1], `"arguments":{"n":9007199254740993}`) {
+		t.Fatalf("Run: second request lost the digits: %s", sent[1])
+	}
+}
+
+type runSequence struct {
+	first  string
+	final  string
+	seen   sync.Locked[[]string]
+	calls  atomic.Int64
+}
+
+func (s *runSequence) serve(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !admitted(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read: %v", err)
+		}
+		s.seen.WithLock(func(bodies *[]string) {
+			*bodies = append(*bodies, string(raw))
+		})
+		w.Header().Set("Content-Type", "application/json")
+		next := s.first
+		if s.calls.Add(1) > 1 {
+			next = s.final
+		}
+		if _, err := io.WriteString(w, next); err != nil {
+			t.Errorf("server write: %v", err)
+		}
+	}))
+}
+
+func (s *runSequence) bodies() []string {
+	var sent []string
+	s.seen.WithLock(func(bodies *[]string) {
+		sent = *bodies
+	})
+	return sent
+}
+
+
+func runBigIntTool(t *testing.T, c *ollama.Client) (int64, bool) {
+	t.Helper()
+	var seen int64
+	var ran bool
+	tool := ai.ToolOf[bigIntArgs]("bignum", "Take a big integer.", func(ctx context.Context, in bigIntArgs) (string, error) {
+		seen = in.N
+		ran = true
+		return "ok", nil
+	})
+	reply, err := ai.Run(context.Background(), c, ai.Request{
+		Model:    "llama3.2",
+		Messages: []ai.Message{{Role: ai.RoleUser, Parts: []ai.Part{ai.Text{Text: "How big?"}}}},
+		Tools:    []ai.Tool{tool},
+	}, ai.Limits{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+		return 0, false
+	}
+	if textOfReply(reply) != "Done." {
+		t.Fatalf("Run: final text = %q, want Done.", textOfReply(reply))
+	}
+	return seen, ran
+}
+
+func textOfReply(reply ai.Reply) string {
+	text := ""
+	for _, part := range reply.Message.Parts {
+		if line, ok := part.(ai.Text); ok {
+			text += line.Text
+		}
+	}
+	return text
+}
