@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"logos/rt"
+
 	"github.com/gosuda/spira/ai"
 )
 
@@ -458,5 +460,88 @@ func TestToolOfRejectsANullObjectWithoutRunningTheFunction(t *testing.T) {
 	}
 	if !ran {
 		t.Fatal("ToolOf empty object: the function did not run")
+	}
+}
+
+type idListArgs struct {
+	IDs []int64 `json:"ids"`
+}
+
+func TestToolOfRejectsNullItemsInRequiredSlices(t *testing.T) {
+	var ran bool
+	tool := ai.ToolOf[idListArgs]("ids", "Take ids.", func(ctx context.Context, in idListArgs) (string, error) {
+		ran = true
+		return "ok", nil
+	})
+	if _, err := tool.Call(t.Context(), `{"ids":[12,null,34]}`); err == nil {
+		t.Fatal("ToolOf null item: expected an error")
+		return
+	}
+	if ran {
+		t.Fatal("ToolOf null item: the function ran")
+		return
+	}
+	if _, err := tool.Call(t.Context(), `{"ids":[12,34]}`); err != nil {
+		t.Fatalf("ToolOf plain items: %v", err)
+		return
+	}
+	if _, err := tool.Call(t.Context(), `{"ids":[]}`); err != nil {
+		t.Fatalf("ToolOf empty items: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf plain items: the function did not run")
+	}
+}
+
+type optionalIDListArgs struct {
+	IDs rt.Option[[]int64] `json:"ids"`
+}
+
+func TestToolOfRejectsNullItemsInOptionalSlices(t *testing.T) {
+	var ran bool
+	tool := ai.ToolOf[optionalIDListArgs]("ids", "Take optional ids.", func(ctx context.Context, in optionalIDListArgs) (string, error) {
+		ran = true
+		return "ok", nil
+	})
+	if _, err := tool.Call(t.Context(), `{"ids":[1,null]}`); err == nil {
+		t.Fatal("ToolOf null item in optional slice: expected an error")
+		return
+	}
+	if ran {
+		t.Fatal("ToolOf null item in optional slice: the function ran")
+		return
+	}
+	if _, err := tool.Call(t.Context(), `{"ids":null}`); err != nil {
+		t.Fatalf("ToolOf null optional slice: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf null optional slice: the function did not run")
+	}
+}
+
+type flagListArgs struct {
+	Flags []rt.Option[bool] `json:"flags"`
+}
+
+func TestToolOfKeepsNullItemsInOptionSlices(t *testing.T) {
+	var seen flagListArgs
+	var ran bool
+	tool := ai.ToolOf[flagListArgs]("flags", "Take flags.", func(ctx context.Context, in flagListArgs) (string, error) {
+		seen = in
+		ran = true
+		return "ok", nil
+	})
+	if _, err := tool.Call(t.Context(), `{"flags":[true,null]}`); err != nil {
+		t.Fatalf("ToolOf null option item: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("ToolOf null option item: the function did not run")
+		return
+	}
+	if len(seen.Flags) != 2 || !seen.Flags[0].Present || seen.Flags[0].Value != true || seen.Flags[1].Present {
+		t.Fatalf("ToolOf null option item flags = %+v, want [present true, absent]", seen.Flags)
 	}
 }

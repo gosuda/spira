@@ -242,6 +242,11 @@ func RecodeToolValue(dst any, v jsontext.Value) error {
 }
 
 func toolFillSlice(dst any, v jsontext.Value) (bool, error) {
+	if toolRequiredSlice(dst) {
+		if err := rejectNullArrayItems(v); err != nil {
+			return true, err
+		}
+	}
 	filled, err := toolFillSliceA(dst, v)
 	if err != nil {
 		return false, err
@@ -250,6 +255,31 @@ func toolFillSlice(dst any, v jsontext.Value) (bool, error) {
 		return true, nil
 	}
 	return toolFillSliceB(dst, v)
+}
+
+func toolRequiredSlice(dst any) bool {
+	switch dst.(type) {
+	case *[]string, *[]bool,
+		*[]int, *[]int8, *[]int16, *[]int32, *[]int64,
+		*[]uint, *[]uint16, *[]uint32, *[]uint64,
+		*[]float32, *[]float64,
+		*[]time.Time:
+		return true
+	}
+	return false
+}
+
+func rejectNullArrayItems(v jsontext.Value) error {
+	var items []jsontext.Value
+	if err := json.Unmarshal([]byte(v), &items); err != nil {
+		return nil
+	}
+	for i, item := range items {
+		if toolValueNull(item) {
+			return fmt.Errorf("null in array item %d", i)
+		}
+	}
+	return nil
 }
 
 func toolFillSliceA(dst any, v jsontext.Value) (bool, error) {
@@ -331,6 +361,9 @@ func toolWrapOptionSlice[E any](dst *rt.Option[[]E], v jsontext.Value) (bool, er
 	if toolValueNull(v) {
 		*dst = rt.Option[[]E]{}
 		return true, nil
+	}
+	if err := rejectNullArrayItems(v); err != nil {
+		return true, err
 	}
 	var e []E
 	if err := RecodeToolValue(&e, v); err != nil {
