@@ -822,7 +822,7 @@ func ToolSchemaText(s schema.Schema) string {
 	case schema.Object:
 		return objectText(v)
 	case schema.Array:
-		return `{"type":"array","items":` + nodeText(v.Items) + `}`
+		return `{"type":"array","items":` + arrayItemsText(v.Items) + `}`
 	case schema.Optional:
 		return nodeText(v.Items)
 	case schema.String:
@@ -844,6 +844,17 @@ func nodeText(n *schema.Node) string {
 		return "true"
 	}
 	return ToolSchemaText(n.Value)
+}
+
+func arrayItemsText(n *schema.Node) string {
+	if n == nil {
+		return "true"
+	}
+	opt, ok := n.Value.(schema.Optional)
+	if !ok {
+		return nodeText(n)
+	}
+	return `{"anyOf":[` + nodeText(opt.Items) + `,{"type":"null"}]}`
 }
 
 func objectText(o schema.Object) string {

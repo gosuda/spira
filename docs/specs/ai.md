@@ -316,6 +316,7 @@ func Structured[T any](text string) (T, error)
 - The schema text MUST set `additionalProperties` to false.
 - Nested objects and arrays MUST use the same schema shape.
 - An option field MUST keep its inner schema outside `required`.
+- An array of options MUST list the inner type and null as alternatives.
 
 ### Structured output
 

@@ -605,3 +605,24 @@ func TestToolOfAcceptsAnIntegralExponentAtTheRoot(t *testing.T) {
 		t.Fatalf("ToolOf root exponent = %d, want 1000", seen)
 	}
 }
+
+func TestToolOfMarksOptionSliceItemsNullable(t *testing.T) {
+	tool := ai.ToolOf[flagListArgs]("flags", "Take flags.", func(ctx context.Context, in flagListArgs) (string, error) {
+		return "ok", nil
+	})
+	var got any
+	if err := json.Unmarshal([]byte(tool.Schema), &got); err != nil {
+		t.Fatalf("ToolOf option slice schema is not JSON: %v", err)
+		return
+	}
+	const hand = `{"type":"object","additionalProperties":false,"required":["flags"],` +
+		`"properties":{"flags":{"type":"array","items":{"anyOf":[{"type":"boolean"},{"type":"null"}]}}}}`
+	var want any
+	if err := json.Unmarshal([]byte(hand), &want); err != nil {
+		t.Fatalf("hand-written schema is not JSON: %v", err)
+		return
+	}
+	if !equalJSON(got, want) {
+		t.Fatalf("ToolOf option slice schema = %s, want %s", tool.Schema, hand)
+	}
+}
