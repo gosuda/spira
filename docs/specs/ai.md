@@ -48,9 +48,9 @@ type Tool struct {
 	Name        string
 	Description string
 	Schema      string
-	Call        func(ctx context.Context, arguments string) (string, error)
 	Direct      bool
 	Confirm     bool
+	Typed       bool
 }
 
 type Decision struct {
@@ -162,6 +162,7 @@ func DecodeToolFieldValue[F any](dst *(F), v jsontext.Value, at string) error
 func FillToolValue(dst any, v jsontext.Value) (bool, error)
 func FillToolOption(dst any, v jsontext.Value) (bool, error)
 func RecodeToolValue(dst any, v jsontext.Value) error
+func CanonicalIntegralNumbers(v jsontext.Value) jsontext.Value
 var ErrConfirmationRequired = fault.New("ai.confirmation_required", fault.Unprocessable, "Tool calls wait for a decision.")
 var ErrToolLimitExceeded = fault.New("ai.tool_limit_exceeded", fault.Unprocessable, "The tool call limit was exceeded.")
 var ErrInvalidDecision = fault.New("ai.invalid_decision", fault.Unprocessable, "The tool call decision is invalid.")
@@ -225,7 +226,8 @@ func Structured[T any](text string) (T, error)
 - `Limits.PerTurn` MUST default to 150.
 - `Run` MUST stop when the reply holds no tool call.
 - `Run` MUST execute pending tool calls when the last message is an assistant message with tool calls.
-- `Run` MUST treat a blank argument string as `{}`.
+- `Run` MUST treat a blank argument string as `{}` for an untyped tool.
+- `Run` MUST pass a blank argument string unchanged to a typed tool.
 - `Run` MUST return `ai.unknown_tool` for a missing tool.
 - `Run` MUST turn a tool error into that call's result text.
 - `Run` MUST use the public message for a tool error that holds a fault.
@@ -293,15 +295,22 @@ func Structured[T any](text string) (T, error)
 - `ToolOf` MUST set `Schema` to the JSON Schema text of `schema.Of[In]`().
 - `ToolOf` MUST panic at derivation when `schema.Of[In]()` names an unsupported field type.
 - `ToolFromSchema` MUST keep the given name, description and call in the returned `Tool`.
+- `ToolFromSchema` MUST mark the returned `Tool` as typed.
 - The tool call MUST decode its arguments into `In`.
+- A null struct argument MUST fail decoding.
 - The tool call MUST call with the zero value of `In` for blank arguments.
 - The tool call MUST reject unknown JSON members.
 - Argument keys MUST match wire names byte for byte.
 - A duplicate key MUST keep the last value.
 - A missing required field MUST fail decoding; a missing option field MUST stay none.
 - JSON null in a non-option field MUST fail decoding; null in an option field MUST stay none.
-- A number MUST keep its literal digits through decoding and MUST fit the field type; a fraction in an integer field MUST fail decoding.
-- A date-time field MUST decode from a date-time string; a duration field from a duration string; a bytes field from a plain string.
+- A number MUST keep its literal digits through decoding.
+- A number MUST fit the field type.
+- An integer field MUST accept an integral decimal or exponent number.
+- A fraction in an integer field MUST fail decoding.
+- A date-time field MUST decode from a date-time string.
+- A duration field MUST decode from a duration string.
+- A bytes field MUST decode from a plain string.
 - A decode failure MUST come back as the tool error text.
 - The tool call MUST NOT run `call` when decoding fails.
 - The schema text MUST hold `type`, `properties` in field order and `required`.
@@ -309,6 +318,7 @@ func Structured[T any](text string) (T, error)
 - The schema text MUST set `additionalProperties` to false.
 - Nested objects and arrays MUST use the same schema shape.
 - An option field MUST keep its inner schema outside `required`.
+- An array of options MUST list the inner type and null as alternatives.
 
 ### Structured output
 

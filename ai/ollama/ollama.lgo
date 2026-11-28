@@ -283,11 +283,11 @@ func (m *wireMessage) parts() []ai.Part {
 		out = append(out, ai.Text{Text: m.Content})
 	}
 	for _, tc := range m.ToolCalls {
-		args, err := json.Marshal(tc.Function.Arguments)
-		if err != nil {
-			args = []byte("{}")
+		args := strings.TrimSpace(string(tc.Function.Arguments))
+		if args == "" {
+			args = "{}"
 		}
-		out = append(out, ai.ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: string(args)})
+		out = append(out, ai.ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: args})
 	}
 	return out
 }
@@ -402,11 +402,13 @@ func addAssistantPart(w *wireMessage, thinking []string, p ai.Part) ([]string, e
 }
 
 func toolCallOf(call ai.ToolCall) (wireToolCall, error) {
-	args := map[string]any{}
-	if call.Arguments != "" {
-		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
-			return wireToolCall{}, fmt.Errorf("ai/ollama: tool call %s: arguments are not a JSON object: %w", call.Name, err)
-		}
+	trimmed := strings.TrimSpace(call.Arguments)
+	if trimmed == "" {
+		trimmed = "{}"
+	}
+	args := jsontext.Value(trimmed)
+	if !args.IsValid() {
+		return wireToolCall{}, fmt.Errorf("ai/ollama: tool call %s: arguments are not JSON: %s", call.Name, trimmed)
 	}
 	return wireToolCall{ID: call.ID, Function: wireToolFunction{Name: call.Name, Arguments: args}}, nil
 }

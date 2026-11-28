@@ -22,7 +22,7 @@ type wireToolCall struct {
 
 type wireToolFunction struct {
 	Name      string         `json:"name,omitempty"`
-	Arguments map[string]any `json:"arguments,omitempty"`
+	Arguments jsontext.Value `json:"arguments,omitempty"`
 }
 
 type wireTool struct {

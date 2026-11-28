@@ -41,7 +41,11 @@ func TestAssembledShopAccount(t *testing.T) {
 	}
 
 	assets := asset.Dev("http://localhost:5173")
-	router, _ := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
+	router, _, err := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
+	if err != nil {
+		t.Fatalf("build test router: %v", err)
+		return
+	}
 	shop := scheduledStockServer(t, router)
 	shop.Client().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse

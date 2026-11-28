@@ -36,6 +36,7 @@ import (
 	"github.com/gosuda/spira/migrate"
 	"github.com/gosuda/spira/openapi"
 	"github.com/gosuda/spira/ops"
+	"github.com/gosuda/spira/resilience"
 	"github.com/gosuda/spira/view"
 	"github.com/gosuda/spira/web"
 
@@ -118,7 +119,10 @@ func assemble(ctx context.Context, settings Settings, service *admin.Server?) (*
 		svc.AllowedHosts = []string{host, innerHost}
 	}
 	svc.ProbeToken = token
-	router, scheduler := buildRouter(shopParts{settings: settings, pool: pool, assets: assets, tags: tags, dev: dev, admin: svc, serviceToken: token})
+	router, scheduler, err := buildRouter(ctx, shopParts{settings: settings, pool: pool, assets: assets, tags: tags, dev: dev, admin: svc, serviceToken: token})
+	if err != nil {
+		return nil, err
+	}
 	application := &Application{DB: pool, Jobs: scheduler, Web: &web.Server{Addr: settings.Addr, Router: router}, Registry: svc, Admin: shopAdmin(inner, token)}
 	return application, nil
 }
@@ -182,7 +186,7 @@ type shopParts struct {
 	admin        *admin.Server?
 	serviceToken string
 }
-func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
+func buildRouter(ctx context.Context, p shopParts) (*web.Router, *job.Scheduler, error) {
 	reg := meter.NewRegistry()
 	router := web.NewRouter()
 	router.Layout = layout.Page(p.tags)
@@ -226,10 +230,9 @@ func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 	})
 	stockFeature := &stock.Feature{Topic: stockEvents}
 	stockFeature.Register(router)
-	brain := &openai.Client{BaseURL: p.settings.ModelURL, Model: p.settings.ModelName, Key: p.settings.ModelKey}
-	catalogMemory := &rag.Memory{Embed: brain}
-	assistFeature := &assist.Feature{Model: brain, Catalog: catalogMemory}
-	assistFeature.Register(router)
+	if err := mountAssist(ctx, router, p); err != nil {
+		return router, scheduler, err
+	}
 	guard := auth.Require(auth.Authenticated())
 	ops.Mount(router, guard, ops.Options{
 		Registry: reg,
@@ -239,7 +242,48 @@ func buildRouter(p shopParts) (*web.Router, *job.Scheduler) {
 	openapi.Mount(router, openapi.Info{Title: "Shop", Version: "1.0.0"})
 	service := p.admin ?? &admin.Server{}
 	service.Mount(router, registryWritesOnly(guard, auth.Require(isService)))
-	return router, scheduler
+	return router, scheduler, nil
+}
+
+func seedAssistCatalog(ctx context.Context, pool *db.Pool, catalog *rag.Memory) error {
+	products, err := store.ListProducts(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("shop: list products for the assistant: %w", err)
+	}
+	docs := make([]rag.Document, 0, len(products))
+	for _, product := range products {
+		docs = append(docs, productDocument(product))
+	}
+	if len(docs) == 0 {
+		return nil
+	}
+	if err := catalog.Add(ctx, docs); err != nil {
+		return fmt.Errorf("shop: index products for the assistant: %w", err)
+	}
+	return nil
+}
+
+func productDocument(product store.Product) rag.Document {
+	return rag.Document{
+		ID:   fmt.Sprintf("p-%d", int64(product.ID)),
+		Text: fmt.Sprintf("%s costs %d with %d in stock", product.Name, product.Price, product.Stock),
+	}
+}
+
+func mountAssist(ctx context.Context, router *web.Router, p shopParts) error {
+	brain := &openai.Client{BaseURL: p.settings.ModelURL, Model: p.settings.ModelName, Key: p.settings.ModelKey, Policy: resilience.Policy{Timeout: 30 * time.Second}}
+	catalog := &rag.Memory{Embed: brain}
+	feature := &assist.Feature{Model: brain, Catalog: catalog}
+	feature.Register(router)
+	if p.settings.ModelURL == "" {
+		return nil
+	}
+	seedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := seedAssistCatalog(seedCtx, p.pool, catalog); err != nil {
+		return err
+	}
+	return nil
 }
 
 func isService(p auth.Principal?) bool {
