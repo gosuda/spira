@@ -16,8 +16,8 @@ func AssembleForTest(ctx context.Context, settings Settings, service *admin.Serv
 	return assemble(ctx, settings, service)
 }
 
-func BuildRouterForTest(pool *db.Pool, assets *asset.Manifest, tags view.Node, dev bool) (*web.Router, *job.Scheduler) {
-	return buildRouter(shopParts{pool: pool, assets: assets, tags: tags, dev: dev})
+func BuildRouterForTest(pool *db.Pool, assets *asset.Manifest, tags view.Node, dev bool) (*web.Router, *job.Scheduler, error) {
+	return buildRouter(context.Background(), shopParts{pool: pool, assets: assets, tags: tags, dev: dev})
 }
 
 func LoadShopSettingsForTest(source config.Source) (Settings, error) {

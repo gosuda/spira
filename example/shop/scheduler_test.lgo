@@ -24,7 +24,11 @@ func TestScheduledStockReachesEventsStream(t *testing.T) {
 		return
 	}
 	assets := asset.Dev("http://localhost:5173")
-	router, scheduler := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
+	router, scheduler, err := shopmain.BuildRouterForTest(pool, assets, view.Group{}, true)
+	if err != nil {
+		t.Fatalf("build test router: %v", err)
+		return
+	}
 	server := scheduledStockServer(t, router)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
