@@ -2,10 +2,13 @@ package main_test
 
 import (
 	"context"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +17,10 @@ import (
 
 	"github.com/gosuda/spira/admin"
 	"github.com/gosuda/spira/app"
+	"github.com/gosuda/spira/db"
+	shopdb "github.com/gosuda/spira/example/shop/db"
 	shopmain "github.com/gosuda/spira/example/shop"
+	"github.com/gosuda/spira/migrate"
 )
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -145,4 +151,173 @@ func TestShopStartsWithNonLoopbackPublicURL(t *testing.T) {
 		t.Errorf("registration target = %q, want the loopback listener, not the advertised URL", got)
 	}
 	pollAdminUp(t, "http://"+settings.Addr, token)
+}
+
+func TestAssistAnswersFromSeededCatalog(t *testing.T) {
+	port := freePort(t)
+	if port == 0 {
+		return
+	}
+	dsn := fmt.Sprintf("file:spira_assist_%d?mode=memory&cache=shared", port)
+	setup := openAssistFixture(t, dsn)
+	if setup == nil {
+		return
+	}
+	defer func() {
+		if err := setup.Stop(context.Background()); err != nil {
+			t.Errorf("stop fixture pool: %v", err)
+		}
+	}()
+	model := serveEchoModel(t)
+	defer model.Close()
+	settings := startupSettings(port)
+	settings.DSN = dsn
+	settings.ModelURL = model.URL
+	settings.ModelName = "echo-1"
+	settings.ModelKey = "test-key"
+	_, token, stop := launchShop(t, settings)
+	defer stop()
+	pollAdminUp(t, settings.PublicURL, token)
+	answer := postAssistAsk(t, settings.PublicURL, "lantern")
+	if strings.Contains(answer, "outside your knowledge base") {
+		t.Fatalf("assist answer reports an empty catalog: %q", answer)
+		return
+	}
+	if !strings.Contains(answer, "Seeded lantern") {
+		t.Fatalf("assist answer lacks the seeded product: %q", answer)
+	}
+}
+
+func openAssistFixture(t *testing.T, dsn string) *db.Pool? {
+	t.Helper()
+	pool, err := db.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open fixture pool: %v", err)
+		return nil
+	}
+	if pool == nil {
+		t.Fatal("open fixture pool: no pool")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("start fixture pool: %v", err)
+		return nil
+	}
+	steps, err := migrate.Load(shopdb.FS())
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+		return nil
+	}
+	if err := migrate.Apply(ctx, pool, steps); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+		return nil
+	}
+	const seed = "INSERT INTO products (id, name, price, stock, created_at) VALUES (1, 'Seeded lantern', 1299, 10, '2026-01-02 10:00:00')"
+	if _, err := pool.ExecContext(ctx, seed); err != nil {
+		t.Fatalf("seed product: %v", err)
+		return nil
+	}
+	return pool
+}
+
+func postAssistAsk(t *testing.T, publicURL string, query string) string {
+	t.Helper()
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.PostForm(publicURL+"/assist/ask", url.Values{"q": []string{query}})
+	if err != nil {
+		t.Fatalf("post assist ask: %v", err)
+		return ""
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close assist body: %v", err)
+		}
+	}()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read assist answer: %v", err)
+		return ""
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("assist status = %d, want 200: %q", resp.StatusCode, string(raw))
+		return ""
+	}
+	return string(raw)
+}
+
+func serveEchoModel(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("model read: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/embeddings":
+			writeEchoEmbeddings(t, w, raw)
+		case "/chat/completions":
+			writeEchoChat(t, w, raw)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+func writeEchoEmbeddings(t *testing.T, w http.ResponseWriter, raw []byte) {
+	t.Helper()
+	var req struct {
+		Input []string `json:"input"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Errorf("model embeddings input: %v", err)
+	}
+	entries := make([]string, 0, len(req.Input))
+	for i := range req.Input {
+		entries = append(entries, fmt.Sprintf(`{"object":"embedding","embedding":[1,0],"index":%d}`, i))
+	}
+	body := `{"object":"list","data":[` + strings.Join(entries, ",") + `],"model":"echo-1","usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}`
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Errorf("model embeddings write: %v", err)
+	}
+}
+
+func writeEchoChat(t *testing.T, w http.ResponseWriter, raw []byte) {
+	t.Helper()
+	content, err := json.Marshal(lastUserText(raw))
+	if err != nil {
+		t.Errorf("model chat content: %v", err)
+	}
+	body := `{"id":"chatcmpl-echo","object":"chat.completion","created":1694268190,"model":"echo-1",` +
+		`"choices":[{"index":0,"message":{"role":"assistant","content":` + string(content) + `},"finish_reason":"stop"}],` +
+		`"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21}}`
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Errorf("model chat write: %v", err)
+	}
+}
+
+func lastUserText(raw []byte) string {
+	var body struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return ""
+	}
+	text := ""
+	for _, m := range body.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		if s, ok := m.Content.(string); ok {
+			text = s
+		} else {
+			text = strings.TrimSpace(fmt.Sprintf("%v", m.Content))
+		}
+	}
+	return text
 }

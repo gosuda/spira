@@ -50,7 +50,7 @@ type Tool struct {
 	Call        func(ctx context.Context, arguments string) (string, error)
 	Direct      bool
 	Confirm     bool
-	typed       bool
+	Typed       bool
 }
 
 type Request struct {

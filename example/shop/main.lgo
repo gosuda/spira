@@ -278,6 +278,11 @@ func mountAssist(ctx context.Context, router *web.Router, p shopParts) error {
 	if p.settings.ModelURL == "" {
 		return nil
 	}
+	seedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := seedAssistCatalog(seedCtx, p.pool, catalog); err != nil {
+		return err
+	}
 	return nil
 }
 

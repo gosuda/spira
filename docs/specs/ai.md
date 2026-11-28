@@ -48,9 +48,9 @@ type Tool struct {
 	Name        string
 	Description string
 	Schema      string
-	Call        func(ctx context.Context, arguments string) (string, error)
 	Direct      bool
 	Confirm     bool
+	Typed       bool
 }
 
 type Decision struct {
@@ -294,6 +294,7 @@ func Structured[T any](text string) (T, error)
 - `ToolOf` MUST set `Schema` to the JSON Schema text of `schema.Of[In]`().
 - `ToolOf` MUST panic at derivation when `schema.Of[In]()` names an unsupported field type.
 - `ToolFromSchema` MUST keep the given name, description and call in the returned `Tool`.
+- `ToolFromSchema` MUST mark the returned `Tool` as typed.
 - The tool call MUST decode its arguments into `In`.
 - A null struct argument MUST fail decoding.
 - The tool call MUST call with the zero value of `In` for blank arguments.
