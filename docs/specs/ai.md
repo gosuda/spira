@@ -303,13 +303,8 @@ func Structured[T any](text string) (T, error)
 - A duplicate key MUST keep the last value.
 - A missing required field MUST fail decoding; a missing option field MUST stay none.
 - JSON null in a non-option field MUST fail decoding; null in an option field MUST stay none.
-- A number MUST keep its literal digits through decoding.
-- A number MUST fit the field type.
-- An integer field MUST accept an integral decimal or exponent number.
-- A fraction in an integer field MUST fail decoding.
-- A date-time field MUST decode from a date-time string.
-- A duration field MUST decode from a duration string.
-- A bytes field MUST decode from a plain string.
+- A number MUST keep its literal digits through decoding and MUST fit the field type; a fraction in an integer field MUST fail decoding.
+- A date-time field MUST decode from a date-time string; a duration field from a duration string; a bytes field from a plain string.
 - A decode failure MUST come back as the tool error text.
 - The tool call MUST NOT run `call` when decoding fails.
 - The schema text MUST hold `type`, `properties` in field order and `required`.
