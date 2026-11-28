@@ -225,7 +225,8 @@ func Structured[T any](text string) (T, error)
 - `Limits.PerTurn` MUST default to 150.
 - `Run` MUST stop when the reply holds no tool call.
 - `Run` MUST execute pending tool calls when the last message is an assistant message with tool calls.
-- `Run` MUST treat a blank argument string as `{}`.
+- `Run` MUST treat a blank argument string as `{}` for an untyped tool.
+- `Run` MUST pass a blank argument string unchanged to a typed tool.
 - `Run` MUST return `ai.unknown_tool` for a missing tool.
 - `Run` MUST turn a tool error into that call's result text.
 - `Run` MUST use the public message for a tool error that holds a fault.

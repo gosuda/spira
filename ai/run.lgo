@@ -214,7 +214,7 @@ func callTool(ctx context.Context, tool Tool, call ToolCall) (string, error) {
 		return "", toolContextFault(call.Name, cerr)
 	}
 	arguments := call.Arguments
-	if strings.TrimSpace(arguments) == "" {
+	if strings.TrimSpace(arguments) == "" && !tool.typed {
 		arguments = "{}"
 	}
 	content, err := tool.Call(ctx, arguments)

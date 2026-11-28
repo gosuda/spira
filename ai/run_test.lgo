@@ -627,3 +627,28 @@ func TestRunChargesNoLimitForACallThatDidNotRun(t *testing.T) {
 	}
 	requireStrings(t, "tools that ran in the turn", log.ran, "weather", "ticket")
 }
+
+func TestRunPassesBlankArgumentsToTypedToolsUnchanged(t *testing.T) {
+	var seen lookupArgs
+	var ran bool
+	tool := ai.ToolOf[lookupArgs]("lookup", "Look up the forecast.", func(ctx context.Context, in lookupArgs) (string, error) {
+		seen = in
+		ran = true
+		return "found ", nil
+	})
+	model := &scripted{replies: []ai.Reply{
+		asking(ai.ToolCall{ID: "c1", Name: "lookup", Arguments: " "}),
+		saying("Rain likely."),
+	}}
+	if _, err := ai.Run(t.Context(), model, ai.Request{Messages: question(), Tools: []ai.Tool{tool}}, ai.Limits{}); err != nil {
+		t.Fatalf("Run: %v", err)
+		return
+	}
+	if !ran {
+		t.Fatal("Run: the typed function did not run for blank arguments")
+		return
+	}
+	if seen.Query != "" || seen.Limit != nil {
+		t.Fatalf("Run: typed blank arguments = %+v, want the zero value", seen)
+	}
+}
